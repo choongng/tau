@@ -3782,18 +3782,18 @@ class TauTuiApp(App[None]):
         background: $tau-prompt-background;
         color: $tau-prompt-text;
         border: none;
-        border-left: tall transparent;
+        border-left: solid transparent;
         margin: 0;
         padding: 1 1;
         max-height: 8;
     }
 
     #prompt:focus {
-        border-left: tall $tau-prompt-border;
+        border-left: solid $tau-prompt-border;
     }
 
     #prompt.-shell-mode {
-        border-left: tall $tau-tool-running;
+        border-left: solid $tau-tool-running;
     }
 
     #compact-session-info {
@@ -3811,7 +3811,7 @@ class TauTuiApp(App[None]):
         padding: 0 1;
         background: $tau-autocomplete-background;
         color: $tau-screen-text;
-        border: tall $tau-border;
+        border: solid $tau-border;
         overflow-y: auto;
     }
 
@@ -3837,7 +3837,7 @@ class TauTuiApp(App[None]):
         max-height: 70%;
         padding: 1 2;
         background: $tau-chrome-background;
-        border: tall $tau-border;
+        border: solid $tau-border;
     }
 
     #session-picker-title,
@@ -3860,7 +3860,7 @@ class TauTuiApp(App[None]):
         margin-bottom: 1;
         background: $tau-prompt-background;
         color: $tau-prompt-text;
-        border: tall $tau-prompt-border;
+        border: solid $tau-prompt-border;
     }
 
     #tools-reference-header {
@@ -3883,7 +3883,7 @@ class TauTuiApp(App[None]):
         height: 1fr;
         background: $tau-prompt-background;
         color: $tau-prompt-text;
-        border: tall $tau-prompt-border;
+        border: solid $tau-prompt-border;
     }
 
     #session-picker-list,
@@ -3894,7 +3894,7 @@ class TauTuiApp(App[None]):
         height: auto;
         max-height: 16;
         background: $tau-transcript-background;
-        border: tall $tau-border;
+        border: solid $tau-border;
     }
 
     ListView,
@@ -3983,7 +3983,7 @@ class TauTuiApp(App[None]):
         max-height: 70%;
         padding: 1 2;
         background: $tau-chrome-background;
-        border: tall $tau-border;
+        border: solid $tau-border;
     }
 
     #extension-select-title,
@@ -4006,12 +4006,12 @@ class TauTuiApp(App[None]):
         height: auto;
         max-height: 16;
         background: $tau-transcript-background;
-        border: tall $tau-border;
+        border: solid $tau-border;
     }
 
     #extension-input-field {
         background: $tau-transcript-background;
-        border: tall $tau-border;
+        border: solid $tau-border;
     }
 
     #extension-select-help,
@@ -4034,7 +4034,7 @@ class TauTuiApp(App[None]):
         max-height: 82%;
         padding: 1 2;
         background: $tau-chrome-background;
-        border: tall $tau-border;
+        border: solid $tau-border;
     }
 
     #local-backend-picker-title,
@@ -4069,7 +4069,7 @@ class TauTuiApp(App[None]):
     #local-configure-screen Select,
     #local-model-action-input {
         background: $tau-transcript-background;
-        border: tall $tau-border;
+        border: solid $tau-border;
         margin-top: 1;
     }
 
@@ -4090,7 +4090,7 @@ class TauTuiApp(App[None]):
 
     #local-model-list:focus,
     #local-action-menu:focus {
-        border: tall $tau-accent;
+        border: solid $tau-accent;
     }
 
     #local-model-list.local-section-inactive > ListItem.-highlight,
@@ -4149,7 +4149,7 @@ class TauTuiApp(App[None]):
         padding: 1 2;
         background: $tau-chrome-background;
         color: $tau-chrome-text;
-        border: tall $tau-border;
+        border: solid $tau-border;
     }
 
     #project-trust-title {
@@ -4166,7 +4166,7 @@ class TauTuiApp(App[None]):
     #project-trust-list {
         background: $tau-transcript-background;
         color: $tau-screen-text;
-        border: tall $tau-border;
+        border: solid $tau-border;
     }
 
     #project-trust-list ListItem.-highlight,
@@ -4183,7 +4183,7 @@ class TauTuiApp(App[None]):
         padding: 1 2;
         background: $tau-chrome-background;
         color: $tau-chrome-text;
-        border: tall $tau-border;
+        border: solid $tau-border;
     }
 
     #command-output-title {
@@ -4197,7 +4197,7 @@ class TauTuiApp(App[None]):
         height: auto;
         max-height: 18;
         background: $tau-transcript-background;
-        border: tall $tau-border;
+        border: solid $tau-border;
     }
 
     #command-output-body {
@@ -4229,7 +4229,7 @@ class TauTuiApp(App[None]):
         padding: 1 2;
         background: $tau-chrome-background;
         color: $tau-chrome-text;
-        border: tall $tau-border;
+        border: solid $tau-border;
     }
 
     #login-method-title,
@@ -4256,7 +4256,7 @@ class TauTuiApp(App[None]):
         max-height: 12;
         background: $tau-transcript-background;
         color: $tau-screen-text;
-        border: tall $tau-border;
+        border: solid $tau-border;
     }
 
     #login-method-list ListItem Label,
@@ -4291,7 +4291,7 @@ class TauTuiApp(App[None]):
         margin-bottom: 1;
         background: $tau-prompt-background;
         color: $tau-prompt-text;
-        border: tall $tau-prompt-border;
+        border: solid $tau-prompt-border;
     }
 
     #login-method-help,
@@ -4321,7 +4321,7 @@ class TauTuiApp(App[None]):
         overflow-y: auto;
         padding: 1 2;
         background: $tau-chrome-background;
-        border: tall $tau-border;
+        border: solid $tau-border;
     }
 
     #login-title {
@@ -4349,7 +4349,7 @@ class TauTuiApp(App[None]):
     #custom-provider-api-key {
         background: $tau-prompt-background;
         color: $tau-prompt-text;
-        border: tall $tau-prompt-border;
+        border: solid $tau-prompt-border;
         margin-bottom: 1;
     }
 
@@ -7349,7 +7349,7 @@ class TauTuiApp(App[None]):
             return
         self._last_activity_indicator_key = render_key
         prompt.styles.border_left = (
-            "tall",
+            "solid",
             _activity_prompt_border_color(
                 theme,
                 frame=self._activity_frame,

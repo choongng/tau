@@ -652,7 +652,7 @@ class TranscriptMessageWidget(Horizontal):
             self._body_background = None
         else:
             self._body_background = background
-            self.styles.border_left = ("tall", self._role_style.border)
+            self.styles.border_left = ("solid", self._role_style.border)
             if background:
                 self.styles.background = background
 
@@ -748,7 +748,7 @@ class TranscriptMessageWidget(Horizontal):
         foreground, background = _split_rich_style_colors(self._role_style.body)
         self._body_foreground = foreground
         self._body_background = background
-        self.styles.border_left = ("tall", self._role_style.border)
+        self.styles.border_left = ("solid", self._role_style.border)
         if background:
             self.styles.background = background
         self._markdown_text = _transcript_item_markdown(
