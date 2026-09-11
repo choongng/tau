@@ -3555,6 +3555,22 @@ class TauTuiApp(App[None]):
         color: $tau-accent;
     }
 
+    /* Textual's Toast severity classes use the 'outer' box, whose edges are
+       half-block glyphs (▌▛▜) that some terminal fonts draw shorter than the
+       full cell, leaving gaps in the left bar. Use solid box-drawing borders
+       with the same severity colors. */
+    Toast.-information {
+        border-left: solid $success;
+    }
+
+    Toast.-warning {
+        border-left: solid $warning;
+    }
+
+    Toast.-error {
+        border-left: solid $error;
+    }
+
     #workspace {
         height: 1fr;
     }
