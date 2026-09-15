@@ -30,6 +30,7 @@ from tau_coding import (
     SessionManager,
     TauPaths,
     TauResourcePaths,
+    load_skills,
 )
 from tau_coding.extensions import (
     CustomMessageView,
@@ -3422,3 +3423,135 @@ def _loaded_extension_module(name: str) -> object:
     ]
     assert candidates, f"extension module {name} not loaded"
     return candidates[-1]
+
+
+# -- skill-directory contributions -------------------------------------------
+
+
+def _skill_plugin(tmp_path: Path, name: str = "campaign-run") -> Path:
+    plugin = tmp_path / "plugin" / "skills"
+    skill_dir = plugin / name
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text(
+        f"---\ndescription: {name}\n---\n# {name}\nDo the thing.", encoding="utf-8"
+    )
+    return plugin
+
+
+def test_register_skill_dir_contributes_directory(tmp_path: Path) -> None:
+    paths = _paths(tmp_path)
+    plugin = _skill_plugin(tmp_path)
+    _write_extension(
+        _user_extensions_dir(paths),
+        "skill_plugin",
+        f"def setup(tau):\n    tau.register_skill_dir({str(plugin)!r})\n",
+    )
+
+    runtime = _runtime_with(paths)
+
+    assert runtime.skill_dirs == (plugin,)
+
+
+def test_registered_skill_dir_yields_loadable_skills(tmp_path: Path) -> None:
+    paths = _paths(tmp_path)
+    plugin = _skill_plugin(tmp_path)
+    _write_extension(
+        _user_extensions_dir(paths),
+        "skill_plugin",
+        f"def setup(tau):\n    tau.register_skill_dir({str(plugin)!r})\n",
+    )
+
+    runtime = _runtime_with(paths)
+    skills = load_skills(paths, extra_skill_dirs=runtime.skill_dirs)
+
+    assert "campaign-run" in {skill.name for skill in skills}
+
+
+def test_register_skill_dir_ignores_missing_path(tmp_path: Path) -> None:
+    paths = _paths(tmp_path)
+    missing = tmp_path / "does-not-exist" / "skills"
+    _write_extension(
+        _user_extensions_dir(paths),
+        "bad_skill",
+        f"def setup(tau):\n    tau.register_skill_dir({str(missing)!r})\n",
+    )
+
+    runtime = _runtime_with(paths)
+
+    assert runtime.skill_dirs == ()
+    assert any("skill directory is missing" in d.message for d in runtime.diagnostics)
+
+
+def test_register_skill_dir_dedupes_by_path(tmp_path: Path) -> None:
+    paths = _paths(tmp_path)
+    plugin = _skill_plugin(tmp_path)
+    body = f"def setup(tau):\n    tau.register_skill_dir({str(plugin)!r})\n"
+    _write_extension(_user_extensions_dir(paths), "dedupe_a", body)
+    _write_extension(_user_extensions_dir(paths), "dedupe_b", body)
+
+    runtime = _runtime_with(paths)
+
+    assert runtime.skill_dirs == (plugin,)
+
+
+def test_register_skill_dir_rolls_back_on_failed_setup(tmp_path: Path) -> None:
+    paths = _paths(tmp_path)
+    plugin = _skill_plugin(tmp_path)
+    _write_extension(
+        _user_extensions_dir(paths),
+        "half_skill",
+        "def setup(tau):\n"
+        f"    tau.register_skill_dir({str(plugin)!r})\n"
+        "    raise RuntimeError('boom')\n",
+    )
+
+    runtime = _runtime_with(paths)
+
+    assert runtime.skill_dirs == ()
+
+
+def test_retire_clears_skill_dirs(tmp_path: Path) -> None:
+    paths = _paths(tmp_path)
+    plugin = _skill_plugin(tmp_path)
+    _write_extension(
+        _user_extensions_dir(paths),
+        "skill_plugin",
+        f"def setup(tau):\n    tau.register_skill_dir({str(plugin)!r})\n",
+    )
+    runtime = _runtime_with(paths)
+    assert runtime.skill_dirs == (plugin,)
+
+    runtime.retire()
+
+    assert runtime.skill_dirs == ()
+
+
+async def test_session_loads_skills_from_extension_skill_dir(tmp_path: Path) -> None:
+    plugin = _skill_plugin(tmp_path)
+    session = await CodingSession.load(
+        _session_config(
+            tmp_path,
+            FakeProvider([]),
+            extension_body=f"def setup(tau):\n    tau.register_skill_dir({str(plugin)!r})\n",
+        )
+    )
+
+    assert "campaign-run" in {skill.name for skill in session.skills}
+    await session.aclose()
+
+
+async def test_session_reload_keeps_extension_skill_dir(tmp_path: Path) -> None:
+    plugin = _skill_plugin(tmp_path)
+    session = await CodingSession.load(
+        _session_config(
+            tmp_path,
+            FakeProvider([]),
+            extension_body=f"def setup(tau):\n    tau.register_skill_dir({str(plugin)!r})\n",
+        )
+    )
+    assert "campaign-run" in {skill.name for skill in session.skills}
+
+    await session.reload()
+
+    assert "campaign-run" in {skill.name for skill in session.skills}
+    await session.aclose()

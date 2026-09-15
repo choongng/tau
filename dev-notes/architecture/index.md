@@ -61,6 +61,7 @@ For the practical frontend contract, see [Building a Custom TUI](../custom-tui.m
 - [Trusted hidden built-in extensions](./trusted-built-in-extensions.md)
 - [Phase 6: Local inference hardening and second-backend validation](./phase-6-local-inference-hardening.md)
 - [Extension Installer](./extension-installer.md)
+- [Extension Skill-Directory Registration](./extension-skill-dir-registration.md)
 - [Phase 22: Compaction Replay Foundation](./phase-22-compaction-foundation.md)
 - [Phase 23: Advanced TUI and Product Polish](./phase-23-tui-polish.md)
 - [Bounded TUI Transcript Rendering](./tui-long-transcript-performance.md)

@@ -40,6 +40,21 @@ registration order. Empty bodies and multi-line titles are ignored with
 diagnostics. Prompt registrations are source-owned and disappear on failed setup, reload, or runtime
 retirement. See `examples/extensions/prompt_section.py`.
 
+## Skill-directory registrations
+
+`tau.register_skill_dir(path)` adds a directory of Agent Skills discovered
+directly from disk (no copying or symlinking). `path` must be a *skills
+directory*: a directory whose subdirectories each contain a `SKILL.md` file, such
+as a plugin's `skills/` tree. This lets a plugin that ships skills (for example a
+Claude Code marketplace plugin) load without editing its layout.
+
+Contributed skills load at the lowest precedence, so a user or project skill
+always overrides a same-named skill from a plugin. The directory must exist when
+`setup` runs; a missing or non-directory path is ignored with a warning
+diagnostic. Contributions are de-duplicated by resolved path and source-owned,
+so failed setup, reload, and runtime retirement remove them. Skills surface in
+the `<available_skills>` index and `/skill:<name>` on the next load or `/reload`.
+
 ## Installing extensions
 
 Install a trusted local or Git extension for future runs with:

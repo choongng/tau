@@ -166,6 +166,7 @@ def setup(tau):
     tau.register_command("name", handler, description="...")
     tau.add_prompt_guideline("Never commit directly to main")
     tau.add_prompt_section("Review procedure", "Read the diff, then run tests.")
+    tau.register_skill_dir("./plugin/skills")  # load a plugin's skills from disk
     tau.on("event_name", handler)            # or @tau.on("event_name")
 
     # message rendering (register in setup; send once running)
@@ -373,6 +374,30 @@ Sections compose in extension load and registration order. Empty bodies and
 multi-line titles are ignored with a resource diagnostic. Registrations are
 source-owned, so failed setup, `/reload`, and generation retirement remove them
 along with the extension's other contributions.
+
+### Skill directories
+
+`register_skill_dir(path)` tells Tau to discover Agent Skills from another
+directory on disk, with no copying or symlinking. `path` must be a *skills
+directory*: a directory whose subdirectories each contain a `SKILL.md` file, such
+as a plugin's `skills/` tree. This is how a plugin that ships skills (for example
+a Claude Code marketplace plugin) is reused without editing its layout.
+
+```python
+from pathlib import Path
+
+
+def setup(tau):
+    tau.register_skill_dir(Path(__file__).parent / "skills")
+```
+
+Contributed skills load at the lowest precedence, so a skill in `~/.tau/skills/`
+or the project's `.tau/skills/` always overrides a same-named skill from a
+plugin. The path must exist when `setup` runs; a missing or non-directory path is
+ignored with a diagnostic. Contributions are de-duplicated by resolved path and
+owned by the registering extension, so failed setup, `/reload`, and generation
+retirement drop them. Skills become available to `/skill:<name>` and the
+`<available_skills>` index on the next load or `/reload`.
 
 ### Commands
 

@@ -246,6 +246,7 @@ class ExtensionRuntime:
         self._commands: dict[str, ExtensionCommand] = {}
         self._prompt_guidelines: list[tuple[str, str, str]] = []
         self._prompt_sections: list[tuple[str, str, PromptSection]] = []
+        self._skill_dirs: list[tuple[str, str, Path]] = []
         self._message_renderers: dict[str, tuple[str, str, MessageRenderer]] = {}
         self._renderer_failures_reported: set[str] = set()
         self._load_diagnostics: list[ResourceDiagnostic] = []
@@ -339,6 +340,7 @@ class ExtensionRuntime:
         self._commands.clear()
         self._prompt_guidelines.clear()
         self._prompt_sections.clear()
+        self._skill_dirs.clear()
         self._message_renderers.clear()
         self._renderer_failures_reported.clear()
         self._turn_requested = None
@@ -414,6 +416,7 @@ class ExtensionRuntime:
         self._commands.clear()
         self._prompt_guidelines.clear()
         self._prompt_sections.clear()
+        self._skill_dirs.clear()
         self._message_renderers.clear()
         self._renderer_failures_reported.clear()
         self._load_diagnostics.clear()
@@ -485,6 +488,11 @@ class ExtensionRuntime:
         self._prompt_sections = [
             (owner, extension, section)
             for owner, extension, section in self._prompt_sections
+            if owner != source_id
+        ]
+        self._skill_dirs = [
+            (owner, extension, skill_dir)
+            for owner, extension, skill_dir in self._skill_dirs
             if owner != source_id
         ]
         self._message_renderers = {
@@ -755,6 +763,45 @@ class ExtensionRuntime:
             )
         )
 
+    def register_skill_dir(self, source_id: str, extension_name: str, path: str | Path) -> None:
+        """Register a skills directory contributed by an extension.
+
+        ``path`` is a skills directory (its subdirectories each hold a
+        ``SKILL.md``), such as a plugin's ``skills/`` tree. Skills load from it
+        at the lowest precedence, so user and project skills override
+        same-named ones. Contributions are deduplicated by resolved path and
+        owned by the registering source so failed setup and retirement clean
+        them up.
+        """
+        candidate = Path(path).expanduser()
+        try:
+            exists_as_dir = candidate.is_dir()
+        except OSError:
+            exists_as_dir = False
+        if not exists_as_dir:
+            self._load_diagnostics.append(
+                ResourceDiagnostic(
+                    kind="extension",
+                    name=extension_name,
+                    path=candidate,
+                    message=f"skill directory is missing or not a directory: {candidate}",
+                    severity="warning",
+                )
+            )
+            return
+        try:
+            resolved = candidate.resolve()
+        except OSError:
+            resolved = candidate
+        for _owner, _extension, existing in self._skill_dirs:
+            try:
+                existing_resolved = existing.resolve()
+            except OSError:
+                existing_resolved = existing
+            if existing_resolved == resolved:
+                return
+        self._skill_dirs.append((source_id, extension_name, candidate))
+
     def subscribe(self, source_id: str, event: str, handler: ExtensionHandler) -> None:
         """Subscribe an extension handler to a named event."""
         known = (
@@ -933,6 +980,11 @@ class ExtensionRuntime:
             )
             for _owner, extension, section in self._prompt_sections
         )
+
+    @property
+    def skill_dirs(self) -> tuple[Path, ...]:
+        """Return extension-contributed skill directories in registration order."""
+        return tuple(skill_dir for _, _, skill_dir in self._skill_dirs)
 
     # -- actions (called through ExtensionAPI) --------------------------------
 

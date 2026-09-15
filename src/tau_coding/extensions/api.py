@@ -1095,6 +1095,20 @@ class ExtensionAPI:
             body,
         )
 
+    def register_skill_dir(self, path: str | Path) -> None:
+        """Contribute a directory of skills, loaded from disk without copying.
+
+        ``path`` must be a skills directory: a directory whose subdirectories
+        each contain a ``SKILL.md`` file (the Agent Skills layout), such as a
+        plugin's ``skills/`` tree. Contributed skills load at the lowest
+        precedence, so a user or project skill always overrides a same-named
+        skill from a plugin. Missing or non-directory paths are ignored with a
+        diagnostic. The contribution is owned by this extension and dropped on
+        failed setup, reload, and runtime retirement.
+        """
+        self._generation.assert_active()
+        self._runtime.register_skill_dir(self._source_id, self._extension_name, path)
+
     def on(
         self,
         event: str,
