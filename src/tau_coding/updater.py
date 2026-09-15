@@ -65,7 +65,7 @@ def update_tau(
     """
     prefix = (environment_prefix or Path(sys.prefix)).resolve()
     if inspect_distribution:
-        direct_url = _installed_direct_url()
+        direct_url = installed_direct_url()
         installer = _installed_installer()
     if direct_url:
         return _failure(
@@ -346,7 +346,11 @@ def _cleanup_windows_handoff(
             update_dir.rmdir()
 
 
-def _installed_direct_url() -> str | None:
+def installed_direct_url() -> str | None:
+    """Return the source URL when the installed distribution came from a direct source.
+
+    Returns None for ordinary registry (PyPI) installs.
+    """
     raw = _distribution_file("direct_url.json")
     if not raw:
         return None

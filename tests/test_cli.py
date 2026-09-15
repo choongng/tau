@@ -364,6 +364,22 @@ def test_version_command_does_not_check_for_updates(monkeypatch: pytest.MonkeyPa
     assert result.stdout.strip() == "tau 1.2.3"
 
 
+def test_startup_notice_passes_detected_direct_url(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(cli, "_current_version", lambda: "0.1.0")
+    monkeypatch.setattr(cli, "installed_direct_url", lambda: "file:///home/dev/tau")
+    seen: dict[str, object] = {}
+
+    def fake_startup_update_notice(version: str, **kwargs: object) -> None:
+        seen["version"] = version
+        seen.update(kwargs)
+        return None
+
+    monkeypatch.setattr(cli, "startup_update_notice", fake_startup_update_notice)
+
+    assert cli._startup_update_notice() is None
+    assert seen == {"version": "0.1.0", "direct_url": "file:///home/dev/tau"}
+
+
 def test_update_command_upgrades_without_startup_check(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         cli,

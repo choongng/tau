@@ -74,7 +74,7 @@ from tau_coding.update_check import (
     startup_release_notes_notice,
     startup_update_notice,
 )
-from tau_coding.updater import update_tau
+from tau_coding.updater import installed_direct_url, update_tau
 from tau_coding.version import current_version as _current_version
 
 
@@ -671,7 +671,7 @@ async def run_openai_tui(
 
 
 def _startup_update_notice() -> UpdateNotice | None:
-    return startup_update_notice(_current_version())
+    return startup_update_notice(_current_version(), direct_url=installed_direct_url())
 
 
 def update_models_command() -> None:

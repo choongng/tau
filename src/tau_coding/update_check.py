@@ -112,14 +112,19 @@ def startup_update_notice(
     cache_path: Path | None = None,
     now: Clock | None = None,
     env: Mapping[str, str] | None = None,
+    direct_url: str | None = None,
 ) -> UpdateNotice | None:
     """Return an update notice when PyPI has a newer stable Tau release.
+
+    Direct installs (``direct_url`` set, i.e. the distribution came from a local
+    or editable source) get no notice: ``tau update`` refuses to change them, so
+    there is no action the notice could ask for.
 
     This function is intentionally best-effort: cache, network, JSON, and version
     parsing failures all become quiet no-ops so startup can continue.
     """
     environment = environ if env is None else env
-    if _update_check_disabled(environment):
+    if _update_check_disabled(environment) or direct_url is not None:
         return None
 
     current_time = (now or _utc_now)()
