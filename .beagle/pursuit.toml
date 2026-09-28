@@ -1,0 +1,11 @@
+# Pursuit goal — written on the user's behalf from their request:
+# "diagnose the error 'Tau 0.4.4 is available (installed: 0.4.2). Run `tau
+# update` to upgrade.' in the tau checkout, committing the fix to choong-dev."
+[goal]
+statement = "Diagnose why Tau shows 'Tau 0.4.4 is available (installed: 0.4.2). Run `tau update` to upgrade.' on this machine, and commit the fix to the choong-dev branch of the tau checkout."
+criteria = [
+  "The cause is recorded: the installed tau is an editable uv-tool install of this checkout whose stale metadata says 0.4.2, while PyPI has 0.4.4; `tau update` refuses direct-URL installs, so the notice cannot be acted on.",
+  "On a direct-URL/editable install the startup update notice is no longer shown; a regular PyPI install still gets its notice.",
+  "Tests covering both behaviors pass in the checkout.",
+  "The fix is committed on branch choong-dev (not pushed).",
+]
