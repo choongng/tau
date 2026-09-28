@@ -37,7 +37,7 @@ for:
 - `plugins/*/agents/*.md` — portable sub-agent definitions (`scout`,
   `step-executor`, `campaign-*`) with `mcp__tilth__*` tool grants.
 - `plugins/beagle-campaign/commands/*.md` — Claude slash commands
-  (`/campaign-run`, `/pursue`, …).
+  (`/campaign-run`, `/pursuit`, `/pursuit-run`, …).
 - `.claude/settings.json` — Claude `hooks` (`Stop`, `PreToolUse`, `SessionStart`).
 - A `beagle`/`tilth` CLI, put on `PATH` by the repo's `setup.sh`.
 
@@ -166,8 +166,65 @@ variable. Beagle skills only ever reference their **own** plugin's tree as
      point `CLAUDE_PLUGIN_ROOT` at that root — this is exactly what the pre-seam
      symlink sweep did, at the cost of the seam's "no copying" property.
 
-`beagle-campaign` is script-bearing but out of scope regardless, so the common
-case stays simple.
+For the skills-only tutorial above, option 1 keeps things simple. The pursuit
+example extension (next section) needs campaign skills beside beagle-dev ones,
+so it takes option 2.
+
+## Pursuit mode: `examples/extensions/beagle.py`
+
+The example extension goes past skills to run beagle's **pursuit** mode (one
+goal, a task tree grown by doing the work, a `done_when` bound before each task)
+in Tau. Symlink it into `~/.tau/extensions/` so dispatched workers load it too.
+
+What it adds, and how each piece maps to what Claude Code provides:
+
+| Claude Code | Tau stand-in in the example | Notes |
+|---|---|---|
+| One `${CLAUDE_PLUGIN_ROOT}` per plugin | One merged root at `$TAU_HOME/beagle-plugin/` (`skills/`, `commands/`, `agents/` as symlinks) | Every beagle-dev / beagle-reference skill, plus campaign's `pursuit-dispatch`, `offload`, `containment`. Only stale *symlinks* are pruned. `BEAGLE_ROOT` overrides `~/beagle`. |
+| `/pursuit`, `/pursuit-run` slash commands | `tau.register_command` injecting the command text as a turn | `${CLAUDE_PLUGIN_ROOT}` is spelled out; `/pursuit-run` is prefixed with a short host mapping. |
+| Task tool + `beagle-dev:step-executor` | `pursuit_dispatch`: a nested `tau -p --append-system-prompt step-executor.md` | Synchronous; its report returns in the same turn, so no `--awaiting` tick. |
+| `ScheduleWakeup` | `pursuit_wakeup` (arm / replace / `stop`) | In-process timer; interactive TUI only (refused in print mode, which the driver treats as a stopping condition). Firing re-expands `/pursuit-run`. |
+| `CLAUDE_CODE_SESSION_ID` / `CLAUDE_PID` | Tau session id exported at `session_start`; `CLAUDE_PID` removed | beagle only trusts a pid named claude/node, so without one it judges liveness by the run's own promises. |
+| `Stop` hook `loop-guard` | `agent_settled` → `beagle hook loop-guard` | Skipped for aborted/errored runs and print mode. An objection becomes one more turn; the next settle passes `stop_hook_active`. |
+| `PreToolUse` hook `commit-claims` | bash `tool_call` → `beagle hook commit-claims` | Only commands containing `commit`, only in a pursuit. |
+| `SessionStart` hook `loop-report` | Output appended to the "Beagle pursuit" prompt section at load | Extensions load before the session binds, so this (and goal discovery) uses the process cwd. |
+
+Hooks are invoked as bare `beagle hook NAME` with the project root as cwd —
+beagle's fast path ignores `--root` — and a JSON payload on stdin. Every bridge
+fails open. Workers get `BEAGLE_TAU_WORKER=1`: they keep the parent's session
+id and register no wakeup, `/pursuit-run` or loop-guard.
+
+### Known gaps versus Claude Code
+
+These make a Tau pursuit correct but **serial and slower** than the same
+pursuit under Claude Code:
+
+- **No background sub-agents or completion notices.** A dispatch blocks the
+  driver's turn for the worker's whole run, so `/pursuit-run`'s pipelining
+  (drafting the next task while a long check proves) is not available.
+- **No sub-agent messaging.** The parent sees only the worker's final stdout;
+  it cannot continue or steer a worker.
+- **One agent persona.** Only step-executor is wired; `scout`, the campaign
+  verifier, per-agent tool grants and Claude model tiers are not.
+- **No MCP.** `mcp__tilth__*` grants do nothing; tilth is CLI-only.
+- **Wakeups do not persist.** A timer dies with the process or `/reload`;
+  `loop-report` and `loop-guard` will name the missed resumption next session.
+- **Only three hooks are bridged.** `cadence`, `close-out`, `commit-trailer`,
+  `transcript-guard`, `work-guard` and `tilth-load` are not.
+
+Closing the first two needs Tau core features (a background agent tool with
+notifications), not more extension code.
+
+### Testing it
+
+`tests/test_beagle_example_extension.py` loads the real extension through
+`ExtensionRuntime` against a fake beagle checkout and a fake `beagle` script
+that logs each hook call. For a live check, in a pursuit project:
+
+```bash
+echo '{"hook_event_name":"SessionStart"}' | beagle hook loop-report
+tau          # then /pursuit-view, /pursuit-run
+```
 
 ## Hooks mapping (optional Tier-2 shim, not required for skills)
 
@@ -213,13 +270,14 @@ of the skill seam — install skills first, add hooks only if you miss them.
 ## Out of scope (and why)
 
 - **Slash commands** (`commands/*.md`, e.g. `/campaign-run`). Tau has no Claude
-  command loader. To expose them you would `tau.register_command(name, handler)`
-  by hand and shell out to `beagle`, or read the `.md` as a prompt. Not automatic.
+  command loader. Each must be registered by hand with
+  `tau.register_command(name, handler)`, as the pursuit example does for
+  `/pursuit` and `/pursuit-run`. Not automatic.
 - **Sub-agents + MCP** (`agents/*.md` with `mcp__tilth__*`; campaign
-  worker/verifier dispatch). Tau's `tau_agent`/`tau_coding` have **no** `Task`/
-  sub-agent tool and **no** MCP client. The campaign half of beagle cannot run
-  until those host features exist in Tau core; `beagle doctor` will keep flagging
-  `tilth` until then. `register_skill_dir` does not and cannot shim this.
+  worker/verifier dispatch). Tau core has **no** `Task`/sub-agent tool and
+  **no** MCP client. The pursuit example approximates one blocking
+  step-executor with a nested `tau -p`; campaign mode's worker/verifier pairs
+  remain out of reach, and `beagle doctor` will keep flagging `tilth`.
 
 ## Design reference (as it applies to beagle)
 
