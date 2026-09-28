@@ -11,10 +11,15 @@ work, and a `done_when` command bound before the work it judges. The pieces
 below exist because a specific part of that model has no Tau equivalent:
 
 - **Skills** — a pursuit's own guidance arrives only if it is loaded. Beagle's
-  `pursuit-dispatch` skill lives in the (deprecated) `beagle-campaign` plugin,
-  so a curated skills directory links just the pursuit skills and registers
-  that, rather than dragging the campaign skills into every pursuit.
-- **`/pursuit`** — the driver. Injects the command's own text as the turn.
+  pursuit skills live in the (deprecated) `beagle-campaign` plugin, beside the
+  engineering-practice skills in `beagle-dev`, and both sets run scripts from
+  `${CLAUDE_PLUGIN_ROOT}/skills/<name>/...`. Claude Code sets that variable per
+  plugin; a shell has one. So the extension links every skill it loads into
+  one merged plugin root under the Tau home, points `CLAUDE_PLUGIN_ROOT` at it,
+  and registers its `skills/` — every script path then resolves, whichever
+  plugin shipped it, without dragging the campaign skills into every pursuit.
+- **`/pursuit`** — the driver. Injects the command's own text as the turn,
+  with `${CLAUDE_PLUGIN_ROOT}` spelled out as the merged root.
 - **`pursuit_dispatch`** — a headless `step-executor`. Tau has no Task tool, so
   delegation is a nested `tau -p` run: the step-executor persona appended, the
   target dir set with `--cwd`, and the model inherited from the session unless
@@ -60,20 +65,33 @@ from tau_coding.extensions import (
     ToolCallHookResult,
 )
 
-BEAGLE = Path.home() / "beagle"
+#: The beagle checkout. `BEAGLE_ROOT` overrides the default `~/beagle`.
+BEAGLE = Path(os.environ.get("BEAGLE_ROOT") or Path.home() / "beagle").expanduser()
 BEAGLE_BIN = os.environ.get("BEAGLE_BIN", "beagle")
 TAU_BIN = os.environ.get("TAU_BIN", "tau")
+PLUGINS = BEAGLE / "plugins"
 
-SCRIPT_PLUGIN = "beagle-dev"  # plugin whose skills reference ${CLAUDE_PLUGIN_ROOT}
-LOAD = ("beagle-dev", "beagle-reference")
+#: Skills linked into the merged root, per plugin; None means all of them. The
+#: pursuit skills live in the deprecated campaign plugin, so only they are
+#: taken from it — `containment` because a worker's brief names its
+#: `run_contained.sh` for every heavy command.
+SKILL_SOURCES: Mapping[str, tuple[str, ...] | None] = {
+    "beagle-dev": None,
+    "beagle-reference": None,
+    "beagle-campaign": ("pursuit-dispatch", "offload", "containment"),
+}
+#: Non-skill trees a driver or skill reaches through `${CLAUDE_PLUGIN_ROOT}`.
+PLUGIN_ROOT_LINKS = {
+    "commands": PLUGINS / "beagle-campaign" / "commands",
+    "agents": PLUGINS / "beagle-dev" / "agents",
+}
+#: The merged plugin root, under the Tau home (so `TAU_HOME` profiles each
+#: get their own).
+MERGED_ROOT_NAME = "beagle-plugin"
 
-# Skills that belong to a pursuit. They live in the deprecated campaign plugin,
-# so they are linked individually instead of loading that plugin's whole tree.
-PURSUIT_SKILLS = ("pursuit-dispatch", "offload")
-CURATED_SKILLS_DIR = Path.home() / ".tau" / "beagle-pursue-skills"
-
-STEP_EXECUTOR = BEAGLE / "plugins" / "beagle-dev" / "agents" / "step-executor.md"
-PURSUIT_COMMAND = BEAGLE / "plugins" / "beagle-campaign" / "commands" / "pursuit.md"
+STEP_EXECUTOR = PLUGINS / "beagle-dev" / "agents" / "step-executor.md"
+PURSUIT_COMMAND = PLUGINS / "beagle-campaign" / "commands" / "pursuit.md"
+PLUGIN_ROOT_VAR = "${CLAUDE_PLUGIN_ROOT}"
 GOAL_BASENAME = "pursuit.toml"
 
 DEFAULT_DISPATCH_TIMEOUT = 900.0
@@ -91,6 +109,8 @@ GUARD_DISABLE_ENV = "BEAGLE_TAU_ALLOW_PURSUIT_EDIT"
 #: Last session cwd the extension saw, so the dispatch tool (which gets no
 #: context) can default to the project it is working in.
 _SEEN_CWD: Path | None = None
+#: The merged plugin root once built, for spelling out driver text.
+_PLUGIN_ROOT: Path | None = None
 
 
 # --------------------------------------------------------------------------- #
@@ -119,6 +139,18 @@ def _find_goal(start: Path | None) -> Path | None:
         except OSError:
             continue
     return None
+
+
+def _driver_text(path: Path) -> str:
+    """A command file as a turn: frontmatter off, the plugin root spelled out.
+
+    The text reaches the model, not a shell, so a `${CLAUDE_PLUGIN_ROOT}` left
+    in it would be read literally — or resolved by a model guessing.
+    """
+    text = _strip_frontmatter(path.read_text(encoding="utf-8", errors="replace"))
+    if _PLUGIN_ROOT is not None:
+        text = text.replace(PLUGIN_ROOT_VAR, str(_PLUGIN_ROOT))
+    return text
 
 
 def _strip_frontmatter(text: str) -> str:
@@ -412,7 +444,7 @@ def _command_pursuit(args: str, context: Any) -> str:
     """Load Beagle's `/pursuit` driver as this turn."""
     if not PURSUIT_COMMAND.is_file():
         return f"/pursuit: driver not found at {PURSUIT_COMMAND}"
-    driver = _strip_frontmatter(PURSUIT_COMMAND.read_text(encoding="utf-8", errors="replace"))
+    driver = _driver_text(PURSUIT_COMMAND)
     note = f"User input to /pursuit:\n{args}\n\n" if args.strip() else ""
     context.api.send_user_message(f"{note}{driver}")
     return "/pursuit: loaded the pursuit driver as this turn."
@@ -472,30 +504,65 @@ def _goal_section(goal_file: Path) -> str | None:
 # --------------------------------------------------------------------------- #
 
 
-def _link_pursuit_skills() -> None:
-    """Symlink the pursuit skills into a curated dir so it can be registered.
+def _wanted_skills() -> dict[str, Path]:
+    """Skill name -> its directory in the checkout, for every skill to load."""
+    wanted: dict[str, Path] = {}
+    for plugin, names in SKILL_SOURCES.items():
+        skills = PLUGINS / plugin / "skills"
+        if names is None:
+            try:
+                names = tuple(sorted(child.name for child in skills.iterdir()))
+            except OSError:
+                continue
+        for name in names:
+            src = skills / name
+            if (src / "SKILL.md").is_file():
+                wanted.setdefault(name, src)
+    return wanted
 
-    `register_skill_dir` wants a directory whose subdirs each hold a SKILL.md,
-    so the pursuit skills — which ship inside the deprecated campaign plugin —
-    are linked one at a time rather than loading that whole tree.
-    """
+
+def _sync_link(link: Path, target: Path) -> None:
+    """Point `link` at `target`, replacing only a symlink this module could own."""
     try:
-        CURATED_SKILLS_DIR.mkdir(parents=True, exist_ok=True)
+        if link.is_symlink():
+            if Path(os.readlink(link)) == target:
+                return
+            link.unlink()
+        elif link.exists():
+            return  # a real file or dir the user manages; leave it alone
+        link.symlink_to(target, target_is_directory=True)
     except OSError:
         return
-    for name in PURSUIT_SKILLS:
-        src = BEAGLE / "plugins" / "beagle-campaign" / "skills" / name
-        if not (src / "SKILL.md").is_file():
-            continue
-        link = CURATED_SKILLS_DIR / name
-        try:
-            if link.is_symlink():
-                continue
-            if link.exists():
-                continue  # a real dir the user manages; leave it alone
-            link.symlink_to(src, target_is_directory=True)
-        except OSError:
-            continue
+
+
+def build_plugin_root(root: Path) -> Path | None:
+    """Link the loaded skills and plugin trees under `root`; its skills dir, or None.
+
+    Idempotent, and it only ever creates or removes symlinks: a link whose
+    skill left the checkout (or the load set) is dropped so the loader never
+    trips on a dangling entry, and anything that is not a symlink is left as
+    the user made it.
+    """
+    skills_dir = root / "skills"
+    try:
+        skills_dir.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return None
+    wanted = _wanted_skills()
+    try:
+        existing = list(skills_dir.iterdir())
+    except OSError:
+        existing = []
+    for entry in existing:
+        if entry.is_symlink() and entry.name not in wanted:
+            with contextlib.suppress(OSError):
+                entry.unlink()
+    for name, src in wanted.items():
+        _sync_link(skills_dir / name, src)
+    for name, target in PLUGIN_ROOT_LINKS.items():
+        if target.is_dir():
+            _sync_link(root / name, target)
+    return skills_dir
 
 
 # --------------------------------------------------------------------------- #
@@ -504,24 +571,20 @@ def _link_pursuit_skills() -> None:
 
 
 def setup(tau: ExtensionAPI) -> None:
-    global _SEEN_CWD
-    # 1. Load the standing engineering-practice skills.
-    for plugin in LOAD:
-        skills = BEAGLE / "plugins" / plugin / "skills"
-        if skills.is_dir():
-            tau.register_skill_dir(skills)
-
-    # 2. Load the pursuit skills (curated; not the deprecated campaign tree).
-    _link_pursuit_skills()
-    if CURATED_SKILLS_DIR.is_dir():
-        tau.register_skill_dir(CURATED_SKILLS_DIR)
-
-    # Several beagle-dev skills run helper scripts with an absolute path built
-    # from ${CLAUDE_PLUGIN_ROOT}/skills/<name>/scripts/... . The bash tool spawns
-    # subprocesses that inherit this process env, so exporting it here makes
-    # those script paths resolve for the loaded plugin.
-    root = BEAGLE / "plugins" / SCRIPT_PLUGIN
-    os.environ.setdefault("CLAUDE_PLUGIN_ROOT", str(root))
+    global _SEEN_CWD, _PLUGIN_ROOT
+    # 1-2. Load the engineering-practice and pursuit skills from one merged
+    #      plugin root. Skills run scripts from ${CLAUDE_PLUGIN_ROOT}/skills/...;
+    #      the bash tool's subprocesses inherit this process env, so exporting
+    #      the merged root makes every such path resolve, whichever plugin
+    #      shipped the skill. Overwritten rather than defaulted: one inherited
+    #      from a Claude Code shell names a single plugin and resolves half.
+    if PLUGINS.is_dir():
+        root = tau.context.paths.home / MERGED_ROOT_NAME
+        skills_dir = build_plugin_root(root)
+        if skills_dir is not None:
+            tau.register_skill_dir(skills_dir)
+            _PLUGIN_ROOT = root
+            os.environ["CLAUDE_PLUGIN_ROOT"] = str(root)
 
     # 3. The driver command, and a no-model state read.
     tau.register_command(
