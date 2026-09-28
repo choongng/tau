@@ -44,6 +44,12 @@ because a specific part of that model has no Tau equivalent:
   driver text is prefixed with a short note mapping its Claude Code names onto
   these. A dispatched worker runs none of the loop: it is one step of its
   parent's, and keeps the parent's session id.
+- **agent types** — background dispatch, completion notices and messaging a
+  running worker come from the separate tau-subagents extension. This module
+  only feeds it: each `beagle-dev` agent is written as an agent type
+  `~/.tau/agents/beagle-dev:<agent>.md`, its Claude tool grants mapped onto
+  Tau's, so the driver's `beagle-dev:step-executor` resolves by name. Without
+  tau-subagents the files are unused and `pursuit_dispatch` stands in.
 
 Everything degrades quietly: with no `beagle`, no pursuit, or no `tau` on PATH,
 the extension loads and simply does less.
@@ -75,6 +81,7 @@ from tau_coding.extensions import (
     ExtensionContext,
     ToolCallHookResult,
 )
+from tau_coding.resources import parse_markdown_resource
 
 #: The beagle checkout. `BEAGLE_ROOT` overrides the default `~/beagle`.
 BEAGLE = Path(os.environ.get("BEAGLE_ROOT") or Path.home() / "beagle").expanduser()
@@ -99,6 +106,26 @@ PLUGIN_ROOT_LINKS = {
 #: The merged plugin root, under the Tau home (so `TAU_HOME` profiles each
 #: get their own).
 MERGED_ROOT_NAME = "beagle-plugin"
+#: Plugins whose `agents/*.md` become tau-subagents agent types, named
+#: `<plugin>:<agent>` so the driver's `beagle-dev:step-executor` resolves as is.
+AGENT_PLUGINS = ("beagle-dev",)
+#: Where tau-subagents reads user agent types (it uses `~`, not `TAU_HOME`).
+AGENTS_DIR = Path(
+    os.environ.get("BEAGLE_TAU_AGENTS_DIR") or Path.home() / ".tau" / "agents"
+).expanduser()
+#: Frontmatter key marking an agent file this module wrote and may replace.
+GENERATED_KEY = "generated_by"
+GENERATED_BY = "beagle-tau-extension"
+#: Claude Code tool names -> Tau's coding tools. Grep and Glob run through bash;
+#: anything unmapped (MCP tools, Task, ...) has no Tau equivalent and is dropped.
+AGENT_TOOL_MAP = {
+    "Read": "read",
+    "Write": "write",
+    "Edit": "edit",
+    "Bash": "bash",
+    "Grep": "bash",
+    "Glob": "bash",
+}
 
 STEP_EXECUTOR = PLUGINS / "beagle-dev" / "agents" / "step-executor.md"
 PURSUIT_COMMAND = PLUGINS / "beagle-campaign" / "commands" / "pursuit.md"
@@ -738,7 +765,19 @@ Host mapping — this driver was written for Claude Code. Under Tau, read it as:
 `prompt: "/pursuit-run"`, and `stop: true` to disarm. It refuses when Tau \
 cannot come back (print mode); that is the refused arm the driver treats as a \
 stopping condition.
-- Dispatching `beagle-dev:step-executor` is the `pursuit_dispatch` tool. It \
+- Dispatching `beagle-dev:step-executor`: when the `agent` tool is available \
+(the tau-subagents extension), call it with `subagent_type: \
+"beagle-dev:step-executor"`, the brief as `prompt`, and `run_in_background: \
+true`, then end the turn exactly as the driver says for a dispatched worker — \
+arm `pursuit_wakeup` with a long delay and record `beagle loop tick --awaiting \
+... --resuming-in N`. The worker's completion arrives as a \
+`<task-notification>` message that starts your next turn; clear the wait with \
+a bare `beagle loop tick`, read the full report with `get_subagent_result` if \
+the notification is truncated, and run the close. Claude Code's `SendMessage` \
+to a running worker is `steer_subagent`; `get_subagent_result` with `wait: \
+true` blocks on one. Parallel independent tasks may each get a background \
+agent.
+- Without the `agent` tool, dispatch is the `pursuit_dispatch` tool. It \
 returns the worker's report within the same turn, so skip the `--awaiting` \
 tick and the bare tick that clears it; run the close straight after.
 - `loop-guard`, `loop-report` and `commit-claims` run inside this Tau \
@@ -895,6 +934,87 @@ def build_plugin_root(root: Path) -> Path | None:
     return skills_dir
 
 
+AGENT_HOST_NOTE = """\
+You run as a Tau sub-agent, translated from a Claude Code agent definition. \
+Your tools are Tau's: `read`, `write`, `edit` and `bash`. Where the text below \
+names `Grep` or `Glob`, use `rg` or `find` through `bash`; MCP tools it names \
+(`mcp__...`) are not available.
+"""
+
+
+def _agent_type_text(src: Path) -> str | None:
+    """A tau-subagents agent-type file translated from a beagle agent, or None."""
+    try:
+        metadata, body = parse_markdown_resource(src.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError):
+        return None
+    tools: list[str] = []
+    for name in (metadata.get("tools") or "").split(","):
+        mapped = AGENT_TOOL_MAP.get(name.strip())
+        if mapped is not None and mapped not in tools:
+            tools.append(mapped)
+    description = " ".join((metadata.get("description") or "").split())
+    lines = ["---", f"description: {description}"]
+    if tools:
+        lines.append(f"tools: {', '.join(tools)}")
+    # No `model:` — Claude's aliases name nothing a Tau provider serves, so the
+    # sub-agent inherits the parent session's model.
+    lines += [f"{GENERATED_KEY}: {GENERATED_BY}", "---", ""]
+    body = body.replace(PLUGIN_ROOT_VAR, str(_PLUGIN_ROOT)) if _PLUGIN_ROOT else body
+    return "\n".join(lines) + AGENT_HOST_NOTE + "\n" + body.lstrip("\n")
+
+
+def _is_generated(path: Path) -> bool:
+    try:
+        metadata, _ = parse_markdown_resource(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError):
+        return False
+    return metadata.get(GENERATED_KEY) == GENERATED_BY
+
+
+def sync_agent_types(agents_dir: Path) -> list[str]:
+    """Write beagle's agents into `agents_dir` as tau-subagents types; their names.
+
+    Idempotent. Only files carrying the generated marker are ever replaced or
+    removed, so an agent type the user wrote under the same name wins, and a
+    type whose beagle agent is gone is pruned rather than left to go stale.
+    """
+    wanted: dict[str, str] = {}
+    for plugin in AGENT_PLUGINS:
+        try:
+            sources = sorted((PLUGINS / plugin / "agents").glob("*.md"))
+        except OSError:
+            continue
+        for src in sources:
+            text = _agent_type_text(src)
+            if text is not None:
+                wanted[f"{plugin}:{src.stem}"] = text
+    try:
+        agents_dir.mkdir(parents=True, exist_ok=True)
+        existing = list(agents_dir.glob("*.md"))
+    except OSError:
+        return []
+    for path in existing:
+        if path.stem not in wanted and _is_generated(path):
+            with contextlib.suppress(OSError):
+                path.unlink()
+    written: list[str] = []
+    for name, text in wanted.items():
+        path = agents_dir / f"{name}.md"
+        try:
+            if path.exists():
+                if not _is_generated(path):
+                    continue
+                if path.read_text(encoding="utf-8") == text:
+                    written.append(name)
+                    continue
+            path.write_text(text, encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            continue
+        written.append(name)
+    return written
+
+
 # --------------------------------------------------------------------------- #
 # setup
 # --------------------------------------------------------------------------- #
@@ -915,6 +1035,9 @@ def setup(tau: ExtensionAPI) -> None:
             tau.register_skill_dir(skills_dir)
             _PLUGIN_ROOT = root
             os.environ["CLAUDE_PLUGIN_ROOT"] = str(root)
+        # Beagle's agents as tau-subagents agent types, for background
+        # dispatch. Harmless without that extension: nothing reads the dir.
+        sync_agent_types(AGENTS_DIR)
 
     # 3. The driver command, and a no-model state read.
     tau.register_command(
@@ -928,7 +1051,8 @@ def setup(tau: ExtensionAPI) -> None:
         description="Show the current pursuit's goal, counts and ready set (no model).",
     )
 
-    # 4. The headless step-executor, since Tau has no Task tool.
+    # 4. The headless step-executor: the blocking fallback for when the
+    #    tau-subagents extension (background `agent` tool) is not loaded.
     tau.register_tool(
         AgentTool(
             name="pursuit_dispatch",

@@ -182,7 +182,9 @@ What it adds, and how each piece maps to what Claude Code provides:
 |---|---|---|
 | One `${CLAUDE_PLUGIN_ROOT}` per plugin | One merged root at `$TAU_HOME/beagle-plugin/` (`skills/`, `commands/`, `agents/` as symlinks) | Every beagle-dev / beagle-reference skill, plus campaign's `pursuit-dispatch`, `offload`, `containment`. Only stale *symlinks* are pruned. `BEAGLE_ROOT` overrides `~/beagle`. |
 | `/pursuit`, `/pursuit-run` slash commands | `tau.register_command` injecting the command text as a turn | `${CLAUDE_PLUGIN_ROOT}` is spelled out; `/pursuit-run` is prefixed with a short host mapping. |
-| Task tool + `beagle-dev:step-executor` | `pursuit_dispatch`: a nested `tau -p --append-system-prompt step-executor.md` | Synchronous; its report returns in the same turn, so no `--awaiting` tick. |
+| Task tool + `beagle-dev:*` agents, `run_in_background` | [tau-subagents](https://github.com/rian-dolphin/tau-subagents)' `agent` tool, with beagle's agents written as agent types `~/.tau/agents/beagle-dev:<agent>.md` | Needs tau-subagents installed. Completion arrives as a `<task-notification>` follow-up that starts the next turn; the driver uses the `--awaiting` tick as in Claude Code. |
+| `SendMessage` to a running agent / `TaskOutput` | tau-subagents' `steer_subagent` / `get_subagent_result` (`wait: true` blocks) | |
+| (fallback without tau-subagents) | `pursuit_dispatch`: a nested `tau -p --append-system-prompt step-executor.md` | Synchronous; its report returns in the same turn, so no `--awaiting` tick. |
 | `ScheduleWakeup` | `pursuit_wakeup` (arm / replace / `stop`) | In-process timer; interactive TUI only (refused in print mode, which the driver treats as a stopping condition). Firing re-expands `/pursuit-run`. |
 | `CLAUDE_CODE_SESSION_ID` / `CLAUDE_PID` | Tau session id exported at `session_start`; `CLAUDE_PID` removed | beagle only trusts a pid named claude/node, so without one it judges liveness by the run's own promises. |
 | `Stop` hook `loop-guard` | `agent_settled` → `beagle hook loop-guard` | Skipped for aborted/errored runs and print mode. An objection becomes one more turn; the next settle passes `stop_hook_active`. |
@@ -196,24 +198,52 @@ id and register no wakeup, `/pursuit-run` or loop-guard.
 
 ### Known gaps versus Claude Code
 
-These make a Tau pursuit correct but **serial and slower** than the same
-pursuit under Claude Code:
+Background sub-agents come from the separate
+[tau-subagents](https://github.com/rian-dolphin/tau-subagents) extension, the
+project's reference sub-agent extension (see
+`architecture/phase-21-extensions.md`), not from Tau core or this example:
 
-- **No background sub-agents or completion notices.** A dispatch blocks the
-  driver's turn for the worker's whole run, so `/pursuit-run`'s pipelining
-  (drafting the next task while a long check proves) is not available.
-- **No sub-agent messaging.** The parent sees only the worker's final stdout;
-  it cannot continue or steer a worker.
-- **One agent persona.** Only step-executor is wired; `scout`, the campaign
-  verifier, per-agent tool grants and Claude model tiers are not.
+```bash
+git clone https://github.com/rian-dolphin/tau-subagents ~/tau-subagents
+ln -s ~/tau-subagents ~/.tau/extensions/tau-subagents
+```
+
+On every load the beagle extension translates each `beagle-dev` agent
+(`step-executor`, `scout`) into `~/.tau/agents/beagle-dev:<agent>.md`, the
+location tau-subagents reads (`BEAGLE_TAU_AGENTS_DIR` overrides it). Claude
+tool grants map onto Tau's (`Read`→`read`, `Edit`→`edit`, `Write`→`write`,
+`Bash`/`Grep`/`Glob`→`bash`); MCP grants and the Claude `model:` alias are
+dropped, so the sub-agent inherits the session model. Only files carrying
+`generated_by: beagle-tau-extension` are rewritten or pruned; a hand-written
+type of the same name wins. `/pursuit-run`'s host note tells the driver to
+dispatch through `agent` with `run_in_background: true` when that tool exists,
+and to fall back to `pursuit_dispatch` otherwise.
+
+Sub-agents run in-process and load extensions too, so this extension runs
+inside each one. That is safe: a child never emits `session_start` (only hosts
+call `emit_pending_session_start`), so it never re-exports
+`CLAUDE_CODE_SESSION_ID`, and it has no UI, so `loop-guard` and
+`pursuit_wakeup` stay inert in it. `commit-claims` and the ground-truth guard
+stay live, which is the point.
+
+Remaining gaps versus Claude Code:
+
+- **Print mode cannot wait.** A background worker still running when a
+  `tau -p` turn ends is lost with the process, like a wakeup. Use foreground
+  `agent` calls there; `/pursuit-run` itself stops at the refused wakeup.
 - **No MCP.** `mcp__tilth__*` grants do nothing; tilth is CLI-only.
 - **Wakeups do not persist.** A timer dies with the process or `/reload`;
   `loop-report` and `loop-guard` will name the missed resumption next session.
 - **Only three hooks are bridged.** `cadence`, `close-out`, `commit-trailer`,
   `transcript-guard`, `work-guard` and `tilth-load` are not.
+- **Campaign agents are not translated.** Only `beagle-dev` agents become
+  types; campaign mode is being retired.
 
-Closing the first two needs Tau core features (a background agent tool with
-notifications), not more extension code.
+tau-subagents 0.2.0's own test suite shows drift against current Tau (its fake
+providers lack the `session_id` keyword, its fake TUI session lacks newer
+attributes, and project-trust gating hides untrusted project skills from its
+skill-index tests); a live background and foreground run against this checkout
+works.
 
 ### Testing it
 

@@ -21,7 +21,7 @@ from tau_agent.tools import AgentTool, AgentToolResult
 from tau_coding.commands import CommandContext
 from tau_coding.events import AgentSettledEvent
 from tau_coding.extensions import ExtensionRuntime
-from tau_coding.resources import TauResourcePaths
+from tau_coding.resources import TauResourcePaths, parse_markdown_resource
 from test_extensions import RecordingSession, RecordingUiBridge
 
 
@@ -63,9 +63,19 @@ def beagle(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     )
     agents = plugins / "beagle-dev" / "agents"
     agents.mkdir()
-    (agents / "step-executor.md").write_text("You execute one step.\n", encoding="utf-8")
+    (agents / "step-executor.md").write_text(
+        "---\nname: step-executor\ndescription: Executes one step: batch edits.\n"
+        "tools: Read, Grep, Glob, Bash, Edit, Write, mcp__tilth__tilth_read\nmodel: sonnet\n"
+        "---\n\nYou execute one step. See ${CLAUDE_PLUGIN_ROOT}/skills.\n",
+        encoding="utf-8",
+    )
+    (agents / "scout.md").write_text(
+        "---\ndescription: Read-only sift.\ntools: Read, Grep\n---\n\nYou sift.\n",
+        encoding="utf-8",
+    )
 
     monkeypatch.setenv("BEAGLE_ROOT", str(root))
+    monkeypatch.setenv("BEAGLE_TAU_AGENTS_DIR", str(tmp_path / "agents"))
     # Recorded so teardown restores whatever the process had; setup overwrites it.
     monkeypatch.setenv("CLAUDE_PLUGIN_ROOT", "/inherited/beagle-dev")
     monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "claude-session")
@@ -419,3 +429,55 @@ async def test_worker_runs_no_loop_and_keeps_parent_session(
     assert runtime.build_command_registry().get("pursuit-run") is None
     assert [t.name for t in runtime.compose_tools([])] == ["pursuit_dispatch"]
     assert os.environ["CLAUDE_CODE_SESSION_ID"] == "claude-session"
+
+
+def test_beagle_agents_become_subagent_types(tmp_path: Path, beagle: Path) -> None:
+    _load(tmp_path)
+    agents = tmp_path / "agents"
+    assert sorted(p.name for p in agents.iterdir()) == [
+        "beagle-dev:scout.md",
+        "beagle-dev:step-executor.md",
+    ]
+    metadata, body = parse_markdown_resource(
+        (agents / "beagle-dev:step-executor.md").read_text(encoding="utf-8")
+    )
+    assert metadata["description"] == "Executes one step: batch edits."
+    # Claude tool names map onto Tau's; Grep/Glob fold into bash, MCP drops.
+    assert metadata["tools"] == "read, bash, edit, write"
+    assert "model" not in metadata  # a Claude alias names no Tau model
+    assert "You run as a Tau sub-agent" in body
+    assert f"See {tmp_path / 'home-tau' / 'beagle-plugin'}/skills." in body
+    scout, _ = parse_markdown_resource((agents / "beagle-dev:scout.md").read_text())
+    assert scout["tools"] == "read, bash"
+
+
+def test_agent_types_keep_user_files_and_prune_stale_ones(tmp_path: Path, beagle: Path) -> None:
+    agents = tmp_path / "agents"
+    agents.mkdir()
+    mine = agents / "beagle-dev:scout.md"
+    mine.write_text("---\ndescription: my own scout\n---\nMine.\n", encoding="utf-8")
+    stale = agents / "beagle-dev:gone.md"
+    stale.write_text("---\ngenerated_by: beagle-tau-extension\n---\nOld.\n", encoding="utf-8")
+    unrelated = agents / "reviewer.md"
+    unrelated.write_text("Review.\n", encoding="utf-8")
+
+    _load(tmp_path)
+    _load(tmp_path)  # idempotent
+
+    assert mine.read_text(encoding="utf-8").endswith("Mine.\n")
+    assert not stale.exists()
+    assert unrelated.exists()
+    assert (agents / "beagle-dev:step-executor.md").exists()
+
+
+def test_pursuit_run_routes_dispatch_through_background_agents(
+    tmp_path: Path, beagle: Path
+) -> None:
+    runtime, session = _bound(tmp_path)
+    session.is_running = True
+    _run_command(runtime, "pursuit-run")
+    [turn] = session.followed_up
+    assert 'subagent_type: "beagle-dev:step-executor"' in " ".join(turn.split())
+    assert "run_in_background" in turn
+    assert "steer_subagent" in turn and "get_subagent_result" in turn
+    assert "pursuit_dispatch" in turn  # the fallback without tau-subagents
