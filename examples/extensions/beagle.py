@@ -1,26 +1,26 @@
-"""Beagle's engineering-practice skills and `pursue`-mode support for Tau.
+"""Beagle's engineering-practice skills and pursuit-mode support for Tau.
 
 Beagle ships as a Claude Code plugin, but Tau does not run Claude Code's
 `.claude/settings.json` hooks — its hooks are this Python extension API. This
 module is therefore the port point: it loads Beagle's skills and re-implements,
-on Tau's own seams, the small set of behaviours `pursue` mode needs.
+on Tau's own seams, the small set of behaviours pursuit mode needs.
 
 Campaign mode is on its way out, so nothing here reintroduces it: no run record,
-no slots, no counted loop. `pursue` is a goal, a task tree grown by doing the
+no slots, no counted loop. A pursuit is a goal, a task tree grown by doing the
 work, and a `done_when` command bound before the work it judges. The pieces
 below exist because a specific part of that model has no Tau equivalent:
 
-- **Skills** — `pursue`'s own guidance arrives only if it is loaded. Beagle's
+- **Skills** — a pursuit's own guidance arrives only if it is loaded. Beagle's
   `pursuit-dispatch` skill lives in the (deprecated) `beagle-campaign` plugin,
-  so a curated skills directory links just the `pursue` skills and registers
+  so a curated skills directory links just the pursuit skills and registers
   that, rather than dragging the campaign skills into every pursuit.
-- **`/pursue`** — the driver. Injects the command's own text as the turn.
-- **`pursue_dispatch`** — a headless `step-executor`. Tau has no Task tool, so
+- **`/pursuit`** — the driver. Injects the command's own text as the turn.
+- **`pursuit_dispatch`** — a headless `step-executor`. Tau has no Task tool, so
   delegation is a nested `tau -p` run: the step-executor persona appended, the
   target dir set with `--cwd`, and the model inherited from the session unless
   the caller names a Tau model/provider. Because the worker is Tau too, the
   ground-truth guard stays live inside it — a sub-agent is not a way around it.
-  The driver still runs `pursue close`; this tool only does the work and
+  The driver still runs `pursuit close`; this tool only does the work and
   returns the report.
 - **ground-truth guard** — the one invariant a hook can enforce: `.beagle/
   pursuit.toml` is the user's, and criteria the agent can edit are criteria the
@@ -69,11 +69,11 @@ LOAD = ("beagle-dev", "beagle-reference")
 
 # Skills that belong to a pursuit. They live in the deprecated campaign plugin,
 # so they are linked individually instead of loading that plugin's whole tree.
-PURSUE_SKILLS = ("pursuit-dispatch", "offload")
+PURSUIT_SKILLS = ("pursuit-dispatch", "offload")
 CURATED_SKILLS_DIR = Path.home() / ".tau" / "beagle-pursue-skills"
 
 STEP_EXECUTOR = BEAGLE / "plugins" / "beagle-dev" / "agents" / "step-executor.md"
-PURSUE_COMMAND = BEAGLE / "plugins" / "beagle-campaign" / "commands" / "pursue.md"
+PURSUIT_COMMAND = BEAGLE / "plugins" / "beagle-campaign" / "commands" / "pursuit.md"
 GOAL_BASENAME = "pursuit.toml"
 
 DEFAULT_DISPATCH_TIMEOUT = 900.0
@@ -266,7 +266,7 @@ def _make_dispatch_result(text: str) -> AgentToolResult:
 
 
 def make_dispatch() -> Any:
-    """Build the `pursue_dispatch` tool executor."""
+    """Build the `pursuit_dispatch` tool executor."""
 
     async def execute(
         tool_call_id: str,
@@ -278,8 +278,8 @@ def make_dispatch() -> Any:
         brief = arguments.get("brief")
         if not isinstance(brief, str) or not brief.strip():
             return _make_dispatch_result(
-                "pursue_dispatch: 'brief' is required. Copy it from `beagle pursue open` — "
-                "intent (motivation), --scope (before/after), --done-when (the gate, verbatim)."
+                "pursuit_dispatch: 'brief' is required. For an open task, pass: run "
+                "`beagle pursuit brief <task>` and do what it says."
             )
 
         cwd_raw = arguments.get("cwd")
@@ -291,7 +291,7 @@ def make_dispatch() -> Any:
 
         if not STEP_EXECUTOR.is_file():
             return _make_dispatch_result(
-                f"pursue_dispatch: step-executor persona not found at {STEP_EXECUTOR}."
+                f"pursuit_dispatch: step-executor persona not found at {STEP_EXECUTOR}."
             )
 
         model = _worker_model(arguments.get("model"))
@@ -327,7 +327,7 @@ def make_dispatch() -> Any:
             )
         except FileNotFoundError:
             return _make_dispatch_result(
-                f"pursue_dispatch: {TAU_BIN!r} not found on PATH; cannot delegate. "
+                f"pursuit_dispatch: {TAU_BIN!r} not found on PATH; cannot delegate. "
                 "Do the work inline, or set TAU_BIN."
             )
 
@@ -340,7 +340,7 @@ def make_dispatch() -> Any:
                 proc.kill()
             await proc.wait()
             return _make_dispatch_result(
-                f"pursue_dispatch: step-executor exceeded its wall-clock budget of "
+                f"pursuit_dispatch: step-executor exceeded its wall-clock budget of "
                 f"{timeout:.0f}s and was killed. Budget the worker in wall-clock, not "
                 "tokens; raise 'timeout' or split the task."
             )
@@ -348,13 +348,13 @@ def make_dispatch() -> Any:
         out = (stdout or b"").decode("utf-8", "replace").strip()
         err = (stderr or b"").decode("utf-8", "replace").strip()
         header = (
-            f"[pursue_dispatch] step-executor "
+            f"[pursuit_dispatch] step-executor "
             f"(model={model or 'inherit'} provider={provider or 'inherit'}) "
             f"cwd={cwd} rc={proc.returncode}\n\n"
         )
         body = out or (f"(no stdout)\nstderr:\n{err}" if err else "(no output)")
         footer = (
-            "\n\n— YOU run the close, not the worker: `beagle pursue close <task> "
+            "\n\n— YOU run the close, not the worker: `beagle pursuit close <task> "
             "--outcome done --spent <n>`, after running its --done-when yourself."
         )
         return _make_dispatch_result(header + body + footer)
@@ -368,9 +368,9 @@ DISPATCH_PARAMETERS = {
         "brief": {
             "type": "string",
             "description": (
-                "The full task brief. Copy it from `beagle pursue open`: the task intent "
-                "(motivation), --scope (before/after paths), and the --done-when gate "
-                "VERBATIM. The worker has no memory of this conversation."
+                "The worker's brief. For an open task: 'run `beagle pursuit brief <task>` "
+                "and do what it says' — the record holds the intent, scope and check. "
+                "The worker has no memory of this conversation."
             ),
         },
         "cwd": {
@@ -408,14 +408,14 @@ DISPATCH_PARAMETERS = {
 # --------------------------------------------------------------------------- #
 
 
-def _command_pursue(args: str, context: Any) -> str:
-    """Load Beagle's `/pursue` driver as this turn."""
-    if not PURSUE_COMMAND.is_file():
-        return f"/pursue: driver not found at {PURSUE_COMMAND}"
-    driver = _strip_frontmatter(PURSUE_COMMAND.read_text(encoding="utf-8", errors="replace"))
-    note = f"User input to /pursue:\n{args}\n\n" if args.strip() else ""
+def _command_pursuit(args: str, context: Any) -> str:
+    """Load Beagle's `/pursuit` driver as this turn."""
+    if not PURSUIT_COMMAND.is_file():
+        return f"/pursuit: driver not found at {PURSUIT_COMMAND}"
+    driver = _strip_frontmatter(PURSUIT_COMMAND.read_text(encoding="utf-8", errors="replace"))
+    note = f"User input to /pursuit:\n{args}\n\n" if args.strip() else ""
     context.api.send_user_message(f"{note}{driver}")
-    return "/pursue: loaded the pursuit driver as this turn."
+    return "/pursuit: loaded the pursuit driver as this turn."
 
 
 def _command_pursuit_view(args: str, context: Any) -> str:
@@ -438,7 +438,7 @@ def _goal_section(goal_file: Path) -> str | None:
     Read straight from the goal file rather than shelling out to `beagle`, so
     loading never depends on `beagle` being on PATH or paying a subprocess at
     setup. The counts and ready set live behind `/pursuit-view` and
-    `beagle pursue next`; this only pins the goal and its criteria — the part
+    `beagle pursuit next`; this only pins the goal and its criteria — the part
     the driver must not lose — and points at the tools.
     """
     try:
@@ -458,10 +458,10 @@ def _goal_section(goal_file: Path) -> str | None:
         lines += [f"  - {str(c).strip()}" for c in criteria if str(c).strip()]
     lines += [
         "",
-        "The loop is `beagle pursue next` / `open` / `close` — the `done_when` bound at "
+        "The loop is `beagle pursuit next` / `open` / `close` — the `done_when` bound at "
         "`open`, before the work, stands in for a verifier. Delegate a chunky step to the "
-        "`pursue_dispatch` tool (a headless step-executor sub-agent) instead of "
-        "grinding it here; YOU run the close, not the worker. `/pursue` loads the full "
+        "`pursuit_dispatch` tool (a headless step-executor sub-agent) instead of "
+        "grinding it here; YOU run the close, not the worker. `/pursuit` loads the full "
         "driver; `/pursuit-view` shows counts and the ready set without a model.",
     ]
     return "\n".join(lines)
@@ -472,18 +472,18 @@ def _goal_section(goal_file: Path) -> str | None:
 # --------------------------------------------------------------------------- #
 
 
-def _link_pursue_skills() -> None:
-    """Symlink the `pursue` skills into a curated dir so it can be registered.
+def _link_pursuit_skills() -> None:
+    """Symlink the pursuit skills into a curated dir so it can be registered.
 
     `register_skill_dir` wants a directory whose subdirs each hold a SKILL.md,
-    so the pursue skills — which ship inside the deprecated campaign plugin —
+    so the pursuit skills — which ship inside the deprecated campaign plugin —
     are linked one at a time rather than loading that whole tree.
     """
     try:
         CURATED_SKILLS_DIR.mkdir(parents=True, exist_ok=True)
     except OSError:
         return
-    for name in PURSUE_SKILLS:
+    for name in PURSUIT_SKILLS:
         src = BEAGLE / "plugins" / "beagle-campaign" / "skills" / name
         if not (src / "SKILL.md").is_file():
             continue
@@ -511,8 +511,8 @@ def setup(tau: ExtensionAPI) -> None:
         if skills.is_dir():
             tau.register_skill_dir(skills)
 
-    # 2. Load the `pursue` skills (curated; not the deprecated campaign tree).
-    _link_pursue_skills()
+    # 2. Load the pursuit skills (curated; not the deprecated campaign tree).
+    _link_pursuit_skills()
     if CURATED_SKILLS_DIR.is_dir():
         tau.register_skill_dir(CURATED_SKILLS_DIR)
 
@@ -525,8 +525,8 @@ def setup(tau: ExtensionAPI) -> None:
 
     # 3. The driver command, and a no-model state read.
     tau.register_command(
-        "pursue",
-        _command_pursue,
+        "pursuit",
+        _command_pursuit,
         description="Found or run a beagle pursuit — one goal, a task tree, no denominator.",
     )
     tau.register_command(
@@ -538,21 +538,22 @@ def setup(tau: ExtensionAPI) -> None:
     # 4. The headless step-executor, since Tau has no Task tool.
     tau.register_tool(
         AgentTool(
-            name="pursue_dispatch",
-            label="pursue_dispatch",
+            name="pursuit_dispatch",
+            label="pursuit_dispatch",
             description=(
                 "Delegate one well-specified pursuit task to a headless step-executor (a nested "
                 "`tau -p`, inheriting this session's model unless a Tau model id is given). Pass "
-                "the full brief (intent, --scope, --done-when verbatim). Returns the executor's "
-                "report; the caller still runs `beagle pursue close`. Use for roughly ten tool "
-                "calls or more of mechanical work, not one-line edits or open-ended exploration."
+                "the brief ('run `beagle pursuit brief <task>` and do what it says'). Returns "
+                "the executor's report; the caller still runs `beagle pursuit close`. Use for "
+                "roughly ten tool calls or more of mechanical work, not one-line edits or "
+                "open-ended exploration."
             ),
             parameters=DISPATCH_PARAMETERS,
             execute_fn=make_dispatch(),
             prompt_snippet="Delegate one pursuit task to a headless step-executor sub-agent.",
             prompt_guidelines=(
-                "Hand pursue_dispatch a self-contained brief; the worker sees no conversation.",
-                "The worker does the work; YOU run `beagle pursue close` after its --done-when.",
+                "Hand pursuit_dispatch a self-contained brief; the worker sees no conversation.",
+                "The worker does the work; YOU run `beagle pursuit close` after its --done-when.",
             ),
         )
     )
