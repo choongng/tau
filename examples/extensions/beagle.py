@@ -38,6 +38,7 @@ the extension loads and simply does less.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import os
 import re
 import subprocess
@@ -186,10 +187,8 @@ def make_guard() -> Any:
     async def guard(event: Any, context: ExtensionContext) -> ToolCallHookResult | None:
         global _SEEN_CWD
         # Record cwd for the dispatch tool, which receives no context.
-        try:
+        with contextlib.suppress(Exception):  # a stale/retired generation, ignore
             _SEEN_CWD = context.cwd
-        except Exception:  # noqa: BLE001 - a stale/retired generation, ignore
-            pass
 
         # Fail open on EVERYTHING: a tool_call handler that raises blocks the
         # tool it was only inspecting, turning a guard bug into a hard wedge.
@@ -223,7 +222,11 @@ def make_guard() -> Any:
                     )
                 return None  # founding write: the file does not exist yet
 
-            if tool == "bash" and goal_r.exists() and _bash_touches_goal(str(args.get("command", ""))):
+            if (
+                tool == "bash"
+                and goal_r.exists()
+                and _bash_touches_goal(str(args.get("command", "")))
+            ):
                 return ToolCallHookResult(
                     block=True,
                     reason=(
@@ -280,7 +283,11 @@ def make_dispatch() -> Any:
             )
 
         cwd_raw = arguments.get("cwd")
-        cwd = Path(cwd_raw).expanduser() if isinstance(cwd_raw, str) and cwd_raw else _SEEN_CWD or Path.cwd()
+        cwd = (
+            Path(cwd_raw).expanduser()
+            if isinstance(cwd_raw, str) and cwd_raw
+            else _SEEN_CWD or Path.cwd()
+        )
 
         if not STEP_EXECUTOR.is_file():
             return _make_dispatch_result(
@@ -298,9 +305,12 @@ def make_dispatch() -> Any:
         # is appended to tau's base system prompt, not swapped for it, so the
         # worker keeps the built-in tool guidance and only gains the persona.
         cmd = [
-            TAU_BIN, "-p",
-            "--cwd", str(cwd),
-            "--append-system-prompt", str(STEP_EXECUTOR),
+            TAU_BIN,
+            "-p",
+            "--cwd",
+            str(cwd),
+            "--append-system-prompt",
+            str(STEP_EXECUTOR),
         ]
         if provider:
             cmd += ["--provider", provider]
@@ -325,11 +335,9 @@ def make_dispatch() -> Any:
             stdout, stderr = await asyncio.wait_for(
                 proc.communicate(brief.encode("utf-8")), timeout=timeout
             )
-        except asyncio.TimeoutError:
-            try:
+        except TimeoutError:
+            with contextlib.suppress(ProcessLookupError):
                 proc.kill()
-            except ProcessLookupError:
-                pass
             await proc.wait()
             return _make_dispatch_result(
                 f"pursue_dispatch: step-executor exceeded its wall-clock budget of "
@@ -385,7 +393,10 @@ DISPATCH_PARAMETERS = {
         },
         "timeout": {
             "type": "number",
-            "description": f"Wall-clock seconds before the worker is killed. Default: {DEFAULT_DISPATCH_TIMEOUT:.0f}.",
+            "description": (
+                "Wall-clock seconds before the worker is killed. "
+                f"Default: {DEFAULT_DISPATCH_TIMEOUT:.0f}."
+            ),
         },
     },
     "required": ["brief"],
