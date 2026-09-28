@@ -6,15 +6,29 @@ checkout, so these exercise its wiring without a beagle install.
 
 from __future__ import annotations
 
+import asyncio
+import json
 import os
+import sys
 from pathlib import Path
+from typing import Any
 
 import pytest
 
+from tau_agent.events import AgentEndEvent
+from tau_agent.messages import AssistantMessage, TextContent
+from tau_agent.tools import AgentTool, AgentToolResult
 from tau_coding.commands import CommandContext
+from tau_coding.events import AgentSettledEvent
 from tau_coding.extensions import ExtensionRuntime
 from tau_coding.resources import TauResourcePaths
-from test_extensions import RecordingSession
+from test_extensions import RecordingSession, RecordingUiBridge
+
+
+@pytest.fixture
+def anyio_backend() -> str:
+    return "asyncio"
+
 
 EXTENSION = Path(__file__).resolve().parents[1] / "examples" / "extensions" / "beagle.py"
 
@@ -43,6 +57,10 @@ def beagle(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
         "---\ndescription: driver\n---\n\nRead ${CLAUDE_PLUGIN_ROOT}/commands/pursuit.md\n",
         encoding="utf-8",
     )
+    (commands / "pursuit-run.md").write_text(
+        "---\nname: pursuit-run\n---\n\nArm with ScheduleWakeup; see ${CLAUDE_PLUGIN_ROOT}.\n",
+        encoding="utf-8",
+    )
     agents = plugins / "beagle-dev" / "agents"
     agents.mkdir()
     (agents / "step-executor.md").write_text("You execute one step.\n", encoding="utf-8")
@@ -50,7 +68,73 @@ def beagle(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     monkeypatch.setenv("BEAGLE_ROOT", str(root))
     # Recorded so teardown restores whatever the process had; setup overwrites it.
     monkeypatch.setenv("CLAUDE_PLUGIN_ROOT", "/inherited/beagle-dev")
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "claude-session")
+    monkeypatch.setenv("CLAUDE_PID", "4242")
+    monkeypatch.delenv("BEAGLE_TAU_WORKER", raising=False)
+    monkeypatch.chdir(tmp_path)  # the process cwd is not a pursuit unless a test says so
     return root
+
+
+FAKE_BEAGLE = """\
+import json, os, sys
+from pathlib import Path
+
+here = Path(os.environ["FAKE_BEAGLE_DIR"])
+stdin = sys.stdin.read()
+with (here / "calls.jsonl").open("a") as log:
+    log.write(json.dumps({"argv": sys.argv[1:], "cwd": os.getcwd(), "stdin": stdin}) + "\\n")
+if json.loads(stdin or "{}").get("stop_hook_active"):
+    sys.exit(0)  # as beagle's Stop hooks do
+reply = here / (sys.argv[2] + ".out")
+if len(sys.argv) > 2 and reply.exists():
+    sys.stdout.write(reply.read_text())
+"""
+
+
+@pytest.fixture
+def fake_beagle(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """A `beagle` that logs each call and prints `<hook>.out` when it exists."""
+    here = tmp_path / "fake-beagle"
+    here.mkdir()
+    script = here / "beagle"
+    script.write_text(f"#!{sys.executable}\n{FAKE_BEAGLE}", encoding="utf-8")
+    script.chmod(0o755)
+    monkeypatch.setenv("BEAGLE_BIN", str(script))
+    monkeypatch.setenv("FAKE_BEAGLE_DIR", str(here))
+    return here
+
+
+def _calls(fake: Path) -> list[dict[str, Any]]:
+    log = fake / "calls.jsonl"
+    if not log.exists():
+        return []
+    return [json.loads(line) for line in log.read_text().splitlines()]
+
+
+def _block(reason: str) -> str:
+    return json.dumps({"decision": "block", "reason": reason}) + "\n"
+
+
+def _pursuit_project(tmp_path: Path) -> Path:
+    project = tmp_path / "project"
+    (project / ".beagle").mkdir(parents=True, exist_ok=True)
+    (project / ".beagle" / "pursuit.toml").write_text(
+        '[goal]\nstatement = "Ship it"\ncriteria = ["it ships"]\n', encoding="utf-8"
+    )
+    return project
+
+
+def _bound(tmp_path: Path, *, ui: bool = True) -> tuple[ExtensionRuntime, RecordingSession]:
+    runtime = _load(tmp_path)
+    session = RecordingSession(tmp_path / "project", running=False)
+    runtime.set_ui_bridge(RecordingUiBridge(has_ui=ui))  # type: ignore[arg-type]
+    runtime.bind(session)  # type: ignore[arg-type]
+    return runtime, session
+
+
+def _tool(runtime: ExtensionRuntime, name: str) -> Any:
+    [tool] = [t for t in runtime.compose_tools([]) if t.name == name]
+    return tool
 
 
 def _load(tmp_path: Path) -> ExtensionRuntime:
@@ -135,3 +219,203 @@ def test_missing_checkout_registers_no_skills(
     assert runtime.skill_dirs == ()
     assert not (tmp_path / "home-tau" / "beagle-plugin").exists()
     assert os.environ["CLAUDE_PLUGIN_ROOT"] == "/inherited"
+
+
+def _run_command(runtime: ExtensionRuntime, name: str, args: str = "") -> None:
+    registry = runtime.build_command_registry()
+    command = registry.get(name)
+    assert command is not None
+    context = CommandContext(
+        session=None,  # type: ignore[arg-type]
+        registry=registry,
+        text=f"/{name} {args}".strip(),
+        name=name,
+        args=args,
+    )
+    command.handler(context)
+
+
+# -- /pursuit-run bridge -------------------------------------------------------
+
+
+@pytest.mark.anyio
+async def test_session_start_names_the_tau_session_to_beagle(tmp_path: Path, beagle: Path) -> None:
+    runtime, session = _bound(tmp_path)
+
+    await runtime.emit_session_start("startup")
+
+    assert os.environ["CLAUDE_CODE_SESSION_ID"] == session.session_id
+    assert "CLAUDE_PID" not in os.environ
+
+
+def test_pursuit_run_injects_host_mapping_and_driver(tmp_path: Path, beagle: Path) -> None:
+    runtime, session = _bound(tmp_path)
+    session.is_running = True
+
+    _run_command(runtime, "pursuit-run")
+
+    [turn] = session.followed_up
+    root = tmp_path / "home-tau" / "beagle-plugin"
+    assert turn.startswith("Host mapping")
+    assert "`pursuit_wakeup`" in turn and "`pursuit_dispatch`" in turn
+    assert f"Arm with ScheduleWakeup; see {root}." in turn
+    assert "name: pursuit-run" not in turn
+
+
+@pytest.mark.anyio
+async def test_wakeup_arms_replaces_fires_and_disarms(tmp_path: Path, beagle: Path) -> None:
+    runtime, session = _bound(tmp_path)
+    session.is_running = True
+    wakeup = _tool(runtime, "pursuit_wakeup")
+
+    armed = await wakeup.execute("c1", {"delay_minutes": 0.2})
+    assert "armed" in armed.text and "--resuming-in 1" in armed.text
+    again = await wakeup.execute("c2", {"delay_minutes": 90, "prompt": "/pursuit-run"})
+    assert "replacing the previous wakeup" in again.text
+    assert "--resuming-in 60" in again.text
+
+    stopped = await wakeup.execute("c3", {"stop": True})
+    assert stopped.text == "pursuit_wakeup: disarmed."
+    assert (await wakeup.execute("c4", {"stop": True})).text == (
+        "pursuit_wakeup: nothing was armed."
+    )
+    assert session.followed_up == []
+
+
+@pytest.mark.anyio
+async def test_wakeup_fire_expands_pursuit_run(
+    tmp_path: Path, beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runtime, session = _bound(tmp_path)
+    session.is_running = True
+    wakeup = _tool(runtime, "pursuit_wakeup")
+    loop = asyncio.get_running_loop()
+    fired: list[Any] = []
+
+    def call_now(delay: float, callback: Any, *args: Any) -> Any:
+        fired.append(delay)
+        return loop.call_soon(callback, *args)
+
+    monkeypatch.setattr(loop, "call_later", call_now)
+    await wakeup.execute("c1", {"delay_minutes": 2})
+    await asyncio.sleep(0)
+
+    assert fired == [120]
+    [turn] = session.followed_up
+    assert turn.startswith("Host mapping")
+
+
+@pytest.mark.anyio
+async def test_wakeup_refuses_without_ui(tmp_path: Path, beagle: Path) -> None:
+    runtime, _ = _bound(tmp_path, ui=False)
+
+    result = await _tool(runtime, "pursuit_wakeup").execute("c1", {"delay_minutes": 1})
+
+    assert "REFUSED" in result.text
+
+
+@pytest.mark.anyio
+async def test_commit_claims_block_stops_the_bash_call(
+    tmp_path: Path, beagle: Path, fake_beagle: Path
+) -> None:
+    project = _pursuit_project(tmp_path)
+    (fake_beagle / "commit-claims.out").write_text(_block("no Claims block"), encoding="utf-8")
+    runtime, _ = _bound(tmp_path)
+    bash = _tool_with_hooks(runtime)
+
+    ls = await bash.execute("c0", {"command": "ls"})
+    committed = await bash.execute("c1", {"command": "git commit -m wip"})
+
+    assert ls.text == "ran"
+    assert committed.text == "Tool call blocked: beagle commit-claims: no Claims block"
+    [call] = [c for c in _calls(fake_beagle) if "commit-claims" in c["argv"]]
+    assert call["argv"] == ["hook", "commit-claims"]
+    assert Path(call["cwd"]) == project
+    payload = json.loads(call["stdin"])
+    assert payload["tool_name"] == "Bash"
+    assert payload["tool_input"] == {"command": "git commit -m wip"}
+
+
+def _tool_with_hooks(runtime: ExtensionRuntime) -> Any:
+    async def run(*_: Any, **__: Any) -> AgentToolResult:
+        return AgentToolResult(content=[TextContent(text="ran")])
+
+    bash = AgentTool(name="bash", label="bash", description="", parameters={}, execute_fn=run)
+    [wrapped] = [t for t in runtime.compose_tools([bash]) if t.name == "bash"]
+    return wrapped
+
+
+def _end(stop_reason: str = "stop") -> AgentEndEvent:
+    message = AssistantMessage(content=[], stop_reason=stop_reason)  # type: ignore[arg-type]
+    return AgentEndEvent(messages=[message])
+
+
+@pytest.mark.anyio
+async def test_loop_guard_objection_starts_one_more_turn(
+    tmp_path: Path, beagle: Path, fake_beagle: Path
+) -> None:
+    project = _pursuit_project(tmp_path)
+    (fake_beagle / "loop-guard.out").write_text(_block("arm the next turn"), encoding="utf-8")
+    runtime, session = _bound(tmp_path)
+
+    await runtime.emit_event(_end())
+    await runtime.emit_event(AgentSettledEvent())
+    await runtime.emit_event(_end())
+    await runtime.emit_event(AgentSettledEvent())
+
+    # The objection became one follow-up; the settle after it went through
+    # with stop_hook_active, so the fake's block was not delivered twice.
+    assert session.followed_up == ["[beagle loop-guard]\n\narm the next turn"]
+    guards = [c for c in _calls(fake_beagle) if "loop-guard" in c["argv"]]
+    assert [json.loads(c["stdin"])["stop_hook_active"] for c in guards] == [False, True]
+    assert all(Path(c["cwd"]) == project for c in guards)
+    assert json.loads(guards[0]["stdin"])["session_id"] == session.session_id
+
+
+@pytest.mark.anyio
+async def test_loop_guard_skips_interrupted_runs_and_print_mode(
+    tmp_path: Path, beagle: Path, fake_beagle: Path
+) -> None:
+    _pursuit_project(tmp_path)
+    (fake_beagle / "loop-guard.out").write_text(_block("keep going"), encoding="utf-8")
+    runtime, session = _bound(tmp_path)
+
+    await runtime.emit_event(_end("aborted"))
+    await runtime.emit_event(AgentSettledEvent())
+    headless, headless_session = _bound(tmp_path, ui=False)
+    await headless.emit_event(_end())
+    await headless.emit_event(AgentSettledEvent())
+
+    assert session.followed_up == [] and headless_session.followed_up == []
+    assert not [c for c in _calls(fake_beagle) if "loop-guard" in c["argv"]]
+
+
+def test_loop_report_joins_the_pursuit_section(
+    tmp_path: Path, beagle: Path, fake_beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project = _pursuit_project(tmp_path)
+    (fake_beagle / "loop-report.out").write_text("beagle: a run is still open here\n")
+    monkeypatch.chdir(project)
+
+    runtime = _load(tmp_path)
+
+    [section] = [s for s in runtime.prompt_sections if s.title == "Beagle pursuit"]
+    assert "This project is a **pursuit**: Ship it" in section.body
+    assert section.body.endswith("beagle: a run is still open here")
+    [call] = _calls(fake_beagle)
+    assert call["argv"] == ["hook", "loop-report"]
+    assert json.loads(call["stdin"])["hook_event_name"] == "SessionStart"
+
+
+@pytest.mark.anyio
+async def test_worker_runs_no_loop_and_keeps_parent_session(
+    tmp_path: Path, beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("BEAGLE_TAU_WORKER", "1")
+    runtime, _ = _bound(tmp_path)
+
+    await runtime.emit_session_start("startup")
+
+    assert runtime.build_command_registry().get("pursuit-run") is None
+    assert [t.name for t in runtime.compose_tools([])] == ["pursuit_dispatch"]
+    assert os.environ["CLAUDE_CODE_SESSION_ID"] == "claude-session"

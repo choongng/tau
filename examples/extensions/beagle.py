@@ -5,10 +5,10 @@ Beagle ships as a Claude Code plugin, but Tau does not run Claude Code's
 module is therefore the port point: it loads Beagle's skills and re-implements,
 on Tau's own seams, the small set of behaviours pursuit mode needs.
 
-Campaign mode is on its way out, so nothing here reintroduces it: no run record,
-no slots, no counted loop. A pursuit is a goal, a task tree grown by doing the
-work, and a `done_when` command bound before the work it judges. The pieces
-below exist because a specific part of that model has no Tau equivalent:
+Campaign mode is on its way out, so nothing here reintroduces it: no slots, no
+counted loop. A pursuit is a goal, a task tree grown by doing the work, and a
+`done_when` command bound before the work it judges. The pieces below exist
+because a specific part of that model has no Tau equivalent:
 
 - **Skills** — a pursuit's own guidance arrives only if it is loaded. Beagle's
   pursuit skills live in the (deprecated) `beagle-campaign` plugin, beside the
@@ -35,6 +35,15 @@ below exist because a specific part of that model has no Tau equivalent:
 - **orientation** — when the project is a pursuit, its goal and criteria are
   added to the system prompt at load, so the driver re-reads the goal every
   session without anything triggering a turn. It is a frame, not an order.
+  Beagle's `loop-report` SessionStart hook output rides along with it.
+- **`/pursuit-run`** — the uncounted loop around `/pursuit`, which needs three
+  things Claude Code gives it: a session id beagle records as the run's driver
+  (exported as `CLAUDE_CODE_SESSION_ID`), a way to arm the next turn
+  (`pursuit_wakeup`, standing in for `ScheduleWakeup`), and the hooks —
+  `loop-guard` on `agent_settled`, `commit-claims` on bash `tool_call`. The
+  driver text is prefixed with a short note mapping its Claude Code names onto
+  these. A dispatched worker runs none of the loop: it is one step of its
+  parent's, and keeps the parent's session id.
 
 Everything degrades quietly: with no `beagle`, no pursuit, or no `tau` on PATH,
 the extension loads and simply does less.
@@ -44,6 +53,8 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
+import math
 import os
 import re
 import subprocess
@@ -91,6 +102,7 @@ MERGED_ROOT_NAME = "beagle-plugin"
 
 STEP_EXECUTOR = PLUGINS / "beagle-dev" / "agents" / "step-executor.md"
 PURSUIT_COMMAND = PLUGINS / "beagle-campaign" / "commands" / "pursuit.md"
+PURSUIT_RUN_COMMAND = PLUGINS / "beagle-campaign" / "commands" / "pursuit-run.md"
 PLUGIN_ROOT_VAR = "${CLAUDE_PLUGIN_ROOT}"
 GOAL_BASENAME = "pursuit.toml"
 
@@ -106,11 +118,28 @@ WORKER_PROVIDER_ENV = "BEAGLE_TAU_DISPATCH_PROVIDER"
 #: Escape hatch: `BEAGLE_TAU_ALLOW_PURSUIT_EDIT=1` disables the ground-truth guard.
 GUARD_DISABLE_ENV = "BEAGLE_TAU_ALLOW_PURSUIT_EDIT"
 
+#: Set in a `pursuit_dispatch` worker's environment. A worker acts for its
+#: parent: it keeps the parent's session id and runs no loop of its own.
+WORKER_ENV = "BEAGLE_TAU_WORKER"
+
+#: Wall-clock cap on one `beagle hook` call; a hook that hangs fails open.
+HOOK_TIMEOUT = 30.0
+#: The wakeup delay's bounds, in minutes (Claude Code clamps to 1..60 too).
+WAKEUP_MIN_MINUTES = 1
+WAKEUP_MAX_MINUTES = 60
+
 #: Last session cwd the extension saw, so the dispatch tool (which gets no
 #: context) can default to the project it is working in.
 _SEEN_CWD: Path | None = None
 #: The merged plugin root once built, for spelling out driver text.
 _PLUGIN_ROOT: Path | None = None
+#: The armed `pursuit_wakeup`, if any. One at a time, like `ScheduleWakeup`.
+_WAKEUP: asyncio.TimerHandle | None = None
+#: Whether the run now settling was started by a loop-guard objection — the
+#: Stop hook's `stop_hook_active`, which lets the next stop through.
+_GUARD_OBJECTED = False
+#: Whether the last run ended on its own, rather than aborted or errored.
+_LAST_RUN_CLEAN = True
 
 
 # --------------------------------------------------------------------------- #
@@ -161,12 +190,17 @@ def _strip_frontmatter(text: str) -> str:
     return text
 
 
-def _run(cmd: list[str], cwd: Path | None, timeout: float) -> tuple[int, str]:
-    """Run a short capture command, failing soft (rc!=0 with the reason inline)."""
+def _run(cmd: list[str], cwd: Path | None, timeout: float, stdin: str = "") -> tuple[int, str]:
+    """Run a short capture command, failing soft (rc!=0 with the reason inline).
+
+    stdin is always fed, never inherited: under the TUI it is the terminal, and
+    a beagle hook reads its payload from it.
+    """
     try:
         proc = subprocess.run(
             cmd,
             cwd=str(cwd) if cwd else None,
+            input=stdin,
             capture_output=True,
             text=True,
             timeout=timeout,
@@ -353,6 +387,7 @@ def make_dispatch() -> Any:
             proc = await asyncio.create_subprocess_exec(
                 *cmd,
                 cwd=str(cwd),
+                env={**os.environ, WORKER_ENV: "1"},
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
@@ -436,6 +471,290 @@ DISPATCH_PARAMETERS = {
 
 
 # --------------------------------------------------------------------------- #
+# host bridge: what Claude Code gives /pursuit-run that Tau does not
+# --------------------------------------------------------------------------- #
+
+
+def _is_worker() -> bool:
+    return bool(os.environ.get(WORKER_ENV))
+
+
+def _adopt_session(context: ExtensionContext) -> None:
+    """Name this Tau session to beagle the way Claude Code names its own.
+
+    `beagle loop start` records `CLAUDE_CODE_SESSION_ID` as the run's driver,
+    and `loop-guard` and `loop show` compare against it to tell this session's
+    run from another's. `CLAUDE_PID` is dropped rather than set: beagle only
+    believes a pid whose process is named claude or node, so Tau's would read
+    as dead — and one inherited from a Claude Code shell would name the wrong
+    driver. Without it, beagle judges liveness by the run's own promises.
+    A worker keeps its parent's id: it acts on the parent's run.
+    """
+    if _is_worker():
+        return
+    os.environ.pop("CLAUDE_PID", None)
+    session_id = context.session_id
+    if session_id:
+        os.environ["CLAUDE_CODE_SESSION_ID"] = session_id
+    else:
+        os.environ.pop("CLAUDE_CODE_SESSION_ID", None)
+
+
+def _on_session_start(event: Any, context: ExtensionContext) -> None:
+    global _SEEN_CWD
+    del event
+    _SEEN_CWD = context.cwd
+    _adopt_session(context)
+
+
+def _block_reason(stdout: str) -> str | None:
+    """The reason from a hook's `{"decision": "block"}` line, or None (allow)."""
+    for line in reversed(stdout.strip().splitlines()):
+        try:
+            data = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(data, dict) and data.get("decision") == "block":
+            return str(data.get("reason") or "blocked by beagle")
+    return None
+
+
+async def _run_hook(name: str, root: Path, payload: Mapping[str, Any]) -> str | None:
+    """Run `beagle hook NAME` as Claude Code would; its stdout, or None on failure.
+
+    The bare `hook NAME` argv is beagle's fast path, which reads the root from
+    the cwd rather than `--root`, so the hook runs in the project root. Every
+    failure — beagle missing, a hang, a crash — fails open, as beagle's own
+    hooks do: a bridge bug must not wedge the agent.
+    """
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            BEAGLE_BIN,
+            "hook",
+            name,
+            cwd=str(root),
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+    except OSError:
+        return None
+    try:
+        stdout, _ = await asyncio.wait_for(
+            proc.communicate(json.dumps(payload).encode("utf-8")), timeout=HOOK_TIMEOUT
+        )
+    except TimeoutError:
+        with contextlib.suppress(ProcessLookupError):
+            proc.kill()
+        await proc.wait()
+        return None
+    return (stdout or b"").decode("utf-8", "replace")
+
+
+def _loop_report(root: Path) -> str:
+    """`beagle hook loop-report`'s text for a session start; "" when silent."""
+    payload = json.dumps({"hook_event_name": "SessionStart", "cwd": str(root)})
+    rc, out = _run([BEAGLE_BIN, "hook", "loop-report"], root, HOOK_TIMEOUT, stdin=payload)
+    if rc != 0 or _block_reason(out) is not None:
+        return ""
+    return out
+
+
+def make_commit_claims() -> Any:
+    """Build the `tool_call` bridge for beagle's `commit-claims` PreToolUse hook."""
+
+    async def commit_claims(event: Any, context: ExtensionContext) -> ToolCallHookResult | None:
+        try:
+            if event.tool_name != "bash":
+                return None
+            command = str((event.arguments or {}).get("command", ""))
+            if "commit" not in command:
+                return None  # beagle's own fast path would leave here too
+            goal = _find_goal(context.cwd)
+            if goal is None:
+                return None
+            out = await _run_hook(
+                "commit-claims",
+                goal.parent.parent,
+                {
+                    "hook_event_name": "PreToolUse",
+                    "session_id": context.session_id or "",
+                    "cwd": str(context.cwd),
+                    "tool_name": "Bash",
+                    "tool_input": {"command": command},
+                },
+            )
+            reason = _block_reason(out) if out else None
+        except Exception:  # noqa: BLE001 - fail open, never block on a bridge bug
+            return None
+        if reason is None:
+            return None
+        return ToolCallHookResult(block=True, reason=f"beagle commit-claims: {reason}")
+
+    return commit_claims
+
+
+def _note_run_end(event: Any, context: ExtensionContext) -> None:
+    """Remember whether the run ended by itself, for the loop-guard."""
+    global _LAST_RUN_CLEAN
+    del context
+    stops = [getattr(m, "stop_reason", None) for m in getattr(event, "messages", ())]
+    stops = [stop for stop in stops if stop is not None]
+    _LAST_RUN_CLEAN = not stops or stops[-1] not in ("aborted", "error")
+
+
+def make_loop_guard(tau: ExtensionAPI) -> Any:
+    """Build the `agent_settled` bridge for beagle's `loop-guard` Stop hook.
+
+    Claude Code runs a Stop hook when the agent finishes a turn — not when the
+    user interrupts it — and a block becomes the model's next input with
+    `stop_hook_active` set on the stop after it. Here an objection starts one
+    more turn through `send_user_message`, and the settle that turn produces
+    is passed to the hook as `stop_hook_active`, so a guard objects at most
+    once per turn the loop takes, exactly as it does under Claude Code.
+    """
+
+    async def loop_guard(event: Any, context: ExtensionContext) -> None:
+        global _GUARD_OBJECTED
+        del event
+        active, _GUARD_OBJECTED = _GUARD_OBJECTED, False
+        try:
+            # Print mode ends with the turn whatever the hook says, and an
+            # interrupted or failed run is not a turn the loop chose to end.
+            if not context.has_ui or not _LAST_RUN_CLEAN:
+                return
+            goal = _find_goal(context.cwd)
+            if goal is None:
+                return
+            out = await _run_hook(
+                "loop-guard",
+                goal.parent.parent,
+                {
+                    "hook_event_name": "Stop",
+                    "session_id": context.session_id or "",
+                    "cwd": str(context.cwd),
+                    "stop_hook_active": active,
+                },
+            )
+            reason = _block_reason(out) if out else None
+            if reason is not None:
+                _GUARD_OBJECTED = True
+                tau.send_user_message(f"[beagle loop-guard]\n\n{reason}")
+        except Exception:  # noqa: BLE001 - fail open; a guard must not wedge the session
+            return
+
+    return loop_guard
+
+
+def _cancel_wakeup() -> bool:
+    global _WAKEUP
+    handle, _WAKEUP = _WAKEUP, None
+    if handle is None or handle.cancelled():
+        return False
+    handle.cancel()
+    return True
+
+
+def _fire_wakeup(tau: ExtensionAPI, prompt: str) -> None:
+    """Deliver an armed wakeup's prompt, expanding `/pursuit-run` itself.
+
+    An extension's message reaches the model as text, not through the slash
+    command parser, so the one prompt the driver arms is expanded here.
+    """
+    global _WAKEUP
+    _WAKEUP = None
+    name, _, args = prompt.strip().partition(" ")
+    text = _pursuit_run_turn(args) if name == "/pursuit-run" else None
+    with contextlib.suppress(Exception):  # a reloaded or closed session: nothing to wake
+        tau.send_user_message(text if text is not None else prompt)
+
+
+def make_wakeup(tau: ExtensionAPI) -> Any:
+    """Build the `pursuit_wakeup` tool: Tau's `ScheduleWakeup`."""
+
+    async def execute(
+        tool_call_id: str,
+        arguments: Mapping[str, Any],
+        signal: ToolCancellationToken | None = None,
+        on_update: ToolUpdateCallback | None = None,
+    ) -> AgentToolResult:
+        global _WAKEUP
+        del tool_call_id, signal, on_update
+        if arguments.get("stop"):
+            if _cancel_wakeup():
+                return _make_dispatch_result("pursuit_wakeup: disarmed.")
+            return _make_dispatch_result("pursuit_wakeup: nothing was armed.")
+        if not tau.context.has_ui:
+            return _make_dispatch_result(
+                "pursuit_wakeup: REFUSED — this Tau session has no interactive frontend "
+                "(print mode ends with the turn), so nothing would come back. A refused "
+                "arm is a stopping condition: do not record a resumption."
+            )
+        try:
+            minutes = math.ceil(float(arguments.get("delay_minutes") or WAKEUP_MIN_MINUTES))
+        except (TypeError, ValueError):
+            minutes = WAKEUP_MIN_MINUTES
+        minutes = max(WAKEUP_MIN_MINUTES, min(WAKEUP_MAX_MINUTES, minutes))
+        raw_prompt = arguments.get("prompt")
+        prompt = raw_prompt.strip() if isinstance(raw_prompt, str) and raw_prompt.strip() else ""
+        prompt = prompt or "/pursuit-run"
+        replaced = _cancel_wakeup()
+        _WAKEUP = asyncio.get_running_loop().call_later(minutes * 60, _fire_wakeup, tau, prompt)
+        return _make_dispatch_result(
+            f"pursuit_wakeup: armed — {prompt!r} in {minutes} minute(s)"
+            + (", replacing the previous wakeup" if replaced else "")
+            + f". Record it: `beagle loop tick --resuming-in {minutes}`."
+        )
+
+    return execute
+
+
+WAKEUP_PARAMETERS = {
+    "type": "object",
+    "properties": {
+        "delay_minutes": {
+            "type": "number",
+            "description": (
+                f"Minutes until the wakeup ({WAKEUP_MIN_MINUTES}-{WAKEUP_MAX_MINUTES}, "
+                "rounded up). The shortest is right when the next task is ready."
+            ),
+        },
+        "prompt": {
+            "type": "string",
+            "description": "What the wakeup delivers. Default: /pursuit-run.",
+        },
+        "stop": {
+            "type": "boolean",
+            "description": "Disarm the pending wakeup instead of arming one.",
+        },
+    },
+}
+
+#: Read before `pursuit-run.md`, which names Claude Code's tools and hooks.
+TAU_HOST_NOTE = """\
+Host mapping — this driver was written for Claude Code. Under Tau, read it as:
+
+- `ScheduleWakeup` is the `pursuit_wakeup` tool: `delay_minutes`, \
+`prompt: "/pursuit-run"`, and `stop: true` to disarm. It refuses when Tau \
+cannot come back (print mode); that is the refused arm the driver treats as a \
+stopping condition.
+- Dispatching `beagle-dev:step-executor` is the `pursuit_dispatch` tool. It \
+returns the worker's report within the same turn, so skip the `--awaiting` \
+tick and the bare tick that clears it; run the close straight after.
+- `loop-guard`, `loop-report` and `commit-claims` run inside this Tau \
+extension. Do not run `beagle hooks install`.
+"""
+
+
+def _pursuit_run_turn(args: str) -> str | None:
+    """The `/pursuit-run` driver as a turn, or None when it is not installed."""
+    if not PURSUIT_RUN_COMMAND.is_file():
+        return None
+    note = f"User input to /pursuit-run:\n{args}\n\n" if args.strip() else ""
+    return f"{note}{TAU_HOST_NOTE}\n{_driver_text(PURSUIT_RUN_COMMAND)}"
+
+
+# --------------------------------------------------------------------------- #
 # commands
 # --------------------------------------------------------------------------- #
 
@@ -448,6 +767,15 @@ def _command_pursuit(args: str, context: Any) -> str:
     note = f"User input to /pursuit:\n{args}\n\n" if args.strip() else ""
     context.api.send_user_message(f"{note}{driver}")
     return "/pursuit: loaded the pursuit driver as this turn."
+
+
+def _command_pursuit_run(args: str, context: Any) -> str:
+    """Load Beagle's `/pursuit-run` loop driver as this turn."""
+    text = _pursuit_run_turn(args)
+    if text is None:
+        return f"/pursuit-run: driver not found at {PURSUIT_RUN_COMMAND}"
+    context.api.send_user_message(text)
+    return "/pursuit-run: loaded the pursuit loop driver as this turn."
 
 
 def _command_pursuit_view(args: str, context: Any) -> str:
@@ -494,7 +822,9 @@ def _goal_section(goal_file: Path) -> str | None:
         "`open`, before the work, stands in for a verifier. Delegate a chunky step to the "
         "`pursuit_dispatch` tool (a headless step-executor sub-agent) instead of "
         "grinding it here; YOU run the close, not the worker. `/pursuit` loads the full "
-        "driver; `/pursuit-view` shows counts and the ready set without a model.",
+        "driver, `/pursuit-run` runs it task after task (arming turns with "
+        "`pursuit_wakeup`), and `/pursuit-view` shows counts and the ready set without "
+        "a model.",
     ]
     return "\n".join(lines)
 
@@ -621,21 +951,65 @@ def setup(tau: ExtensionAPI) -> None:
         )
     )
 
-    # 5. Enforce the pursuit ground truth on every tool call.
+    # 5. Enforce the pursuit ground truth on every tool call, and bridge
+    #    beagle's commit-claims PreToolUse hook onto the same seam.
     tau.on("tool_call", make_guard())
+    tau.on("tool_call", make_commit_claims())
 
-    # 6. If this project is a pursuit, pin its goal into the prompt at load —
+    # 6. What /pursuit-run needs from its host: a session id beagle can record
+    #    as the driver, a wakeup, and the Stop hook. A worker runs none of the
+    #    loop — it is one step of its parent's.
+    with contextlib.suppress(Exception):  # context may not be bound yet
+        _adopt_session(tau.context)
+    tau.on("session_start", _on_session_start)
+    if not _is_worker():
+        tau.register_command(
+            "pursuit-run",
+            _command_pursuit_run,
+            description="Run a beagle pursuit task after task until it cannot move.",
+        )
+        tau.register_tool(
+            AgentTool(
+                name="pursuit_wakeup",
+                label="pursuit_wakeup",
+                description=(
+                    "Arm this session's next turn (Claude Code's ScheduleWakeup): after "
+                    "delay_minutes, deliver prompt (default /pursuit-run). One wakeup at a "
+                    "time; arming again replaces it, stop=true disarms it. Refused in print "
+                    "mode, where the session ends with the turn."
+                ),
+                parameters=WAKEUP_PARAMETERS,
+                execute_fn=make_wakeup(tau),
+                prompt_snippet="Arm the pursuit loop's next turn (ScheduleWakeup).",
+                prompt_guidelines=(
+                    "Arm pursuit_wakeup before `beagle loop tick --resuming-in`, never after, "
+                    "and treat a refused arm as a stopping condition.",
+                ),
+            )
+        )
+        tau.on("agent_end", _note_run_end)
+        tau.on("agent_settled", make_loop_guard(tau))
+        tau.on("session_shutdown", lambda event, context: _cancel_wakeup())
+
+    # 7. If this project is a pursuit, pin its goal into the prompt at load —
     #    the frame arrives, but nothing here triggers a turn. A pursuit founded
     #    mid-session (outside a load) simply misses the section until the next
     #    reload, which is the right trade against auto-starting work.
+    #    Extensions load before the session binds, so the session cwd is not
+    #    readable yet; the process cwd is where `tau` (or a worker) was started.
     try:
         cwd = tau.context.cwd
-        _SEEN_CWD = cwd
-    except Exception:  # noqa: BLE001 - context may not be bound yet
-        cwd = None
-    if cwd is not None:
-        goal = _find_goal(cwd)
-        if goal is not None:
-            section = _goal_section(goal)
-            if section:
-                tau.add_prompt_section("Beagle pursuit", section)
+    except Exception:  # noqa: BLE001 - not bound yet at load
+        cwd = Path.cwd()
+    _SEEN_CWD = cwd
+    goal = _find_goal(cwd)
+    if goal is not None:
+        section = _goal_section(goal)
+        # loop-report is the SessionStart hook: what a run left in flight, and
+        # the driver's core while one is. The system prompt outlives
+        # compaction, so this also covers what the hook re-prints after one.
+        report = "" if _is_worker() else _loop_report(goal.parent.parent)
+        if section and report:
+            section = f"{section}\n\nAt session start, `beagle hook loop-report` said:\n\n{report}"
+        if section:
+            tau.add_prompt_section("Beagle pursuit", section)
