@@ -19,10 +19,11 @@ because a specific part of that model has no Tau equivalent:
   one merged plugin root under the Tau home, points `CLAUDE_PLUGIN_ROOT` at it,
   and registers its `skills/` — every script path then resolves, whichever
   plugin shipped it, taking only the named pursuit skills from their plugin.
-- **`/pursuit`** — the driver. Injects the command's own text as the turn,
-  with `${CLAUDE_PLUGIN_ROOT}` spelled out as the merged root. Registered only
-  when the checkout has the driver file; a checkout that is present but lacks
-  it is reported at session start and in the prompt, not degraded quietly.
+- **`/pursuit`** — the driver. Injects the command's own text as the turn, in
+  the `<skill>` block `/skill:<name>` sends, with `${CLAUDE_PLUGIN_ROOT}`
+  spelled out as the merged root. Registered only when the checkout has the
+  driver file; a checkout that is present but lacks it is reported at session
+  start and in the prompt, not degraded quietly.
 - **`pursuit_dispatch`** — a headless `step-executor`. Tau has no Task tool, so
   delegation is a nested `tau -p` run: the step-executor persona appended, the
   target dir set with `--cwd`, and the model inherited from the session unless
@@ -85,6 +86,7 @@ from tau_coding.extensions import (
     ToolCallHookResult,
 )
 from tau_coding.resources import parse_markdown_resource
+from tau_coding.skills import Skill, format_skill_invocation
 
 #: The beagle checkout. `BEAGLE_ROOT` overrides the default `~/beagle`.
 BEAGLE = Path(os.environ.get("BEAGLE_ROOT") or Path.home() / "beagle").expanduser()
@@ -226,7 +228,7 @@ def _driver_missing(name: str) -> str:
 
 
 def _driver_text(path: Path) -> str:
-    """A command file as a turn: frontmatter off, the plugin root spelled out.
+    """A command file's body: frontmatter off, the plugin root spelled out.
 
     The text reaches the model, not a shell, so a `${CLAUDE_PLUGIN_ROOT}` left
     in it would be read literally — or resolved by a model guessing.
@@ -235,6 +237,24 @@ def _driver_text(path: Path) -> str:
     if _PLUGIN_ROOT is not None:
         text = text.replace(PLUGIN_ROOT_VAR, str(_PLUGIN_ROOT))
     return text
+
+
+def _driver_turn(name: str, args: str, preamble: str = "") -> str | None:
+    """Driver command file `name` as a Tau skill invocation; None when absent.
+
+    The same `<skill>` block `/skill:<name>` sends, so the TUI shows "Using
+    skill" rather than the whole driver as a user message, and the user's
+    input follows the block as `/skill:` arguments do. Located under the merged
+    root, where `${CLAUDE_PLUGIN_ROOT}` in its body now points. A Tau-only
+    preamble goes inside the block, ahead of the driver it qualifies.
+    """
+    path = _driver_file(name)
+    if path is None:
+        return None
+    location = _PLUGIN_ROOT / "commands" / name if _PLUGIN_ROOT is not None else path
+    body = f"{preamble}\n{_driver_text(path)}" if preamble else _driver_text(path)
+    skill = Skill(name=Path(name).stem, path=location, content=body)
+    return format_skill_invocation(skill, args)
 
 
 def _strip_frontmatter(text: str) -> str:
@@ -711,15 +731,15 @@ def _cancel_wakeup() -> bool:
 
 
 def _fire_wakeup(tau: ExtensionAPI, prompt: str) -> None:
-    """Deliver an armed wakeup's prompt, expanding `/pursuit-run` itself.
+    """Deliver an armed wakeup's prompt, expanding a pursuit driver itself.
 
     An extension's message reaches the model as text, not through the slash
-    command parser, so the one prompt the driver arms is expanded here.
+    command parser, so the driver commands a wakeup may carry are expanded here.
     """
     global _WAKEUP
     _WAKEUP = None
     name, _, args = prompt.strip().partition(" ")
-    text = _pursuit_run_turn(args) if name == "/pursuit-run" else None
+    text = _DRIVER_TURNS[name](args) if name in _DRIVER_TURNS else None
     with contextlib.suppress(Exception):  # a reloaded or closed session: nothing to wake
         tau.send_user_message(text if text is not None else prompt)
 
@@ -813,13 +833,18 @@ extension. Do not run `beagle hooks install`.
 """
 
 
+def _pursuit_turn(args: str) -> str | None:
+    """The `/pursuit` driver as a turn, or None when it is not installed."""
+    return _driver_turn(PURSUIT_COMMAND, args)
+
+
 def _pursuit_run_turn(args: str) -> str | None:
     """The `/pursuit-run` driver as a turn, or None when it is not installed."""
-    driver = _driver_file(PURSUIT_RUN_COMMAND)
-    if driver is None:
-        return None
-    note = f"User input to /pursuit-run:\n{args}\n\n" if args.strip() else ""
-    return f"{note}{TAU_HOST_NOTE}\n{_driver_text(driver)}"
+    return _driver_turn(PURSUIT_RUN_COMMAND, args, preamble=TAU_HOST_NOTE)
+
+
+#: Driver commands a wakeup's prompt may name, expanded as their command would.
+_DRIVER_TURNS = {"/pursuit": _pursuit_turn, "/pursuit-run": _pursuit_run_turn}
 
 
 # --------------------------------------------------------------------------- #
@@ -829,12 +854,10 @@ def _pursuit_run_turn(args: str) -> str | None:
 
 def _command_pursuit(args: str, context: Any) -> str:
     """Load Beagle's `/pursuit` driver as this turn."""
-    path = _driver_file(PURSUIT_COMMAND)
-    if path is None:
+    text = _pursuit_turn(args)
+    if text is None:
         return f"/pursuit: {_driver_missing(PURSUIT_COMMAND)}"
-    driver = _driver_text(path)
-    note = f"User input to /pursuit:\n{args}\n\n" if args.strip() else ""
-    context.api.send_user_message(f"{note}{driver}")
+    context.api.send_user_message(text)
     return "/pursuit: loaded the pursuit driver as this turn."
 
 

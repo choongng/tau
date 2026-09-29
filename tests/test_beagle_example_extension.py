@@ -23,6 +23,7 @@ from tau_coding.commands import CommandContext
 from tau_coding.events import AgentSettledEvent
 from tau_coding.extensions import ExtensionRuntime
 from tau_coding.resources import TauResourcePaths, parse_markdown_resource
+from tau_coding.skills import parse_skill_invocation
 from test_extensions import RecordingSession, RecordingUiBridge
 
 
@@ -272,8 +273,12 @@ def test_pursuit_driver_spells_out_plugin_root(tmp_path: Path, beagle: Path) -> 
 
     [turn] = session.followed_up
     root = tmp_path / "home-tau" / "beagle-plugin"
-    assert turn.startswith("User input to /pursuit:\ngo\n\n")
-    assert f"Read {root}/commands/pursuit.md" in turn
+    invocation = parse_skill_invocation(turn)
+    assert invocation is not None
+    assert invocation.name == "pursuit"
+    assert invocation.location == str(root / "commands" / "pursuit.md")
+    assert invocation.additional_instructions == "go"
+    assert f"Read {root}/commands/pursuit.md" in invocation.content
     assert "${CLAUDE_PLUGIN_ROOT}" not in turn
     assert "description: driver" not in turn
 
@@ -326,9 +331,14 @@ def test_pursuit_run_injects_host_mapping_and_driver(tmp_path: Path, beagle: Pat
 
     [turn] = session.followed_up
     root = tmp_path / "home-tau" / "beagle-plugin"
-    assert turn.startswith("Host mapping")
-    assert "`pursuit_wakeup`" in turn and "`pursuit_dispatch`" in turn
-    assert f"Arm with ScheduleWakeup; see {root}." in turn
+    invocation = parse_skill_invocation(turn)
+    assert invocation is not None
+    assert invocation.name == "pursuit-run"
+    assert invocation.additional_instructions is None
+    body = invocation.content
+    # The host mapping qualifies the driver, so it sits inside the block ahead of it.
+    assert body.index("Host mapping") < body.index(f"Arm with ScheduleWakeup; see {root}.")
+    assert "`pursuit_wakeup`" in body and "`pursuit_dispatch`" in body
     assert "name: pursuit-run" not in turn
 
 
@@ -372,7 +382,27 @@ async def test_wakeup_fire_expands_pursuit_run(
 
     assert fired == [120]
     [turn] = session.followed_up
-    assert turn.startswith("Host mapping")
+    invocation = parse_skill_invocation(turn)
+    assert invocation is not None and invocation.name == "pursuit-run"
+    assert invocation.content.startswith("References are relative to")
+    assert "Host mapping" in invocation.content
+
+
+@pytest.mark.anyio
+async def test_wakeup_fire_expands_pursuit(
+    tmp_path: Path, beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runtime, session = _bound(tmp_path)
+    session.is_running = True
+    loop = asyncio.get_running_loop()
+    monkeypatch.setattr(loop, "call_later", lambda delay, cb, *a: loop.call_soon(cb, *a))
+    await _tool(runtime, "pursuit_wakeup").execute("c1", {"prompt": "/pursuit next"})
+    await asyncio.sleep(0)
+
+    [turn] = session.followed_up
+    invocation = parse_skill_invocation(turn)
+    assert invocation is not None and invocation.name == "pursuit"
+    assert invocation.additional_instructions == "next"
 
 
 @pytest.mark.anyio

@@ -181,7 +181,7 @@ What it adds, and how each piece maps to what Claude Code provides:
 | Claude Code | Tau stand-in in the example | Notes |
 |---|---|---|
 | One `${CLAUDE_PLUGIN_ROOT}` per plugin | One merged root at `$TAU_HOME/beagle-plugin/` (`skills/`, `commands/`, `agents/` as symlinks) | Every beagle-dev / beagle-reference skill, plus campaign's `pursuit-dispatch`, `offload`, `containment`. Only stale *symlinks* are pruned. `BEAGLE_ROOT` overrides `~/beagle`. |
-| `/pursuit`, `/pursuit-run` slash commands | `tau.register_command` injecting the command text as a turn | `${CLAUDE_PLUGIN_ROOT}` is spelled out; `/pursuit-run` is prefixed with a short host mapping. |
+| `/pursuit`, `/pursuit-run` slash commands | `tau.register_command` injecting the command text as a turn, in the same `<skill>` block `/skill:<name>` sends | `${CLAUDE_PLUGIN_ROOT}` is spelled out; the user's input follows the block; `/pursuit-run`'s body opens with a short host mapping. |
 | Task tool + `beagle-dev:*` agents, `run_in_background` | [tau-subagents](https://github.com/rian-dolphin/tau-subagents)' `agent` tool, with beagle's agents written as agent types `~/.tau/agents/beagle-dev:<agent>.md` | Needs tau-subagents installed. Completion arrives as a `<task-notification>` follow-up that starts the next turn; the driver uses the `--awaiting` tick as in Claude Code. |
 | `SendMessage` to a running agent / `TaskOutput` | tau-subagents' `steer_subagent` / `get_subagent_result` (`wait: true` blocks) | |
 | (fallback without tau-subagents) | `pursuit_dispatch`: a nested `tau -p --append-system-prompt step-executor.md` | Synchronous; its report returns in the same turn, so no `--awaiting` tick. |
