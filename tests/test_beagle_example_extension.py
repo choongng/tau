@@ -339,6 +339,7 @@ def test_pursuit_run_injects_host_mapping_and_driver(tmp_path: Path, beagle: Pat
     # The host mapping qualifies the driver, so it sits inside the block ahead of it.
     assert body.index("Host mapping") < body.index(f"Arm with ScheduleWakeup; see {root}.")
     assert "`pursuit_wakeup`" in body and "`pursuit_dispatch`" in body
+    assert "--for N --resuming-in N" in body
     assert "name: pursuit-run" not in turn
 
 

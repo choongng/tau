@@ -818,7 +818,8 @@ stopping condition.
 "beagle-dev:step-executor"`, the brief as `prompt`, and `run_in_background: \
 true`, then end the turn exactly as the driver says for a dispatched worker — \
 arm `pursuit_wakeup` with a long delay and record `beagle loop tick --awaiting \
-... --resuming-in N`. The worker's completion arrives as a \
+"<worker> on <task>" --for N --resuming-in N`, `--for` the driver's believed \
+wait. The worker's completion arrives as a \
 `<task-notification>` message that starts your next turn; clear the wait with \
 a bare `beagle loop tick`, read the full report with `get_subagent_result` if \
 the notification is truncated, and run the close. Claude Code's `SendMessage` \
