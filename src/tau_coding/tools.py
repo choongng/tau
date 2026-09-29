@@ -40,6 +40,10 @@ from tau_coding.image_processing import (
 
 DEFAULT_MAX_OUTPUT_BYTES = 50 * 1024
 DEFAULT_MAX_OUTPUT_LINES = 2_000
+#: Seconds a model-issued bash command may run when the call names no timeout.
+#: Long enough for a test suite or a pinned check; short enough that a command
+#: that never ends hands control back instead of wedging the agent for good.
+DEFAULT_BASH_TIMEOUT_SECONDS = 600.0
 IMAGE_SNIFF_BYTES = 64 * 1024
 UTF8_BOM = "\ufeff"
 
@@ -589,6 +593,7 @@ def create_bash_tool_definition(
     *,
     cwd: str | Path | None = None,
     shell_command_prefix: str | None = None,
+    default_timeout: float | None = DEFAULT_BASH_TIMEOUT_SECONDS,
 ) -> ToolDefinition:
     """Create a definition for the `bash` tool.
 
@@ -596,7 +601,8 @@ def create_bash_tool_definition(
     directory, disconnects stdin, and combines stdout and stderr into one UTF-8
     decoded output stream. Disconnecting stdin keeps interactive programs from
     competing with Tau for terminal input. The optional `timeout` argument must
-    be positive when supplied. On timeout, POSIX commands are started in a new
+    be positive when supplied; without it the command gets `default_timeout`
+    seconds, and `None` there leaves it unbounded. On timeout, POSIX commands are started in a new
     session and the entire process group is killed so shell children from
     pipelines or compound commands do not continue running; non-POSIX platforms
     fall back to killing the direct subprocess.
@@ -609,6 +615,8 @@ def create_bash_tool_definition(
     """
     root = Path.cwd() if cwd is None else Path(cwd)
     prefix = shell_command_prefix.strip() if shell_command_prefix else None
+    if default_timeout is not None and default_timeout <= 0:
+        raise ValueError("default_timeout must be greater than 0")
 
     async def execute(
         arguments: Mapping[str, JSONValue],
@@ -619,6 +627,9 @@ def create_bash_tool_definition(
         timeout = _optional_float_arg(arguments, "timeout")
         if timeout is not None and timeout <= 0:
             raise ToolInputError("timeout must be greater than 0")
+        timeout_defaulted = timeout is None and default_timeout is not None
+        if timeout is None:
+            timeout = default_timeout
         if signal is not None and signal.is_cancelled():
             raise ToolInputError("Command cancelled")
 
@@ -678,6 +689,11 @@ def create_bash_tool_definition(
             status = (
                 f"Command timed out after {timeout:g} seconds" if timeout else "Command timed out"
             )
+            if timeout_defaulted:
+                status += (
+                    " (the default; pass a larger `timeout` if the command"
+                    " is expected to run longer)"
+                )
         elif cancelled:
             status = "Command cancelled"
         elif exit_code not in (0, None):
@@ -691,6 +707,7 @@ def create_bash_tool_definition(
                 "command": command,
                 "exit_code": exit_code,
                 "timed_out": timed_out,
+                "timeout_seconds": timeout,
                 "cancelled": cancelled,
                 "duration_seconds": round(monotonic() - start, 3),
                 "truncation": truncation.to_json(),
@@ -705,7 +722,12 @@ def create_bash_tool_definition(
             "Execute a bash command in the current working directory. Returns stdout and stderr. "
             f"Output is truncated to last {DEFAULT_MAX_OUTPUT_LINES} lines or "
             f"{DEFAULT_MAX_OUTPUT_BYTES // 1024}KB (whichever is hit first). If truncated, "
-            "full output is saved to a temp file. Optionally provide a timeout in seconds."
+            "full output is saved to a temp file. Optionally provide a timeout in seconds"
+            + (
+                f"; without one the command is killed after {default_timeout:g} seconds."
+                if default_timeout is not None
+                else "."
+            )
         ),
         prompt_snippet="Execute bash commands (ls, grep, find, etc.)",
         prompt_guidelines=(
@@ -725,7 +747,11 @@ def create_bash_tool_definition(
                 },
                 "timeout": {
                     "type": "number",
-                    "description": "Timeout in seconds (optional, no default timeout)",
+                    "description": (
+                        f"Timeout in seconds (optional, default {default_timeout:g})"
+                        if default_timeout is not None
+                        else "Timeout in seconds (optional, no default timeout)"
+                    ),
                 },
             },
             "required": ["command", "description"],
@@ -738,11 +764,13 @@ def create_bash_tool(
     *,
     cwd: str | Path | None = None,
     shell_command_prefix: str | None = None,
+    default_timeout: float | None = DEFAULT_BASH_TIMEOUT_SECONDS,
 ) -> AgentTool:
     """Create an `AgentTool` for executing shell commands with captured output."""
     return create_bash_tool_definition(
         cwd=cwd,
         shell_command_prefix=shell_command_prefix,
+        default_timeout=default_timeout,
     ).to_agent_tool()
 
 
