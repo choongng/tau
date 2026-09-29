@@ -11,15 +11,18 @@ counted loop. A pursuit is a goal, a task tree grown by doing the work, and a
 because a specific part of that model has no Tau equivalent:
 
 - **Skills** — a pursuit's own guidance arrives only if it is loaded. Beagle's
-  pursuit skills live in the (deprecated) `beagle-campaign` plugin, beside the
-  engineering-practice skills in `beagle-dev`, and both sets run scripts from
+  pursuit skills live in the `beagle-pursuit` plugin (`beagle-campaign` in
+  checkouts before the rename), beside the engineering-practice skills in
+  `beagle-dev`, and both sets run scripts from
   `${CLAUDE_PLUGIN_ROOT}/skills/<name>/...`. Claude Code sets that variable per
   plugin; a shell has one. So the extension links every skill it loads into
   one merged plugin root under the Tau home, points `CLAUDE_PLUGIN_ROOT` at it,
   and registers its `skills/` — every script path then resolves, whichever
-  plugin shipped it, without dragging the campaign skills into every pursuit.
+  plugin shipped it, taking only the named pursuit skills from their plugin.
 - **`/pursuit`** — the driver. Injects the command's own text as the turn,
-  with `${CLAUDE_PLUGIN_ROOT}` spelled out as the merged root.
+  with `${CLAUDE_PLUGIN_ROOT}` spelled out as the merged root. Registered only
+  when the checkout has the driver file; a checkout that is present but lacks
+  it is reported at session start and in the prompt, not degraded quietly.
 - **`pursuit_dispatch`** — a headless `step-executor`. Tau has no Task tool, so
   delegation is a nested `tau -p` run: the step-executor persona appended, the
   target dir set with `--cwd`, and the model inherited from the session unless
@@ -89,19 +92,26 @@ BEAGLE_BIN = os.environ.get("BEAGLE_BIN", "beagle")
 TAU_BIN = os.environ.get("TAU_BIN", "tau")
 PLUGINS = BEAGLE / "plugins"
 
-#: Skills linked into the merged root, per plugin; None means all of them. The
-#: pursuit skills live in the deprecated campaign plugin, so only they are
-#: taken from it — `containment` because a worker's brief names its
-#: `run_contained.sh` for every heavy command.
+#: The plugin that ships the pursuit driver and its skills, newest name first:
+#: beagle renamed `beagle-campaign` to `beagle-pursuit`, and an older checkout
+#: still has only the old name. The first one holding a thing wins.
+PURSUIT_PLUGINS = ("beagle-pursuit", "beagle-campaign")
+#: The pursuit skills, taken by name from the pursuit plugin rather than all of
+#: it — `containment` because a worker's brief names its `run_contained.sh` for
+#: every heavy command.
+PURSUIT_SKILLS = ("pursuit-dispatch", "offload", "containment")
+#: Skills linked into the merged root, per plugin; None means all of them.
+#: Order matters: a name is taken from the first plugin that has it.
 SKILL_SOURCES: Mapping[str, tuple[str, ...] | None] = {
     "beagle-dev": None,
     "beagle-reference": None,
-    "beagle-campaign": ("pursuit-dispatch", "offload", "containment"),
+    **{plugin: PURSUIT_SKILLS for plugin in PURSUIT_PLUGINS},
 }
-#: Non-skill trees a driver or skill reaches through `${CLAUDE_PLUGIN_ROOT}`.
-PLUGIN_ROOT_LINKS = {
-    "commands": PLUGINS / "beagle-campaign" / "commands",
-    "agents": PLUGINS / "beagle-dev" / "agents",
+#: Non-skill trees a driver or skill reaches through `${CLAUDE_PLUGIN_ROOT}`,
+#: each with its candidates in preference order.
+PLUGIN_ROOT_LINKS: Mapping[str, tuple[Path, ...]] = {
+    "commands": tuple(PLUGINS / plugin / "commands" for plugin in PURSUIT_PLUGINS),
+    "agents": (PLUGINS / "beagle-dev" / "agents",),
 }
 #: The merged plugin root, under the Tau home (so `TAU_HOME` profiles each
 #: get their own).
@@ -128,8 +138,8 @@ AGENT_TOOL_MAP = {
 }
 
 STEP_EXECUTOR = PLUGINS / "beagle-dev" / "agents" / "step-executor.md"
-PURSUIT_COMMAND = PLUGINS / "beagle-campaign" / "commands" / "pursuit.md"
-PURSUIT_RUN_COMMAND = PLUGINS / "beagle-campaign" / "commands" / "pursuit-run.md"
+PURSUIT_COMMAND = "pursuit.md"
+PURSUIT_RUN_COMMAND = "pursuit-run.md"
 PLUGIN_ROOT_VAR = "${CLAUDE_PLUGIN_ROOT}"
 GOAL_BASENAME = "pursuit.toml"
 
@@ -195,6 +205,24 @@ def _find_goal(start: Path | None) -> Path | None:
         except OSError:
             continue
     return None
+
+
+def _driver_file(name: str) -> Path | None:
+    """The pursuit plugin's command file `name`, from the first plugin that has it."""
+    for commands in PLUGIN_ROOT_LINKS["commands"]:
+        path = commands / name
+        if path.is_file():
+            return path
+    return None
+
+
+def _driver_missing(name: str) -> str:
+    """Why a driver command cannot run: where it was looked for."""
+    looked = ", ".join(str(commands / name) for commands in PLUGIN_ROOT_LINKS["commands"])
+    return (
+        f"beagle's {name} driver was not found (looked in {looked}). The beagle "
+        f"checkout at {BEAGLE} may predate or postdate this extension's layout."
+    )
 
 
 def _driver_text(path: Path) -> str:
@@ -787,10 +815,11 @@ extension. Do not run `beagle hooks install`.
 
 def _pursuit_run_turn(args: str) -> str | None:
     """The `/pursuit-run` driver as a turn, or None when it is not installed."""
-    if not PURSUIT_RUN_COMMAND.is_file():
+    driver = _driver_file(PURSUIT_RUN_COMMAND)
+    if driver is None:
         return None
     note = f"User input to /pursuit-run:\n{args}\n\n" if args.strip() else ""
-    return f"{note}{TAU_HOST_NOTE}\n{_driver_text(PURSUIT_RUN_COMMAND)}"
+    return f"{note}{TAU_HOST_NOTE}\n{_driver_text(driver)}"
 
 
 # --------------------------------------------------------------------------- #
@@ -800,9 +829,10 @@ def _pursuit_run_turn(args: str) -> str | None:
 
 def _command_pursuit(args: str, context: Any) -> str:
     """Load Beagle's `/pursuit` driver as this turn."""
-    if not PURSUIT_COMMAND.is_file():
-        return f"/pursuit: driver not found at {PURSUIT_COMMAND}"
-    driver = _driver_text(PURSUIT_COMMAND)
+    path = _driver_file(PURSUIT_COMMAND)
+    if path is None:
+        return f"/pursuit: {_driver_missing(PURSUIT_COMMAND)}"
+    driver = _driver_text(path)
     note = f"User input to /pursuit:\n{args}\n\n" if args.strip() else ""
     context.api.send_user_message(f"{note}{driver}")
     return "/pursuit: loaded the pursuit driver as this turn."
@@ -812,7 +842,7 @@ def _command_pursuit_run(args: str, context: Any) -> str:
     """Load Beagle's `/pursuit-run` loop driver as this turn."""
     text = _pursuit_run_turn(args)
     if text is None:
-        return f"/pursuit-run: driver not found at {PURSUIT_RUN_COMMAND}"
+        return f"/pursuit-run: {_driver_missing(PURSUIT_RUN_COMMAND)}"
     context.api.send_user_message(text)
     return "/pursuit-run: loaded the pursuit loop driver as this turn."
 
@@ -928,9 +958,14 @@ def build_plugin_root(root: Path) -> Path | None:
                 entry.unlink()
     for name, src in wanted.items():
         _sync_link(skills_dir / name, src)
-    for name, target in PLUGIN_ROOT_LINKS.items():
-        if target.is_dir():
+    for name, candidates in PLUGIN_ROOT_LINKS.items():
+        target = next((c for c in candidates if c.is_dir()), None)
+        if target is not None:
             _sync_link(root / name, target)
+        elif (root / name).is_symlink():
+            # Its tree left the checkout: a dangling link would read as present.
+            with contextlib.suppress(OSError):
+                (root / name).unlink()
     return skills_dir
 
 
@@ -1039,12 +1074,20 @@ def setup(tau: ExtensionAPI) -> None:
         # dispatch. Harmless without that extension: nothing reads the dir.
         sync_agent_types(AGENTS_DIR)
 
-    # 3. The driver command, and a no-model state read.
-    tau.register_command(
-        "pursuit",
-        _command_pursuit,
-        description="Found or run a beagle pursuit — one goal, a task tree, no denominator.",
-    )
+    # 3. The driver command, and a no-model state read. A driver command is
+    #    registered only when its file is there: one that exists but cannot run
+    #    reads, to a model listing its commands, as a loop it can offer. A
+    #    checkout that is present but lacks a driver is a layout mismatch, not
+    #    an absent install, so it is said aloud rather than degraded quietly.
+    problems: list[str] = []
+    if _driver_file(PURSUIT_COMMAND) is not None:
+        tau.register_command(
+            "pursuit",
+            _command_pursuit,
+            description="Found or run a beagle pursuit — one goal, a task tree, no denominator.",
+        )
+    elif PLUGINS.is_dir():
+        problems.append(f"/pursuit is not registered: {_driver_missing(PURSUIT_COMMAND)}")
     tau.register_command(
         "pursuit-view",
         _command_pursuit_view,
@@ -1087,11 +1130,16 @@ def setup(tau: ExtensionAPI) -> None:
         _adopt_session(tau.context)
     tau.on("session_start", _on_session_start)
     if not _is_worker():
-        tau.register_command(
-            "pursuit-run",
-            _command_pursuit_run,
-            description="Run a beagle pursuit task after task until it cannot move.",
-        )
+        if _driver_file(PURSUIT_RUN_COMMAND) is not None:
+            tau.register_command(
+                "pursuit-run",
+                _command_pursuit_run,
+                description="Run a beagle pursuit task after task until it cannot move.",
+            )
+        elif PLUGINS.is_dir():
+            problems.append(
+                f"/pursuit-run is not registered: {_driver_missing(PURSUIT_RUN_COMMAND)}"
+            )
         tau.register_tool(
             AgentTool(
                 name="pursuit_wakeup",
@@ -1114,6 +1162,16 @@ def setup(tau: ExtensionAPI) -> None:
         tau.on("agent_end", _note_run_end)
         tau.on("agent_settled", make_loop_guard(tau))
         tau.on("session_shutdown", lambda event, context: _cancel_wakeup())
+
+    if problems:
+        notice = "Beagle extension: " + " ".join(problems)
+        tau.on("session_start", lambda event, context: context.ui.notify(notice, "warning"))
+        tau.add_prompt_section(
+            "Beagle extension problems",
+            "\n".join(f"- {p}" for p in problems)
+            + "\n\nDo not offer these commands to the user or say the pursuit loop is "
+            "available; tell them the extension and the beagle checkout disagree.",
+        )
 
     # 7. If this project is a pursuit, pin its goal into the prompt at load —
     #    the frame arrives, but nothing here triggers a turn. A pursuit founded

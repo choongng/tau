@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import shutil
 import sys
 from pathlib import Path
 from typing import Any
@@ -49,9 +50,9 @@ def beagle(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     plugins = root / "plugins"
     _skill(plugins, "beagle-dev", "python-coding")
     _skill(plugins, "beagle-reference", "tilth-usage")
-    for name in ("pursuit-dispatch", "offload", "containment", "campaign-planning"):
-        _skill(plugins, "beagle-campaign", name)
-    commands = plugins / "beagle-campaign" / "commands"
+    for name in ("pursuit-dispatch", "offload", "containment", "hook-design"):
+        _skill(plugins, "beagle-pursuit", name)
+    commands = plugins / "beagle-pursuit" / "commands"
     commands.mkdir()
     (commands / "pursuit.md").write_text(
         "---\ndescription: driver\n---\n\nRead ${CLAUDE_PLUGIN_ROOT}/commands/pursuit.md\n",
@@ -170,11 +171,11 @@ def test_merged_plugin_root_links_loaded_skills(tmp_path: Path, beagle: Path) ->
 
     assert runtime.skill_dirs == (root / "skills",)
     linked = sorted(p.name for p in (root / "skills").iterdir())
-    # Every beagle-dev / beagle-reference skill, but only the pursuit ones from campaign.
+    # Every beagle-dev / beagle-reference skill, but only the named pursuit ones.
     assert linked == ["containment", "offload", "pursuit-dispatch", "python-coding", "tilth-usage"]
-    campaign = beagle / "plugins" / "beagle-campaign"
-    assert (root / "skills" / "containment").resolve() == campaign / "skills" / "containment"
-    assert (root / "commands").resolve() == campaign / "commands"
+    pursuit = beagle / "plugins" / "beagle-pursuit"
+    assert (root / "skills" / "containment").resolve() == pursuit / "skills" / "containment"
+    assert (root / "commands").resolve() == pursuit / "commands"
     assert (root / "agents").resolve() == beagle / "plugins" / "beagle-dev" / "agents"
     assert os.environ["CLAUDE_PLUGIN_ROOT"] == str(root)
 
@@ -191,6 +192,65 @@ def test_merged_plugin_root_prunes_only_stale_symlinks(tmp_path: Path, beagle: P
     assert not (skills / "gone").is_symlink()
     assert (skills / "mine").is_dir()
     assert (skills / "python-coding").is_symlink()
+
+
+def test_pre_rename_checkout_still_loads_from_campaign(tmp_path: Path, beagle: Path) -> None:
+    plugins = beagle / "plugins"
+    (plugins / "beagle-pursuit").rename(plugins / "beagle-campaign")
+
+    runtime = _load(tmp_path)
+
+    root = tmp_path / "home-tau" / "beagle-plugin"
+    campaign = plugins / "beagle-campaign"
+    assert (root / "skills" / "offload").resolve() == campaign / "skills" / "offload"
+    assert (root / "commands").resolve() == campaign / "commands"
+    registry = runtime.build_command_registry()
+    assert registry.get("pursuit") is not None and registry.get("pursuit-run") is not None
+
+
+def test_renamed_checkout_relinks_and_drops_dangling_trees(tmp_path: Path, beagle: Path) -> None:
+    root = tmp_path / "home-tau" / "beagle-plugin"
+    root.mkdir(parents=True)
+    # What a load against the pre-rename layout left behind.
+    (root / "commands").symlink_to(
+        beagle / "plugins" / "beagle-campaign" / "commands", target_is_directory=True
+    )
+    (root / "agents").symlink_to(tmp_path / "gone-agents", target_is_directory=True)
+    shutil.rmtree(beagle / "plugins" / "beagle-dev" / "agents")
+
+    _load(tmp_path)
+
+    assert (root / "commands").resolve() == beagle / "plugins" / "beagle-pursuit" / "commands"
+    assert not (root / "agents").is_symlink()
+
+
+@pytest.mark.anyio
+async def test_missing_driver_is_not_registered_and_is_reported(
+    tmp_path: Path, beagle: Path
+) -> None:
+    shutil.rmtree(beagle / "plugins" / "beagle-pursuit" / "commands")
+    runtime = _load(tmp_path)
+    session = RecordingSession(tmp_path / "project", running=False)
+    ui = RecordingUiBridge(has_ui=True)
+    runtime.set_ui_bridge(ui)  # type: ignore[arg-type]
+    runtime.bind(session)  # type: ignore[arg-type]
+
+    await runtime.emit_session_start("startup")
+
+    registry = runtime.build_command_registry()
+    assert registry.get("pursuit") is None and registry.get("pursuit-run") is None
+    assert registry.get("pursuit-view") is not None
+    [(notice, level)] = ui.notifications
+    assert level == "warning"
+    assert "/pursuit-run is not registered" in notice and "pursuit-run.md" in notice
+    [section] = [s for s in runtime.prompt_sections if s.title == "Beagle extension problems"]
+    assert "Do not offer these commands" in section.body
+
+
+def test_complete_checkout_reports_no_problems(tmp_path: Path, beagle: Path) -> None:
+    runtime = _load(tmp_path)
+
+    assert not [s for s in runtime.prompt_sections if s.title == "Beagle extension problems"]
 
 
 def test_pursuit_driver_spells_out_plugin_root(tmp_path: Path, beagle: Path) -> None:
