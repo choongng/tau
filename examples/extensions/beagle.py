@@ -45,7 +45,9 @@ because a specific part of that model has no Tau equivalent:
   (`beagle loop tick --awaiting`, inside its lease), the driver session's
   edit, write and writing-bash calls into an open task's declared `scope`
   are refused: two writers on one tree lose one's work. Only the recorded
-  driver session is held; a subagent's calls carry its own session id.
+  driver session is held; a subagent's calls carry its own session id. A
+  cancelled worker sends no notice to end that wait, so a `stop_subagent`
+  result while one stands says to clear it with a bare `beagle loop tick`.
 - **orientation** — when the project is a pursuit, its goal and criteria are
   added to the system prompt at load, so the driver re-reads the goal every
   session without anything triggering a turn. It is a frame, not an order.
@@ -110,6 +112,7 @@ from tau_coding.extensions import (
     ExtensionAPI,
     ExtensionContext,
     ToolCallHookResult,
+    ToolResultHookResult,
 )
 from tau_coding.resources import parse_markdown_resource
 from tau_coding.skills import Skill, format_skill_invocation
@@ -806,20 +809,29 @@ def _json_out(argv: list[str], root: Path) -> Any:
     return json.loads(out) if rc == 0 else None
 
 
-def _read_awaited_scope(root: Path, session_id: str) -> _AwaitedScope | None:
-    """The scope this session's run is waiting on a worker in, or None.
+def _live_wait(root: Path, session_id: str) -> str | None:
+    """What this session's run declares it is awaiting, while the lease holds.
 
     None unless a run is in flight, this session is its recorded driver (a
-    subagent's own session never is), and a declared wait is inside its
-    lease. The scope is every open task's: `awaiting` is free text, so which
-    open task the worker holds cannot be read off it reliably.
+    subagent's own session never is), and the declared wait is in its lease.
     """
     record = _json_out(["loop", "read", "--json"], root)
     if not isinstance(record, dict) or not record.get("awaiting"):
         return None
     if not session_id or record.get("driver_session") != session_id:
         return None
-    if not _lease_live(record):
+    return str(record["awaiting"]) if _lease_live(record) else None
+
+
+def _read_awaited_scope(root: Path, session_id: str) -> _AwaitedScope | None:
+    """The scope this session's run is waiting on a worker in, or None.
+
+    None without a live wait (`_live_wait`). The scope is every open task's:
+    `awaiting` is free text, so which open task the worker holds cannot be
+    read off it reliably.
+    """
+    awaiting = _live_wait(root, session_id)
+    if awaiting is None:
         return None
     listing = _json_out(["pursuit", "tree", "--json", "--status", "open"], root)
     tasks = [row["id"] for row in listing or () if isinstance(row, dict) and row.get("id")]
@@ -830,7 +842,7 @@ def _read_awaited_scope(root: Path, session_id: str) -> _AwaitedScope | None:
         scope += [e for e in entries or () if isinstance(e, str) and e.strip()]
     if not scope:
         return None
-    return _AwaitedScope(str(record["awaiting"]), tuple(tasks), tuple(scope))
+    return _AwaitedScope(awaiting, tuple(tasks), tuple(scope))
 
 
 async def _awaited_scope(root: Path, session_id: str) -> _AwaitedScope | None:
@@ -923,6 +935,45 @@ def make_scope_guard() -> Any:
         )
 
     return scope_guard
+
+
+#: Appended to a `stop_subagent` result while this session's run declares a wait.
+STOPPED_WORKER_NOTE = """
+
+beagle: this session's pursuit run still declares it is awaiting \
+"{awaiting}". If that was the worker just stopped, nothing will arrive to \
+clear it: run a bare `beagle loop tick` now, then take the task back or \
+dispatch it again."""
+
+
+def make_stopped_worker_note() -> Any:
+    """Build the `tool_result` hook that remembers a stopped worker's wait.
+
+    A cancelled tau-subagents run sends no `<task-notification>`, so a
+    `--awaiting` declared for it would stand until its lease ran out, holding
+    the scope guard and silencing the Stop hooks. When the driver stops a
+    worker itself, the result says so. It does not tick for the driver:
+    `awaiting` is free text naming a worker type and a task, not a run id,
+    so which of several parallel workers it meant cannot be told from here.
+    """
+
+    async def note(event: Any, context: ExtensionContext) -> ToolResultHookResult | None:
+        try:
+            if event.tool_name != "stop_subagent":
+                return None
+            goal = _find_goal(Path(context.cwd))
+            if goal is None:
+                return None
+            root, session = goal.parent.parent, context.session_id or ""
+            awaiting = await asyncio.to_thread(_live_wait, root, session)
+            if awaiting is None:
+                return None
+            text = event.result.text + STOPPED_WORKER_NOTE.format(awaiting=awaiting)
+        except Exception:  # noqa: BLE001 - fail open; a note must not break the tool
+            return None
+        return ToolResultHookResult(content=text)
+
+    return note
 
 
 # --------------------------------------------------------------------------- #
@@ -1600,9 +1651,10 @@ true`, then end the turn exactly as the driver says for a dispatched worker — 
 arm `pursuit_wakeup` with a long delay and record `beagle loop tick --awaiting \
 "<worker> on <task>" --for N --resuming-in N`, `--for` the driver's believed \
 wait. The worker's completion arrives as a \
-`<task-notification>` message that starts your next turn; clear the wait with \
-a bare `beagle loop tick`, read the full report with `get_subagent_result` if \
-the notification is truncated, and run the close. Claude Code's `SendMessage` \
+`<task-notification>` message that starts your next turn, an errored run's \
+too; clear the wait with a bare `beagle loop tick` whatever its status, \
+read the full report with `get_subagent_result` if the notification is \
+truncated, and run the close. Claude Code's `SendMessage` \
 to a running worker is `steer_subagent`; `get_subagent_result` with `wait: \
 true` blocks on one. Parallel independent tasks may each get a background \
 agent.
@@ -1962,6 +2014,7 @@ def setup(tau: ExtensionAPI) -> None:
     tau.on("tool_call", make_bash_hooks())
     if not _is_worker():
         tau.on("tool_call", make_scope_guard())
+        tau.on("tool_result", make_stopped_worker_note())
 
     # 6. What /pursuit-run needs from its host: a session id beagle can record
     #    as the driver, a wakeup, and the Stop hook. A worker runs none of the

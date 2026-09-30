@@ -1074,3 +1074,20 @@ def test_host_note_names_worktree_isolation(tmp_path: Path, beagle: Path) -> Non
     note = " ".join(session.followed_up[0].split())
     assert 'pass `isolation: "worktree"`' in note
     assert "`isolated: true` is not that" in note
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(("driver", "noted"), [("session-1", True), ("other-session", False)])
+async def test_stopping_a_worker_reminds_the_driver_to_clear_its_wait(
+    tmp_path: Path, beagle: Path, fake_beagle: Path, driver: str, noted: bool
+) -> None:
+    project = _pursuit_project(tmp_path)
+    _awaiting_worker(project, fake_beagle, driver=driver)
+    runtime, _ = _bound(tmp_path)
+
+    result = await _tool_with_hooks(runtime, "stop_subagent").execute("c1", {"agent_id": "a1"})
+
+    assert result.text.startswith("ran")
+    reminded = 'awaiting "step-executor on T0002"' in " ".join(result.text.split())
+    assert reminded is noted
+    assert ("bare `beagle loop tick`" in result.text) is noted
