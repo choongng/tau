@@ -72,6 +72,7 @@ import shlex
 import subprocess
 import tomllib
 from collections.abc import Mapping
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -168,14 +169,17 @@ HOOK_TIMEOUT = 30.0
 #: The wakeup delay's bounds, in minutes (Claude Code clamps to 1..60 too).
 WAKEUP_MIN_MINUTES = 1
 WAKEUP_MAX_MINUTES = 60
+#: `beagle loop read`'s exit status when no run is in flight.
+LOOP_IDLE_EXIT = 3
 
 #: Last session cwd the extension saw, so the dispatch tool (which gets no
 #: context) can default to the project it is working in.
 _SEEN_CWD: Path | None = None
 #: The merged plugin root once built, for spelling out driver text.
 _PLUGIN_ROOT: Path | None = None
-#: The armed `pursuit_wakeup`, if any. One at a time, like `ScheduleWakeup`.
-_WAKEUP: asyncio.TimerHandle | None = None
+#: The armed or fired-but-undelivered `pursuit_wakeup`, if any. One at a time,
+#: like `ScheduleWakeup`.
+_WAKEUP: _Wakeup | None = None
 #: Whether the run now settling was started by a loop-guard objection — the
 #: Stop hook's `stop_hook_active`, which lets the next stop through.
 _GUARD_OBJECTED = False
@@ -946,27 +950,133 @@ def make_loop_guard(tau: ExtensionAPI) -> Any:
     return loop_guard
 
 
-def _cancel_wakeup() -> bool:
-    global _WAKEUP
-    handle, _WAKEUP = _WAKEUP, None
-    if handle is None or handle.cancelled():
-        return False
-    handle.cancel()
-    return True
+@dataclass(eq=False)
+class _Wakeup:
+    """One armed `pursuit_wakeup`: the token delivery checks it still holds.
 
-
-def _fire_wakeup(tau: ExtensionAPI, prompt: str) -> None:
-    """Deliver an armed wakeup's prompt, expanding a pursuit driver itself.
-
-    An extension's message reaches the model as text, not through the slash
-    command parser, so the driver commands a wakeup may carry are expanded here.
+    Stop, a re-arm and shutdown void it by replacing `_WAKEUP`; a delivery
+    whose token is no longer `_WAKEUP` sends nothing. `run` is the loop run in
+    flight when it was armed (its `started_at`), so a wakeup that outlives the
+    run it was armed for is dropped rather than starting the loop again.
     """
+
+    prompt: str
+    root: Path | None
+    run: str | None
+    handle: asyncio.TimerHandle | None = None
+    fired: bool = False
+    task: asyncio.Task[None] | None = None
+
+
+async def _loop_run(root: Path) -> str | None:
+    """The in-flight loop run's start time; "" when idle; None when unknown.
+
+    `beagle loop read` prints the start time and exits 3 with no run in
+    flight. Anything else — beagle missing, a crash, a hang — is unknown,
+    which the caller treats as "do not second-guess the wakeup".
+    """
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            BEAGLE_BIN,
+            "loop",
+            "read",
+            "--root",
+            str(root),
+            cwd=str(root),
+            stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+    except OSError:
+        return None
+    try:
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=HOOK_TIMEOUT)
+    except TimeoutError:
+        with contextlib.suppress(ProcessLookupError):
+            proc.kill()
+        await proc.wait()
+        return None
+    if proc.returncode == LOOP_IDLE_EXIT:
+        return ""
+    if proc.returncode != 0:
+        return None
+    return (stdout or b"").decode("utf-8", "replace").strip() or None
+
+
+def _void_wakeup() -> _Wakeup | None:
+    """Void the current wakeup, armed or fired-and-pending; the one voided."""
     global _WAKEUP
-    _WAKEUP = None
-    name, _, args = prompt.strip().partition(" ")
+    wakeup, _WAKEUP = _WAKEUP, None
+    if wakeup is not None and wakeup.handle is not None:
+        wakeup.handle.cancel()
+    return wakeup
+
+
+def _fire_wakeup(tau: ExtensionAPI, wakeup: _Wakeup) -> None:
+    """The timer ran out: deliver now if the session is idle, else at its settle."""
+    if _WAKEUP is not wakeup:
+        return
+    wakeup.fired = True
+    with contextlib.suppress(Exception):  # a reloaded or closed session: the settle decides
+        if tau.context.is_running:
+            return  # a turn is on; `_deliver_pending_wakeup` sends it when it ends
+    wakeup.task = asyncio.get_running_loop().create_task(_deliver_wakeup(tau, wakeup, False))
+
+
+async def _deliver_wakeup(tau: ExtensionAPI, wakeup: _Wakeup, settling: bool) -> None:
+    """Send a fired wakeup's prompt, unless something since has voided it.
+
+    Checked at the last moment, because a message once queued cannot be
+    recalled: the token must still be current (no stop, no newer arm), and a
+    loop run the wakeup was armed for must still be in flight. Outside a
+    settle, a turn that started meanwhile keeps it pending for that turn's
+    settle, where it is sent after the Stop hooks have had their say.
+    """
+    if _WAKEUP is not wakeup:
+        return
+    if wakeup.run and wakeup.root is not None:
+        now = await _loop_run(wakeup.root)
+        if _WAKEUP is not wakeup:
+            return
+        if now is not None and now != wakeup.run:
+            _void_wakeup()
+            with contextlib.suppress(Exception):
+                tau.context.ui.notify(
+                    f"pursuit_wakeup: dropped {wakeup.prompt!r} — the loop run it was "
+                    "armed for is no longer in flight (`beagle loop stop` ran, or a new "
+                    "run started).",
+                    "info",
+                )
+            return
+    with contextlib.suppress(Exception):
+        if not settling and tau.context.is_running:
+            return  # still pending; the settle delivers it
+    _void_wakeup()
+    name, _, args = wakeup.prompt.strip().partition(" ")
     text = _DRIVER_TURNS[name](args) if name in _DRIVER_TURNS else None
     with contextlib.suppress(Exception):  # a reloaded or closed session: nothing to wake
-        tau.send_user_message(text if text is not None else prompt)
+        tau.send_user_message(text if text is not None else wakeup.prompt)
+
+
+def make_wakeup_delivery(tau: ExtensionAPI) -> Any:
+    """Build the `agent_settled` handler that sends a wakeup that fired mid-turn.
+
+    Registered after the Stop-hook bridge, so it sees whether a hook objected
+    on this settle; an objection already starts the next turn, and the wakeup
+    waits for the settle after it rather than queueing behind it.
+    """
+
+    async def deliver(event: Any, context: ExtensionContext) -> None:
+        del event, context
+        wakeup = _WAKEUP
+        if wakeup is None or not wakeup.fired or _GUARD_OBJECTED:
+            return
+        try:
+            await _deliver_wakeup(tau, wakeup, True)
+        except Exception:  # noqa: BLE001 - a delivery bug must not wedge the session
+            return
+
+    return deliver
 
 
 def make_wakeup(tau: ExtensionAPI) -> Any:
@@ -981,9 +1091,19 @@ def make_wakeup(tau: ExtensionAPI) -> Any:
         global _WAKEUP
         del tool_call_id, signal, on_update
         if arguments.get("stop"):
-            if _cancel_wakeup():
-                return _make_dispatch_result("pursuit_wakeup: disarmed.")
-            return _make_dispatch_result("pursuit_wakeup: nothing was armed.")
+            voided = _void_wakeup()
+            if voided is None:
+                return _make_dispatch_result(
+                    "pursuit_wakeup: nothing was armed, and no fired wakeup is waiting "
+                    "to be delivered."
+                )
+            if voided.fired:
+                return _make_dispatch_result(
+                    f"pursuit_wakeup: the wakeup had already fired, during a turn, and "
+                    f"its {voided.prompt!r} was waiting for that turn to end. That "
+                    "pending delivery is now voided; it will not arrive."
+                )
+            return _make_dispatch_result("pursuit_wakeup: disarmed before it fired.")
         if not tau.context.has_ui:
             return _make_dispatch_result(
                 "pursuit_wakeup: REFUSED — this Tau session has no interactive frontend "
@@ -998,11 +1118,18 @@ def make_wakeup(tau: ExtensionAPI) -> Any:
         raw_prompt = arguments.get("prompt")
         prompt = raw_prompt.strip() if isinstance(raw_prompt, str) and raw_prompt.strip() else ""
         prompt = prompt or "/pursuit-run"
-        replaced = _cancel_wakeup()
-        _WAKEUP = asyncio.get_running_loop().call_later(minutes * 60, _fire_wakeup, tau, prompt)
+        goal = _find_goal(tau.context.cwd)
+        root = goal.parent.parent if goal is not None else None
+        run = await _loop_run(root) if root is not None else None
+        replaced = _void_wakeup()
+        wakeup = _Wakeup(prompt=prompt, root=root, run=run or None)
+        _WAKEUP = wakeup
+        wakeup.handle = asyncio.get_running_loop().call_later(
+            minutes * 60, _fire_wakeup, tau, wakeup
+        )
         return _make_dispatch_result(
             f"pursuit_wakeup: armed — {prompt!r} in {minutes} minute(s)"
-            + (", replacing the previous wakeup" if replaced else "")
+            + (", replacing the previous wakeup" if replaced is not None else "")
             + f". Record it: `beagle loop tick --resuming-in {minutes}`."
         )
 
@@ -1410,7 +1537,8 @@ def setup(tau: ExtensionAPI) -> None:
         )
         tau.on("agent_end", _note_run_end)
         tau.on("agent_settled", make_loop_guard(tau))
-        tau.on("session_shutdown", lambda event, context: _cancel_wakeup())
+        tau.on("agent_settled", make_wakeup_delivery(tau))
+        tau.on("session_shutdown", lambda event, context: _void_wakeup())
 
     if problems:
         notice = "Beagle extension: " + " ".join(problems)

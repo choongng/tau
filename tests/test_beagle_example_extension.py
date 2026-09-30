@@ -83,6 +83,8 @@ def beagle(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "claude-session")
     monkeypatch.setenv("CLAUDE_PID", "4242")
     monkeypatch.delenv("BEAGLE_TAU_WORKER", raising=False)
+    # Never the real beagle: a test that wants one takes `fake_beagle`.
+    monkeypatch.setenv("BEAGLE_BIN", str(tmp_path / "no-beagle-bin"))
     monkeypatch.chdir(tmp_path)  # the process cwd is not a pursuit unless a test says so
     return root
 
@@ -100,12 +102,16 @@ if json.loads(stdin or "{}").get("stop_hook_active"):
 reply = here / (sys.argv[2] + ".out")
 if len(sys.argv) > 2 and reply.exists():
     sys.stdout.write(reply.read_text())
+status = here / (sys.argv[2] + ".rc")
+if len(sys.argv) > 2 and status.exists():
+    sys.exit(int(status.read_text()))
 """
 
 
 @pytest.fixture
 def fake_beagle(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
-    """A `beagle` that logs each call and prints `<hook>.out` when it exists."""
+    """A `beagle` that logs each call, prints `<argv[2]>.out` when it exists and
+    exits with `<argv[2]>.rc`'s status (else 0)."""
     here = tmp_path / "fake-beagle"
     here.mkdir()
     script = here / "beagle"
@@ -343,10 +349,36 @@ def test_pursuit_run_injects_host_mapping_and_driver(tmp_path: Path, beagle: Pat
     assert "name: pursuit-run" not in turn
 
 
+def _capture_timers(monkeypatch: pytest.MonkeyPatch) -> list[tuple[float, Any, tuple[Any, ...]]]:
+    """Record wakeup timers instead of waiting on them; fire with `_fire`.
+
+    Only a delay of a minute or more is a wakeup's; shorter ones (`sleep`,
+    `wait_for`) are asyncio's own and run as normal.
+    """
+    loop = asyncio.get_running_loop()
+    timers: list[tuple[float, Any, tuple[Any, ...]]] = []
+    real = loop.call_later
+
+    def record(delay: float, callback: Any, *args: Any) -> Any:
+        if delay < 60:
+            return real(delay, callback, *args)
+        timers.append((delay, callback, args))
+        return real(3600, lambda: None)
+
+    monkeypatch.setattr(loop, "call_later", record)
+    return timers
+
+
+async def _fire(timer: tuple[float, Any, tuple[Any, ...]]) -> None:
+    _, callback, args = timer
+    callback(*args)
+    for _ in range(50):  # let a delivery task, and any beagle subprocess, finish
+        await asyncio.sleep(0.01)
+
+
 @pytest.mark.anyio
-async def test_wakeup_arms_replaces_fires_and_disarms(tmp_path: Path, beagle: Path) -> None:
+async def test_wakeup_arms_replaces_and_disarms(tmp_path: Path, beagle: Path) -> None:
     runtime, session = _bound(tmp_path)
-    session.is_running = True
     wakeup = _tool(runtime, "pursuit_wakeup")
 
     armed = await wakeup.execute("c1", {"delay_minutes": 0.2})
@@ -356,10 +388,9 @@ async def test_wakeup_arms_replaces_fires_and_disarms(tmp_path: Path, beagle: Pa
     assert "--resuming-in 60" in again.text
 
     stopped = await wakeup.execute("c3", {"stop": True})
-    assert stopped.text == "pursuit_wakeup: disarmed."
-    assert (await wakeup.execute("c4", {"stop": True})).text == (
-        "pursuit_wakeup: nothing was armed."
-    )
+    assert stopped.text == "pursuit_wakeup: disarmed before it fired."
+    nothing = await wakeup.execute("c4", {"stop": True})
+    assert nothing.text.startswith("pursuit_wakeup: nothing was armed")
     assert session.followed_up == []
 
 
@@ -368,20 +399,13 @@ async def test_wakeup_fire_expands_pursuit_run(
     tmp_path: Path, beagle: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     runtime, session = _bound(tmp_path)
-    session.is_running = True
-    wakeup = _tool(runtime, "pursuit_wakeup")
-    loop = asyncio.get_running_loop()
-    fired: list[Any] = []
+    timers = _capture_timers(monkeypatch)
+    await _tool(runtime, "pursuit_wakeup").execute("c1", {"delay_minutes": 2})
 
-    def call_now(delay: float, callback: Any, *args: Any) -> Any:
-        fired.append(delay)
-        return loop.call_soon(callback, *args)
+    [timer] = timers
+    assert timer[0] == 120
+    await _fire(timer)
 
-    monkeypatch.setattr(loop, "call_later", call_now)
-    await wakeup.execute("c1", {"delay_minutes": 2})
-    await asyncio.sleep(0)
-
-    assert fired == [120]
     [turn] = session.followed_up
     invocation = parse_skill_invocation(turn)
     assert invocation is not None and invocation.name == "pursuit-run"
@@ -394,16 +418,94 @@ async def test_wakeup_fire_expands_pursuit(
     tmp_path: Path, beagle: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     runtime, session = _bound(tmp_path)
-    session.is_running = True
-    loop = asyncio.get_running_loop()
-    monkeypatch.setattr(loop, "call_later", lambda delay, cb, *a: loop.call_soon(cb, *a))
+    timers = _capture_timers(monkeypatch)
     await _tool(runtime, "pursuit_wakeup").execute("c1", {"prompt": "/pursuit next"})
-    await asyncio.sleep(0)
+    await _fire(timers[0])
 
     [turn] = session.followed_up
     invocation = parse_skill_invocation(turn)
     assert invocation is not None and invocation.name == "pursuit"
     assert invocation.additional_instructions == "next"
+
+
+@pytest.mark.anyio
+async def test_wakeup_firing_mid_turn_waits_for_the_settle(
+    tmp_path: Path, beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runtime, session = _bound(tmp_path)
+    timers = _capture_timers(monkeypatch)
+    await _tool(runtime, "pursuit_wakeup").execute("c1", {"prompt": "resume"})
+    session.is_running = True
+
+    await _fire(timers[0])
+    assert session.followed_up == []  # nothing queued behind the running turn
+    await runtime.emit_event(AgentSettledEvent())
+
+    assert session.followed_up == ["resume"]
+
+
+@pytest.mark.anyio
+async def test_stop_voids_a_fired_wakeup_pending_delivery(
+    tmp_path: Path, beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runtime, session = _bound(tmp_path)
+    timers = _capture_timers(monkeypatch)
+    wakeup = _tool(runtime, "pursuit_wakeup")
+    await wakeup.execute("c1", {"prompt": "resume"})
+    session.is_running = True
+    await _fire(timers[0])
+
+    stopped = await wakeup.execute("c2", {"stop": True})
+    await runtime.emit_event(AgentSettledEvent())
+
+    assert "already fired" in stopped.text and "now voided" in stopped.text
+    assert session.followed_up == []
+
+
+@pytest.mark.anyio
+async def test_rearm_voids_a_fired_wakeup_pending_delivery(
+    tmp_path: Path, beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runtime, session = _bound(tmp_path)
+    timers = _capture_timers(monkeypatch)
+    wakeup = _tool(runtime, "pursuit_wakeup")
+    await wakeup.execute("c1", {"prompt": "first"})
+    session.is_running = True
+    await _fire(timers[0])
+
+    await wakeup.execute("c2", {"prompt": "second", "delay_minutes": 30})
+    await runtime.emit_event(AgentSettledEvent())
+    await _fire(timers[0])  # the stale timer, had it not been cancelled
+
+    assert session.followed_up == []
+    session.is_running = False
+    await _fire(timers[1])
+    assert session.followed_up == ["second"]
+
+
+@pytest.mark.anyio
+async def test_wakeup_is_dropped_once_its_loop_run_stops(
+    tmp_path: Path, beagle: Path, fake_beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project = _pursuit_project(tmp_path)
+    (fake_beagle / "read.out").write_text("2026-09-29T10:00:00+00:00\n", encoding="utf-8")
+    runtime = _load(tmp_path)
+    session = RecordingSession(project, running=False)
+    ui = RecordingUiBridge(has_ui=True)
+    runtime.set_ui_bridge(ui)  # type: ignore[arg-type]
+    runtime.bind(session)  # type: ignore[arg-type]
+    timers = _capture_timers(monkeypatch)
+    await _tool(runtime, "pursuit_wakeup").execute("c1", {})
+
+    (fake_beagle / "read.out").unlink()
+    (fake_beagle / "read.rc").write_text("3", encoding="utf-8")  # `beagle loop stop` ran
+    await _fire(timers[0])
+
+    assert session.followed_up == []
+    [(notice, _)] = ui.notifications
+    assert "no longer in flight" in notice
+    reads = [c["argv"] for c in _calls(fake_beagle) if c["argv"][:2] == ["loop", "read"]]
+    assert reads == [["loop", "read", "--root", str(project)]] * 2
 
 
 @pytest.mark.anyio
