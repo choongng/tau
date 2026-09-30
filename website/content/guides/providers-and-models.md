@@ -545,7 +545,9 @@ tau --provider local-gateway -p "summarize this project" # one-shot print mode
 Catalog TOML is for provider and model metadata. It does **not** accept runtime
 request options such as custom HTTP headers, timeouts, or retry settings. Put
 those in `~/.tau/providers.json` instead. Saved `providers.json` entries support
-`headers`, `timeout_seconds`, `max_retries`, and `max_retry_delay_seconds`. For
+`headers`, `timeout_seconds`, `max_retries`, and `max_retry_delay_seconds`, and
+the opt-in local-server options described under
+[Single-slot local servers](#single-slot-local-servers). For
 the full JSON shape, the catalog TOML shape, and `thinking_levels` for custom
 models, see [Configuration]({{< relref "../reference/configuration.md#providers" >}}).
 
@@ -590,6 +592,39 @@ client) used the slot and evicted this session's cached prefix, so the turn ran
 as slowly as a cold start. The same signal reaches extensions and RPC clients as
 the `prompt_cache_miss` event. Providers that never report cache reads never
 show it.
+
+## Single-slot local servers
+
+A llama.cpp server keeps a cached prompt prefix per slot, and with
+`--parallel 1` it has exactly one slot. Tau's hosted-API cache hints
+(`prompt_cache_key`, affinity headers) do nothing there, so custom
+OpenAI-compatible providers that point at `llama-server` can opt in to its own
+fields in `~/.tau/providers.json`. Both options are off unless you set them:
+
+```json
+{
+  "provider_preferences": {
+    "krang": {
+      "cache_prompt": true,
+      "id_slot_count": 1
+    }
+  }
+}
+```
+
+- `cache_prompt: true` sends llama.cpp's `cache_prompt` field so the server
+  reuses the longest cached prefix instead of reprocessing the whole prompt.
+- `id_slot_count` sends an `id_slot` chosen from the session id, in
+  `0..id_slot_count-1`. Set it to the server's `--parallel` value. Each session
+  then asks for the same slot on every turn (and after a resume), so sessions
+  on a multi-slot server stop overwriting each other's cached prefix. Requests
+  without a session id, such as model discovery, omit it.
+
+Both fields apply to chat-completions requests only. Servers that reject
+unknown request fields will fail with these set, so enable them only for
+llama.cpp or servers that accept its fields. The built-in `llama.cpp` backend
+configured through `/local` is managed separately and does not read these
+preferences.
 
 ## How credentials are resolved
 
