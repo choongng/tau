@@ -1658,6 +1658,15 @@ truncated, and run the close. Claude Code's `SendMessage` \
 to a running worker is `steer_subagent`; `get_subagent_result` with `wait: \
 true` blocks on one. Parallel independent tasks may each get a background \
 agent.
+- Spawning a worker: leave `provider` and `model` unset, so it runs on this \
+session's own provider and model; Claude Code's `sonnet`-style picks name \
+nothing Tau serves. Set `max_turns` from the task's budget (`budget_tokens` in \
+`beagle pursuit show <task>`), so a worker past it is told to wrap up. After a \
+background spawn, end the turn; do not poll `get_subagent_result`, since the \
+notification comes to you.
+- Prose in a shell command (briefs, intents, close notes, commit messages) \
+goes in a quoted heredoc (`<<'EOF'`), a file, or single quotes, never double \
+quotes, which expand `$` and backticks.
 - While a background worker is awaited, its open task's declared scope is \
 the worker's: this extension refuses this session's writes there. For a \
 worker that must not share your tree, pass `isolation: "worktree"`; it works \

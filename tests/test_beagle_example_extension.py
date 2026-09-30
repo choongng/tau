@@ -1091,3 +1091,14 @@ async def test_stopping_a_worker_reminds_the_driver_to_clear_its_wait(
     reminded = 'awaiting "step-executor on T0002"' in " ".join(result.text.split())
     assert reminded is noted
     assert ("bare `beagle loop tick`" in result.text) is noted
+
+
+def test_host_note_gives_the_worker_spawn_rules(tmp_path: Path, beagle: Path) -> None:
+    runtime, session = _bound(tmp_path)
+    _run_command(runtime, "pursuit-run")
+
+    note = " ".join(session.followed_up[0].split())
+    assert "leave `provider` and `model` unset" in note
+    assert "Set `max_turns` from the task's budget" in note
+    assert "do not poll `get_subagent_result`" in note
+    assert "quoted heredoc (`<<'EOF'`), a file, or single quotes, never double quotes" in note
