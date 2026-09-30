@@ -852,3 +852,14 @@ def test_explicit_pursuit_run_always_sends_the_full_driver(tmp_path: Path, beagl
 
     first, second = session.followed_up
     assert first == second and parse_skill_invocation(second) is not None
+
+
+def test_host_notes_name_the_merged_containment_launcher(tmp_path: Path, beagle: Path) -> None:
+    runtime, session = _bound(tmp_path)
+    _run_command(runtime, "pursuit-run")
+
+    launcher = tmp_path / "home-tau" / "beagle-plugin" / "skills/containment/scripts"
+    assert f"`{launcher}/run_contained.sh`" in " ".join(session.followed_up[0].split())
+    worker = (tmp_path / "agents" / "beagle-dev:step-executor.md").read_text(encoding="utf-8")
+    assert f"`{launcher}/run_contained.sh`" in " ".join(worker.split())
+    assert "${CLAUDE_PLUGIN_ROOT}" not in session.followed_up[0] + worker

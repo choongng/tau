@@ -367,6 +367,8 @@ def _driver_turn(name: str, args: str, preamble: str = "") -> str | None:
     if path is None:
         return None
     location = _PLUGIN_ROOT / "commands" / name if _PLUGIN_ROOT is not None else path
+    if preamble and _PLUGIN_ROOT is not None:
+        preamble = preamble.replace(PLUGIN_ROOT_VAR, str(_PLUGIN_ROOT))
     body = f"{preamble}\n{_driver_text(path)}" if preamble else _driver_text(path)
     skill = Skill(name=Path(name).stem, path=location, content=body)
     return format_skill_invocation(skill, args)
@@ -1333,6 +1335,10 @@ agent.
 - Without the `agent` tool, dispatch is the `pursuit_dispatch` tool. It \
 returns the worker's report within the same turn, so skip the `--awaiting` \
 tick and the bare tick that clears it; run the close straight after.
+- Skill scripts live under `${CLAUDE_PLUGIN_ROOT}`; the containment launcher \
+is `${CLAUDE_PLUGIN_ROOT}/skills/containment/scripts/run_contained.sh`. Use \
+that path, in briefs too, never a `~/.claude/plugins/cache/...` one, even if \
+beagle prints it: a Tau-only host has no such cache, and an upgrade moves it.
 - `loop-guard`, `loop-report` and `commit-claims` run inside this Tau \
 extension. Do not run `beagle hooks install`.
 """
@@ -1483,7 +1489,10 @@ AGENT_HOST_NOTE = """\
 You run as a Tau sub-agent, translated from a Claude Code agent definition. \
 Your tools are Tau's: `read`, `write`, `edit` and `bash`. Where the text below \
 names `Grep` or `Glob`, use `rg` or `find` through `bash`; MCP tools it names \
-(`mcp__...`) are not available.
+(`mcp__...`) are not available. Beagle's skill scripts live under \
+`${CLAUDE_PLUGIN_ROOT}/skills/`; run the containment launcher as \
+`${CLAUDE_PLUGIN_ROOT}/skills/containment/scripts/run_contained.sh`, not from \
+any `~/.claude/plugins/cache/...` path a brief or beagle names.
 """
 
 
@@ -1505,8 +1514,9 @@ def _agent_type_text(src: Path) -> str | None:
     # No `model:` — Claude's aliases name nothing a Tau provider serves, so the
     # sub-agent inherits the parent session's model.
     lines += [f"{GENERATED_KEY}: {GENERATED_BY}", "---", ""]
-    body = body.replace(PLUGIN_ROOT_VAR, str(_PLUGIN_ROOT)) if _PLUGIN_ROOT else body
-    return "\n".join(lines) + AGENT_HOST_NOTE + "\n" + body.lstrip("\n")
+    text = AGENT_HOST_NOTE + "\n" + body.lstrip("\n")
+    text = text.replace(PLUGIN_ROOT_VAR, str(_PLUGIN_ROOT)) if _PLUGIN_ROOT else text
+    return "\n".join(lines) + text
 
 
 def _is_generated(path: Path) -> bool:
