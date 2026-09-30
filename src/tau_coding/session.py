@@ -38,7 +38,7 @@ from tau_agent.session import (
     SessionStorage,
     ThinkingLevelChangeEntry,
 )
-from tau_agent.session.entries import SessionEntry
+from tau_agent.session.entries import MessageDelivery, MessageSource, SessionEntry
 from tau_agent.session.jsonl import entry_to_json_line
 from tau_agent.session.tree import SessionTreeError, path_to_entry
 from tau_agent.tool_history import ToolHistoryRepair, repair_tool_history
@@ -486,6 +486,7 @@ class CodingSession:
         self._persisted_message_ids: set[int] = set()
         self._ended_message_ids: set[int] = set()
         self._pending_message_writes: dict[int, _PendingMessageWrite] = {}
+        self._message_origins: dict[int, tuple[AgentMessage, MessageDelivery, MessageSource]] = {}
         self._attach_persistence_listener()
 
     @classmethod
@@ -1410,6 +1411,7 @@ class CodingSession:
             if custom_type is not None
             else UserMessage(content=content)
         )
+        self._record_message_origin(message, delivery="steer", source="extension")
         self._harness.steer_message(message)
 
     def queue_follow_up_message(
@@ -1425,6 +1427,7 @@ class CodingSession:
             if custom_type is not None
             else UserMessage(content=content)
         )
+        self._record_message_origin(message, delivery="follow_up", source="extension")
         self._harness.follow_up_message(message)
 
     async def append_custom_entry(self, namespace: str, data: dict[str, JSONValue]) -> None:
@@ -1523,17 +1526,37 @@ class CodingSession:
 
     def clear_queued_messages(self) -> QueuedMessages:
         """Clear queued steering and follow-up messages."""
-        return self._harness.clear_queues()
+        cleared = self._harness.clear_queues()
+        for message in (*cleared.steering, *cleared.follow_up):
+            self._message_origins.pop(id(message), None)
+        return cleared
 
     def pop_latest_follow_up_message(self) -> str | None:
         """Remove and return the most recently queued follow-up message."""
         message = self._harness.pop_latest_follow_up()
-        return None if message is None else message_text(message)
+        if message is None:
+            return None
+        self._message_origins.pop(id(message), None)
+        return message_text(message)
 
     def pop_latest_steering_message(self) -> str | None:
         """Remove and return the most recently queued steering message."""
         message = self._harness.pop_latest_steering()
-        return None if message is None else message_text(message)
+        if message is None:
+            return None
+        self._message_origins.pop(id(message), None)
+        return message_text(message)
+
+    def _record_message_origin(
+        self, message: AgentMessage, *, delivery: MessageDelivery, source: MessageSource
+    ) -> None:
+        """Remember how a user-side message entered the run until it is persisted.
+
+        The harness queues bare messages, so origin rides beside them keyed by
+        object identity. The entry keeps the message alive, which keeps its
+        id() from being reused while the record exists.
+        """
+        self._message_origins[id(message)] = (message, delivery, source)
 
     def set_model(self, model: str) -> None:
         """Switch the active model for future turns and make it the default."""
@@ -3184,13 +3207,17 @@ class CodingSession:
 
         if self._harness.is_running:
             if streaming_behavior == "steer":
-                self._harness.steer(expanded_content)
+                steer_message = UserMessage(content=expanded_content)
+                self._record_message_origin(steer_message, delivery="steer", source=source)
+                self._harness.steer_message(steer_message)
                 session_event_0 = self.queue_update_event()
                 await self._extension_runtime.emit_event(session_event_0)
                 yield session_event_0
                 return
             if streaming_behavior == "follow_up":
-                self._harness.follow_up(expanded_content)
+                follow_up_message = UserMessage(content=expanded_content)
+                self._record_message_origin(follow_up_message, delivery="follow_up", source=source)
+                self._harness.follow_up_message(follow_up_message)
                 session_event_0 = self.queue_update_event()
                 await self._extension_runtime.emit_event(session_event_0)
                 yield session_event_0
@@ -3221,6 +3248,7 @@ class CodingSession:
                 )
             else:
                 prompt_message = UserMessage(content=expanded_content)
+            self._record_message_origin(prompt_message, delivery="prompt", source=source)
             events = self._harness.prompt_message(prompt_message)
             self._invalidate_context_usage_cache()
             async for event in events:
@@ -3510,7 +3538,13 @@ class CodingSession:
         pending = self._pending_message_writes.get(message_id)
         is_retry = pending is not None
         if pending is None:
-            entry = _session_entry_for_message(parent_id=self._last_parent_id, message=message)
+            origin = self._message_origins.pop(message_id, None)
+            entry = _session_entry_for_message(
+                parent_id=self._last_parent_id,
+                message=message,
+                delivery=None if origin is None else origin[1],
+                source=None if origin is None else origin[2],
+            )
             pending = _PendingMessageWrite(message=message, entry=entry)
             self._pending_message_writes[message_id] = pending
 
@@ -4080,7 +4114,11 @@ def is_retryable_huggingface_route_error(message: AssistantMessage) -> bool:
 
 
 def _session_entry_for_message(
-    *, parent_id: str | None, message: AgentMessage
+    *,
+    parent_id: str | None,
+    message: AgentMessage,
+    delivery: MessageDelivery | None = None,
+    source: MessageSource | None = None,
 ) -> MessageEntry | CustomMessageEntry:
     """Build the canonical persisted entry for one completed runtime message."""
     if isinstance(message, CustomMessage):
@@ -4091,8 +4129,10 @@ def _session_entry_for_message(
             content=message.content,
             display=message.display,
             details=message.details,
+            delivery=delivery,
+            source=source,
         )
-    return MessageEntry(parent_id=parent_id, message=message)
+    return MessageEntry(parent_id=parent_id, message=message, delivery=delivery, source=source)
 
 
 def _detach_missing_parents(entries: list[SessionEntry]) -> list[SessionEntry]:

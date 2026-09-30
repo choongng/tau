@@ -40,6 +40,7 @@ from tau_agent.session import (
     SessionInfoEntry,
     ThinkingLevelChangeEntry,
 )
+from tau_agent.session.jsonl import entry_to_json_line
 from tau_ai import (
     CancellationToken,
     FakeProvider,
@@ -1416,6 +1417,66 @@ async def test_prompt_queues_steering_while_session_is_running(tmp_path: Path) -
     assert [entry.message for entry in message_entries] == list(session.messages)
     assert leaf_entries == []
     assert not any(isinstance(event, QueueUpdateEvent) for event in run_events)
+
+
+@pytest.mark.anyio
+async def test_queued_messages_persist_as_own_entries_marked_with_delivery_and_source(
+    tmp_path: Path,
+) -> None:
+    storage = JsonlSessionStorage(tmp_path / "session.jsonl")
+    provider = WaitingProvider()
+    session = await CodingSession.load(_config(tmp_path, provider, storage))
+
+    task = asyncio.create_task(_collect_session_events(session.prompt("Hello")))
+    await provider.started.wait()
+    await _collect_session_events(session.prompt("Human steer", streaming_behavior="steer"))
+    session.queue_steering_message("Extension steer")
+    await _collect_session_events(session.prompt("Human follow-up", streaming_behavior="follow_up"))
+    session.queue_follow_up_message("Extension follow-up")
+    provider.release.set()
+    await task
+
+    reloaded = await JsonlSessionStorage(tmp_path / "session.jsonl").read_all()
+    user_entries = [
+        entry
+        for entry in reloaded
+        if isinstance(entry, MessageEntry) and isinstance(entry.message, UserMessage)
+    ]
+    assert [(entry.message.text, entry.delivery, entry.source) for entry in user_entries] == [
+        ("Hello", "prompt", "interactive"),
+        ("Human steer", "steer", "interactive"),
+        ("Extension steer", "steer", "extension"),
+        ("Human follow-up", "follow_up", "interactive"),
+        ("Extension follow-up", "follow_up", "extension"),
+    ]
+    assistant_entries = [
+        entry
+        for entry in reloaded
+        if isinstance(entry, MessageEntry) and isinstance(entry.message, AssistantMessage)
+    ]
+    assert all(entry.delivery is None and entry.source is None for entry in assistant_entries)
+    assert session._message_origins == {}
+
+
+@pytest.mark.anyio
+async def test_extension_started_prompt_is_marked_as_extension_source(tmp_path: Path) -> None:
+    storage = JsonlSessionStorage(tmp_path / "session.jsonl")
+    provider = FakeProvider([[assistant_start(), assistant_done(AssistantMessage(content="ok"))]])
+    session = await CodingSession.load(_config(tmp_path, provider, storage))
+
+    await _collect_session_events(
+        session.prompt("wake up", source="extension", custom_type="beagle:wake")
+    )
+
+    entries = await storage.read_all()
+    custom_entries = [entry for entry in entries if isinstance(entry, CustomMessageEntry)]
+    assert [(entry.delivery, entry.source) for entry in custom_entries] == [("prompt", "extension")]
+
+
+def test_message_entry_origin_fields_are_omitted_when_unset() -> None:
+    line = entry_to_json_line(MessageEntry(message=UserMessage(content="hi")))
+    assert "delivery" not in line
+    assert "source" not in line
 
 
 @pytest.mark.anyio
