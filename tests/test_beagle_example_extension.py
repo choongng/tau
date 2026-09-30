@@ -572,3 +572,73 @@ def test_pursuit_run_routes_dispatch_through_background_agents(
     assert "run_in_background" in turn
     assert "steer_subagent" in turn and "get_subagent_result" in turn
     assert "pursuit_dispatch" in turn  # the fallback without tau-subagents
+
+
+# -- ground-truth guard --------------------------------------------------------
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    "command",
+    [
+        "echo x > .beagle/pursuit.toml",
+        "echo x >> ./.beagle/pursuit.toml 2>&1",
+        "printf x | tee -a .beagle/pursuit.toml >/dev/null",
+        "sed -i 's/Ship/Skip/' .beagle/pursuit.toml",
+        "sed -Ei.bak -e 's/a/b/' .beagle/pursuit.toml",
+        "cp /tmp/new.toml .beagle/pursuit.toml",
+        "cp /tmp/pursuit.toml .beagle/",
+        "mv .beagle/pursuit.toml /tmp/old.toml",
+        "cd .beagle && cat > pursuit.toml <<'EOF'\n[goal]\nEOF",
+        "bash -c 'truncate -s 0 .beagle/pursuit.toml'",
+        "git checkout -- .beagle/pursuit.toml",
+    ],
+)
+async def test_guard_blocks_shell_writes_to_the_goal(
+    tmp_path: Path, beagle: Path, command: str
+) -> None:
+    _pursuit_project(tmp_path)
+    runtime, _ = _bound(tmp_path)
+
+    result = await _tool_with_hooks(runtime).execute("c1", {"command": command})
+
+    assert result.text.startswith("Tool call blocked: refusing a shell write to ")
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    "command",
+    [
+        "cat .beagle/pursuit.toml",
+        "git check-ignore -v .beagle/pursuit.toml > /tmp/ignored.txt",
+        "grep -n criteria .beagle/pursuit.toml | tee /tmp/criteria.txt",
+        "cp .beagle/pursuit.toml /tmp/backup.toml",
+        "sed -n '1,5p' .beagle/pursuit.toml",
+        "git add .beagle/pursuit.toml && git commit -m 'Found the pursuit' 2>&1",
+        "cat > notes.md <<'EOF'\nnever run: echo x > .beagle/pursuit.toml\nEOF",
+        "diff .beagle/pursuit.toml other.toml >/dev/null; echo $?",
+    ],
+)
+async def test_guard_lets_reads_of_the_goal_through(
+    tmp_path: Path, beagle: Path, command: str
+) -> None:
+    _pursuit_project(tmp_path)
+    runtime, _ = _bound(tmp_path)
+
+    result = await _tool_with_hooks(runtime).execute("c1", {"command": command})
+
+    assert result.text == "ran"
+
+
+@pytest.mark.anyio
+async def test_guard_falls_back_to_blocking_an_unparseable_write(
+    tmp_path: Path, beagle: Path
+) -> None:
+    _pursuit_project(tmp_path)
+    runtime, _ = _bound(tmp_path)
+
+    result = await _tool_with_hooks(runtime).execute(
+        "c1", {"command": "echo 'unclosed > .beagle/pursuit.toml"}
+    )
+
+    assert result.text.startswith("Tool call blocked:")

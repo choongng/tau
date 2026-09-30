@@ -63,10 +63,12 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import fnmatch
 import json
 import math
 import os
 import re
+import shlex
 import subprocess
 import tomllib
 from collections.abc import Mapping
@@ -293,20 +295,243 @@ def _run(cmd: list[str], cwd: Path | None, timeout: float, stdin: str = "") -> t
 # --------------------------------------------------------------------------- #
 
 _WRITE_TOKEN = re.compile(r"(>>|>|tee\b|\bsed\b|\btruncate\b|\bdd\b|\binstall\b)")
+_HEREDOC = re.compile(r"(?<!<)<<(-?)\s*(['\"]?)([A-Za-z_][\w.-]*)\2")
+#: Words that run the command after them: skipped to find the real one.
+_WRAPPERS = frozenset({"sudo", "env", "command", "nice", "nohup", "time", "exec", "builtin"})
+_SHELLS = frozenset({"sh", "bash", "zsh", "dash"})
+_GLOB_CHARS = frozenset("*?[")
 
 
-def _bash_touches_goal(command: str) -> bool:
-    """True if a bash command plausibly writes the pursuit goal, not reads it.
+def _strip_heredocs(command: str) -> str:
+    """`command` with every here-document body removed, keeping the `<<` lines.
 
-    Conservative in the safe direction: it only fires when the command names
-    `pursuit.toml` AND carries a write token (`>`, `tee`, `sed`, ...). `cat
-    pursuit.toml` or `git commit -m 'tighten pursuit.toml'` pass through; a
-    redirect, in-place `sed`, or `cp/mv/tee` naming the goal does not. This is a
-    backstop for the write/edit path, which is the exact mistake, not a parser.
+    A body is data fed to a command, not shell: `cat <<EOF > notes.md` followed
+    by a paragraph that mentions `> pursuit.toml` writes only notes.md.
+    """
+    kept: list[str] = []
+    pending: list[tuple[str, bool]] = []
+    for line in command.split("\n"):
+        if pending:
+            delimiter, dash = pending[0]
+            if (line.lstrip("\t") if dash else line).strip() == delimiter:
+                pending.pop(0)
+            continue
+        kept.append(line)
+        pending += [(m.group(3), bool(m.group(1))) for m in _HEREDOC.finditer(line)]
+    return "\n".join(kept)
+
+
+def _shell_tokens(command: str) -> list[str] | None:
+    """Shell words and operators, heredoc bodies dropped; None if unparseable."""
+    text = _strip_heredocs(command).replace("\\\n", " ").replace("\n", " ; ")
+    lexer = shlex.shlex(text, posix=True, punctuation_chars=True)
+    lexer.whitespace_split = True
+    try:
+        return list(lexer)
+    except ValueError:  # an unclosed quote: not a command this can read
+        return None
+
+
+def _is_operator(token: str) -> bool:
+    return bool(token) and all(c in "();<>|&" for c in token)
+
+
+def _positional(args: list[str], takes_value: frozenset[str] = frozenset()) -> list[str]:
+    """`args` without options, and without the values of options in `takes_value`."""
+    out: list[str] = []
+    skip = ended = False
+    for arg in args:
+        if skip:
+            skip = False
+        elif ended:
+            out.append(arg)
+        elif arg == "--":
+            ended = True
+        elif arg.startswith("-") and arg != "-":
+            skip = arg in takes_value
+        else:
+            out.append(arg)
+    return out
+
+
+def _sed_in_place_files(args: list[str]) -> list[str]:
+    """The files `sed -i` rewrites; [] when it is not in-place."""
+    in_place = False
+    has_script = False
+    rest: list[str] = []
+    it = iter(args)
+    for arg in it:
+        if arg.startswith("--in-place"):
+            in_place = True
+        elif arg in ("--expression", "--file"):
+            has_script = True
+            next(it, None)
+        elif arg.startswith(("--expression=", "--file=")):
+            has_script = True
+        elif arg.startswith("-") and not arg.startswith("--") and arg != "-":
+            for i, flag in enumerate(arg[1:]):
+                if flag == "i":
+                    in_place = True
+                    break  # the rest is a backup suffix
+                if flag in "ef":
+                    has_script = True
+                    if i == len(arg) - 2:
+                        next(it, None)
+                    break
+        elif not arg.startswith("--"):
+            rest.append(arg)
+    if not in_place:
+        return []
+    return rest if has_script else rest[1:]
+
+
+def _copy_targets(args: list[str], cwd: Path, moves: bool) -> list[str]:
+    """What `cp`/`mv`/`install`/`ln` writes: the destination (per source when it
+    is a directory), and for `mv` the sources it removes."""
+    target_dir: str | None = None
+    rest: list[str] = []
+    it = iter(args)
+    for arg in it:
+        if arg in ("-t", "--target-directory"):
+            target_dir = next(it, None)
+        elif arg.startswith("--target-directory="):
+            target_dir = arg.split("=", 1)[1]
+        elif arg in ("-m", "--mode", "-o", "--owner", "-g", "--group", "-S", "--suffix"):
+            next(it, None)
+        elif not arg.startswith("-") or arg == "-":
+            rest.append(arg)
+    if target_dir is not None:
+        sources, dest = rest, target_dir
+    elif len(rest) >= 2:
+        sources, dest = rest[:-1], rest[-1]
+    else:
+        return []
+    dest_path = Path(dest).expanduser()
+    is_dir = dest.endswith("/") or (cwd / dest_path).is_dir()
+    targets = [str(dest_path / Path(s).name) for s in sources] if is_dir else [dest]
+    return targets + (sources if moves else [])
+
+
+def _command_targets(argv: list[str], cwd: Path) -> list[str] | None:
+    """The paths one simple command (argv, redirects removed) writes."""
+    while argv and ("=" in argv[0] and not argv[0].startswith("=") or argv[0] in _WRAPPERS):
+        argv = argv[1:]
+        while argv and argv[0].startswith("-"):  # a wrapper's own options
+            argv = argv[1:]
+    if not argv:
+        return []
+    name, args = Path(argv[0]).name, argv[1:]
+    if name == "tee":
+        return _positional(args)
+    if name == "sed":
+        return _sed_in_place_files(args)
+    if name in ("cp", "mv", "install", "ln"):
+        return _copy_targets(args, cwd, moves=name == "mv")
+    if name in ("rm", "truncate", "shred", "unlink"):
+        return _positional(args, frozenset({"-s", "--size", "-r", "--reference", "-n"}))
+    if name == "dd":
+        return [a[3:] for a in args if a.startswith("of=")]
+    if name == "git" and args:
+        sub, sub_args = args[0], args[1:]
+        if sub == "checkout" and "--" in sub_args:
+            return sub_args[sub_args.index("--") + 1 :]
+        if sub == "restore":
+            return _positional(sub_args, frozenset({"-s", "--source"}))
+        if sub in ("stash", "clean") or (sub == "reset" and "--hard" in sub_args):
+            return ["."]  # the whole work tree
+    return []
+
+
+def _bash_write_targets(command: str, cwd: Path) -> list[Path] | None:
+    """Every path a bash command would write, resolved; None if unparseable.
+
+    Deliberately narrow: a redirect target, a `tee` argument, a `sed -i` file,
+    a `cp`/`mv`/`install`/`ln` destination (and what `mv` removes), `dd of=`,
+    `rm`/`truncate`, and the `git` verbs that rewrite tracked files (`stash`,
+    `clean` and `reset --hard` stand for the whole tree as `.`). A path that is
+    only read — `cat pursuit.toml > /tmp/x`, `git check-ignore -v pursuit.toml`
+    — is not a target. `cd` is followed along a chain, and `bash -c '...'` is
+    read one level down. Anything else (a Python one-liner, `find -delete`) is
+    not seen: this backs up the write/edit guard, it does not replace it.
+    """
+    tokens = _shell_tokens(command)
+    if tokens is None:
+        return None
+    here = cwd
+    found: list[Path] = []
+
+    def add(raw: str, base: Path) -> None:
+        path = Path(raw).expanduser()
+        found.append(Path(os.path.normpath(base / path)))
+
+    segment: list[str] = []
+    tokens.append(";")
+    i = 0
+    while i < len(tokens):
+        token = tokens[i]
+        if _is_operator(token) and ("<" in token or ">" in token):
+            target = tokens[i + 1] if i + 1 < len(tokens) else ""
+            if segment and segment[-1].isdigit():
+                segment.pop()  # the fd number of `2>`, not an argument
+            fd_dup = token.endswith("&") and (target.isdigit() or target == "-")
+            if ">" in token and target and not _is_operator(target) and not fd_dup:
+                add(target, here)
+            i += 2 if target and not _is_operator(target) else 1
+            continue
+        if not _is_operator(token):
+            segment.append(token)
+            i += 1
+            continue
+        # A separator: the simple command before it is complete.
+        if segment and segment[0] == "cd":
+            dest = next((a for a in segment[1:] if not a.startswith("-")), "~")
+            here = Path(os.path.normpath(here / Path(dest).expanduser()))
+        elif segment and Path(segment[0]).name in _SHELLS and "-c" in segment[1:]:
+            script_at = segment.index("-c") + 1
+            if script_at < len(segment):
+                nested = _bash_write_targets(segment[script_at], here)
+                if nested is None:
+                    return None
+                found += nested
+        else:
+            for raw in _command_targets(segment, here):
+                add(raw, here)
+        segment = []
+        i += 1
+    return found
+
+
+def _names_path(targets: list[Path], path: Path) -> bool:
+    """Whether one of `targets` is `path`, literally or as a glob matching it."""
+    for target in targets:
+        text = str(target)
+        if target == path or (_GLOB_CHARS & set(text) and fnmatch.fnmatch(str(path), text)):
+            return True
+    return False
+
+
+def _bash_writes_goal(command: str, cwd: Path, goal: Path) -> bool:
+    """True if a bash command writes the pursuit goal, not merely reads it.
+
+    Blocks only when `pursuit.toml` is an actual write target (see
+    `_bash_write_targets`): `git check-ignore -v .beagle/pursuit.toml` beside
+    an unrelated `> /tmp/out` passes, `sed -i ... .beagle/pursuit.toml` does
+    not. A command too broken to parse falls back to the old test — it names
+    the goal and carries a write token — so doubt still lands on the safe side.
     """
     if GOAL_BASENAME not in command:
         return False
-    return bool(_WRITE_TOKEN.search(command))
+    targets = _bash_write_targets(command, cwd)
+    if targets is None:
+        return bool(_WRITE_TOKEN.search(command))
+    return _names_path([_resolved(t) for t in targets], goal)
+
+
+def _resolved(path: Path) -> Path:
+    try:
+        return path.resolve()
+    except (OSError, ValueError):
+        return path
 
 
 def _goal_path_from_args(args: Mapping[str, Any], cwd: Path) -> Path | None:
@@ -366,13 +591,13 @@ def make_guard() -> Any:
             if (
                 tool == "bash"
                 and goal_r.exists()
-                and _bash_touches_goal(str(args.get("command", "")))
+                and _bash_writes_goal(str(args.get("command", "")), Path(cwd), goal_r)
             ):
                 return ToolCallHookResult(
                     block=True,
                     reason=(
                         f"refusing a shell write to {goal} — the pursuit goal is the user's. "
-                        "Reading it (`cat`, `grep`) is fine; this command looks like a write. "
+                        "Reading it (`cat`, `grep`) is fine; this command writes it. "
                         f"(Escape hatch, if the user directs it: set {GUARD_DISABLE_ENV}=1.)"
                     ),
                 )
