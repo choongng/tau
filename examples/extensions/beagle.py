@@ -41,6 +41,11 @@ because a specific part of that model has no Tau equivalent:
   agent can meet by editing them. The founding write is allowed (the file does
   not exist yet); editing it after founding is blocked. This fails open: a hook
   that raised on its own error would block the very tool call it inspects.
+- **scope guard** — while `/pursuit-run` waits on a background worker
+  (`beagle loop tick --awaiting`, inside its lease), the driver session's
+  edit, write and writing-bash calls into an open task's declared `scope`
+  are refused: two writers on one tree lose one's work. Only the recorded
+  driver session is held; a subagent's calls carry its own session id.
 - **orientation** — when the project is a pursuit, its goal and criteria are
   added to the system prompt at load, so the driver re-reads the goal every
   session without anything triggering a turn. It is a frame, not an order.
@@ -90,6 +95,7 @@ import subprocess
 import tomllib
 from collections.abc import Mapping
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -189,6 +195,11 @@ WAKEUP_MIN_MINUTES = 1
 WAKEUP_MAX_MINUTES = 60
 #: `beagle loop read`'s exit status when no run is in flight.
 LOOP_IDLE_EXIT = 3
+#: beagle's loop record (`beagle loop --file`'s default), watched only for
+#: change; what it says is read through `beagle loop read --json`.
+LOOP_REL = Path(".beagle") / "loop.json"
+#: How long beagle believes an `awaiting` with no `--for`, in minutes.
+AWAITING_TTL_MINUTES = 45
 
 #: Last session cwd the extension saw, so the dispatch tool (which gets no
 #: context) can default to the project it is working in.
@@ -753,6 +764,165 @@ def make_guard() -> Any:
         return None
 
     return guard
+
+
+# --------------------------------------------------------------------------- #
+# driver/worker isolation: the driver keeps out of an awaited worker's scope
+# --------------------------------------------------------------------------- #
+
+
+@dataclass(frozen=True)
+class _AwaitedScope:
+    """What the driver session is waiting on, and the open tasks' scope."""
+
+    awaiting: str
+    tasks: tuple[str, ...]
+    scope: tuple[str, ...]
+
+
+#: Root -> (loop file stat, session, scope), so beagle is asked once per change.
+_SCOPE_CACHE: dict[Path, tuple[tuple[int, int, str], _AwaitedScope | None]] = {}
+
+
+def _lease_live(record: Mapping[str, Any]) -> bool:
+    """Whether a declared `awaiting` is inside its lease, as beagle judges it.
+
+    An undatable or future-dated wait is not believed — beagle's own rule,
+    since a suppression nobody can date is one nobody can end.
+    """
+    try:
+        at = datetime.fromisoformat(str(record.get("awaiting_at") or ""))
+    except ValueError:
+        return False
+    if at.tzinfo is None:
+        at = at.replace(tzinfo=UTC)
+    minutes = record.get("awaiting_minutes") or AWAITING_TTL_MINUTES
+    elapsed = (datetime.now(UTC) - at).total_seconds()
+    return isinstance(minutes, int | float) and 0 <= elapsed <= minutes * 60
+
+
+def _json_out(argv: list[str], root: Path) -> Any:
+    rc, out = _run([BEAGLE_BIN, *argv, "--root", str(root)], root, HOOK_TIMEOUT)
+    return json.loads(out) if rc == 0 else None
+
+
+def _read_awaited_scope(root: Path, session_id: str) -> _AwaitedScope | None:
+    """The scope this session's run is waiting on a worker in, or None.
+
+    None unless a run is in flight, this session is its recorded driver (a
+    subagent's own session never is), and a declared wait is inside its
+    lease. The scope is every open task's: `awaiting` is free text, so which
+    open task the worker holds cannot be read off it reliably.
+    """
+    record = _json_out(["loop", "read", "--json"], root)
+    if not isinstance(record, dict) or not record.get("awaiting"):
+        return None
+    if not session_id or record.get("driver_session") != session_id:
+        return None
+    if not _lease_live(record):
+        return None
+    listing = _json_out(["pursuit", "tree", "--json", "--status", "open"], root)
+    tasks = [row["id"] for row in listing or () if isinstance(row, dict) and row.get("id")]
+    scope: list[str] = []
+    for task in tasks:
+        node = _json_out(["pursuit", "show", str(task)], root)
+        entries = node.get("scope") if isinstance(node, dict) else None
+        scope += [e for e in entries or () if isinstance(e, str) and e.strip()]
+    if not scope:
+        return None
+    return _AwaitedScope(str(record["awaiting"]), tuple(tasks), tuple(scope))
+
+
+async def _awaited_scope(root: Path, session_id: str) -> _AwaitedScope | None:
+    """`_read_awaited_scope`, cached until beagle's loop record changes."""
+    try:
+        stat = (root / LOOP_REL).stat()
+    except OSError:
+        return None  # no record: no run in flight
+    key = (stat.st_mtime_ns, stat.st_size, session_id)
+    cached = _SCOPE_CACHE.get(root)
+    if cached is None or cached[0] != key:
+        found = await asyncio.to_thread(_read_awaited_scope, root, session_id)
+        _SCOPE_CACHE[root] = cached = (key, found)
+    return cached[1]
+
+
+def _scope_hit(target: Path, root: Path, scope: tuple[str, ...]) -> str | None:
+    """The scope entry `target` writes into, or contains, or None.
+
+    A scope entry is a path under the project root — a file, a directory, or a
+    glob. A write lands in it when the target is the entry, sits under it, or
+    matches its glob; a target that CONTAINS an entry (`rm -r src`, or the
+    whole tree for `git reset --hard`) lands in it too.
+    """
+    for entry in scope:
+        text = entry.strip().rstrip("/") or "."
+        if _GLOB_CHARS & set(text):
+            pattern = str(root / text)
+            static = Path(pattern.split("*")[0].split("?")[0].split("[")[0])
+            if fnmatch.fnmatch(str(target), pattern) or target in (static, *static.parents):
+                return entry
+            continue
+        path = _resolved(root / text)
+        if target == path or path in target.parents or target in path.parents:
+            return entry
+    return None
+
+
+def _write_targets(tool: str, args: Mapping[str, Any], cwd: Path) -> list[Path]:
+    """The paths an edit, write or bash call writes; [] for anything else."""
+    if tool in ("write", "edit"):
+        target = _goal_path_from_args(args, cwd)
+        return [target] if target is not None else []
+    if tool == "bash":
+        return [_resolved(t) for t in _bash_write_targets(str(args.get("command", "")), cwd) or ()]
+    return []
+
+
+def make_scope_guard() -> Any:
+    """Build the `tool_call` guard that keeps the driver out of a worker's scope.
+
+    While `/pursuit-run` waits on a background worker (`beagle loop tick
+    --awaiting`), the worker owns the open task's declared scope; a driver
+    that edits it too races the worker and one side's work is lost. Only the
+    driver session is held back: a subagent's tool calls carry its own
+    session id and pass. A command too broken to parse passes too — this
+    guards a race, not the ground truth, and fails open like everything here.
+    """
+
+    async def scope_guard(event: Any, context: ExtensionContext) -> ToolCallHookResult | None:
+        try:
+            cwd = Path(context.cwd)
+            targets = _write_targets(event.tool_name, event.arguments or {}, cwd)
+            goal = _find_goal(cwd) if targets else None
+            if goal is None:
+                return None
+            root = _resolved(goal.parent.parent)
+            waiting = await _awaited_scope(root, context.session_id or "")
+            if waiting is None:
+                return None
+            for target in targets:
+                entry = _scope_hit(target, root, waiting.scope)
+                if entry is not None:
+                    break
+            else:
+                return None
+        except Exception:  # noqa: BLE001 - fail open, never block on a guard bug
+            return None
+        tasks = ", ".join(waiting.tasks)
+        return ToolCallHookResult(
+            block=True,
+            reason=(
+                f"refusing to write {target}: it is in open task {tasks}'s scope "
+                f"(`{entry}`), and this session is waiting on a worker for it "
+                f"({waiting.awaiting}). Two writers on one tree lose one's work. Wait "
+                "for its completion notice, steer it with `steer_subagent`, or stop it "
+                "and take the task back; if the worker is gone, clear the wait with a "
+                "bare `beagle loop tick` first."
+            ),
+        )
+
+    return scope_guard
 
 
 # --------------------------------------------------------------------------- #
@@ -1436,6 +1606,12 @@ the notification is truncated, and run the close. Claude Code's `SendMessage` \
 to a running worker is `steer_subagent`; `get_subagent_result` with `wait: \
 true` blocks on one. Parallel independent tasks may each get a background \
 agent.
+- While a background worker is awaited, its open task's declared scope is \
+the worker's: this extension refuses this session's writes there. For a \
+worker that must not share your tree, pass `isolation: "worktree"`; it works \
+in a detached copy and its changes come back on a `tau-agent-<id>` branch for \
+you to merge. `isolated: true` is not that: it only spawns the worker without \
+extensions, so without beagle's skills and guards.
 - Without the `agent` tool, dispatch is the `pursuit_dispatch` tool. It \
 returns the worker's report within the same turn, so skip the `--awaiting` \
 tick and the bare tick that clears it; run the close straight after.
@@ -1784,6 +1960,8 @@ def setup(tau: ExtensionAPI) -> None:
     #    beagle's Bash PreToolUse hooks onto the same seam.
     tau.on("tool_call", make_guard())
     tau.on("tool_call", make_bash_hooks())
+    if not _is_worker():
+        tau.on("tool_call", make_scope_guard())
 
     # 6. What /pursuit-run needs from its host: a session id beagle can record
     #    as the driver, a wakeup, and the Stop hook. A worker runs none of the

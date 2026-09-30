@@ -11,6 +11,7 @@ import json
 import os
 import shutil
 import sys
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -612,12 +613,12 @@ async def test_commit_claims_block_stops_the_bash_call(
     assert payload["tool_input"] == {"command": "git commit -m wip"}
 
 
-def _tool_with_hooks(runtime: ExtensionRuntime) -> Any:
+def _tool_with_hooks(runtime: ExtensionRuntime, name: str = "bash") -> Any:
     async def run(*_: Any, **__: Any) -> AgentToolResult:
         return AgentToolResult(content=[TextContent(text="ran")])
 
-    bash = AgentTool(name="bash", label="bash", description="", parameters={}, execute_fn=run)
-    [wrapped] = [t for t in runtime.compose_tools([bash]) if t.name == "bash"]
+    tool = AgentTool(name=name, label=name, description="", parameters={}, execute_fn=run)
+    [wrapped] = [t for t in runtime.compose_tools([tool]) if t.name == name]
     return wrapped
 
 
@@ -664,6 +665,89 @@ async def test_loop_guard_skips_interrupted_runs_and_print_mode(
 
     assert session.followed_up == [] and headless_session.followed_up == []
     assert not [c for c in _calls(fake_beagle) if "loop-guard" in c["argv"]]
+
+
+def _awaiting_worker(
+    project: Path, fake: Path, *, driver: str = "session-1", minutes_ago: int = 5
+) -> None:
+    """A run driven by `driver`, waiting on a worker whose open task owns `src/`."""
+    at = (datetime.now(UTC) - timedelta(minutes=minutes_ago)).isoformat()
+    record = {
+        "started_at": at,
+        "driver_session": driver,
+        "awaiting": "step-executor on T0002",
+        "awaiting_at": at,
+        "awaiting_minutes": 30,
+    }
+    (project / ".beagle" / "loop.json").write_text(json.dumps(record), encoding="utf-8")
+    (fake / "read.out").write_text(json.dumps(record), encoding="utf-8")
+    (fake / "tree.out").write_text(json.dumps([{"id": "T0002", "status": "open"}]))
+    (fake / "show.out").write_text(json.dumps({"id": "T0002", "scope": ["src/", "Makefile"]}))
+
+
+@pytest.mark.anyio
+async def test_driver_is_kept_out_of_an_awaited_workers_scope(
+    tmp_path: Path, beagle: Path, fake_beagle: Path
+) -> None:
+    project = _pursuit_project(tmp_path)
+    _awaiting_worker(project, fake_beagle)
+    runtime, _ = _bound(tmp_path)
+    edit, bash = _tool_with_hooks(runtime, "edit"), _tool_with_hooks(runtime, "bash")
+
+    blocked = [
+        await edit.execute("c1", {"path": "src/app.py", "old_text": "a", "new_text": "b"}),
+        await bash.execute("c2", {"command": "sed -i s/a/b/ src/app.py"}),
+        await bash.execute("c3", {"command": "echo all: > Makefile"}),
+        await bash.execute("c4", {"command": "rm -rf src"}),
+        await bash.execute("c5", {"command": "git reset --hard"}),
+    ]
+    allowed = [
+        await edit.execute("c6", {"path": "docs/notes.md", "old_text": "a", "new_text": "b"}),
+        await bash.execute("c7", {"command": "grep -rn TODO src > /tmp/todo.txt"}),
+        await bash.execute("c8", {"command": "pytest src"}),
+    ]
+
+    assert all("refusing to write" in r.text for r in blocked), [r.text for r in blocked]
+    assert "T0002" in blocked[0].text and "`src/`" in blocked[0].text
+    assert "bare `beagle loop tick`" in blocked[0].text
+    assert [r.text for r in allowed] == ["ran"] * 3
+    # The loop record did not change, so beagle was asked once.
+    assert [c["argv"][1] for c in _calls(fake_beagle)] == ["read", "tree", "show"]
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(("driver", "minutes_ago"), [("subagent-session", 5), ("session-1", 31)])
+async def test_scope_guard_passes_subagents_and_lapsed_waits(
+    tmp_path: Path, beagle: Path, fake_beagle: Path, driver: str, minutes_ago: int
+) -> None:
+    project = _pursuit_project(tmp_path)
+    _awaiting_worker(project, fake_beagle, driver=driver, minutes_ago=minutes_ago)
+    runtime, _ = _bound(tmp_path)
+
+    result = await _tool_with_hooks(runtime, "write").execute(
+        "c1", {"path": "src/app.py", "content": "x"}
+    )
+
+    assert result.text == "ran"
+
+
+@pytest.mark.anyio
+async def test_scope_guard_rereads_when_the_wait_is_cleared(
+    tmp_path: Path, beagle: Path, fake_beagle: Path
+) -> None:
+    project = _pursuit_project(tmp_path)
+    _awaiting_worker(project, fake_beagle)
+    runtime, _ = _bound(tmp_path)
+    write = _tool_with_hooks(runtime, "write")
+
+    before = await write.execute("c1", {"path": "src/app.py", "content": "x"})
+    cleared = {"started_at": "2026-01-01T00:00:00+00:00", "driver_session": "session-1"}
+    (project / ".beagle" / "loop.json").write_text(json.dumps(cleared) + "\n")
+    (fake_beagle / "read.out").write_text(json.dumps(cleared))
+    after = await write.execute("c2", {"path": "src/app.py", "content": "x"})
+
+    assert "refusing to write" in before.text
+    assert after.text == "ran"
 
 
 def _install_hooks(project: Path, *names: str, timeout: int = 900) -> None:
@@ -981,3 +1065,12 @@ def test_host_notes_name_the_merged_containment_launcher(tmp_path: Path, beagle:
     worker = (tmp_path / "agents" / "beagle-dev:step-executor.md").read_text(encoding="utf-8")
     assert f"`{launcher}/run_contained.sh`" in " ".join(worker.split())
     assert "${CLAUDE_PLUGIN_ROOT}" not in session.followed_up[0] + worker
+
+
+def test_host_note_names_worktree_isolation(tmp_path: Path, beagle: Path) -> None:
+    runtime, session = _bound(tmp_path)
+    _run_command(runtime, "pursuit-run")
+
+    note = " ".join(session.followed_up[0].split())
+    assert 'pass `isolation: "worktree"`' in note
+    assert "`isolated: true` is not that" in note
