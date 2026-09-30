@@ -35,6 +35,17 @@ def anyio_backend() -> str:
 EXTENSION = Path(__file__).resolve().parents[1] / "examples" / "extensions" / "beagle.py"
 
 
+PLUGINS = ("beagle-dev", "beagle-pursuit", "beagle-reference")
+
+
+def _marketplace(root: Path, plugins: dict[str, str]) -> None:
+    """Write beagle's marketplace manifest listing `plugins` (name -> source)."""
+    manifest = root / ".claude-plugin" / "marketplace.json"
+    manifest.parent.mkdir(parents=True, exist_ok=True)
+    entries = [{"name": name, "source": source} for name, source in plugins.items()]
+    manifest.write_text(json.dumps({"name": "beagle", "plugins": entries}), encoding="utf-8")
+
+
 def _skill(plugins: Path, plugin: str, name: str) -> Path:
     skill = plugins / plugin / "skills" / name
     skill.mkdir(parents=True)
@@ -46,9 +57,14 @@ def _skill(plugins: Path, plugin: str, name: str) -> Path:
 
 @pytest.fixture
 def beagle(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
-    """A fake beagle checkout with the three plugins the extension reads."""
+    """A fake beagle checkout: three plugins, listed in a marketplace manifest."""
     root = tmp_path / "beagle"
     plugins = root / "plugins"
+    for plugin in PLUGINS:
+        manifest = plugins / plugin / ".claude-plugin" / "plugin.json"
+        manifest.parent.mkdir(parents=True)
+        manifest.write_text(json.dumps({"name": plugin}), encoding="utf-8")
+    _marketplace(root, {plugin: f"./plugins/{plugin}" for plugin in PLUGINS})
     _skill(plugins, "beagle-dev", "python-coding")
     _skill(plugins, "beagle-reference", "tilth-usage")
     for name in ("pursuit-dispatch", "offload", "containment", "hook-design"):
@@ -172,19 +188,89 @@ def _load(tmp_path: Path) -> ExtensionRuntime:
     return runtime
 
 
-def test_merged_plugin_root_links_loaded_skills(tmp_path: Path, beagle: Path) -> None:
+def test_merged_plugin_root_links_every_plugins_skills(tmp_path: Path, beagle: Path) -> None:
     runtime = _load(tmp_path)
     root = tmp_path / "home-tau" / "beagle-plugin"
 
     assert runtime.skill_dirs == (root / "skills",)
     linked = sorted(p.name for p in (root / "skills").iterdir())
-    # Every beagle-dev / beagle-reference skill, but only the named pursuit ones.
-    assert linked == ["containment", "offload", "pursuit-dispatch", "python-coding", "tilth-usage"]
+    assert linked == [
+        "containment",
+        "hook-design",
+        "offload",
+        "pursuit-dispatch",
+        "python-coding",
+        "tilth-usage",
+    ]
     pursuit = beagle / "plugins" / "beagle-pursuit"
     assert (root / "skills" / "containment").resolve() == pursuit / "skills" / "containment"
     assert (root / "commands").resolve() == pursuit / "commands"
     assert (root / "agents").resolve() == beagle / "plugins" / "beagle-dev" / "agents"
     assert os.environ["CLAUDE_PLUGIN_ROOT"] == str(root)
+
+
+@pytest.mark.anyio
+async def test_layout_follows_the_marketplace_manifest(tmp_path: Path, beagle: Path) -> None:
+    # Moved and renamed: the manifest says where each plugin now lives.
+    shutil.move(beagle / "plugins", beagle / "pkgs")
+    (beagle / "pkgs" / "beagle-pursuit").rename(beagle / "pkgs" / "pursuit")
+    _marketplace(
+        beagle,
+        {
+            "beagle-dev": "./pkgs/beagle-dev",
+            "beagle-pursuit": "./pkgs/pursuit",
+            "beagle-reference": "./pkgs/beagle-reference",
+        },
+    )
+    runtime, _ = _bound(tmp_path)
+    await runtime.emit_session_start("startup")
+
+    root = tmp_path / "home-tau" / "beagle-plugin"
+    pursuit = beagle / "pkgs" / "pursuit"
+    assert (root / "commands").resolve() == pursuit / "commands"
+    assert (root / "skills" / "offload").resolve() == pursuit / "skills" / "offload"
+    registry = runtime.build_command_registry()
+    assert registry.get("pursuit") is not None and registry.get("pursuit-run") is not None
+    assert not [s for s in runtime.prompt_sections if s.title == "Beagle extension problems"]
+
+
+def test_checkout_without_a_manifest_is_scanned(tmp_path: Path, beagle: Path) -> None:
+    (beagle / ".claude-plugin" / "marketplace.json").unlink()
+    (beagle / "plugins" / "stale-tooling-only").mkdir()  # no plugin.json: not a plugin
+
+    runtime = _load(tmp_path)
+
+    root = tmp_path / "home-tau" / "beagle-plugin"
+    assert (root / "commands").resolve() == beagle / "plugins" / "beagle-pursuit" / "commands"
+    assert runtime.build_command_registry().get("pursuit-run") is not None
+
+
+@pytest.mark.anyio
+async def test_missing_plugin_and_skill_clash_are_reported(tmp_path: Path, beagle: Path) -> None:
+    _marketplace(
+        beagle,
+        {
+            "beagle-dev": "./plugins/beagle-dev",
+            "beagle-pursuit": "./plugins/beagle-pursuit",
+            "beagle-reference": "./plugins/beagle-reference",
+            "beagle-gone": "./plugins/beagle-gone",
+        },
+    )
+    _skill(beagle / "plugins", "beagle-reference", "offload")
+    runtime = _load(tmp_path)
+    session = RecordingSession(tmp_path / "project", running=False)
+    ui = RecordingUiBridge(has_ui=True)
+    runtime.set_ui_bridge(ui)  # type: ignore[arg-type]
+    runtime.bind(session)  # type: ignore[arg-type]
+
+    await runtime.emit_session_start("startup")
+
+    [(notice, level)] = ui.notifications
+    assert level == "warning"
+    assert "lists beagle-gone at ./plugins/beagle-gone, which is missing" in notice
+    assert "'offload' ships in both beagle-pursuit and beagle-reference" in notice
+    offload = tmp_path / "home-tau" / "beagle-plugin" / "skills" / "offload"
+    assert offload.resolve() == beagle / "plugins" / "beagle-pursuit" / "skills" / "offload"
 
 
 def test_merged_plugin_root_prunes_only_stale_symlinks(tmp_path: Path, beagle: Path) -> None:
@@ -199,20 +285,6 @@ def test_merged_plugin_root_prunes_only_stale_symlinks(tmp_path: Path, beagle: P
     assert not (skills / "gone").is_symlink()
     assert (skills / "mine").is_dir()
     assert (skills / "python-coding").is_symlink()
-
-
-def test_pre_rename_checkout_still_loads_from_campaign(tmp_path: Path, beagle: Path) -> None:
-    plugins = beagle / "plugins"
-    (plugins / "beagle-pursuit").rename(plugins / "beagle-campaign")
-
-    runtime = _load(tmp_path)
-
-    root = tmp_path / "home-tau" / "beagle-plugin"
-    campaign = plugins / "beagle-campaign"
-    assert (root / "skills" / "offload").resolve() == campaign / "skills" / "offload"
-    assert (root / "commands").resolve() == campaign / "commands"
-    registry = runtime.build_command_registry()
-    assert registry.get("pursuit") is not None and registry.get("pursuit-run") is not None
 
 
 def test_renamed_checkout_relinks_and_drops_dangling_trees(tmp_path: Path, beagle: Path) -> None:
@@ -251,7 +323,7 @@ async def test_missing_driver_is_not_registered_and_is_reported(
     assert level == "warning"
     assert "/pursuit-run is not registered" in notice and "pursuit-run.md" in notice
     [section] = [s for s in runtime.prompt_sections if s.title == "Beagle extension problems"]
-    assert "Do not offer these commands" in section.body
+    assert "Do not offer a command listed here" in section.body
 
 
 def test_complete_checkout_reports_no_problems(tmp_path: Path, beagle: Path) -> None:

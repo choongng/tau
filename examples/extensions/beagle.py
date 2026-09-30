@@ -10,20 +10,25 @@ counted loop. A pursuit is a goal, a task tree grown by doing the work, and a
 `done_when` command bound before the work it judges. The pieces below exist
 because a specific part of that model has no Tau equivalent:
 
-- **Skills** — a pursuit's own guidance arrives only if it is loaded. Beagle's
-  pursuit skills live in the `beagle-pursuit` plugin (`beagle-campaign` in
-  checkouts before the rename), beside the engineering-practice skills in
-  `beagle-dev`, and both sets run scripts from
-  `${CLAUDE_PLUGIN_ROOT}/skills/<name>/...`. Claude Code sets that variable per
-  plugin; a shell has one. So the extension links every skill it loads into
-  one merged plugin root under the Tau home, points `CLAUDE_PLUGIN_ROOT` at it,
-  and registers its `skills/` — every script path then resolves, whichever
-  plugin shipped it, taking only the named pursuit skills from their plugin.
+- **Skills** — a pursuit's own guidance arrives only if it is loaded. Which
+  plugins the checkout ships, and where, is read from beagle's marketplace
+  manifest (`.claude-plugin/marketplace.json`; a checkout without one is
+  scanned for `plugins/*/.claude-plugin/plugin.json`), never assumed: the
+  pursuit plugin is whichever holds the driver commands, the worker's is
+  whichever holds `agents/step-executor.md`. Every skill of every plugin is
+  loaded — no curated subset to go stale — and a name two plugins share is
+  taken from the first in manifest order and reported. Skills run scripts
+  from `${CLAUDE_PLUGIN_ROOT}/skills/<name>/...`. Claude Code sets that
+  variable per plugin; a shell has one. So the extension links every skill
+  into one merged plugin root under the Tau home, points `CLAUDE_PLUGIN_ROOT`
+  at it, and registers its `skills/` — every script path then resolves,
+  whichever plugin shipped it. A listed plugin that is missing, a manifest
+  that does not parse, or a missing driver is said at session start (a
+  warning, and a prompt section), not degraded quietly.
 - **`/pursuit`** — the driver. Injects the command's own text as the turn, in
   the `<skill>` block `/skill:<name>` sends, with `${CLAUDE_PLUGIN_ROOT}`
   spelled out as the merged root. Registered only when the checkout has the
-  driver file; a checkout that is present but lacks it is reported at session
-  start and in the prompt, not degraded quietly.
+  driver file.
 - **`pursuit_dispatch`** — a headless `step-executor`. Tau has no Task tool, so
   delegation is a nested `tau -p` run: the step-executor persona appended, the
   target dir set with `--cwd`, and the model inherited from the session unless
@@ -50,8 +55,8 @@ because a specific part of that model has no Tau equivalent:
   parent's, and keeps the parent's session id.
 - **agent types** — background dispatch, completion notices and messaging a
   running worker come from the separate tau-subagents extension. This module
-  only feeds it: each `beagle-dev` agent is written as an agent type
-  `~/.tau/agents/beagle-dev:<agent>.md`, its Claude tool grants mapped onto
+  only feeds it: each agent a beagle plugin ships is written as an agent type
+  `~/.tau/agents/<plugin>:<agent>.md`, its Claude tool grants mapped onto
   Tau's, so the driver's `beagle-dev:step-executor` resolves by name. Without
   tau-subagents the files are unused and `pursuit_dispatch` stands in.
 
@@ -95,35 +100,17 @@ from tau_coding.skills import Skill, format_skill_invocation
 BEAGLE = Path(os.environ.get("BEAGLE_ROOT") or Path.home() / "beagle").expanduser()
 BEAGLE_BIN = os.environ.get("BEAGLE_BIN", "beagle")
 TAU_BIN = os.environ.get("TAU_BIN", "tau")
-PLUGINS = BEAGLE / "plugins"
-
-#: The plugin that ships the pursuit driver and its skills, newest name first:
-#: beagle renamed `beagle-campaign` to `beagle-pursuit`, and an older checkout
-#: still has only the old name. The first one holding a thing wins.
-PURSUIT_PLUGINS = ("beagle-pursuit", "beagle-campaign")
-#: The pursuit skills, taken by name from the pursuit plugin rather than all of
-#: it — `containment` because a worker's brief names its `run_contained.sh` for
-#: every heavy command.
-PURSUIT_SKILLS = ("pursuit-dispatch", "offload", "containment")
-#: Skills linked into the merged root, per plugin; None means all of them.
-#: Order matters: a name is taken from the first plugin that has it.
-SKILL_SOURCES: Mapping[str, tuple[str, ...] | None] = {
-    "beagle-dev": None,
-    "beagle-reference": None,
-    **{plugin: PURSUIT_SKILLS for plugin in PURSUIT_PLUGINS},
-}
-#: Non-skill trees a driver or skill reaches through `${CLAUDE_PLUGIN_ROOT}`,
-#: each with its candidates in preference order.
-PLUGIN_ROOT_LINKS: Mapping[str, tuple[Path, ...]] = {
-    "commands": tuple(PLUGINS / plugin / "commands" for plugin in PURSUIT_PLUGINS),
-    "agents": (PLUGINS / "beagle-dev" / "agents",),
-}
+#: Beagle's marketplace manifest: which plugins the checkout ships, in order,
+#: and where each lives. The layout is read from it, never assumed.
+MARKETPLACE = Path(".claude-plugin") / "marketplace.json"
+#: A plugin's own manifest, for a checkout with no marketplace file.
+PLUGIN_MANIFEST = Path(".claude-plugin") / "plugin.json"
+#: What makes a plugin the pursuit plugin, and which one ships the worker.
+DRIVER_DIR = Path("commands")
+STEP_EXECUTOR_REL = Path("agents") / "step-executor.md"
 #: The merged plugin root, under the Tau home (so `TAU_HOME` profiles each
 #: get their own).
 MERGED_ROOT_NAME = "beagle-plugin"
-#: Plugins whose `agents/*.md` become tau-subagents agent types, named
-#: `<plugin>:<agent>` so the driver's `beagle-dev:step-executor` resolves as is.
-AGENT_PLUGINS = ("beagle-dev",)
 #: Where tau-subagents reads user agent types (it uses `~`, not `TAU_HOME`).
 AGENTS_DIR = Path(
     os.environ.get("BEAGLE_TAU_AGENTS_DIR") or Path.home() / ".tau" / "agents"
@@ -142,7 +129,6 @@ AGENT_TOOL_MAP = {
     "Glob": "bash",
 }
 
-STEP_EXECUTOR = PLUGINS / "beagle-dev" / "agents" / "step-executor.md"
 PURSUIT_COMMAND = "pursuit.md"
 PURSUIT_RUN_COMMAND = "pursuit-run.md"
 PLUGIN_ROOT_VAR = "${CLAUDE_PLUGIN_ROOT}"
@@ -215,21 +201,144 @@ def _find_goal(start: Path | None) -> Path | None:
     return None
 
 
+@dataclass(frozen=True)
+class Layout:
+    """The beagle checkout's plugins, as its own manifests describe them.
+
+    `plugins` is (name, directory) in manifest order, which is also the order
+    ties break in: a skill, driver or agents tree is taken from the first
+    plugin that has it. `problems` are what a user should hear at session
+    start — a listed plugin that is missing, a manifest that does not parse,
+    a skill two plugins both ship.
+    """
+
+    plugins: tuple[tuple[str, Path], ...] = ()
+    found_by: str = ""
+    problems: tuple[str, ...] = ()
+
+    def first(self, rel: Path) -> Path | None:
+        """`<plugin>/rel` from the first plugin where it exists."""
+        for _, directory in self.plugins:
+            if (directory / rel).exists():
+                return directory / rel
+        return None
+
+    @property
+    def commands_dir(self) -> Path | None:
+        """The pursuit plugin's `commands/`: the one holding a driver."""
+        for name in (PURSUIT_RUN_COMMAND, PURSUIT_COMMAND):
+            found = self.first(DRIVER_DIR / name)
+            if found is not None:
+                return found.parent
+        return None
+
+    @property
+    def step_executor(self) -> Path | None:
+        return self.first(STEP_EXECUTOR_REL)
+
+    @property
+    def agents_dir(self) -> Path | None:
+        """The `agents/` holding the step-executor, else the first there is."""
+        found = self.step_executor
+        return found.parent if found is not None else self.first(Path("agents"))
+
+    def skills(self) -> tuple[dict[str, Path], list[str]]:
+        """Every plugin's skills, name -> directory; and the clashes, described.
+
+        All of them, not a curated list: a pursuit's driver and briefs name
+        skills beyond the three it opens with (`state-stores`, `repo-hygiene`,
+        ...), and a curated list goes stale the day beagle adds one.
+        """
+        wanted: dict[str, Path] = {}
+        owner: dict[str, str] = {}
+        clashes: list[str] = []
+        for plugin, directory in self.plugins:
+            try:
+                children = sorted((directory / "skills").iterdir())
+            except OSError:
+                continue
+            for src in children:
+                if not (src / "SKILL.md").is_file():
+                    continue
+                if src.name in wanted:
+                    clashes.append(
+                        f"skill {src.name!r} ships in both {owner[src.name]} and {plugin}; "
+                        f"{owner[src.name]}'s is loaded."
+                    )
+                    continue
+                wanted[src.name] = src
+                owner[src.name] = plugin
+        return wanted, clashes
+
+
+#: The checkout's plugins, resolved at setup.
+_LAYOUT = Layout()
+
+
+def _plugin_name(directory: Path) -> str:
+    try:
+        data = json.loads((directory / PLUGIN_MANIFEST).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return directory.name
+    name = data.get("name") if isinstance(data, dict) else None
+    return name if isinstance(name, str) and name else directory.name
+
+
+def resolve_layout(beagle: Path) -> Layout:
+    """Read which plugins `beagle` ships, and where, from its manifests.
+
+    The marketplace manifest first — it names each plugin and its `source`
+    directory, so a rename or a move is followed rather than broken. A
+    checkout without one is scanned: `plugins/*` directories that carry a
+    `plugin.json`, else every `plugins/*` directory. No beagle at all is an
+    empty layout with no problems: the extension then does less, quietly.
+    """
+    problems: list[str] = []
+    manifest = beagle / MARKETPLACE
+    if manifest.is_file():
+        try:
+            data = json.loads(manifest.read_text(encoding="utf-8"))
+            entries = data.get("plugins") if isinstance(data, dict) else None
+            if not isinstance(entries, list):
+                raise ValueError("no `plugins` list")
+        except (OSError, ValueError) as exc:
+            problems.append(f"{manifest} could not be read ({exc}); scanned the checkout instead.")
+        else:
+            plugins: list[tuple[str, Path]] = []
+            for entry in entries:
+                name = entry.get("name") if isinstance(entry, dict) else None
+                source = entry.get("source") if isinstance(entry, dict) else None
+                if not isinstance(name, str) or not isinstance(source, str):
+                    continue  # a remote source: nothing in this checkout to load
+                directory = Path(os.path.normpath(beagle / source))
+                if directory.is_dir():
+                    plugins.append((name, directory))
+                else:
+                    problems.append(f"{manifest} lists {name} at {source}, which is missing.")
+            if plugins:
+                return Layout(tuple(plugins), str(manifest), tuple(problems))
+    scanned = beagle / "plugins"
+    try:
+        dirs = sorted(d for d in scanned.iterdir() if d.is_dir())
+    except OSError:
+        return Layout(problems=tuple(problems))
+    chosen = [d for d in dirs if (d / PLUGIN_MANIFEST).is_file()] or dirs
+    plugins = tuple((_plugin_name(d), d) for d in chosen)
+    return Layout(plugins, f"a scan of {scanned}", tuple(problems))
+
+
 def _driver_file(name: str) -> Path | None:
     """The pursuit plugin's command file `name`, from the first plugin that has it."""
-    for commands in PLUGIN_ROOT_LINKS["commands"]:
-        path = commands / name
-        if path.is_file():
-            return path
-    return None
+    return _LAYOUT.first(DRIVER_DIR / name)
 
 
 def _driver_missing(name: str) -> str:
     """Why a driver command cannot run: where it was looked for."""
-    looked = ", ".join(str(commands / name) for commands in PLUGIN_ROOT_LINKS["commands"])
+    plugins = ", ".join(f"{n} ({d})" for n, d in _LAYOUT.plugins) or "none found"
     return (
-        f"beagle's {name} driver was not found (looked in {looked}). The beagle "
-        f"checkout at {BEAGLE} may predate or postdate this extension's layout."
+        f"beagle's {name} driver was not found in the commands/ of any plugin "
+        f"({plugins}; from {_LAYOUT.found_by or BEAGLE}). The beagle checkout at "
+        f"{BEAGLE} may predate or postdate this extension."
     )
 
 
@@ -659,9 +768,11 @@ def make_dispatch() -> Any:
             else _SEEN_CWD or Path.cwd()
         )
 
-        if not STEP_EXECUTOR.is_file():
+        step_executor = _LAYOUT.step_executor
+        if step_executor is None:
             return _make_dispatch_result(
-                f"pursuit_dispatch: step-executor persona not found at {STEP_EXECUTOR}."
+                "pursuit_dispatch: no beagle plugin ships "
+                f"{STEP_EXECUTOR_REL} (looked in {_LAYOUT.found_by or BEAGLE})."
             )
 
         model = _worker_model(arguments.get("model"))
@@ -680,7 +791,7 @@ def make_dispatch() -> Any:
             "--cwd",
             str(cwd),
             "--append-system-prompt",
-            str(STEP_EXECUTOR),
+            str(step_executor),
         ]
         if provider:
             cmd += ["--provider", provider]
@@ -1320,23 +1431,6 @@ def _goal_section(goal_file: Path) -> str | None:
 # --------------------------------------------------------------------------- #
 
 
-def _wanted_skills() -> dict[str, Path]:
-    """Skill name -> its directory in the checkout, for every skill to load."""
-    wanted: dict[str, Path] = {}
-    for plugin, names in SKILL_SOURCES.items():
-        skills = PLUGINS / plugin / "skills"
-        if names is None:
-            try:
-                names = tuple(sorted(child.name for child in skills.iterdir()))
-            except OSError:
-                continue
-        for name in names:
-            src = skills / name
-            if (src / "SKILL.md").is_file():
-                wanted.setdefault(name, src)
-    return wanted
-
-
 def _sync_link(link: Path, target: Path) -> None:
     """Point `link` at `target`, replacing only a symlink this module could own."""
     try:
@@ -1364,7 +1458,7 @@ def build_plugin_root(root: Path) -> Path | None:
         skills_dir.mkdir(parents=True, exist_ok=True)
     except OSError:
         return None
-    wanted = _wanted_skills()
+    wanted, _ = _LAYOUT.skills()
     try:
         existing = list(skills_dir.iterdir())
     except OSError:
@@ -1375,8 +1469,7 @@ def build_plugin_root(root: Path) -> Path | None:
                 entry.unlink()
     for name, src in wanted.items():
         _sync_link(skills_dir / name, src)
-    for name, candidates in PLUGIN_ROOT_LINKS.items():
-        target = next((c for c in candidates if c.is_dir()), None)
+    for name, target in (("commands", _LAYOUT.commands_dir), ("agents", _LAYOUT.agents_dir)):
         if target is not None:
             _sync_link(root / name, target)
         elif (root / name).is_symlink():
@@ -1432,9 +1525,9 @@ def sync_agent_types(agents_dir: Path) -> list[str]:
     type whose beagle agent is gone is pruned rather than left to go stale.
     """
     wanted: dict[str, str] = {}
-    for plugin in AGENT_PLUGINS:
+    for plugin, directory in _LAYOUT.plugins:
         try:
-            sources = sorted((PLUGINS / plugin / "agents").glob("*.md"))
+            sources = sorted((directory / "agents").glob("*.md"))
         except OSError:
             continue
         for src in sources:
@@ -1473,14 +1566,17 @@ def sync_agent_types(agents_dir: Path) -> list[str]:
 
 
 def setup(tau: ExtensionAPI) -> None:
-    global _SEEN_CWD, _PLUGIN_ROOT
+    global _SEEN_CWD, _PLUGIN_ROOT, _LAYOUT
+    _LAYOUT = resolve_layout(BEAGLE)
+    problems: list[str] = list(_LAYOUT.problems)
     # 1-2. Load the engineering-practice and pursuit skills from one merged
     #      plugin root. Skills run scripts from ${CLAUDE_PLUGIN_ROOT}/skills/...;
     #      the bash tool's subprocesses inherit this process env, so exporting
     #      the merged root makes every such path resolve, whichever plugin
     #      shipped the skill. Overwritten rather than defaulted: one inherited
     #      from a Claude Code shell names a single plugin and resolves half.
-    if PLUGINS.is_dir():
+    if _LAYOUT.plugins:
+        problems += _LAYOUT.skills()[1]
         root = tau.context.paths.home / MERGED_ROOT_NAME
         skills_dir = build_plugin_root(root)
         if skills_dir is not None:
@@ -1496,14 +1592,13 @@ def setup(tau: ExtensionAPI) -> None:
     #    reads, to a model listing its commands, as a loop it can offer. A
     #    checkout that is present but lacks a driver is a layout mismatch, not
     #    an absent install, so it is said aloud rather than degraded quietly.
-    problems: list[str] = []
     if _driver_file(PURSUIT_COMMAND) is not None:
         tau.register_command(
             "pursuit",
             _command_pursuit,
             description="Found or run a beagle pursuit — one goal, a task tree, no denominator.",
         )
-    elif PLUGINS.is_dir():
+    elif _LAYOUT.plugins:
         problems.append(f"/pursuit is not registered: {_driver_missing(PURSUIT_COMMAND)}")
     tau.register_command(
         "pursuit-view",
@@ -1553,7 +1648,7 @@ def setup(tau: ExtensionAPI) -> None:
                 _command_pursuit_run,
                 description="Run a beagle pursuit task after task until it cannot move.",
             )
-        elif PLUGINS.is_dir():
+        elif _LAYOUT.plugins:
             problems.append(
                 f"/pursuit-run is not registered: {_driver_missing(PURSUIT_RUN_COMMAND)}"
             )
@@ -1587,8 +1682,9 @@ def setup(tau: ExtensionAPI) -> None:
         tau.add_prompt_section(
             "Beagle extension problems",
             "\n".join(f"- {p}" for p in problems)
-            + "\n\nDo not offer these commands to the user or say the pursuit loop is "
-            "available; tell them the extension and the beagle checkout disagree.",
+            + "\n\nDo not offer a command listed here as not registered, or say the "
+            "pursuit loop is available when it is not; tell the user the extension and the "
+            "beagle checkout disagree.",
         )
 
     # 7. If this project is a pursuit, pin its goal into the prompt at load —
