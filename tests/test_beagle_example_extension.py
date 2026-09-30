@@ -17,7 +17,7 @@ from typing import Any
 import pytest
 
 from tau_agent.events import AgentEndEvent
-from tau_agent.messages import AssistantMessage, TextContent
+from tau_agent.messages import AssistantMessage, TextContent, UserMessage
 from tau_agent.tools import AgentTool, AgentToolResult
 from tau_coding.commands import CommandContext
 from tau_coding.events import AgentSettledEvent
@@ -744,3 +744,39 @@ async def test_guard_falls_back_to_blocking_an_unparseable_write(
     )
 
     assert result.text.startswith("Tool call blocked:")
+
+
+@pytest.mark.anyio
+async def test_repeat_wakeup_sends_a_stub_until_the_driver_leaves_context(
+    tmp_path: Path, beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runtime, session = _bound(tmp_path)
+    timers = _capture_timers(monkeypatch)
+    wakeup = _tool(runtime, "pursuit_wakeup")
+
+    await wakeup.execute("c1", {})
+    await _fire(timers[0])
+    [full] = session.followed_up
+    session.messages = (UserMessage(content=full),)  # the driver is now in context
+    await wakeup.execute("c2", {})
+    await _fire(timers[1])
+    session.messages = (UserMessage(content="Summary of the earlier conversation."),)
+    await wakeup.execute("c3", {})
+    await _fire(timers[2])
+
+    first, stub, after_compaction = session.followed_up
+    assert parse_skill_invocation(first) is not None
+    assert stub.startswith("/pursuit-run\n\n(A `pursuit_wakeup`.")
+    assert "already in this conversation" in stub and "Host mapping" not in stub
+    assert after_compaction == first
+
+
+def test_explicit_pursuit_run_always_sends_the_full_driver(tmp_path: Path, beagle: Path) -> None:
+    runtime, session = _bound(tmp_path)
+
+    _run_command(runtime, "pursuit-run")
+    session.messages = (UserMessage(content=session.followed_up[0]),)
+    _run_command(runtime, "pursuit-run")
+
+    first, second = session.followed_up
+    assert first == second and parse_skill_invocation(second) is not None

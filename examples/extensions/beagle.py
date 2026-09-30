@@ -1052,10 +1052,43 @@ async def _deliver_wakeup(tau: ExtensionAPI, wakeup: _Wakeup, settling: bool) ->
         if not settling and tau.context.is_running:
             return  # still pending; the settle delivers it
     _void_wakeup()
-    name, _, args = wakeup.prompt.strip().partition(" ")
-    text = _DRIVER_TURNS[name](args) if name in _DRIVER_TURNS else None
     with contextlib.suppress(Exception):  # a reloaded or closed session: nothing to wake
-        tau.send_user_message(text if text is not None else wakeup.prompt)
+        tau.send_user_message(_wakeup_turn(tau, wakeup.prompt))
+
+
+def _in_context(tau: ExtensionAPI, text: str) -> bool:
+    """Whether a user message in the live context still carries `text` verbatim.
+
+    Read from the transcript rather than remembered, so a compaction (which
+    folds old turns into a summary), a resume or a branch all count as the
+    driver being gone, and so does a driver file that changed since.
+    """
+    try:
+        transcript = tau.context.transcript
+    except Exception:  # noqa: BLE001 - unknown means "send it in full"
+        return False
+    return any(
+        getattr(message, "role", None) == "user" and text in message.text for message in transcript
+    )
+
+
+def _wakeup_turn(tau: ExtensionAPI, prompt: str) -> str:
+    """What a wakeup sends: its prompt, with a driver command expanded.
+
+    An extension's message reaches the model as text, not through the slash
+    command parser, so a driver command is expanded here — in full the first
+    time, and as a short resume stub while the full driver is still in the
+    context, since a loop's every wakeup re-sending several pages of an
+    unchanged skill is most of what it would spend.
+    """
+    name, _, args = prompt.strip().partition(" ")
+    expand = _DRIVER_TURNS.get(name)
+    block = expand("") if expand is not None else None
+    if expand is None or block is None:
+        return prompt
+    if _in_context(tau, block):
+        return RESUME_STUB.format(prompt=prompt.strip(), name=name)
+    return expand(args) or prompt
 
 
 def make_wakeup_delivery(tau: ExtensionAPI) -> Any:
@@ -1156,6 +1189,14 @@ WAKEUP_PARAMETERS = {
         },
     },
 }
+
+#: A repeat wakeup's turn while the driver it names is still in the context.
+RESUME_STUB = """\
+{prompt}
+
+(A `pursuit_wakeup`. The `{name}` driver and its Tau host mapping are already \
+in this conversation, unchanged since they were loaded; do not reload them. \
+Continue the loop from its next step.)"""
 
 #: Read before `pursuit-run.md`, which names Claude Code's tools and hooks.
 TAU_HOST_NOTE = """\
