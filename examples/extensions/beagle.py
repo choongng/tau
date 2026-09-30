@@ -10,20 +10,25 @@ counted loop. A pursuit is a goal, a task tree grown by doing the work, and a
 `done_when` command bound before the work it judges. The pieces below exist
 because a specific part of that model has no Tau equivalent:
 
-- **Skills** — a pursuit's own guidance arrives only if it is loaded. Beagle's
-  pursuit skills live in the `beagle-pursuit` plugin (`beagle-campaign` in
-  checkouts before the rename), beside the engineering-practice skills in
-  `beagle-dev`, and both sets run scripts from
-  `${CLAUDE_PLUGIN_ROOT}/skills/<name>/...`. Claude Code sets that variable per
-  plugin; a shell has one. So the extension links every skill it loads into
-  one merged plugin root under the Tau home, points `CLAUDE_PLUGIN_ROOT` at it,
-  and registers its `skills/` — every script path then resolves, whichever
-  plugin shipped it, taking only the named pursuit skills from their plugin.
+- **Skills** — a pursuit's own guidance arrives only if it is loaded. Which
+  plugins the checkout ships, and where, is read from beagle's marketplace
+  manifest (`.claude-plugin/marketplace.json`; a checkout without one is
+  scanned for `plugins/*/.claude-plugin/plugin.json`), never assumed: the
+  pursuit plugin is whichever holds the driver commands, the worker's is
+  whichever holds `agents/step-executor.md`. Every skill of every plugin is
+  loaded — no curated subset to go stale — and a name two plugins share is
+  taken from the first in manifest order and reported. Skills run scripts
+  from `${CLAUDE_PLUGIN_ROOT}/skills/<name>/...`. Claude Code sets that
+  variable per plugin; a shell has one. So the extension links every skill
+  into one merged plugin root under the Tau home, points `CLAUDE_PLUGIN_ROOT`
+  at it, and registers its `skills/` — every script path then resolves,
+  whichever plugin shipped it. A listed plugin that is missing, a manifest
+  that does not parse, or a missing driver is said at session start (a
+  warning, and a prompt section), not degraded quietly.
 - **`/pursuit`** — the driver. Injects the command's own text as the turn, in
   the `<skill>` block `/skill:<name>` sends, with `${CLAUDE_PLUGIN_ROOT}`
   spelled out as the merged root. Registered only when the checkout has the
-  driver file; a checkout that is present but lacks it is reported at session
-  start and in the prompt, not degraded quietly.
+  driver file.
 - **`pursuit_dispatch`** — a headless `step-executor`. Tau has no Task tool, so
   delegation is a nested `tau -p` run: the step-executor persona appended, the
   target dir set with `--cwd`, and the model inherited from the session unless
@@ -36,6 +41,13 @@ because a specific part of that model has no Tau equivalent:
   agent can meet by editing them. The founding write is allowed (the file does
   not exist yet); editing it after founding is blocked. This fails open: a hook
   that raised on its own error would block the very tool call it inspects.
+- **scope guard** — while `/pursuit-run` waits on a background worker
+  (`beagle loop tick --awaiting`, inside its lease), the driver session's
+  edit, write and writing-bash calls into an open task's declared `scope`
+  are refused: two writers on one tree lose one's work. Only the recorded
+  driver session is held; a subagent's calls carry its own session id. A
+  cancelled worker sends no notice to end that wait, so a `stop_subagent`
+  result while one stands says to clear it with a bare `beagle loop tick`.
 - **orientation** — when the project is a pursuit, its goal and criteria are
   added to the system prompt at load, so the driver re-reads the goal every
   session without anything triggering a turn. It is a frame, not an order.
@@ -43,15 +55,27 @@ because a specific part of that model has no Tau equivalent:
 - **`/pursuit-run`** — the uncounted loop around `/pursuit`, which needs three
   things Claude Code gives it: a session id beagle records as the run's driver
   (exported as `CLAUDE_CODE_SESSION_ID`), a way to arm the next turn
-  (`pursuit_wakeup`, standing in for `ScheduleWakeup`), and the hooks —
-  `loop-guard` on `agent_settled`, `commit-claims` on bash `tool_call`. The
-  driver text is prefixed with a short note mapping its Claude Code names onto
-  these. A dispatched worker runs none of the loop: it is one step of its
+  (`pursuit_wakeup`, standing in for `ScheduleWakeup`), and the hooks (next
+  bullet). The driver text is prefixed with a short note mapping its Claude
+  Code names onto these. A dispatched worker runs none of the loop: it is one step of its
   parent's, and keeps the parent's session id.
+- **hooks** — Tau never reads `.claude/settings.json`, so beagle's hooks run
+  here, on Tau's seams: Stop hooks on `agent_settled` (objections joined into
+  one more turn, and `stop_hook_active` set on the settle it produces),
+  SessionStart hooks at load into the system prompt, and Bash PreToolUse hooks
+  on the bash `tool_call`. `loop-guard`, `loop-report` and `commit-claims` run
+  in any pursuit; `close-out`, `cadence`, `cadence-report` and
+  `commit-trailer` run when `beagle hooks install` put them in the project's
+  settings, under their installed timeouts — installing is how to switch them
+  on under Tau as well. `tilth-load` (a Claude Code ToolSearch reminder) and
+  `transcript-guard` (which needs a transcript path Tau does not expose) are
+  not bridged; if installed, a one-time note at session start says so.
+- **`BEAGLE_HOST=tau`** — set for every subprocess, so beagle can tell a Tau
+  host from Claude Code, whose `CLAUDE_*` variables this extension borrows.
 - **agent types** — background dispatch, completion notices and messaging a
   running worker come from the separate tau-subagents extension. This module
-  only feeds it: each `beagle-dev` agent is written as an agent type
-  `~/.tau/agents/beagle-dev:<agent>.md`, its Claude tool grants mapped onto
+  only feeds it: each agent a beagle plugin ships is written as an agent type
+  `~/.tau/agents/<plugin>:<agent>.md`, its Claude tool grants mapped onto
   Tau's, so the driver's `beagle-dev:step-executor` resolves by name. Without
   tau-subagents the files are unused and `pursuit_dispatch` stands in.
 
@@ -63,13 +87,17 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import fnmatch
 import json
 import math
 import os
 import re
+import shlex
 import subprocess
 import tomllib
 from collections.abc import Mapping
+from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -84,6 +112,7 @@ from tau_coding.extensions import (
     ExtensionAPI,
     ExtensionContext,
     ToolCallHookResult,
+    ToolResultHookResult,
 )
 from tau_coding.resources import parse_markdown_resource
 from tau_coding.skills import Skill, format_skill_invocation
@@ -92,35 +121,17 @@ from tau_coding.skills import Skill, format_skill_invocation
 BEAGLE = Path(os.environ.get("BEAGLE_ROOT") or Path.home() / "beagle").expanduser()
 BEAGLE_BIN = os.environ.get("BEAGLE_BIN", "beagle")
 TAU_BIN = os.environ.get("TAU_BIN", "tau")
-PLUGINS = BEAGLE / "plugins"
-
-#: The plugin that ships the pursuit driver and its skills, newest name first:
-#: beagle renamed `beagle-campaign` to `beagle-pursuit`, and an older checkout
-#: still has only the old name. The first one holding a thing wins.
-PURSUIT_PLUGINS = ("beagle-pursuit", "beagle-campaign")
-#: The pursuit skills, taken by name from the pursuit plugin rather than all of
-#: it — `containment` because a worker's brief names its `run_contained.sh` for
-#: every heavy command.
-PURSUIT_SKILLS = ("pursuit-dispatch", "offload", "containment")
-#: Skills linked into the merged root, per plugin; None means all of them.
-#: Order matters: a name is taken from the first plugin that has it.
-SKILL_SOURCES: Mapping[str, tuple[str, ...] | None] = {
-    "beagle-dev": None,
-    "beagle-reference": None,
-    **{plugin: PURSUIT_SKILLS for plugin in PURSUIT_PLUGINS},
-}
-#: Non-skill trees a driver or skill reaches through `${CLAUDE_PLUGIN_ROOT}`,
-#: each with its candidates in preference order.
-PLUGIN_ROOT_LINKS: Mapping[str, tuple[Path, ...]] = {
-    "commands": tuple(PLUGINS / plugin / "commands" for plugin in PURSUIT_PLUGINS),
-    "agents": (PLUGINS / "beagle-dev" / "agents",),
-}
+#: Beagle's marketplace manifest: which plugins the checkout ships, in order,
+#: and where each lives. The layout is read from it, never assumed.
+MARKETPLACE = Path(".claude-plugin") / "marketplace.json"
+#: A plugin's own manifest, for a checkout with no marketplace file.
+PLUGIN_MANIFEST = Path(".claude-plugin") / "plugin.json"
+#: What makes a plugin the pursuit plugin, and which one ships the worker.
+DRIVER_DIR = Path("commands")
+STEP_EXECUTOR_REL = Path("agents") / "step-executor.md"
 #: The merged plugin root, under the Tau home (so `TAU_HOME` profiles each
 #: get their own).
 MERGED_ROOT_NAME = "beagle-plugin"
-#: Plugins whose `agents/*.md` become tau-subagents agent types, named
-#: `<plugin>:<agent>` so the driver's `beagle-dev:step-executor` resolves as is.
-AGENT_PLUGINS = ("beagle-dev",)
 #: Where tau-subagents reads user agent types (it uses `~`, not `TAU_HOME`).
 AGENTS_DIR = Path(
     os.environ.get("BEAGLE_TAU_AGENTS_DIR") or Path.home() / ".tau" / "agents"
@@ -139,7 +150,6 @@ AGENT_TOOL_MAP = {
     "Glob": "bash",
 }
 
-STEP_EXECUTOR = PLUGINS / "beagle-dev" / "agents" / "step-executor.md"
 PURSUIT_COMMAND = "pursuit.md"
 PURSUIT_RUN_COMMAND = "pursuit-run.md"
 PLUGIN_ROOT_VAR = "${CLAUDE_PLUGIN_ROOT}"
@@ -161,22 +171,50 @@ GUARD_DISABLE_ENV = "BEAGLE_TAU_ALLOW_PURSUIT_EDIT"
 #: parent: it keeps the parent's session id and runs no loop of its own.
 WORKER_ENV = "BEAGLE_TAU_WORKER"
 
-#: Wall-clock cap on one `beagle hook` call; a hook that hangs fails open.
+#: Wall-clock cap on one bridged-by-default `beagle hook` call; a hook that
+#: hangs fails open. An installed hook gets its own entry's timeout instead.
 HOOK_TIMEOUT = 30.0
+#: Where Claude Code reads a project's hooks, the key beagle marks its own
+#: entries with, and the timeout `beagle hooks install` writes by default.
+SETTINGS_REL = Path(".claude") / "settings.json"
+HOOK_MARKER = "beagle"
+DEFAULT_HOOK_TIMEOUT = 900.0
+#: Installed Stop hooks bridged on `agent_settled`, in the order they run.
+STOP_HOOKS = ("cadence", "close-out")
+#: Every hook this extension runs, installed or not.
+BRIDGED_HOOKS = frozenset(
+    {"loop-guard", "loop-report", "commit-claims", *STOP_HOOKS, "cadence-report", "commit-trailer"}
+)
+#: Installed hooks deliberately not bridged, and why; said once at session start.
+UNBRIDGED_HOOKS = {
+    "tilth-load": "it prints a call to Claude Code's ToolSearch, which Tau does not have",
+    "transcript-guard": "it needs the session transcript path, which Tau does not give extensions",
+}
+#: Set for every beagle subprocess (and the bash tool's), so beagle can tell a
+#: Tau host from Claude Code, whose `CLAUDE_*` variables this extension borrows.
+HOST_ENV = "BEAGLE_HOST"
 #: The wakeup delay's bounds, in minutes (Claude Code clamps to 1..60 too).
 WAKEUP_MIN_MINUTES = 1
 WAKEUP_MAX_MINUTES = 60
+#: `beagle loop read`'s exit status when no run is in flight.
+LOOP_IDLE_EXIT = 3
+#: beagle's loop record (`beagle loop --file`'s default), watched only for
+#: change; what it says is read through `beagle loop read --json`.
+LOOP_REL = Path(".beagle") / "loop.json"
+#: How long beagle believes an `awaiting` with no `--for`, in minutes.
+AWAITING_TTL_MINUTES = 45
 
 #: Last session cwd the extension saw, so the dispatch tool (which gets no
 #: context) can default to the project it is working in.
 _SEEN_CWD: Path | None = None
 #: The merged plugin root once built, for spelling out driver text.
 _PLUGIN_ROOT: Path | None = None
-#: The armed `pursuit_wakeup`, if any. One at a time, like `ScheduleWakeup`.
-_WAKEUP: asyncio.TimerHandle | None = None
-#: Whether the run now settling was started by a loop-guard objection — the
-#: Stop hook's `stop_hook_active`, which lets the next stop through.
-_GUARD_OBJECTED = False
+#: The armed or fired-but-undelivered `pursuit_wakeup`, if any. One at a time,
+#: like `ScheduleWakeup`.
+_WAKEUP: _Wakeup | None = None
+#: Whether the run now settling was started by a Stop-hook objection — the
+#: hooks' `stop_hook_active`, which lets the next stop through.
+_STOP_BLOCKED = False
 #: Whether the last run ended on its own, rather than aborted or errored.
 _LAST_RUN_CLEAN = True
 
@@ -209,21 +247,144 @@ def _find_goal(start: Path | None) -> Path | None:
     return None
 
 
+@dataclass(frozen=True)
+class Layout:
+    """The beagle checkout's plugins, as its own manifests describe them.
+
+    `plugins` is (name, directory) in manifest order, which is also the order
+    ties break in: a skill, driver or agents tree is taken from the first
+    plugin that has it. `problems` are what a user should hear at session
+    start — a listed plugin that is missing, a manifest that does not parse,
+    a skill two plugins both ship.
+    """
+
+    plugins: tuple[tuple[str, Path], ...] = ()
+    found_by: str = ""
+    problems: tuple[str, ...] = ()
+
+    def first(self, rel: Path) -> Path | None:
+        """`<plugin>/rel` from the first plugin where it exists."""
+        for _, directory in self.plugins:
+            if (directory / rel).exists():
+                return directory / rel
+        return None
+
+    @property
+    def commands_dir(self) -> Path | None:
+        """The pursuit plugin's `commands/`: the one holding a driver."""
+        for name in (PURSUIT_RUN_COMMAND, PURSUIT_COMMAND):
+            found = self.first(DRIVER_DIR / name)
+            if found is not None:
+                return found.parent
+        return None
+
+    @property
+    def step_executor(self) -> Path | None:
+        return self.first(STEP_EXECUTOR_REL)
+
+    @property
+    def agents_dir(self) -> Path | None:
+        """The `agents/` holding the step-executor, else the first there is."""
+        found = self.step_executor
+        return found.parent if found is not None else self.first(Path("agents"))
+
+    def skills(self) -> tuple[dict[str, Path], list[str]]:
+        """Every plugin's skills, name -> directory; and the clashes, described.
+
+        All of them, not a curated list: a pursuit's driver and briefs name
+        skills beyond the three it opens with (`state-stores`, `repo-hygiene`,
+        ...), and a curated list goes stale the day beagle adds one.
+        """
+        wanted: dict[str, Path] = {}
+        owner: dict[str, str] = {}
+        clashes: list[str] = []
+        for plugin, directory in self.plugins:
+            try:
+                children = sorted((directory / "skills").iterdir())
+            except OSError:
+                continue
+            for src in children:
+                if not (src / "SKILL.md").is_file():
+                    continue
+                if src.name in wanted:
+                    clashes.append(
+                        f"skill {src.name!r} ships in both {owner[src.name]} and {plugin}; "
+                        f"{owner[src.name]}'s is loaded."
+                    )
+                    continue
+                wanted[src.name] = src
+                owner[src.name] = plugin
+        return wanted, clashes
+
+
+#: The checkout's plugins, resolved at setup.
+_LAYOUT = Layout()
+
+
+def _plugin_name(directory: Path) -> str:
+    try:
+        data = json.loads((directory / PLUGIN_MANIFEST).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return directory.name
+    name = data.get("name") if isinstance(data, dict) else None
+    return name if isinstance(name, str) and name else directory.name
+
+
+def resolve_layout(beagle: Path) -> Layout:
+    """Read which plugins `beagle` ships, and where, from its manifests.
+
+    The marketplace manifest first — it names each plugin and its `source`
+    directory, so a rename or a move is followed rather than broken. A
+    checkout without one is scanned: `plugins/*` directories that carry a
+    `plugin.json`, else every `plugins/*` directory. No beagle at all is an
+    empty layout with no problems: the extension then does less, quietly.
+    """
+    problems: list[str] = []
+    manifest = beagle / MARKETPLACE
+    if manifest.is_file():
+        try:
+            data = json.loads(manifest.read_text(encoding="utf-8"))
+            entries = data.get("plugins") if isinstance(data, dict) else None
+            if not isinstance(entries, list):
+                raise ValueError("no `plugins` list")
+        except (OSError, ValueError) as exc:
+            problems.append(f"{manifest} could not be read ({exc}); scanned the checkout instead.")
+        else:
+            plugins: list[tuple[str, Path]] = []
+            for entry in entries:
+                name = entry.get("name") if isinstance(entry, dict) else None
+                source = entry.get("source") if isinstance(entry, dict) else None
+                if not isinstance(name, str) or not isinstance(source, str):
+                    continue  # a remote source: nothing in this checkout to load
+                directory = Path(os.path.normpath(beagle / source))
+                if directory.is_dir():
+                    plugins.append((name, directory))
+                else:
+                    problems.append(f"{manifest} lists {name} at {source}, which is missing.")
+            if plugins:
+                return Layout(tuple(plugins), str(manifest), tuple(problems))
+    scanned = beagle / "plugins"
+    try:
+        dirs = sorted(d for d in scanned.iterdir() if d.is_dir())
+    except OSError:
+        return Layout(problems=tuple(problems))
+    chosen = [d for d in dirs if (d / PLUGIN_MANIFEST).is_file()] or dirs
+    plugins = tuple((_plugin_name(d), d) for d in chosen)
+    return Layout(plugins, f"a scan of {scanned}", tuple(problems))
+
+
 def _driver_file(name: str) -> Path | None:
     """The pursuit plugin's command file `name`, from the first plugin that has it."""
-    for commands in PLUGIN_ROOT_LINKS["commands"]:
-        path = commands / name
-        if path.is_file():
-            return path
-    return None
+    return _LAYOUT.first(DRIVER_DIR / name)
 
 
 def _driver_missing(name: str) -> str:
     """Why a driver command cannot run: where it was looked for."""
-    looked = ", ".join(str(commands / name) for commands in PLUGIN_ROOT_LINKS["commands"])
+    plugins = ", ".join(f"{n} ({d})" for n, d in _LAYOUT.plugins) or "none found"
     return (
-        f"beagle's {name} driver was not found (looked in {looked}). The beagle "
-        f"checkout at {BEAGLE} may predate or postdate this extension's layout."
+        f"beagle's {name} driver was not found in the commands/ of any plugin "
+        f"({plugins}; from {_LAYOUT.found_by or BEAGLE}). The beagle checkout at "
+        f"{BEAGLE} may predate or postdate this extension."
     )
 
 
@@ -252,6 +413,8 @@ def _driver_turn(name: str, args: str, preamble: str = "") -> str | None:
     if path is None:
         return None
     location = _PLUGIN_ROOT / "commands" / name if _PLUGIN_ROOT is not None else path
+    if preamble and _PLUGIN_ROOT is not None:
+        preamble = preamble.replace(PLUGIN_ROOT_VAR, str(_PLUGIN_ROOT))
     body = f"{preamble}\n{_driver_text(path)}" if preamble else _driver_text(path)
     skill = Skill(name=Path(name).stem, path=location, content=body)
     return format_skill_invocation(skill, args)
@@ -293,20 +456,243 @@ def _run(cmd: list[str], cwd: Path | None, timeout: float, stdin: str = "") -> t
 # --------------------------------------------------------------------------- #
 
 _WRITE_TOKEN = re.compile(r"(>>|>|tee\b|\bsed\b|\btruncate\b|\bdd\b|\binstall\b)")
+_HEREDOC = re.compile(r"(?<!<)<<(-?)\s*(['\"]?)([A-Za-z_][\w.-]*)\2")
+#: Words that run the command after them: skipped to find the real one.
+_WRAPPERS = frozenset({"sudo", "env", "command", "nice", "nohup", "time", "exec", "builtin"})
+_SHELLS = frozenset({"sh", "bash", "zsh", "dash"})
+_GLOB_CHARS = frozenset("*?[")
 
 
-def _bash_touches_goal(command: str) -> bool:
-    """True if a bash command plausibly writes the pursuit goal, not reads it.
+def _strip_heredocs(command: str) -> str:
+    """`command` with every here-document body removed, keeping the `<<` lines.
 
-    Conservative in the safe direction: it only fires when the command names
-    `pursuit.toml` AND carries a write token (`>`, `tee`, `sed`, ...). `cat
-    pursuit.toml` or `git commit -m 'tighten pursuit.toml'` pass through; a
-    redirect, in-place `sed`, or `cp/mv/tee` naming the goal does not. This is a
-    backstop for the write/edit path, which is the exact mistake, not a parser.
+    A body is data fed to a command, not shell: `cat <<EOF > notes.md` followed
+    by a paragraph that mentions `> pursuit.toml` writes only notes.md.
+    """
+    kept: list[str] = []
+    pending: list[tuple[str, bool]] = []
+    for line in command.split("\n"):
+        if pending:
+            delimiter, dash = pending[0]
+            if (line.lstrip("\t") if dash else line).strip() == delimiter:
+                pending.pop(0)
+            continue
+        kept.append(line)
+        pending += [(m.group(3), bool(m.group(1))) for m in _HEREDOC.finditer(line)]
+    return "\n".join(kept)
+
+
+def _shell_tokens(command: str) -> list[str] | None:
+    """Shell words and operators, heredoc bodies dropped; None if unparseable."""
+    text = _strip_heredocs(command).replace("\\\n", " ").replace("\n", " ; ")
+    lexer = shlex.shlex(text, posix=True, punctuation_chars=True)
+    lexer.whitespace_split = True
+    try:
+        return list(lexer)
+    except ValueError:  # an unclosed quote: not a command this can read
+        return None
+
+
+def _is_operator(token: str) -> bool:
+    return bool(token) and all(c in "();<>|&" for c in token)
+
+
+def _positional(args: list[str], takes_value: frozenset[str] = frozenset()) -> list[str]:
+    """`args` without options, and without the values of options in `takes_value`."""
+    out: list[str] = []
+    skip = ended = False
+    for arg in args:
+        if skip:
+            skip = False
+        elif ended:
+            out.append(arg)
+        elif arg == "--":
+            ended = True
+        elif arg.startswith("-") and arg != "-":
+            skip = arg in takes_value
+        else:
+            out.append(arg)
+    return out
+
+
+def _sed_in_place_files(args: list[str]) -> list[str]:
+    """The files `sed -i` rewrites; [] when it is not in-place."""
+    in_place = False
+    has_script = False
+    rest: list[str] = []
+    it = iter(args)
+    for arg in it:
+        if arg.startswith("--in-place"):
+            in_place = True
+        elif arg in ("--expression", "--file"):
+            has_script = True
+            next(it, None)
+        elif arg.startswith(("--expression=", "--file=")):
+            has_script = True
+        elif arg.startswith("-") and not arg.startswith("--") and arg != "-":
+            for i, flag in enumerate(arg[1:]):
+                if flag == "i":
+                    in_place = True
+                    break  # the rest is a backup suffix
+                if flag in "ef":
+                    has_script = True
+                    if i == len(arg) - 2:
+                        next(it, None)
+                    break
+        elif not arg.startswith("--"):
+            rest.append(arg)
+    if not in_place:
+        return []
+    return rest if has_script else rest[1:]
+
+
+def _copy_targets(args: list[str], cwd: Path, moves: bool) -> list[str]:
+    """What `cp`/`mv`/`install`/`ln` writes: the destination (per source when it
+    is a directory), and for `mv` the sources it removes."""
+    target_dir: str | None = None
+    rest: list[str] = []
+    it = iter(args)
+    for arg in it:
+        if arg in ("-t", "--target-directory"):
+            target_dir = next(it, None)
+        elif arg.startswith("--target-directory="):
+            target_dir = arg.split("=", 1)[1]
+        elif arg in ("-m", "--mode", "-o", "--owner", "-g", "--group", "-S", "--suffix"):
+            next(it, None)
+        elif not arg.startswith("-") or arg == "-":
+            rest.append(arg)
+    if target_dir is not None:
+        sources, dest = rest, target_dir
+    elif len(rest) >= 2:
+        sources, dest = rest[:-1], rest[-1]
+    else:
+        return []
+    dest_path = Path(dest).expanduser()
+    is_dir = dest.endswith("/") or (cwd / dest_path).is_dir()
+    targets = [str(dest_path / Path(s).name) for s in sources] if is_dir else [dest]
+    return targets + (sources if moves else [])
+
+
+def _command_targets(argv: list[str], cwd: Path) -> list[str] | None:
+    """The paths one simple command (argv, redirects removed) writes."""
+    while argv and ("=" in argv[0] and not argv[0].startswith("=") or argv[0] in _WRAPPERS):
+        argv = argv[1:]
+        while argv and argv[0].startswith("-"):  # a wrapper's own options
+            argv = argv[1:]
+    if not argv:
+        return []
+    name, args = Path(argv[0]).name, argv[1:]
+    if name == "tee":
+        return _positional(args)
+    if name == "sed":
+        return _sed_in_place_files(args)
+    if name in ("cp", "mv", "install", "ln"):
+        return _copy_targets(args, cwd, moves=name == "mv")
+    if name in ("rm", "truncate", "shred", "unlink"):
+        return _positional(args, frozenset({"-s", "--size", "-r", "--reference", "-n"}))
+    if name == "dd":
+        return [a[3:] for a in args if a.startswith("of=")]
+    if name == "git" and args:
+        sub, sub_args = args[0], args[1:]
+        if sub == "checkout" and "--" in sub_args:
+            return sub_args[sub_args.index("--") + 1 :]
+        if sub == "restore":
+            return _positional(sub_args, frozenset({"-s", "--source"}))
+        if sub in ("stash", "clean") or (sub == "reset" and "--hard" in sub_args):
+            return ["."]  # the whole work tree
+    return []
+
+
+def _bash_write_targets(command: str, cwd: Path) -> list[Path] | None:
+    """Every path a bash command would write, resolved; None if unparseable.
+
+    Deliberately narrow: a redirect target, a `tee` argument, a `sed -i` file,
+    a `cp`/`mv`/`install`/`ln` destination (and what `mv` removes), `dd of=`,
+    `rm`/`truncate`, and the `git` verbs that rewrite tracked files (`stash`,
+    `clean` and `reset --hard` stand for the whole tree as `.`). A path that is
+    only read — `cat pursuit.toml > /tmp/x`, `git check-ignore -v pursuit.toml`
+    — is not a target. `cd` is followed along a chain, and `bash -c '...'` is
+    read one level down. Anything else (a Python one-liner, `find -delete`) is
+    not seen: this backs up the write/edit guard, it does not replace it.
+    """
+    tokens = _shell_tokens(command)
+    if tokens is None:
+        return None
+    here = cwd
+    found: list[Path] = []
+
+    def add(raw: str, base: Path) -> None:
+        path = Path(raw).expanduser()
+        found.append(Path(os.path.normpath(base / path)))
+
+    segment: list[str] = []
+    tokens.append(";")
+    i = 0
+    while i < len(tokens):
+        token = tokens[i]
+        if _is_operator(token) and ("<" in token or ">" in token):
+            target = tokens[i + 1] if i + 1 < len(tokens) else ""
+            if segment and segment[-1].isdigit():
+                segment.pop()  # the fd number of `2>`, not an argument
+            fd_dup = token.endswith("&") and (target.isdigit() or target == "-")
+            if ">" in token and target and not _is_operator(target) and not fd_dup:
+                add(target, here)
+            i += 2 if target and not _is_operator(target) else 1
+            continue
+        if not _is_operator(token):
+            segment.append(token)
+            i += 1
+            continue
+        # A separator: the simple command before it is complete.
+        if segment and segment[0] == "cd":
+            dest = next((a for a in segment[1:] if not a.startswith("-")), "~")
+            here = Path(os.path.normpath(here / Path(dest).expanduser()))
+        elif segment and Path(segment[0]).name in _SHELLS and "-c" in segment[1:]:
+            script_at = segment.index("-c") + 1
+            if script_at < len(segment):
+                nested = _bash_write_targets(segment[script_at], here)
+                if nested is None:
+                    return None
+                found += nested
+        else:
+            for raw in _command_targets(segment, here):
+                add(raw, here)
+        segment = []
+        i += 1
+    return found
+
+
+def _names_path(targets: list[Path], path: Path) -> bool:
+    """Whether one of `targets` is `path`, literally or as a glob matching it."""
+    for target in targets:
+        text = str(target)
+        if target == path or (_GLOB_CHARS & set(text) and fnmatch.fnmatch(str(path), text)):
+            return True
+    return False
+
+
+def _bash_writes_goal(command: str, cwd: Path, goal: Path) -> bool:
+    """True if a bash command writes the pursuit goal, not merely reads it.
+
+    Blocks only when `pursuit.toml` is an actual write target (see
+    `_bash_write_targets`): `git check-ignore -v .beagle/pursuit.toml` beside
+    an unrelated `> /tmp/out` passes, `sed -i ... .beagle/pursuit.toml` does
+    not. A command too broken to parse falls back to the old test — it names
+    the goal and carries a write token — so doubt still lands on the safe side.
     """
     if GOAL_BASENAME not in command:
         return False
-    return bool(_WRITE_TOKEN.search(command))
+    targets = _bash_write_targets(command, cwd)
+    if targets is None:
+        return bool(_WRITE_TOKEN.search(command))
+    return _names_path([_resolved(t) for t in targets], goal)
+
+
+def _resolved(path: Path) -> Path:
+    try:
+        return path.resolve()
+    except (OSError, ValueError):
+        return path
 
 
 def _goal_path_from_args(args: Mapping[str, Any], cwd: Path) -> Path | None:
@@ -366,13 +752,13 @@ def make_guard() -> Any:
             if (
                 tool == "bash"
                 and goal_r.exists()
-                and _bash_touches_goal(str(args.get("command", "")))
+                and _bash_writes_goal(str(args.get("command", "")), Path(cwd), goal_r)
             ):
                 return ToolCallHookResult(
                     block=True,
                     reason=(
                         f"refusing a shell write to {goal} — the pursuit goal is the user's. "
-                        "Reading it (`cat`, `grep`) is fine; this command looks like a write. "
+                        "Reading it (`cat`, `grep`) is fine; this command writes it. "
                         f"(Escape hatch, if the user directs it: set {GUARD_DISABLE_ENV}=1.)"
                     ),
                 )
@@ -381,6 +767,213 @@ def make_guard() -> Any:
         return None
 
     return guard
+
+
+# --------------------------------------------------------------------------- #
+# driver/worker isolation: the driver keeps out of an awaited worker's scope
+# --------------------------------------------------------------------------- #
+
+
+@dataclass(frozen=True)
+class _AwaitedScope:
+    """What the driver session is waiting on, and the open tasks' scope."""
+
+    awaiting: str
+    tasks: tuple[str, ...]
+    scope: tuple[str, ...]
+
+
+#: Root -> (loop file stat, session, scope), so beagle is asked once per change.
+_SCOPE_CACHE: dict[Path, tuple[tuple[int, int, str], _AwaitedScope | None]] = {}
+
+
+def _lease_live(record: Mapping[str, Any]) -> bool:
+    """Whether a declared `awaiting` is inside its lease, as beagle judges it.
+
+    An undatable or future-dated wait is not believed — beagle's own rule,
+    since a suppression nobody can date is one nobody can end.
+    """
+    try:
+        at = datetime.fromisoformat(str(record.get("awaiting_at") or ""))
+    except ValueError:
+        return False
+    if at.tzinfo is None:
+        at = at.replace(tzinfo=UTC)
+    minutes = record.get("awaiting_minutes") or AWAITING_TTL_MINUTES
+    elapsed = (datetime.now(UTC) - at).total_seconds()
+    return isinstance(minutes, int | float) and 0 <= elapsed <= minutes * 60
+
+
+def _json_out(argv: list[str], root: Path) -> Any:
+    rc, out = _run([BEAGLE_BIN, *argv, "--root", str(root)], root, HOOK_TIMEOUT)
+    return json.loads(out) if rc == 0 else None
+
+
+def _live_wait(root: Path, session_id: str) -> str | None:
+    """What this session's run declares it is awaiting, while the lease holds.
+
+    None unless a run is in flight, this session is its recorded driver (a
+    subagent's own session never is), and the declared wait is in its lease.
+    """
+    record = _json_out(["loop", "read", "--json"], root)
+    if not isinstance(record, dict) or not record.get("awaiting"):
+        return None
+    if not session_id or record.get("driver_session") != session_id:
+        return None
+    return str(record["awaiting"]) if _lease_live(record) else None
+
+
+def _read_awaited_scope(root: Path, session_id: str) -> _AwaitedScope | None:
+    """The scope this session's run is waiting on a worker in, or None.
+
+    None without a live wait (`_live_wait`). The scope is every open task's:
+    `awaiting` is free text, so which open task the worker holds cannot be
+    read off it reliably.
+    """
+    awaiting = _live_wait(root, session_id)
+    if awaiting is None:
+        return None
+    listing = _json_out(["pursuit", "tree", "--json", "--status", "open"], root)
+    tasks = [row["id"] for row in listing or () if isinstance(row, dict) and row.get("id")]
+    scope: list[str] = []
+    for task in tasks:
+        node = _json_out(["pursuit", "show", str(task)], root)
+        entries = node.get("scope") if isinstance(node, dict) else None
+        scope += [e for e in entries or () if isinstance(e, str) and e.strip()]
+    if not scope:
+        return None
+    return _AwaitedScope(awaiting, tuple(tasks), tuple(scope))
+
+
+async def _awaited_scope(root: Path, session_id: str) -> _AwaitedScope | None:
+    """`_read_awaited_scope`, cached until beagle's loop record changes."""
+    try:
+        stat = (root / LOOP_REL).stat()
+    except OSError:
+        return None  # no record: no run in flight
+    key = (stat.st_mtime_ns, stat.st_size, session_id)
+    cached = _SCOPE_CACHE.get(root)
+    if cached is None or cached[0] != key:
+        found = await asyncio.to_thread(_read_awaited_scope, root, session_id)
+        _SCOPE_CACHE[root] = cached = (key, found)
+    return cached[1]
+
+
+def _scope_hit(target: Path, root: Path, scope: tuple[str, ...]) -> str | None:
+    """The scope entry `target` writes into, or contains, or None.
+
+    A scope entry is a path under the project root — a file, a directory, or a
+    glob. A write lands in it when the target is the entry, sits under it, or
+    matches its glob; a target that CONTAINS an entry (`rm -r src`, or the
+    whole tree for `git reset --hard`) lands in it too.
+    """
+    for entry in scope:
+        text = entry.strip().rstrip("/") or "."
+        if _GLOB_CHARS & set(text):
+            pattern = str(root / text)
+            static = Path(pattern.split("*")[0].split("?")[0].split("[")[0])
+            if fnmatch.fnmatch(str(target), pattern) or target in (static, *static.parents):
+                return entry
+            continue
+        path = _resolved(root / text)
+        if target == path or path in target.parents or target in path.parents:
+            return entry
+    return None
+
+
+def _write_targets(tool: str, args: Mapping[str, Any], cwd: Path) -> list[Path]:
+    """The paths an edit, write or bash call writes; [] for anything else."""
+    if tool in ("write", "edit"):
+        target = _goal_path_from_args(args, cwd)
+        return [target] if target is not None else []
+    if tool == "bash":
+        return [_resolved(t) for t in _bash_write_targets(str(args.get("command", "")), cwd) or ()]
+    return []
+
+
+def make_scope_guard() -> Any:
+    """Build the `tool_call` guard that keeps the driver out of a worker's scope.
+
+    While `/pursuit-run` waits on a background worker (`beagle loop tick
+    --awaiting`), the worker owns the open task's declared scope; a driver
+    that edits it too races the worker and one side's work is lost. Only the
+    driver session is held back: a subagent's tool calls carry its own
+    session id and pass. A command too broken to parse passes too — this
+    guards a race, not the ground truth, and fails open like everything here.
+    """
+
+    async def scope_guard(event: Any, context: ExtensionContext) -> ToolCallHookResult | None:
+        try:
+            cwd = Path(context.cwd)
+            targets = _write_targets(event.tool_name, event.arguments or {}, cwd)
+            goal = _find_goal(cwd) if targets else None
+            if goal is None:
+                return None
+            root = _resolved(goal.parent.parent)
+            waiting = await _awaited_scope(root, context.session_id or "")
+            if waiting is None:
+                return None
+            for target in targets:
+                entry = _scope_hit(target, root, waiting.scope)
+                if entry is not None:
+                    break
+            else:
+                return None
+        except Exception:  # noqa: BLE001 - fail open, never block on a guard bug
+            return None
+        tasks = ", ".join(waiting.tasks)
+        return ToolCallHookResult(
+            block=True,
+            reason=(
+                f"refusing to write {target}: it is in open task {tasks}'s scope "
+                f"(`{entry}`), and this session is waiting on a worker for it "
+                f"({waiting.awaiting}). Two writers on one tree lose one's work. Wait "
+                "for its completion notice, steer it with `steer_subagent`, or stop it "
+                "and take the task back; if the worker is gone, clear the wait with a "
+                "bare `beagle loop tick` first."
+            ),
+        )
+
+    return scope_guard
+
+
+#: Appended to a `stop_subagent` result while this session's run declares a wait.
+STOPPED_WORKER_NOTE = """
+
+beagle: this session's pursuit run still declares it is awaiting \
+"{awaiting}". If that was the worker just stopped, nothing will arrive to \
+clear it: run a bare `beagle loop tick` now, then take the task back or \
+dispatch it again."""
+
+
+def make_stopped_worker_note() -> Any:
+    """Build the `tool_result` hook that remembers a stopped worker's wait.
+
+    A cancelled tau-subagents run sends no `<task-notification>`, so a
+    `--awaiting` declared for it would stand until its lease ran out, holding
+    the scope guard and silencing the Stop hooks. When the driver stops a
+    worker itself, the result says so. It does not tick for the driver:
+    `awaiting` is free text naming a worker type and a task, not a run id,
+    so which of several parallel workers it meant cannot be told from here.
+    """
+
+    async def note(event: Any, context: ExtensionContext) -> ToolResultHookResult | None:
+        try:
+            if event.tool_name != "stop_subagent":
+                return None
+            goal = _find_goal(Path(context.cwd))
+            if goal is None:
+                return None
+            root, session = goal.parent.parent, context.session_id or ""
+            awaiting = await asyncio.to_thread(_live_wait, root, session)
+            if awaiting is None:
+                return None
+            text = event.result.text + STOPPED_WORKER_NOTE.format(awaiting=awaiting)
+        except Exception:  # noqa: BLE001 - fail open; a note must not break the tool
+            return None
+        return ToolResultHookResult(content=text)
+
+    return note
 
 
 # --------------------------------------------------------------------------- #
@@ -430,9 +1023,11 @@ def make_dispatch() -> Any:
             else _SEEN_CWD or Path.cwd()
         )
 
-        if not STEP_EXECUTOR.is_file():
+        step_executor = _LAYOUT.step_executor
+        if step_executor is None:
             return _make_dispatch_result(
-                f"pursuit_dispatch: step-executor persona not found at {STEP_EXECUTOR}."
+                "pursuit_dispatch: no beagle plugin ships "
+                f"{STEP_EXECUTOR_REL} (looked in {_LAYOUT.found_by or BEAGLE})."
             )
 
         model = _worker_model(arguments.get("model"))
@@ -451,7 +1046,7 @@ def make_dispatch() -> Any:
             "--cwd",
             str(cwd),
             "--append-system-prompt",
-            str(STEP_EXECUTOR),
+            str(step_executor),
         ]
         if provider:
             cmd += ["--provider", provider]
@@ -594,7 +1189,9 @@ def _block_reason(stdout: str) -> str | None:
     return None
 
 
-async def _run_hook(name: str, root: Path, payload: Mapping[str, Any]) -> str | None:
+async def _run_hook(
+    name: str, root: Path, payload: Mapping[str, Any], timeout: float = HOOK_TIMEOUT
+) -> str | None:
     """Run `beagle hook NAME` as Claude Code would; its stdout, or None on failure.
 
     The bare `hook NAME` argv is beagle's fast path, which reads the root from
@@ -616,7 +1213,7 @@ async def _run_hook(name: str, root: Path, payload: Mapping[str, Any]) -> str | 
         return None
     try:
         stdout, _ = await asyncio.wait_for(
-            proc.communicate(json.dumps(payload).encode("utf-8")), timeout=HOOK_TIMEOUT
+            proc.communicate(json.dumps(payload).encode("utf-8")), timeout=timeout
         )
     except TimeoutError:
         with contextlib.suppress(ProcessLookupError):
@@ -626,51 +1223,110 @@ async def _run_hook(name: str, root: Path, payload: Mapping[str, Any]) -> str | 
     return (stdout or b"").decode("utf-8", "replace")
 
 
-def _loop_report(root: Path) -> str:
-    """`beagle hook loop-report`'s text for a session start; "" when silent."""
-    payload = json.dumps({"hook_event_name": "SessionStart", "cwd": str(root)})
-    rc, out = _run([BEAGLE_BIN, "hook", "loop-report"], root, HOOK_TIMEOUT, stdin=payload)
+def _hook_root(cwd: Path) -> tuple[Path, dict[str, float]] | None:
+    """The project whose `.claude/settings.json` installs beagle hooks, and them.
+
+    Claude Code reads a project's hooks from `<root>/.claude/settings.json`;
+    beagle marks the entries it wrote with a `"beagle": "<name>"` key, which is
+    how `beagle hooks installed` finds them and how this finds them. Each name
+    maps to the entry's own timeout (beagle writes 900s). The nearest ancestor
+    of `cwd` with such a file wins; None when there is none or it is unreadable.
+    """
+    for directory in (cwd, *cwd.parents):
+        settings = directory / SETTINGS_REL
+        if not settings.is_file():
+            continue
+        try:
+            data = json.loads(settings.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return None
+        hooks: dict[str, float] = {}
+        groups = data.get("hooks") if isinstance(data, dict) else None
+        for entries in (groups or {}).values() if isinstance(groups, dict) else ():
+            for group in entries if isinstance(entries, list) else ():
+                inner = group.get("hooks") if isinstance(group, dict) else None
+                for hook in inner if isinstance(inner, list) else ():
+                    name = hook.get(HOOK_MARKER) if isinstance(hook, dict) else None
+                    if isinstance(name, str) and name:
+                        timeout = hook.get("timeout")
+                        ok = isinstance(timeout, int | float) and timeout > 0
+                        hooks[name] = float(timeout) if ok else DEFAULT_HOOK_TIMEOUT
+        if hooks:
+            return directory, hooks
+    return None
+
+
+def _session_start_report(name: str, root: Path) -> str:
+    """A SessionStart hook's text (`loop-report`, `cadence-report`); "" when silent."""
+    payload = json.dumps({"hook_event_name": "SessionStart", "source": "startup", "cwd": str(root)})
+    rc, out = _run([BEAGLE_BIN, "hook", name], root, HOOK_TIMEOUT, stdin=payload)
     if rc != 0 or _block_reason(out) is not None:
         return ""
-    return out
+    return out.strip()
 
 
-def make_commit_claims() -> Any:
-    """Build the `tool_call` bridge for beagle's `commit-claims` PreToolUse hook."""
+def _unbridged_notice(cwd: Path) -> str | None:
+    """A one-line note naming installed hooks Tau deliberately does not run."""
+    found = _hook_root(cwd)
+    if found is None:
+        return None
+    skipped = [name for name in sorted(found[1]) if name not in BRIDGED_HOOKS]
+    if not skipped:
+        return None
+    why = "; ".join(
+        f"{name} ({UNBRIDGED_HOOKS.get(name, 'no Tau equivalent')})" for name in skipped
+    )
+    return f"Beagle: installed hooks not run under Tau: {why}."
 
-    async def commit_claims(event: Any, context: ExtensionContext) -> ToolCallHookResult | None:
+
+def make_bash_hooks() -> Any:
+    """Build the `tool_call` bridge for beagle's Bash PreToolUse hooks.
+
+    `commit-claims` runs whenever the project is a pursuit, as it always has
+    here; `commit-trailer` runs when `beagle hooks install` put it in the
+    project's settings. Both only judge `git commit`, so both are skipped for a
+    command that does not say "commit" — beagle's own fast path leaves there too.
+    """
+
+    async def bash_hooks(event: Any, context: ExtensionContext) -> ToolCallHookResult | None:
         try:
             if event.tool_name != "bash":
                 return None
             command = str((event.arguments or {}).get("command", ""))
             if "commit" not in command:
-                return None  # beagle's own fast path would leave here too
-            goal = _find_goal(context.cwd)
-            if goal is None:
                 return None
-            out = await _run_hook(
-                "commit-claims",
-                goal.parent.parent,
-                {
-                    "hook_event_name": "PreToolUse",
-                    "session_id": context.session_id or "",
-                    "cwd": str(context.cwd),
-                    "tool_name": "Bash",
-                    "tool_input": {"command": command},
-                },
-            )
-            reason = _block_reason(out) if out else None
+            cwd = Path(context.cwd)
+            runs: list[tuple[str, Path, float]] = []
+            goal = _find_goal(cwd)
+            if goal is not None:
+                runs.append(("commit-claims", goal.parent.parent, HOOK_TIMEOUT))
+            installed = _hook_root(cwd)
+            if installed is not None and "commit-trailer" in installed[1]:
+                runs.append(("commit-trailer", installed[0], installed[1]["commit-trailer"]))
+            payload = {
+                "hook_event_name": "PreToolUse",
+                "session_id": context.session_id or "",
+                "cwd": str(cwd),
+                "tool_name": "Bash",
+                "tool_input": {"command": command},
+            }
+            reasons: list[str] = []
+            for name, root, timeout in runs:
+                out = await _run_hook(name, root, payload, timeout)
+                reason = _block_reason(out) if out else None
+                if reason is not None:
+                    reasons.append(f"beagle {name}: {reason}")
         except Exception:  # noqa: BLE001 - fail open, never block on a bridge bug
             return None
-        if reason is None:
+        if not reasons:
             return None
-        return ToolCallHookResult(block=True, reason=f"beagle commit-claims: {reason}")
+        return ToolCallHookResult(block=True, reason="\n\n".join(reasons))
 
-    return commit_claims
+    return bash_hooks
 
 
 def _note_run_end(event: Any, context: ExtensionContext) -> None:
-    """Remember whether the run ended by itself, for the loop-guard."""
+    """Remember whether the run ended by itself, for the Stop hooks."""
     global _LAST_RUN_CLEAN
     del context
     stops = [getattr(m, "stop_reason", None) for m in getattr(event, "messages", ())]
@@ -678,70 +1334,220 @@ def _note_run_end(event: Any, context: ExtensionContext) -> None:
     _LAST_RUN_CLEAN = not stops or stops[-1] not in ("aborted", "error")
 
 
-def make_loop_guard(tau: ExtensionAPI) -> Any:
-    """Build the `agent_settled` bridge for beagle's `loop-guard` Stop hook.
+def make_stop_hooks(tau: ExtensionAPI) -> Any:
+    """Build the `agent_settled` bridge for beagle's Stop hooks.
 
-    Claude Code runs a Stop hook when the agent finishes a turn — not when the
-    user interrupts it — and a block becomes the model's next input with
-    `stop_hook_active` set on the stop after it. Here an objection starts one
-    more turn through `send_user_message`, and the settle that turn produces
-    is passed to the hook as `stop_hook_active`, so a guard objects at most
-    once per turn the loop takes, exactly as it does under Claude Code.
+    `loop-guard` runs whenever the project is a pursuit; `cadence` and
+    `close-out` run when `beagle hooks install` put them in the project's
+    settings, each under its installed timeout. Claude Code runs Stop hooks
+    when the agent finishes a turn — not when the user interrupts it — and a
+    block becomes the model's next input with `stop_hook_active` set on the
+    stop after it. Here every objection on one settle joins one more turn
+    through `send_user_message`, and the settle that turn produces passes
+    `stop_hook_active` to all of them, so each objects at most once per stop,
+    as under Claude Code. Beagle does not order its Stop hooks, and neither
+    does this: each is run in turn, and none sees another's verdict.
     """
 
-    async def loop_guard(event: Any, context: ExtensionContext) -> None:
-        global _GUARD_OBJECTED
+    async def stop_hooks(event: Any, context: ExtensionContext) -> None:
+        global _STOP_BLOCKED
         del event
-        active, _GUARD_OBJECTED = _GUARD_OBJECTED, False
+        active, _STOP_BLOCKED = _STOP_BLOCKED, False
         try:
-            # Print mode ends with the turn whatever the hook says, and an
-            # interrupted or failed run is not a turn the loop chose to end.
+            # Print mode ends with the turn whatever a hook says, and an
+            # interrupted or failed run is not a turn the agent chose to end.
             if not context.has_ui or not _LAST_RUN_CLEAN:
                 return
-            goal = _find_goal(context.cwd)
-            if goal is None:
-                return
-            out = await _run_hook(
-                "loop-guard",
-                goal.parent.parent,
-                {
-                    "hook_event_name": "Stop",
-                    "session_id": context.session_id or "",
-                    "cwd": str(context.cwd),
-                    "stop_hook_active": active,
-                },
-            )
-            reason = _block_reason(out) if out else None
-            if reason is not None:
-                _GUARD_OBJECTED = True
-                tau.send_user_message(f"[beagle loop-guard]\n\n{reason}")
-        except Exception:  # noqa: BLE001 - fail open; a guard must not wedge the session
+            cwd = Path(context.cwd)
+            runs: list[tuple[str, Path, float]] = []
+            goal = _find_goal(cwd)
+            if goal is not None:
+                runs.append(("loop-guard", goal.parent.parent, HOOK_TIMEOUT))
+            installed = _hook_root(cwd)
+            if installed is not None:
+                root, hooks = installed
+                runs += [(name, root, hooks[name]) for name in STOP_HOOKS if name in hooks]
+            payload = {
+                "hook_event_name": "Stop",
+                "session_id": context.session_id or "",
+                "cwd": str(cwd),
+                "stop_hook_active": active,
+            }
+            reasons: list[str] = []
+            for name, root, timeout in runs:
+                out = await _run_hook(name, root, payload, timeout)
+                reason = _block_reason(out) if out else None
+                if reason is not None:
+                    reasons.append(f"[beagle {name}]\n\n{reason}")
+            if reasons:
+                _STOP_BLOCKED = True
+                tau.send_user_message("\n\n".join(reasons))
+        except Exception:  # noqa: BLE001 - fail open; a hook must not wedge the session
             return
 
-    return loop_guard
+    return stop_hooks
 
 
-def _cancel_wakeup() -> bool:
+@dataclass(eq=False)
+class _Wakeup:
+    """One armed `pursuit_wakeup`: the token delivery checks it still holds.
+
+    Stop, a re-arm and shutdown void it by replacing `_WAKEUP`; a delivery
+    whose token is no longer `_WAKEUP` sends nothing. `run` is the loop run in
+    flight when it was armed (its `started_at`), so a wakeup that outlives the
+    run it was armed for is dropped rather than starting the loop again.
+    """
+
+    prompt: str
+    root: Path | None
+    run: str | None
+    handle: asyncio.TimerHandle | None = None
+    fired: bool = False
+    task: asyncio.Task[None] | None = None
+
+
+async def _loop_run(root: Path) -> str | None:
+    """The in-flight loop run's start time; "" when idle; None when unknown.
+
+    `beagle loop read` prints the start time and exits 3 with no run in
+    flight. Anything else — beagle missing, a crash, a hang — is unknown,
+    which the caller treats as "do not second-guess the wakeup".
+    """
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            BEAGLE_BIN,
+            "loop",
+            "read",
+            "--root",
+            str(root),
+            cwd=str(root),
+            stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+    except OSError:
+        return None
+    try:
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=HOOK_TIMEOUT)
+    except TimeoutError:
+        with contextlib.suppress(ProcessLookupError):
+            proc.kill()
+        await proc.wait()
+        return None
+    if proc.returncode == LOOP_IDLE_EXIT:
+        return ""
+    if proc.returncode != 0:
+        return None
+    return (stdout or b"").decode("utf-8", "replace").strip() or None
+
+
+def _void_wakeup() -> _Wakeup | None:
+    """Void the current wakeup, armed or fired-and-pending; the one voided."""
     global _WAKEUP
-    handle, _WAKEUP = _WAKEUP, None
-    if handle is None or handle.cancelled():
+    wakeup, _WAKEUP = _WAKEUP, None
+    if wakeup is not None and wakeup.handle is not None:
+        wakeup.handle.cancel()
+    return wakeup
+
+
+def _fire_wakeup(tau: ExtensionAPI, wakeup: _Wakeup) -> None:
+    """The timer ran out: deliver now if the session is idle, else at its settle."""
+    if _WAKEUP is not wakeup:
+        return
+    wakeup.fired = True
+    with contextlib.suppress(Exception):  # a reloaded or closed session: the settle decides
+        if tau.context.is_running:
+            return  # a turn is on; `_deliver_pending_wakeup` sends it when it ends
+    wakeup.task = asyncio.get_running_loop().create_task(_deliver_wakeup(tau, wakeup, False))
+
+
+async def _deliver_wakeup(tau: ExtensionAPI, wakeup: _Wakeup, settling: bool) -> None:
+    """Send a fired wakeup's prompt, unless something since has voided it.
+
+    Checked at the last moment, because a message once queued cannot be
+    recalled: the token must still be current (no stop, no newer arm), and a
+    loop run the wakeup was armed for must still be in flight. Outside a
+    settle, a turn that started meanwhile keeps it pending for that turn's
+    settle, where it is sent after the Stop hooks have had their say.
+    """
+    if _WAKEUP is not wakeup:
+        return
+    if wakeup.run and wakeup.root is not None:
+        now = await _loop_run(wakeup.root)
+        if _WAKEUP is not wakeup:
+            return
+        if now is not None and now != wakeup.run:
+            _void_wakeup()
+            with contextlib.suppress(Exception):
+                tau.context.ui.notify(
+                    f"pursuit_wakeup: dropped {wakeup.prompt!r} — the loop run it was "
+                    "armed for is no longer in flight (`beagle loop stop` ran, or a new "
+                    "run started).",
+                    "info",
+                )
+            return
+    with contextlib.suppress(Exception):
+        if not settling and tau.context.is_running:
+            return  # still pending; the settle delivers it
+    _void_wakeup()
+    with contextlib.suppress(Exception):  # a reloaded or closed session: nothing to wake
+        tau.send_user_message(_wakeup_turn(tau, wakeup.prompt))
+
+
+def _in_context(tau: ExtensionAPI, text: str) -> bool:
+    """Whether a user message in the live context still carries `text` verbatim.
+
+    Read from the transcript rather than remembered, so a compaction (which
+    folds old turns into a summary), a resume or a branch all count as the
+    driver being gone, and so does a driver file that changed since.
+    """
+    try:
+        transcript = tau.context.transcript
+    except Exception:  # noqa: BLE001 - unknown means "send it in full"
         return False
-    handle.cancel()
-    return True
+    return any(
+        getattr(message, "role", None) == "user" and text in message.text for message in transcript
+    )
 
 
-def _fire_wakeup(tau: ExtensionAPI, prompt: str) -> None:
-    """Deliver an armed wakeup's prompt, expanding a pursuit driver itself.
+def _wakeup_turn(tau: ExtensionAPI, prompt: str) -> str:
+    """What a wakeup sends: its prompt, with a driver command expanded.
 
     An extension's message reaches the model as text, not through the slash
-    command parser, so the driver commands a wakeup may carry are expanded here.
+    command parser, so a driver command is expanded here — in full the first
+    time, and as a short resume stub while the full driver is still in the
+    context, since a loop's every wakeup re-sending several pages of an
+    unchanged skill is most of what it would spend.
     """
-    global _WAKEUP
-    _WAKEUP = None
     name, _, args = prompt.strip().partition(" ")
-    text = _DRIVER_TURNS[name](args) if name in _DRIVER_TURNS else None
-    with contextlib.suppress(Exception):  # a reloaded or closed session: nothing to wake
-        tau.send_user_message(text if text is not None else prompt)
+    expand = _DRIVER_TURNS.get(name)
+    block = expand("") if expand is not None else None
+    if expand is None or block is None:
+        return prompt
+    if _in_context(tau, block):
+        return RESUME_STUB.format(prompt=prompt.strip(), name=name)
+    return expand(args) or prompt
+
+
+def make_wakeup_delivery(tau: ExtensionAPI) -> Any:
+    """Build the `agent_settled` handler that sends a wakeup that fired mid-turn.
+
+    Registered after the Stop-hook bridge, so it sees whether a hook objected
+    on this settle; an objection already starts the next turn, and the wakeup
+    waits for the settle after it rather than queueing behind it.
+    """
+
+    async def deliver(event: Any, context: ExtensionContext) -> None:
+        del event, context
+        wakeup = _WAKEUP
+        if wakeup is None or not wakeup.fired or _STOP_BLOCKED:
+            return
+        try:
+            await _deliver_wakeup(tau, wakeup, True)
+        except Exception:  # noqa: BLE001 - a delivery bug must not wedge the session
+            return
+
+    return deliver
 
 
 def make_wakeup(tau: ExtensionAPI) -> Any:
@@ -756,9 +1562,19 @@ def make_wakeup(tau: ExtensionAPI) -> Any:
         global _WAKEUP
         del tool_call_id, signal, on_update
         if arguments.get("stop"):
-            if _cancel_wakeup():
-                return _make_dispatch_result("pursuit_wakeup: disarmed.")
-            return _make_dispatch_result("pursuit_wakeup: nothing was armed.")
+            voided = _void_wakeup()
+            if voided is None:
+                return _make_dispatch_result(
+                    "pursuit_wakeup: nothing was armed, and no fired wakeup is waiting "
+                    "to be delivered."
+                )
+            if voided.fired:
+                return _make_dispatch_result(
+                    f"pursuit_wakeup: the wakeup had already fired, during a turn, and "
+                    f"its {voided.prompt!r} was waiting for that turn to end. That "
+                    "pending delivery is now voided; it will not arrive."
+                )
+            return _make_dispatch_result("pursuit_wakeup: disarmed before it fired.")
         if not tau.context.has_ui:
             return _make_dispatch_result(
                 "pursuit_wakeup: REFUSED — this Tau session has no interactive frontend "
@@ -773,11 +1589,18 @@ def make_wakeup(tau: ExtensionAPI) -> Any:
         raw_prompt = arguments.get("prompt")
         prompt = raw_prompt.strip() if isinstance(raw_prompt, str) and raw_prompt.strip() else ""
         prompt = prompt or "/pursuit-run"
-        replaced = _cancel_wakeup()
-        _WAKEUP = asyncio.get_running_loop().call_later(minutes * 60, _fire_wakeup, tau, prompt)
+        goal = _find_goal(tau.context.cwd)
+        root = goal.parent.parent if goal is not None else None
+        run = await _loop_run(root) if root is not None else None
+        replaced = _void_wakeup()
+        wakeup = _Wakeup(prompt=prompt, root=root, run=run or None)
+        _WAKEUP = wakeup
+        wakeup.handle = asyncio.get_running_loop().call_later(
+            minutes * 60, _fire_wakeup, tau, wakeup
+        )
         return _make_dispatch_result(
             f"pursuit_wakeup: armed — {prompt!r} in {minutes} minute(s)"
-            + (", replacing the previous wakeup" if replaced else "")
+            + (", replacing the previous wakeup" if replaced is not None else "")
             + f". Record it: `beagle loop tick --resuming-in {minutes}`."
         )
 
@@ -805,6 +1628,14 @@ WAKEUP_PARAMETERS = {
     },
 }
 
+#: A repeat wakeup's turn while the driver it names is still in the context.
+RESUME_STUB = """\
+{prompt}
+
+(A `pursuit_wakeup`. The `{name}` driver and its Tau host mapping are already \
+in this conversation, unchanged since they were loaded; do not reload them. \
+Continue the loop from its next step.)"""
+
 #: Read before `pursuit-run.md`, which names Claude Code's tools and hooks.
 TAU_HOST_NOTE = """\
 Host mapping — this driver was written for Claude Code. Under Tau, read it as:
@@ -820,17 +1651,41 @@ true`, then end the turn exactly as the driver says for a dispatched worker — 
 arm `pursuit_wakeup` with a long delay and record `beagle loop tick --awaiting \
 "<worker> on <task>" --for N --resuming-in N`, `--for` the driver's believed \
 wait. The worker's completion arrives as a \
-`<task-notification>` message that starts your next turn; clear the wait with \
-a bare `beagle loop tick`, read the full report with `get_subagent_result` if \
-the notification is truncated, and run the close. Claude Code's `SendMessage` \
+`<task-notification>` message that starts your next turn, an errored run's \
+too; clear the wait with a bare `beagle loop tick` whatever its status, \
+read the full report with `get_subagent_result` if the notification is \
+truncated, and run the close. Claude Code's `SendMessage` \
 to a running worker is `steer_subagent`; `get_subagent_result` with `wait: \
 true` blocks on one. Parallel independent tasks may each get a background \
 agent.
+- Spawning a worker: leave `provider` and `model` unset, so it runs on this \
+session's own provider and model; Claude Code's `sonnet`-style picks name \
+nothing Tau serves. Set `max_turns` from the task's budget (`budget_tokens` in \
+`beagle pursuit show <task>`), so a worker past it is told to wrap up. After a \
+background spawn, end the turn; do not poll `get_subagent_result`, since the \
+notification comes to you.
+- Prose in a shell command (briefs, intents, close notes, commit messages) \
+goes in a quoted heredoc (`<<'EOF'`), a file, or single quotes, never double \
+quotes, which expand `$` and backticks.
+- While a background worker is awaited, its open task's declared scope is \
+the worker's: this extension refuses this session's writes there. For a \
+worker that must not share your tree, pass `isolation: "worktree"`; it works \
+in a detached copy and its changes come back on a `tau-agent-<id>` branch for \
+you to merge. `isolated: true` is not that: it only spawns the worker without \
+extensions, so without beagle's skills and guards.
 - Without the `agent` tool, dispatch is the `pursuit_dispatch` tool. It \
 returns the worker's report within the same turn, so skip the `--awaiting` \
 tick and the bare tick that clears it; run the close straight after.
-- `loop-guard`, `loop-report` and `commit-claims` run inside this Tau \
-extension. Do not run `beagle hooks install`.
+- Skill scripts live under `${CLAUDE_PLUGIN_ROOT}`; the containment launcher \
+is `${CLAUDE_PLUGIN_ROOT}/skills/containment/scripts/run_contained.sh`. Use \
+that path, in briefs too, never a `~/.claude/plugins/cache/...` one, even if \
+beagle prints it: a Tau-only host has no such cache, and an upgrade moves it.
+- Beagle's hooks run inside this Tau extension, never from \
+`.claude/settings.json`: `loop-guard`, `loop-report` and `commit-claims` \
+always, and `close-out`, `cadence`, `cadence-report` and `commit-trailer` when \
+`beagle hooks install` has put them in the project's settings — so installing \
+them is how to switch them on here too. `tilth-load` and `transcript-guard` \
+have no Tau equivalent and are skipped.
 """
 
 
@@ -927,23 +1782,6 @@ def _goal_section(goal_file: Path) -> str | None:
 # --------------------------------------------------------------------------- #
 
 
-def _wanted_skills() -> dict[str, Path]:
-    """Skill name -> its directory in the checkout, for every skill to load."""
-    wanted: dict[str, Path] = {}
-    for plugin, names in SKILL_SOURCES.items():
-        skills = PLUGINS / plugin / "skills"
-        if names is None:
-            try:
-                names = tuple(sorted(child.name for child in skills.iterdir()))
-            except OSError:
-                continue
-        for name in names:
-            src = skills / name
-            if (src / "SKILL.md").is_file():
-                wanted.setdefault(name, src)
-    return wanted
-
-
 def _sync_link(link: Path, target: Path) -> None:
     """Point `link` at `target`, replacing only a symlink this module could own."""
     try:
@@ -971,7 +1809,7 @@ def build_plugin_root(root: Path) -> Path | None:
         skills_dir.mkdir(parents=True, exist_ok=True)
     except OSError:
         return None
-    wanted = _wanted_skills()
+    wanted, _ = _LAYOUT.skills()
     try:
         existing = list(skills_dir.iterdir())
     except OSError:
@@ -982,8 +1820,7 @@ def build_plugin_root(root: Path) -> Path | None:
                 entry.unlink()
     for name, src in wanted.items():
         _sync_link(skills_dir / name, src)
-    for name, candidates in PLUGIN_ROOT_LINKS.items():
-        target = next((c for c in candidates if c.is_dir()), None)
+    for name, target in (("commands", _LAYOUT.commands_dir), ("agents", _LAYOUT.agents_dir)):
         if target is not None:
             _sync_link(root / name, target)
         elif (root / name).is_symlink():
@@ -997,7 +1834,10 @@ AGENT_HOST_NOTE = """\
 You run as a Tau sub-agent, translated from a Claude Code agent definition. \
 Your tools are Tau's: `read`, `write`, `edit` and `bash`. Where the text below \
 names `Grep` or `Glob`, use `rg` or `find` through `bash`; MCP tools it names \
-(`mcp__...`) are not available.
+(`mcp__...`) are not available. Beagle's skill scripts live under \
+`${CLAUDE_PLUGIN_ROOT}/skills/`; run the containment launcher as \
+`${CLAUDE_PLUGIN_ROOT}/skills/containment/scripts/run_contained.sh`, not from \
+any `~/.claude/plugins/cache/...` path a brief or beagle names.
 """
 
 
@@ -1019,8 +1859,9 @@ def _agent_type_text(src: Path) -> str | None:
     # No `model:` — Claude's aliases name nothing a Tau provider serves, so the
     # sub-agent inherits the parent session's model.
     lines += [f"{GENERATED_KEY}: {GENERATED_BY}", "---", ""]
-    body = body.replace(PLUGIN_ROOT_VAR, str(_PLUGIN_ROOT)) if _PLUGIN_ROOT else body
-    return "\n".join(lines) + AGENT_HOST_NOTE + "\n" + body.lstrip("\n")
+    text = AGENT_HOST_NOTE + "\n" + body.lstrip("\n")
+    text = text.replace(PLUGIN_ROOT_VAR, str(_PLUGIN_ROOT)) if _PLUGIN_ROOT else text
+    return "\n".join(lines) + text
 
 
 def _is_generated(path: Path) -> bool:
@@ -1039,9 +1880,9 @@ def sync_agent_types(agents_dir: Path) -> list[str]:
     type whose beagle agent is gone is pruned rather than left to go stale.
     """
     wanted: dict[str, str] = {}
-    for plugin in AGENT_PLUGINS:
+    for plugin, directory in _LAYOUT.plugins:
         try:
-            sources = sorted((PLUGINS / plugin / "agents").glob("*.md"))
+            sources = sorted((directory / "agents").glob("*.md"))
         except OSError:
             continue
         for src in sources:
@@ -1079,15 +1920,50 @@ def sync_agent_types(agents_dir: Path) -> list[str]:
 # --------------------------------------------------------------------------- #
 
 
+def _bridge_session_start_hooks(tau: ExtensionAPI, cwd: Path) -> None:
+    """Run an installed `cadence-report` into the prompt; note unbridged hooks.
+
+    SessionStart stdout joins the session's context under Claude Code; here it
+    is a prompt section, which also outlives compaction. The note about hooks
+    left unbridged is shown once per load, not on every session switch.
+    """
+    installed = _hook_root(cwd)
+    if installed is not None and "cadence-report" in installed[1]:
+        report = _session_start_report("cadence-report", installed[0])
+        if report:
+            tau.add_prompt_section(
+                "Beagle cadences",
+                f"At session start, `beagle hook cadence-report` said:\n\n{report}",
+            )
+    notice = _unbridged_notice(cwd)
+    if notice is None:
+        return
+    shown: list[bool] = []
+
+    def notify(event: Any, context: ExtensionContext) -> None:
+        del event
+        if not shown:
+            shown.append(True)
+            context.ui.notify(notice, "info")
+
+    tau.on("session_start", notify)
+
+
 def setup(tau: ExtensionAPI) -> None:
-    global _SEEN_CWD, _PLUGIN_ROOT
+    global _SEEN_CWD, _PLUGIN_ROOT, _LAYOUT
+    # Every beagle this process starts, hooks and the bash tool's alike,
+    # inherits this, so beagle can tell it is not under Claude Code.
+    os.environ[HOST_ENV] = "tau"
+    _LAYOUT = resolve_layout(BEAGLE)
+    problems: list[str] = list(_LAYOUT.problems)
     # 1-2. Load the engineering-practice and pursuit skills from one merged
     #      plugin root. Skills run scripts from ${CLAUDE_PLUGIN_ROOT}/skills/...;
     #      the bash tool's subprocesses inherit this process env, so exporting
     #      the merged root makes every such path resolve, whichever plugin
     #      shipped the skill. Overwritten rather than defaulted: one inherited
     #      from a Claude Code shell names a single plugin and resolves half.
-    if PLUGINS.is_dir():
+    if _LAYOUT.plugins:
+        problems += _LAYOUT.skills()[1]
         root = tau.context.paths.home / MERGED_ROOT_NAME
         skills_dir = build_plugin_root(root)
         if skills_dir is not None:
@@ -1103,14 +1979,13 @@ def setup(tau: ExtensionAPI) -> None:
     #    reads, to a model listing its commands, as a loop it can offer. A
     #    checkout that is present but lacks a driver is a layout mismatch, not
     #    an absent install, so it is said aloud rather than degraded quietly.
-    problems: list[str] = []
     if _driver_file(PURSUIT_COMMAND) is not None:
         tau.register_command(
             "pursuit",
             _command_pursuit,
             description="Found or run a beagle pursuit — one goal, a task tree, no denominator.",
         )
-    elif PLUGINS.is_dir():
+    elif _LAYOUT.plugins:
         problems.append(f"/pursuit is not registered: {_driver_missing(PURSUIT_COMMAND)}")
     tau.register_command(
         "pursuit-view",
@@ -1143,9 +2018,12 @@ def setup(tau: ExtensionAPI) -> None:
     )
 
     # 5. Enforce the pursuit ground truth on every tool call, and bridge
-    #    beagle's commit-claims PreToolUse hook onto the same seam.
+    #    beagle's Bash PreToolUse hooks onto the same seam.
     tau.on("tool_call", make_guard())
-    tau.on("tool_call", make_commit_claims())
+    tau.on("tool_call", make_bash_hooks())
+    if not _is_worker():
+        tau.on("tool_call", make_scope_guard())
+        tau.on("tool_result", make_stopped_worker_note())
 
     # 6. What /pursuit-run needs from its host: a session id beagle can record
     #    as the driver, a wakeup, and the Stop hook. A worker runs none of the
@@ -1160,7 +2038,7 @@ def setup(tau: ExtensionAPI) -> None:
                 _command_pursuit_run,
                 description="Run a beagle pursuit task after task until it cannot move.",
             )
-        elif PLUGINS.is_dir():
+        elif _LAYOUT.plugins:
             problems.append(
                 f"/pursuit-run is not registered: {_driver_missing(PURSUIT_RUN_COMMAND)}"
             )
@@ -1184,8 +2062,9 @@ def setup(tau: ExtensionAPI) -> None:
             )
         )
         tau.on("agent_end", _note_run_end)
-        tau.on("agent_settled", make_loop_guard(tau))
-        tau.on("session_shutdown", lambda event, context: _cancel_wakeup())
+        tau.on("agent_settled", make_stop_hooks(tau))
+        tau.on("agent_settled", make_wakeup_delivery(tau))
+        tau.on("session_shutdown", lambda event, context: _void_wakeup())
 
     if problems:
         notice = "Beagle extension: " + " ".join(problems)
@@ -1193,8 +2072,9 @@ def setup(tau: ExtensionAPI) -> None:
         tau.add_prompt_section(
             "Beagle extension problems",
             "\n".join(f"- {p}" for p in problems)
-            + "\n\nDo not offer these commands to the user or say the pursuit loop is "
-            "available; tell them the extension and the beagle checkout disagree.",
+            + "\n\nDo not offer a command listed here as not registered, or say the "
+            "pursuit loop is available when it is not; tell the user the extension and the "
+            "beagle checkout disagree.",
         )
 
     # 7. If this project is a pursuit, pin its goal into the prompt at load —
@@ -1208,13 +2088,15 @@ def setup(tau: ExtensionAPI) -> None:
     except Exception:  # noqa: BLE001 - not bound yet at load
         cwd = Path.cwd()
     _SEEN_CWD = cwd
+    if not _is_worker():
+        _bridge_session_start_hooks(tau, cwd)
     goal = _find_goal(cwd)
     if goal is not None:
         section = _goal_section(goal)
         # loop-report is the SessionStart hook: what a run left in flight, and
         # the driver's core while one is. The system prompt outlives
         # compaction, so this also covers what the hook re-prints after one.
-        report = "" if _is_worker() else _loop_report(goal.parent.parent)
+        report = "" if _is_worker() else _session_start_report("loop-report", goal.parent.parent)
         if section and report:
             section = f"{section}\n\nAt session start, `beagle hook loop-report` said:\n\n{report}"
         if section:
