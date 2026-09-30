@@ -48,6 +48,11 @@ because a specific part of that model has no Tau equivalent:
   driver session is held; a subagent's calls carry its own session id. A
   cancelled worker sends no notice to end that wait, so a `stop_subagent`
   result while one stands says to clear it with a bare `beagle loop tick`.
+- **ended drivers** — workers and the wakeup end with the Tau session that
+  started them, so a run whose driver session has ended is stopped at the
+  next session start (`beagle loop stop`), and the next `/pursuit-run` is
+  told where the cancelled worker's partial work is. Each session records
+  its pid under the Tau home, since beagle trusts no Tau pid.
 - **orientation** — when the project is a pursuit, its goal and criteria are
   added to the system prompt at load, so the driver re-reads the goal every
   session without anything triggering a turn. It is a frame, not an order.
@@ -203,6 +208,11 @@ LOOP_IDLE_EXIT = 3
 LOOP_REL = Path(".beagle") / "loop.json"
 #: How long beagle believes an `awaiting` with no `--for`, in minutes.
 AWAITING_TTL_MINUTES = 45
+#: Where each Tau session that may drive a pursuit records its process, one
+#: `<session id>.json` per session, under the Tau home.
+DRIVERS_REL = Path("state") / "beagle-drivers"
+#: How long an ended or dead driver's record is kept before it is pruned.
+DRIVER_RECORD_DAYS = 7
 
 #: Last session cwd the extension saw, so the dispatch tool (which gets no
 #: context) can default to the project it is working in.
@@ -217,6 +227,13 @@ _WAKEUP: _Wakeup | None = None
 _STOP_BLOCKED = False
 #: Whether the last run ended on its own, rather than aborted or errored.
 _LAST_RUN_CLEAN = True
+#: The driver records' directory, once the Tau home is known.
+_DRIVERS_DIR: Path | None = None
+#: The session this process last registered as a possible driver.
+_DRIVER_SESSION: str | None = None
+#: What the next `/pursuit-run` turn is told about a run stopped because its
+#: Tau driver had ended, until one is sent.
+_ENDED_RUN_NOTE: str | None = None
 
 
 # --------------------------------------------------------------------------- #
@@ -1177,6 +1194,38 @@ def _on_session_start(event: Any, context: ExtensionContext) -> None:
     _adopt_session(context)
 
 
+async def _on_driver_session_start(event: Any, context: ExtensionContext) -> None:
+    """Retire a run whose Tau driver has ended, then record this session.
+
+    Load already did this for the process's cwd; this covers `/new`,
+    `/resume` and branches in the same process, whose outgoing session was
+    marked ended at shutdown. Retiring comes first: a resumed session is the
+    run's recorded driver, but not the process that ran its workers.
+    """
+    global _ENDED_RUN_NOTE
+    del event
+    goal = _find_goal(context.cwd)
+    if goal is not None:
+        note = await asyncio.to_thread(_retire_gone_driver, goal.parent.parent)
+        if note is not None:
+            _ENDED_RUN_NOTE = note
+            context.ui.notify(RETIRED_NOTICE, "warning")
+    _register_driver(context.session_id)
+
+
+def _notify_retired_once() -> Any:
+    """A `session_start` handler saying, once, that load retired a run."""
+    shown: list[bool] = []
+
+    def notify(event: Any, context: ExtensionContext) -> None:
+        del event
+        if not shown:
+            shown.append(True)
+            context.ui.notify(RETIRED_NOTICE, "warning")
+
+    return notify
+
+
 def _block_reason(stdout: str) -> str | None:
     """The reason from a hook's `{"decision": "block"}` line, or None (allow)."""
     for line in reversed(stdout.strip().splitlines()):
@@ -1450,6 +1499,146 @@ def _void_wakeup() -> _Wakeup | None:
     return wakeup
 
 
+ENDED_RUN_NOTE = """\
+beagle (Tau): the pursuit run driven by Tau session {session} was stopped \
+with `beagle loop stop`, because that session ended ({why}). A Tau session's \
+workers and wakeup end with it, so nothing was going to come back for that \
+run. {awaiting}Start a new run as the driver below says. A task that run left \
+open may hold a cancelled worker's partial work: before redoing it, read \
+`git status` and `git diff` in its scope (or the worker's `tau-agent-*` \
+branch, if it ran in a worktree) and the worker's transcript under \
+`~/.tau/subagents/*/{session}/tasks/`, then finish the task or close it \
+abandoned."""
+
+
+RETIRED_NOTICE = (
+    "Beagle: stopped the pursuit run left by an ended Tau session; /pursuit-run starts a new one."
+)
+
+
+def _process_start(pid: int) -> str | None:
+    """`pid`'s start time in clock ticks (Linux `/proc`), to tell a reused pid apart."""
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+    except OSError:
+        return None
+    fields = stat.rpartition(")")[2].split()  # the name may hold spaces
+    return fields[19] if len(fields) > 19 else None  # field 22, `starttime`
+
+
+def _pid_alive(pid: int, start: str | None) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        pass  # someone else's process: alive, and not ours
+    now = _process_start(pid)
+    return start is None or now is None or now == start
+
+
+def _driver_record(session_id: str | None) -> Path | None:
+    if _DRIVERS_DIR is None or not session_id or "/" in session_id:
+        return None
+    return _DRIVERS_DIR / f"{session_id}.json"
+
+
+def _register_driver(session_id: str | None) -> None:
+    """Record this process as the one `session_id` runs in; prune stale records.
+
+    beagle records a run's driver session but, under Tau, no pid it believes
+    (see `_adopt_session`), so it cannot tell a gone driver from a live one and
+    tells every other session to stand down until the wait's lease runs out.
+    This record is what lets the next session tell instead.
+    """
+    global _DRIVER_SESSION
+    path = _driver_record(session_id)
+    if path is None:
+        return
+    _DRIVER_SESSION = session_id
+    pid = os.getpid()
+    record = {"pid": pid, "start": _process_start(pid), "ended": False}
+    with contextlib.suppress(OSError):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(record), encoding="utf-8")
+        tmp.replace(path)
+        cutoff = datetime.now(UTC).timestamp() - DRIVER_RECORD_DAYS * 86400
+        for old in path.parent.glob("*.json"):
+            if old != path and old.stat().st_mtime < cutoff and _driver_gone(old.stem):
+                old.unlink(missing_ok=True)
+
+
+def _end_driver() -> None:
+    """Mark this process's driver session ended: its workers and wakeup go with it."""
+    path = _driver_record(_DRIVER_SESSION)
+    if path is None:
+        return
+    with contextlib.suppress(OSError, ValueError):
+        record = json.loads(path.read_text(encoding="utf-8"))
+        record["ended"] = True
+        path.write_text(json.dumps(record), encoding="utf-8")
+
+
+def _driver_gone(session_id: str) -> str | None:
+    """Why the Tau session `session_id` can no longer drive a run, or None.
+
+    None too for a session with no record here — a Claude Code session, or
+    one from before this record existed — which is left to beagle's own rules.
+    """
+    path = _driver_record(session_id)
+    try:
+        record = json.loads(path.read_text(encoding="utf-8")) if path else None
+    except (OSError, ValueError):
+        return None
+    if not isinstance(record, dict):
+        return None
+    if record.get("ended"):
+        return "the session was closed, replaced or reloaded"
+    pid = record.get("pid")
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+        return None
+    start = record.get("start")
+    if not _pid_alive(pid, start if isinstance(start, str) else None):
+        return f"its Tau process {pid} exited"
+    return None
+
+
+def _retire_gone_driver(root: Path) -> str | None:
+    """Stop the run whose Tau driver has ended; the note for the next driver.
+
+    Workers do not outlive the Tau session that spawned them, so a run whose
+    driver session ended has nothing left that will come back: no worker to
+    report, no wakeup to fire. Left in place, beagle would tell a new session
+    to stand down, and a resumed one that its dead worker still holds the
+    task. Stopping it lets the next `/pursuit-run` start clean and pick the
+    open task up as one a previous session left.
+    """
+    if not (root / LOOP_REL).is_file():
+        return None
+    record = _json_out(["loop", "read", "--json"], root)
+    if not isinstance(record, dict):
+        return None
+    session = str(record.get("driver_session") or "")
+    why = _driver_gone(session)
+    if why is None:
+        return None
+    awaiting = str(record.get("awaiting") or "")
+    reason = f"Tau driver session {session} ended ({why}); its workers ended with it"
+    if awaiting:
+        reason += f"; it was awaiting: {awaiting}"
+    rc, _ = _run(
+        [BEAGLE_BIN, "loop", "stop", "--reason", reason, "--root", str(root)], root, HOOK_TIMEOUT
+    )
+    if rc != 0:
+        return None
+    return ENDED_RUN_NOTE.format(
+        session=session,
+        why=why,
+        awaiting=f'It was awaiting "{awaiting}". ' if awaiting else "",
+    )
+
+
 def _fire_wakeup(tau: ExtensionAPI, wakeup: _Wakeup) -> None:
     """The timer ran out: deliver now if the session is idle, else at its settle."""
     if _WAKEUP is not wakeup:
@@ -1695,8 +1884,19 @@ def _pursuit_turn(args: str) -> str | None:
 
 
 def _pursuit_run_turn(args: str) -> str | None:
-    """The `/pursuit-run` driver as a turn, or None when it is not installed."""
-    return _driver_turn(PURSUIT_RUN_COMMAND, args, preamble=TAU_HOST_NOTE)
+    """The `/pursuit-run` driver as a turn, or None when it is not installed.
+
+    A note about a run stopped because its Tau driver ended leads the first
+    one sent after the stop.
+    """
+    global _ENDED_RUN_NOTE
+    preamble = TAU_HOST_NOTE
+    if _ENDED_RUN_NOTE is not None:
+        preamble = f"{_ENDED_RUN_NOTE}\n\n{preamble}"
+    text = _driver_turn(PURSUIT_RUN_COMMAND, args, preamble=preamble)
+    if text is not None:
+        _ENDED_RUN_NOTE = None
+    return text
 
 
 #: Driver commands a wakeup's prompt may name, expanded as their command would.
@@ -1950,11 +2150,12 @@ def _bridge_session_start_hooks(tau: ExtensionAPI, cwd: Path) -> None:
 
 
 def setup(tau: ExtensionAPI) -> None:
-    global _SEEN_CWD, _PLUGIN_ROOT, _LAYOUT
+    global _SEEN_CWD, _PLUGIN_ROOT, _LAYOUT, _DRIVERS_DIR, _ENDED_RUN_NOTE
     # Every beagle this process starts, hooks and the bash tool's alike,
     # inherits this, so beagle can tell it is not under Claude Code.
     os.environ[HOST_ENV] = "tau"
     _LAYOUT = resolve_layout(BEAGLE)
+    _DRIVERS_DIR = tau.context.paths.home / DRIVERS_REL
     problems: list[str] = list(_LAYOUT.problems)
     # 1-2. Load the engineering-practice and pursuit skills from one merged
     #      plugin root. Skills run scripts from ${CLAUDE_PLUGIN_ROOT}/skills/...;
@@ -2065,6 +2266,10 @@ def setup(tau: ExtensionAPI) -> None:
         tau.on("agent_settled", make_stop_hooks(tau))
         tau.on("agent_settled", make_wakeup_delivery(tau))
         tau.on("session_shutdown", lambda event, context: _void_wakeup())
+        # Workers do not outlive their session, so a run this session drives
+        # ends with it; the next session to start sees that and retires it.
+        tau.on("session_start", _on_driver_session_start)
+        tau.on("session_shutdown", lambda event, context: _end_driver())
 
     if problems:
         notice = "Beagle extension: " + " ".join(problems)
@@ -2096,7 +2301,14 @@ def setup(tau: ExtensionAPI) -> None:
         # loop-report is the SessionStart hook: what a run left in flight, and
         # the driver's core while one is. The system prompt outlives
         # compaction, so this also covers what the hook re-prints after one.
-        report = "" if _is_worker() else _session_start_report("loop-report", goal.parent.parent)
+        report = ""
+        if not _is_worker():
+            # Before loop-report, so it does not tell this session to stand
+            # down for a driver that has ended.
+            _ENDED_RUN_NOTE = _retire_gone_driver(goal.parent.parent)
+            if _ENDED_RUN_NOTE is not None:
+                tau.on("session_start", _notify_retired_once())
+            report = _session_start_report("loop-report", goal.parent.parent)
         if section and report:
             section = f"{section}\n\nAt session start, `beagle hook loop-report` said:\n\n{report}"
         if section:

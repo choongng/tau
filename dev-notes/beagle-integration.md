@@ -186,7 +186,7 @@ What it adds, and how each piece maps to what Claude Code provides:
 | `SendMessage` to a running agent / `TaskOutput` | tau-subagents' `steer_subagent` / `get_subagent_result` (`wait: true` blocks) | |
 | (fallback without tau-subagents) | `pursuit_dispatch`: a nested `tau -p --append-system-prompt step-executor.md` | Synchronous; its report returns in the same turn, so no `--awaiting` tick. |
 | `ScheduleWakeup` | `pursuit_wakeup` (arm / replace / `stop`) | In-process timer; interactive TUI only (refused in print mode, which the driver treats as a stopping condition). Firing re-expands `/pursuit-run`. |
-| `CLAUDE_CODE_SESSION_ID` / `CLAUDE_PID` | Tau session id exported at `session_start`; `CLAUDE_PID` removed | beagle only trusts a pid named claude/node, so without one it judges liveness by the run's own promises. |
+| `CLAUDE_CODE_SESSION_ID` / `CLAUDE_PID` | Tau session id exported at `session_start`; `CLAUDE_PID` removed; each session's pid recorded under `$TAU_HOME/state/beagle-drivers/` | beagle only trusts a pid named claude/node, so without one it judges liveness by the run's own promises. The bridge judges it instead: see *A driver that has ended* below. |
 | `Stop` hooks `loop-guard`, `close-out`, `cadence` | `agent_settled` → `beagle hook NAME` | `loop-guard` in any pursuit; the others when installed in the project's `.claude/settings.json`, under the entry's timeout. Skipped for aborted/errored runs and print mode. Objections from one settle join into one more turn; the next settle passes `stop_hook_active` to all of them. |
 | `PreToolUse` hooks `commit-claims`, `commit-trailer` | bash `tool_call` → `beagle hook NAME` | Only commands containing `commit`; `commit-claims` in a pursuit, `commit-trailer` when installed. |
 | `SessionStart` hooks `loop-report`, `cadence-report` | Prompt sections at load ("Beagle pursuit", "Beagle cadences") | `cadence-report` when installed. Extensions load before the session binds, so this (and goal discovery) uses the process cwd. |
@@ -235,8 +235,9 @@ Remaining gaps versus Claude Code:
   `tau -p` turn ends is lost with the process, like a wakeup. Use foreground
   `agent` calls there; `/pursuit-run` itself stops at the refused wakeup.
 - **No MCP.** `mcp__tilth__*` grants do nothing; tilth is CLI-only.
-- **Wakeups do not persist.** A timer dies with the process or `/reload`;
-  `loop-report` and `loop-guard` will name the missed resumption next session.
+- **A run does not outlive its driver session.** Workers and the wakeup die
+  with the session (see below), so the run is stopped at the next session
+  start and `/pursuit-run` starts a new one. Wakeups are not persisted.
 - **Two installed hooks are not bridged.** `tilth-load` and
   `transcript-guard` (see the table). `beagle hooks install` is how the others
   are switched on under Tau too.
@@ -250,6 +251,38 @@ providers lack the `session_id` keyword, its fake TUI session lacks newer
 attributes, and project-trust gating hides untrusted project skills from its
 skill-index tests); a live background and foreground run against this checkout
 works.
+
+### A driver that has ended
+
+Workers do not outlive the Tau session that spawned them: tau-subagents
+cancels them at every `session_shutdown` (quit, `/new`, `/resume`, a branch,
+`/reload`), and a crash or a closed terminal takes them down with the
+process. The wakeup goes the same way. So once its driver session has ended,
+a run has nothing left that will come back for it. beagle cannot tell that
+under Tau (it has no pid it trusts), and would tell a new session to stand
+down, and a resumed one that its dead worker still holds the task, until the
+wait's lease ran out.
+
+The bridge closes that gap itself:
+
+- Every non-worker session writes `$TAU_HOME/state/beagle-drivers/<session
+  id>.json` with its pid and the pid's start time, and marks it `ended` at
+  `session_shutdown`.
+- At load, and at every `session_start`, a run whose `driver_session` has
+  such a record that is ended, or whose process is gone, is stopped with
+  `beagle loop stop --reason` naming the session and what it was awaiting.
+  Load does this before `loop-report`, so the report does not say to stand
+  down. A session with no record (a Claude Code session, say) is left to
+  beagle.
+- The user gets a warning, and the next `/pursuit-run` turn starts with a
+  note: the run was stopped, and a task it left open may hold a cancelled
+  worker's partial work — uncommitted changes in its scope, a `tau-agent-*`
+  branch, and its transcript under `~/.tau/subagents/*/<session>/tasks/` —
+  to read before redoing the task. The driver then treats that task as one
+  a previous session left open: finish it, or close it abandoned.
+
+Some work is lost this way: whatever the worker had not written to disk. That
+is the trade for workers that never outlive the session driving them.
 
 ### Testing it
 

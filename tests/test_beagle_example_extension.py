@@ -10,6 +10,7 @@ import asyncio
 import json
 import os
 import shutil
+import subprocess
 import sys
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -115,6 +116,9 @@ here = Path(os.environ["FAKE_BEAGLE_DIR"])
 stdin = sys.stdin.read()
 with (here / "calls.jsonl").open("a") as log:
     log.write(json.dumps({"argv": sys.argv[1:], "cwd": os.getcwd(), "stdin": stdin}) + "\\n")
+if sys.argv[1:3] == ["loop", "stop"]:  # as beagle does: no run in flight after
+    (here / "read.out").unlink(missing_ok=True)
+    (here / "read.rc").write_text("3")
 if json.loads(stdin or "{}").get("stop_hook_active"):
     sys.exit(0)  # as beagle's Stop hooks do
 reply = here / (sys.argv[2] + ".out")
@@ -1102,3 +1106,124 @@ def test_host_note_gives_the_worker_spawn_rules(tmp_path: Path, beagle: Path) ->
     assert "Set `max_turns` from the task's budget" in note
     assert "do not poll `get_subagent_result`" in note
     assert "quoted heredoc (`<<'EOF'`), a file, or single quotes, never double quotes" in note
+
+
+# -- a run whose Tau driver has ended -------------------------------------------
+
+
+def _left_run(project: Path, fake: Path, driver: str) -> None:
+    """A run driven by `driver`, still waiting on its worker."""
+    at = datetime.now(UTC).isoformat()
+    record = {
+        "started_at": at,
+        "started_by": "/pursuit-run",
+        "driver_session": driver,
+        "awaiting": "step-executor on T0003",
+        "awaiting_at": at,
+        "awaiting_minutes": 120,
+    }
+    (project / ".beagle" / "loop.json").write_text(json.dumps(record), encoding="utf-8")
+    (fake / "read.out").write_text(json.dumps(record), encoding="utf-8")
+
+
+def _driver_entry(tmp_path: Path, session: str, **record: Any) -> Path:
+    path = tmp_path / "home-tau" / "state" / "beagle-drivers" / f"{session}.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(record), encoding="utf-8")
+    return path
+
+
+def _exited_pid() -> int:
+    proc = subprocess.run(
+        [sys.executable, "-c", "import os; print(os.getpid())"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return int(proc.stdout)
+
+
+def _stops(fake: Path) -> list[list[str]]:
+    return [c["argv"] for c in _calls(fake) if c["argv"][:2] == ["loop", "stop"]]
+
+
+@pytest.mark.anyio
+async def test_load_retires_a_run_whose_tau_driver_exited(
+    tmp_path: Path, beagle: Path, fake_beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project = _pursuit_project(tmp_path)
+    _left_run(project, fake_beagle, "old-session")
+    _driver_entry(tmp_path, "old-session", pid=_exited_pid(), start=None, ended=False)
+    monkeypatch.chdir(project)
+    runtime = _load(tmp_path)
+    ui = RecordingUiBridge(has_ui=True)
+    runtime.set_ui_bridge(ui)  # type: ignore[arg-type]
+    session = RecordingSession(project, running=True)
+    runtime.bind(session)  # type: ignore[arg-type]
+
+    await runtime.emit_session_start("startup")
+    _run_command(runtime, "pursuit-run")
+    _run_command(runtime, "pursuit-run")
+
+    [stop] = _stops(fake_beagle)
+    reason = stop[stop.index("--reason") + 1]
+    assert "old-session" in reason and "exited" in reason
+    assert "awaiting: step-executor on T0003" in reason
+    # Retired before loop-report, which would otherwise say to stand down.
+    order = [c["argv"][1] for c in _calls(fake_beagle)]
+    assert order.index("stop") < order.index("loop-report")
+    assert [level for _, level in ui.notifications] == ["warning"]
+    first, second = session.followed_up
+    assert first.index("was stopped with `beagle loop stop`") < first.index("Host mapping")
+    assert 'awaiting "step-executor on T0003"' in first
+    assert "~/.tau/subagents/*/old-session/tasks/" in first
+    assert "beagle loop stop" not in second  # said once
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("entry", ["live", "unknown"])
+async def test_a_live_or_unknown_driver_keeps_its_run(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    entry: str,
+) -> None:
+    project = _pursuit_project(tmp_path)
+    _left_run(project, fake_beagle, "other-session")
+    if entry == "live":  # another Tau process, still running
+        _driver_entry(tmp_path, "other-session", pid=os.getppid(), start=None, ended=False)
+    monkeypatch.chdir(project)
+    runtime = _load(tmp_path)
+    runtime.bind(RecordingSession(project, running=False))  # type: ignore[arg-type]
+
+    await runtime.emit_session_start("startup")
+
+    assert _stops(fake_beagle) == []
+
+
+@pytest.mark.anyio
+async def test_a_session_that_ends_retires_its_run_at_the_next_start(
+    tmp_path: Path, beagle: Path, fake_beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project = _pursuit_project(tmp_path)
+    monkeypatch.chdir(project)
+    runtime = _load(tmp_path)
+    runtime.set_ui_bridge(RecordingUiBridge(has_ui=True))  # type: ignore[arg-type]
+    session = RecordingSession(project, running=False)
+    runtime.bind(session)  # type: ignore[arg-type]
+    await runtime.emit_session_start("startup")
+    entry = tmp_path / "home-tau" / "state" / "beagle-drivers" / f"{session.session_id}.json"
+    assert json.loads(entry.read_text())["pid"] == os.getpid()
+    _left_run(project, fake_beagle, session.session_id)
+
+    # This process is alive, so only the shutdown mark says its workers are gone.
+    await runtime.emit_session_start("resume")
+    assert _stops(fake_beagle) == []
+    await runtime.emit_session_shutdown("resume")
+    assert json.loads(entry.read_text())["ended"] is True
+    await runtime.emit_session_start("resume")
+
+    [stop] = _stops(fake_beagle)
+    assert "closed, replaced or reloaded" in stop[stop.index("--reason") + 1]
+    assert json.loads(entry.read_text())["ended"] is False  # re-recorded as live
