@@ -377,7 +377,10 @@ See the [Providers & models guide]({{< relref "../guides/providers-and-models.md
 ## Shell settings
 
 Tau runs shell commands in a **non-interactive** shell — both terminal-input
-commands (`! gst`, `!! ll`) and the agent's `bash` tool. Non-interactive shells
+commands (`! gst`, `!! ll`) and the agent's `bash` tool. On macOS and Linux
+that shell is `bash` from your `PATH`; only when bash is not installed does
+Tau fall back to `/bin/sh`, and the tool's description then tells the model to
+avoid bash-only syntax. Non-interactive shells
 don't load your aliases from `~/.zshrc` or `~/.bashrc`, and Tau deliberately
 never reads those files (they can hold tokens and side effects).
 

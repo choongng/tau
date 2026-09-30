@@ -13,6 +13,7 @@ import asyncio
 import difflib
 import json
 import os
+import shutil
 import signal
 import tempfile
 from collections.abc import Awaitable, Callable, Mapping
@@ -46,6 +47,21 @@ DEFAULT_MAX_OUTPUT_LINES = 2_000
 DEFAULT_BASH_TIMEOUT_SECONDS = 600.0
 IMAGE_SNIFF_BYTES = 64 * 1024
 UTF8_BOM = "\ufeff"
+
+
+def _resolve_posix_shell() -> tuple[str, bool]:
+    """Return the shell the bash tool runs on POSIX and whether it is bash.
+
+    The tool is named and described as bash, so models write bashisms such as
+    `${PIPESTATUS[0]}` or `[[ ... ]]`. `create_subprocess_shell` defaults to
+    `/bin/sh`, which is dash on Debian-family systems and rejects them. Bash is
+    therefore resolved from `PATH`; only when it is absent does the tool fall
+    back to `/bin/sh` and say so in its description.
+    """
+    bash = shutil.which("bash")
+    if bash is not None:
+        return bash, True
+    return "/bin/sh", False
 
 
 class ToolInputError(ValueError):
@@ -597,9 +613,10 @@ def create_bash_tool_definition(
 ) -> ToolDefinition:
     """Create a definition for the `bash` tool.
 
-    The tool runs a shell command with `cwd` as the subprocess working
-    directory, disconnects stdin, and combines stdout and stderr into one UTF-8
-    decoded output stream. Disconnecting stdin keeps interactive programs from
+    The tool runs a command under bash (or `/bin/sh` when bash is absent; see
+    `_resolve_posix_shell`) with `cwd` as the subprocess working directory,
+    disconnects stdin, and combines stdout and stderr into one UTF-8 decoded
+    output stream. Disconnecting stdin keeps interactive programs from
     competing with Tau for terminal input. The optional `timeout` argument must
     be positive when supplied; without it the command gets `default_timeout`
     seconds, and `None` there leaves it unbounded. On timeout, POSIX commands are started in a new
@@ -617,6 +634,10 @@ def create_bash_tool_definition(
     prefix = shell_command_prefix.strip() if shell_command_prefix else None
     if default_timeout is not None and default_timeout <= 0:
         raise ValueError("default_timeout must be greater than 0")
+    if os.name == "posix":
+        shell_executable, runs_bash = _resolve_posix_shell()
+    else:
+        shell_executable, runs_bash = None, False
 
     async def execute(
         arguments: Mapping[str, JSONValue],
@@ -642,7 +663,7 @@ def create_bash_tool_definition(
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.STDOUT,
                 start_new_session=True,
-                executable="bash" if prefix else None,
+                executable=shell_executable,
             )
         else:
             process = await asyncio.create_subprocess_shell(
@@ -719,7 +740,13 @@ def create_bash_tool_definition(
     return ToolDefinition(
         name="bash",
         description=(
-            "Execute a bash command in the current working directory. Returns stdout and stderr. "
+            (
+                "Execute a bash command in the current working directory. "
+                if runs_bash
+                else "Execute a shell command in the current working directory. It runs "
+                "under the system shell, not bash, so avoid bash-only syntax. "
+            )
+            + "Returns stdout and stderr. "
             f"Output is truncated to last {DEFAULT_MAX_OUTPUT_LINES} lines or "
             f"{DEFAULT_MAX_OUTPUT_BYTES // 1024}KB (whichever is hit first). If truncated, "
             "full output is saved to a temp file. Optionally provide a timeout in seconds"
