@@ -98,6 +98,7 @@ def beagle(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     monkeypatch.setenv("CLAUDE_PLUGIN_ROOT", "/inherited/beagle-dev")
     monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "claude-session")
     monkeypatch.setenv("CLAUDE_PID", "4242")
+    monkeypatch.setenv("BEAGLE_HOST", "inherited")
     monkeypatch.delenv("BEAGLE_TAU_WORKER", raising=False)
     # Never the real beagle: a test that wants one takes `fake_beagle`.
     monkeypatch.setenv("BEAGLE_BIN", str(tmp_path / "no-beagle-bin"))
@@ -663,6 +664,123 @@ async def test_loop_guard_skips_interrupted_runs_and_print_mode(
 
     assert session.followed_up == [] and headless_session.followed_up == []
     assert not [c for c in _calls(fake_beagle) if "loop-guard" in c["argv"]]
+
+
+def _install_hooks(project: Path, *names: str, timeout: int = 900) -> None:
+    """Write `.claude/settings.json` as `beagle hooks install NAMES` would."""
+    events = {
+        "Stop": {"cadence", "close-out", "loop-guard"},
+        "SessionStart": {"cadence-report", "loop-report", "tilth-load"},
+    }
+    hooks: dict[str, list[Any]] = {}
+    for name in names:
+        event = next((e for e, members in events.items() if name in members), "PreToolUse")
+        entry = {"type": "command", "command": f"beagle hook {name}", "timeout": timeout}
+        hooks.setdefault(event, []).append({"hooks": [{**entry, "beagle": name}]})
+    settings = project / ".claude" / "settings.json"
+    settings.parent.mkdir(parents=True, exist_ok=True)
+    settings.write_text(json.dumps({"hooks": hooks}), encoding="utf-8")
+
+
+@pytest.mark.anyio
+async def test_installed_stop_hooks_share_one_objection_per_stop(
+    tmp_path: Path, beagle: Path, fake_beagle: Path
+) -> None:
+    project = _pursuit_project(tmp_path)
+    _install_hooks(project, "close-out", "commit-trailer")
+    (fake_beagle / "loop-guard.out").write_text(_block("arm the next turn"), encoding="utf-8")
+    (fake_beagle / "close-out.out").write_text(_block("gates failed"), encoding="utf-8")
+    (fake_beagle / "cadence.out").write_text(_block("not installed"), encoding="utf-8")
+    runtime, session = _bound(tmp_path)
+
+    await runtime.emit_event(_end())
+    await runtime.emit_event(AgentSettledEvent())
+    await runtime.emit_event(_end())
+    await runtime.emit_event(AgentSettledEvent())
+
+    # Both objections became one turn; `cadence` is not installed, so it never ran.
+    assert session.followed_up == [
+        "[beagle loop-guard]\n\narm the next turn\n\n[beagle close-out]\n\ngates failed"
+    ]
+    stops = [c for c in _calls(fake_beagle) if c["argv"][1] in ("loop-guard", "close-out")]
+    assert [c["argv"][1] for c in stops] == ["loop-guard", "close-out"] * 2
+    assert [json.loads(c["stdin"])["stop_hook_active"] for c in stops] == [False] * 2 + [True] * 2
+    assert all(Path(c["cwd"]) == project for c in stops)
+    assert not [c for c in _calls(fake_beagle) if c["argv"][1] == "cadence"]
+
+
+@pytest.mark.anyio
+async def test_installed_close_out_runs_outside_a_pursuit(
+    tmp_path: Path, beagle: Path, fake_beagle: Path
+) -> None:
+    project = tmp_path / "project"
+    _install_hooks(project, "cadence")
+    (fake_beagle / "cadence.out").write_text(_block("a blocking cadence failed"))
+    runtime, session = _bound(tmp_path)
+
+    await runtime.emit_event(_end())
+    await runtime.emit_event(AgentSettledEvent())
+
+    assert session.followed_up == ["[beagle cadence]\n\na blocking cadence failed"]
+    assert [c["argv"] for c in _calls(fake_beagle)] == [["hook", "cadence"]]
+
+
+@pytest.mark.anyio
+async def test_installed_commit_trailer_joins_commit_claims(
+    tmp_path: Path, beagle: Path, fake_beagle: Path
+) -> None:
+    project = _pursuit_project(tmp_path)
+    _install_hooks(project, "commit-trailer")
+    (fake_beagle / "commit-trailer.out").write_text(_block("forbidden Co-Authored-By"))
+    runtime, _ = _bound(tmp_path)
+    bash = _tool_with_hooks(runtime)
+
+    ls = await bash.execute("c0", {"command": "ls"})
+    committed = await bash.execute("c1", {"command": "git commit -m wip"})
+
+    assert ls.text == "ran"
+    assert committed.text == "Tool call blocked: beagle commit-trailer: forbidden Co-Authored-By"
+    calls = _calls(fake_beagle)
+    assert [c["argv"] for c in calls] == [["hook", "commit-claims"], ["hook", "commit-trailer"]]
+    assert all(Path(c["cwd"]) == project for c in calls)
+
+
+@pytest.mark.anyio
+async def test_cadence_report_joins_the_prompt_and_unbridged_hooks_are_noted_once(
+    tmp_path: Path, beagle: Path, fake_beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project = tmp_path / "project"
+    _install_hooks(project, "cadence-report", "tilth-load", "transcript-guard", "loop-report")
+    (fake_beagle / "cadence-report.out").write_text("beagle: 1 cadence overdue: audit\n")
+    monkeypatch.chdir(project)
+    runtime = _load(tmp_path)
+    ui = RecordingUiBridge(has_ui=True)
+    runtime.set_ui_bridge(ui)  # type: ignore[arg-type]
+    runtime.bind(RecordingSession(project, running=False))  # type: ignore[arg-type]
+
+    await runtime.emit_session_start("startup")
+    await runtime.emit_session_start("resume")
+
+    [section] = [s for s in runtime.prompt_sections if s.title == "Beagle cadences"]
+    assert section.body.endswith("beagle: 1 cadence overdue: audit")
+    [call] = _calls(fake_beagle)
+    assert call["argv"] == ["hook", "cadence-report"]
+    assert json.loads(call["stdin"])["source"] == "startup"
+    [(notice, level)] = ui.notifications
+    assert level == "info"
+    assert "tilth-load (" in notice and "transcript-guard (" in notice
+    assert "loop-report" not in notice and "cadence-report" not in notice
+
+
+def test_beagle_subprocesses_are_told_the_host_is_tau(tmp_path: Path, beagle: Path) -> None:
+    runtime, session = _bound(tmp_path)
+    _run_command(runtime, "pursuit-run")
+
+    assert os.environ["BEAGLE_HOST"] == "tau"
+    # The host note says installing hooks switches them on, not to avoid it.
+    note = " ".join(session.followed_up[0].split())
+    assert "Do not run `beagle hooks install`" not in note
+    assert "`commit-trailer` when `beagle hooks install` has put them" in note
 
 
 def test_loop_report_joins_the_pursuit_section(

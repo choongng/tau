@@ -48,11 +48,23 @@ because a specific part of that model has no Tau equivalent:
 - **`/pursuit-run`** — the uncounted loop around `/pursuit`, which needs three
   things Claude Code gives it: a session id beagle records as the run's driver
   (exported as `CLAUDE_CODE_SESSION_ID`), a way to arm the next turn
-  (`pursuit_wakeup`, standing in for `ScheduleWakeup`), and the hooks —
-  `loop-guard` on `agent_settled`, `commit-claims` on bash `tool_call`. The
-  driver text is prefixed with a short note mapping its Claude Code names onto
-  these. A dispatched worker runs none of the loop: it is one step of its
+  (`pursuit_wakeup`, standing in for `ScheduleWakeup`), and the hooks (next
+  bullet). The driver text is prefixed with a short note mapping its Claude
+  Code names onto these. A dispatched worker runs none of the loop: it is one step of its
   parent's, and keeps the parent's session id.
+- **hooks** — Tau never reads `.claude/settings.json`, so beagle's hooks run
+  here, on Tau's seams: Stop hooks on `agent_settled` (objections joined into
+  one more turn, and `stop_hook_active` set on the settle it produces),
+  SessionStart hooks at load into the system prompt, and Bash PreToolUse hooks
+  on the bash `tool_call`. `loop-guard`, `loop-report` and `commit-claims` run
+  in any pursuit; `close-out`, `cadence`, `cadence-report` and
+  `commit-trailer` run when `beagle hooks install` put them in the project's
+  settings, under their installed timeouts — installing is how to switch them
+  on under Tau as well. `tilth-load` (a Claude Code ToolSearch reminder) and
+  `transcript-guard` (which needs a transcript path Tau does not expose) are
+  not bridged; if installed, a one-time note at session start says so.
+- **`BEAGLE_HOST=tau`** — set for every subprocess, so beagle can tell a Tau
+  host from Claude Code, whose `CLAUDE_*` variables this extension borrows.
 - **agent types** — background dispatch, completion notices and messaging a
   running worker come from the separate tau-subagents extension. This module
   only feeds it: each agent a beagle plugin ships is written as an agent type
@@ -150,8 +162,28 @@ GUARD_DISABLE_ENV = "BEAGLE_TAU_ALLOW_PURSUIT_EDIT"
 #: parent: it keeps the parent's session id and runs no loop of its own.
 WORKER_ENV = "BEAGLE_TAU_WORKER"
 
-#: Wall-clock cap on one `beagle hook` call; a hook that hangs fails open.
+#: Wall-clock cap on one bridged-by-default `beagle hook` call; a hook that
+#: hangs fails open. An installed hook gets its own entry's timeout instead.
 HOOK_TIMEOUT = 30.0
+#: Where Claude Code reads a project's hooks, the key beagle marks its own
+#: entries with, and the timeout `beagle hooks install` writes by default.
+SETTINGS_REL = Path(".claude") / "settings.json"
+HOOK_MARKER = "beagle"
+DEFAULT_HOOK_TIMEOUT = 900.0
+#: Installed Stop hooks bridged on `agent_settled`, in the order they run.
+STOP_HOOKS = ("cadence", "close-out")
+#: Every hook this extension runs, installed or not.
+BRIDGED_HOOKS = frozenset(
+    {"loop-guard", "loop-report", "commit-claims", *STOP_HOOKS, "cadence-report", "commit-trailer"}
+)
+#: Installed hooks deliberately not bridged, and why; said once at session start.
+UNBRIDGED_HOOKS = {
+    "tilth-load": "it prints a call to Claude Code's ToolSearch, which Tau does not have",
+    "transcript-guard": "it needs the session transcript path, which Tau does not give extensions",
+}
+#: Set for every beagle subprocess (and the bash tool's), so beagle can tell a
+#: Tau host from Claude Code, whose `CLAUDE_*` variables this extension borrows.
+HOST_ENV = "BEAGLE_HOST"
 #: The wakeup delay's bounds, in minutes (Claude Code clamps to 1..60 too).
 WAKEUP_MIN_MINUTES = 1
 WAKEUP_MAX_MINUTES = 60
@@ -166,9 +198,9 @@ _PLUGIN_ROOT: Path | None = None
 #: The armed or fired-but-undelivered `pursuit_wakeup`, if any. One at a time,
 #: like `ScheduleWakeup`.
 _WAKEUP: _Wakeup | None = None
-#: Whether the run now settling was started by a loop-guard objection — the
-#: Stop hook's `stop_hook_active`, which lets the next stop through.
-_GUARD_OBJECTED = False
+#: Whether the run now settling was started by a Stop-hook objection — the
+#: hooks' `stop_hook_active`, which lets the next stop through.
+_STOP_BLOCKED = False
 #: Whether the last run ended on its own, rather than aborted or errored.
 _LAST_RUN_CLEAN = True
 
@@ -936,7 +968,9 @@ def _block_reason(stdout: str) -> str | None:
     return None
 
 
-async def _run_hook(name: str, root: Path, payload: Mapping[str, Any]) -> str | None:
+async def _run_hook(
+    name: str, root: Path, payload: Mapping[str, Any], timeout: float = HOOK_TIMEOUT
+) -> str | None:
     """Run `beagle hook NAME` as Claude Code would; its stdout, or None on failure.
 
     The bare `hook NAME` argv is beagle's fast path, which reads the root from
@@ -958,7 +992,7 @@ async def _run_hook(name: str, root: Path, payload: Mapping[str, Any]) -> str | 
         return None
     try:
         stdout, _ = await asyncio.wait_for(
-            proc.communicate(json.dumps(payload).encode("utf-8")), timeout=HOOK_TIMEOUT
+            proc.communicate(json.dumps(payload).encode("utf-8")), timeout=timeout
         )
     except TimeoutError:
         with contextlib.suppress(ProcessLookupError):
@@ -968,51 +1002,110 @@ async def _run_hook(name: str, root: Path, payload: Mapping[str, Any]) -> str | 
     return (stdout or b"").decode("utf-8", "replace")
 
 
-def _loop_report(root: Path) -> str:
-    """`beagle hook loop-report`'s text for a session start; "" when silent."""
-    payload = json.dumps({"hook_event_name": "SessionStart", "cwd": str(root)})
-    rc, out = _run([BEAGLE_BIN, "hook", "loop-report"], root, HOOK_TIMEOUT, stdin=payload)
+def _hook_root(cwd: Path) -> tuple[Path, dict[str, float]] | None:
+    """The project whose `.claude/settings.json` installs beagle hooks, and them.
+
+    Claude Code reads a project's hooks from `<root>/.claude/settings.json`;
+    beagle marks the entries it wrote with a `"beagle": "<name>"` key, which is
+    how `beagle hooks installed` finds them and how this finds them. Each name
+    maps to the entry's own timeout (beagle writes 900s). The nearest ancestor
+    of `cwd` with such a file wins; None when there is none or it is unreadable.
+    """
+    for directory in (cwd, *cwd.parents):
+        settings = directory / SETTINGS_REL
+        if not settings.is_file():
+            continue
+        try:
+            data = json.loads(settings.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return None
+        hooks: dict[str, float] = {}
+        groups = data.get("hooks") if isinstance(data, dict) else None
+        for entries in (groups or {}).values() if isinstance(groups, dict) else ():
+            for group in entries if isinstance(entries, list) else ():
+                inner = group.get("hooks") if isinstance(group, dict) else None
+                for hook in inner if isinstance(inner, list) else ():
+                    name = hook.get(HOOK_MARKER) if isinstance(hook, dict) else None
+                    if isinstance(name, str) and name:
+                        timeout = hook.get("timeout")
+                        ok = isinstance(timeout, int | float) and timeout > 0
+                        hooks[name] = float(timeout) if ok else DEFAULT_HOOK_TIMEOUT
+        if hooks:
+            return directory, hooks
+    return None
+
+
+def _session_start_report(name: str, root: Path) -> str:
+    """A SessionStart hook's text (`loop-report`, `cadence-report`); "" when silent."""
+    payload = json.dumps({"hook_event_name": "SessionStart", "source": "startup", "cwd": str(root)})
+    rc, out = _run([BEAGLE_BIN, "hook", name], root, HOOK_TIMEOUT, stdin=payload)
     if rc != 0 or _block_reason(out) is not None:
         return ""
-    return out
+    return out.strip()
 
 
-def make_commit_claims() -> Any:
-    """Build the `tool_call` bridge for beagle's `commit-claims` PreToolUse hook."""
+def _unbridged_notice(cwd: Path) -> str | None:
+    """A one-line note naming installed hooks Tau deliberately does not run."""
+    found = _hook_root(cwd)
+    if found is None:
+        return None
+    skipped = [name for name in sorted(found[1]) if name not in BRIDGED_HOOKS]
+    if not skipped:
+        return None
+    why = "; ".join(
+        f"{name} ({UNBRIDGED_HOOKS.get(name, 'no Tau equivalent')})" for name in skipped
+    )
+    return f"Beagle: installed hooks not run under Tau: {why}."
 
-    async def commit_claims(event: Any, context: ExtensionContext) -> ToolCallHookResult | None:
+
+def make_bash_hooks() -> Any:
+    """Build the `tool_call` bridge for beagle's Bash PreToolUse hooks.
+
+    `commit-claims` runs whenever the project is a pursuit, as it always has
+    here; `commit-trailer` runs when `beagle hooks install` put it in the
+    project's settings. Both only judge `git commit`, so both are skipped for a
+    command that does not say "commit" — beagle's own fast path leaves there too.
+    """
+
+    async def bash_hooks(event: Any, context: ExtensionContext) -> ToolCallHookResult | None:
         try:
             if event.tool_name != "bash":
                 return None
             command = str((event.arguments or {}).get("command", ""))
             if "commit" not in command:
-                return None  # beagle's own fast path would leave here too
-            goal = _find_goal(context.cwd)
-            if goal is None:
                 return None
-            out = await _run_hook(
-                "commit-claims",
-                goal.parent.parent,
-                {
-                    "hook_event_name": "PreToolUse",
-                    "session_id": context.session_id or "",
-                    "cwd": str(context.cwd),
-                    "tool_name": "Bash",
-                    "tool_input": {"command": command},
-                },
-            )
-            reason = _block_reason(out) if out else None
+            cwd = Path(context.cwd)
+            runs: list[tuple[str, Path, float]] = []
+            goal = _find_goal(cwd)
+            if goal is not None:
+                runs.append(("commit-claims", goal.parent.parent, HOOK_TIMEOUT))
+            installed = _hook_root(cwd)
+            if installed is not None and "commit-trailer" in installed[1]:
+                runs.append(("commit-trailer", installed[0], installed[1]["commit-trailer"]))
+            payload = {
+                "hook_event_name": "PreToolUse",
+                "session_id": context.session_id or "",
+                "cwd": str(cwd),
+                "tool_name": "Bash",
+                "tool_input": {"command": command},
+            }
+            reasons: list[str] = []
+            for name, root, timeout in runs:
+                out = await _run_hook(name, root, payload, timeout)
+                reason = _block_reason(out) if out else None
+                if reason is not None:
+                    reasons.append(f"beagle {name}: {reason}")
         except Exception:  # noqa: BLE001 - fail open, never block on a bridge bug
             return None
-        if reason is None:
+        if not reasons:
             return None
-        return ToolCallHookResult(block=True, reason=f"beagle commit-claims: {reason}")
+        return ToolCallHookResult(block=True, reason="\n\n".join(reasons))
 
-    return commit_claims
+    return bash_hooks
 
 
 def _note_run_end(event: Any, context: ExtensionContext) -> None:
-    """Remember whether the run ended by itself, for the loop-guard."""
+    """Remember whether the run ended by itself, for the Stop hooks."""
     global _LAST_RUN_CLEAN
     del context
     stops = [getattr(m, "stop_reason", None) for m in getattr(event, "messages", ())]
@@ -1020,47 +1113,58 @@ def _note_run_end(event: Any, context: ExtensionContext) -> None:
     _LAST_RUN_CLEAN = not stops or stops[-1] not in ("aborted", "error")
 
 
-def make_loop_guard(tau: ExtensionAPI) -> Any:
-    """Build the `agent_settled` bridge for beagle's `loop-guard` Stop hook.
+def make_stop_hooks(tau: ExtensionAPI) -> Any:
+    """Build the `agent_settled` bridge for beagle's Stop hooks.
 
-    Claude Code runs a Stop hook when the agent finishes a turn — not when the
-    user interrupts it — and a block becomes the model's next input with
-    `stop_hook_active` set on the stop after it. Here an objection starts one
-    more turn through `send_user_message`, and the settle that turn produces
-    is passed to the hook as `stop_hook_active`, so a guard objects at most
-    once per turn the loop takes, exactly as it does under Claude Code.
+    `loop-guard` runs whenever the project is a pursuit; `cadence` and
+    `close-out` run when `beagle hooks install` put them in the project's
+    settings, each under its installed timeout. Claude Code runs Stop hooks
+    when the agent finishes a turn — not when the user interrupts it — and a
+    block becomes the model's next input with `stop_hook_active` set on the
+    stop after it. Here every objection on one settle joins one more turn
+    through `send_user_message`, and the settle that turn produces passes
+    `stop_hook_active` to all of them, so each objects at most once per stop,
+    as under Claude Code. Beagle does not order its Stop hooks, and neither
+    does this: each is run in turn, and none sees another's verdict.
     """
 
-    async def loop_guard(event: Any, context: ExtensionContext) -> None:
-        global _GUARD_OBJECTED
+    async def stop_hooks(event: Any, context: ExtensionContext) -> None:
+        global _STOP_BLOCKED
         del event
-        active, _GUARD_OBJECTED = _GUARD_OBJECTED, False
+        active, _STOP_BLOCKED = _STOP_BLOCKED, False
         try:
-            # Print mode ends with the turn whatever the hook says, and an
-            # interrupted or failed run is not a turn the loop chose to end.
+            # Print mode ends with the turn whatever a hook says, and an
+            # interrupted or failed run is not a turn the agent chose to end.
             if not context.has_ui or not _LAST_RUN_CLEAN:
                 return
-            goal = _find_goal(context.cwd)
-            if goal is None:
-                return
-            out = await _run_hook(
-                "loop-guard",
-                goal.parent.parent,
-                {
-                    "hook_event_name": "Stop",
-                    "session_id": context.session_id or "",
-                    "cwd": str(context.cwd),
-                    "stop_hook_active": active,
-                },
-            )
-            reason = _block_reason(out) if out else None
-            if reason is not None:
-                _GUARD_OBJECTED = True
-                tau.send_user_message(f"[beagle loop-guard]\n\n{reason}")
-        except Exception:  # noqa: BLE001 - fail open; a guard must not wedge the session
+            cwd = Path(context.cwd)
+            runs: list[tuple[str, Path, float]] = []
+            goal = _find_goal(cwd)
+            if goal is not None:
+                runs.append(("loop-guard", goal.parent.parent, HOOK_TIMEOUT))
+            installed = _hook_root(cwd)
+            if installed is not None:
+                root, hooks = installed
+                runs += [(name, root, hooks[name]) for name in STOP_HOOKS if name in hooks]
+            payload = {
+                "hook_event_name": "Stop",
+                "session_id": context.session_id or "",
+                "cwd": str(cwd),
+                "stop_hook_active": active,
+            }
+            reasons: list[str] = []
+            for name, root, timeout in runs:
+                out = await _run_hook(name, root, payload, timeout)
+                reason = _block_reason(out) if out else None
+                if reason is not None:
+                    reasons.append(f"[beagle {name}]\n\n{reason}")
+            if reasons:
+                _STOP_BLOCKED = True
+                tau.send_user_message("\n\n".join(reasons))
+        except Exception:  # noqa: BLE001 - fail open; a hook must not wedge the session
             return
 
-    return loop_guard
+    return stop_hooks
 
 
 @dataclass(eq=False)
@@ -1215,7 +1319,7 @@ def make_wakeup_delivery(tau: ExtensionAPI) -> Any:
     async def deliver(event: Any, context: ExtensionContext) -> None:
         del event, context
         wakeup = _WAKEUP
-        if wakeup is None or not wakeup.fired or _GUARD_OBJECTED:
+        if wakeup is None or not wakeup.fired or _STOP_BLOCKED:
             return
         try:
             await _deliver_wakeup(tau, wakeup, True)
@@ -1339,8 +1443,12 @@ tick and the bare tick that clears it; run the close straight after.
 is `${CLAUDE_PLUGIN_ROOT}/skills/containment/scripts/run_contained.sh`. Use \
 that path, in briefs too, never a `~/.claude/plugins/cache/...` one, even if \
 beagle prints it: a Tau-only host has no such cache, and an upgrade moves it.
-- `loop-guard`, `loop-report` and `commit-claims` run inside this Tau \
-extension. Do not run `beagle hooks install`.
+- Beagle's hooks run inside this Tau extension, never from \
+`.claude/settings.json`: `loop-guard`, `loop-report` and `commit-claims` \
+always, and `close-out`, `cadence`, `cadence-report` and `commit-trailer` when \
+`beagle hooks install` has put them in the project's settings — so installing \
+them is how to switch them on here too. `tilth-load` and `transcript-guard` \
+have no Tau equivalent and are skipped.
 """
 
 
@@ -1575,8 +1683,40 @@ def sync_agent_types(agents_dir: Path) -> list[str]:
 # --------------------------------------------------------------------------- #
 
 
+def _bridge_session_start_hooks(tau: ExtensionAPI, cwd: Path) -> None:
+    """Run an installed `cadence-report` into the prompt; note unbridged hooks.
+
+    SessionStart stdout joins the session's context under Claude Code; here it
+    is a prompt section, which also outlives compaction. The note about hooks
+    left unbridged is shown once per load, not on every session switch.
+    """
+    installed = _hook_root(cwd)
+    if installed is not None and "cadence-report" in installed[1]:
+        report = _session_start_report("cadence-report", installed[0])
+        if report:
+            tau.add_prompt_section(
+                "Beagle cadences",
+                f"At session start, `beagle hook cadence-report` said:\n\n{report}",
+            )
+    notice = _unbridged_notice(cwd)
+    if notice is None:
+        return
+    shown: list[bool] = []
+
+    def notify(event: Any, context: ExtensionContext) -> None:
+        del event
+        if not shown:
+            shown.append(True)
+            context.ui.notify(notice, "info")
+
+    tau.on("session_start", notify)
+
+
 def setup(tau: ExtensionAPI) -> None:
     global _SEEN_CWD, _PLUGIN_ROOT, _LAYOUT
+    # Every beagle this process starts, hooks and the bash tool's alike,
+    # inherits this, so beagle can tell it is not under Claude Code.
+    os.environ[HOST_ENV] = "tau"
     _LAYOUT = resolve_layout(BEAGLE)
     problems: list[str] = list(_LAYOUT.problems)
     # 1-2. Load the engineering-practice and pursuit skills from one merged
@@ -1641,9 +1781,9 @@ def setup(tau: ExtensionAPI) -> None:
     )
 
     # 5. Enforce the pursuit ground truth on every tool call, and bridge
-    #    beagle's commit-claims PreToolUse hook onto the same seam.
+    #    beagle's Bash PreToolUse hooks onto the same seam.
     tau.on("tool_call", make_guard())
-    tau.on("tool_call", make_commit_claims())
+    tau.on("tool_call", make_bash_hooks())
 
     # 6. What /pursuit-run needs from its host: a session id beagle can record
     #    as the driver, a wakeup, and the Stop hook. A worker runs none of the
@@ -1682,7 +1822,7 @@ def setup(tau: ExtensionAPI) -> None:
             )
         )
         tau.on("agent_end", _note_run_end)
-        tau.on("agent_settled", make_loop_guard(tau))
+        tau.on("agent_settled", make_stop_hooks(tau))
         tau.on("agent_settled", make_wakeup_delivery(tau))
         tau.on("session_shutdown", lambda event, context: _void_wakeup())
 
@@ -1708,13 +1848,15 @@ def setup(tau: ExtensionAPI) -> None:
     except Exception:  # noqa: BLE001 - not bound yet at load
         cwd = Path.cwd()
     _SEEN_CWD = cwd
+    if not _is_worker():
+        _bridge_session_start_hooks(tau, cwd)
     goal = _find_goal(cwd)
     if goal is not None:
         section = _goal_section(goal)
         # loop-report is the SessionStart hook: what a run left in flight, and
         # the driver's core while one is. The system prompt outlives
         # compaction, so this also covers what the hook re-prints after one.
-        report = "" if _is_worker() else _loop_report(goal.parent.parent)
+        report = "" if _is_worker() else _session_start_report("loop-report", goal.parent.parent)
         if section and report:
             section = f"{section}\n\nAt session start, `beagle hook loop-report` said:\n\n{report}"
         if section:
