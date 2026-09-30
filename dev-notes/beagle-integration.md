@@ -180,16 +180,19 @@ What it adds, and how each piece maps to what Claude Code provides:
 
 | Claude Code | Tau stand-in in the example | Notes |
 |---|---|---|
-| One `${CLAUDE_PLUGIN_ROOT}` per plugin | One merged root at `$TAU_HOME/beagle-plugin/` (`skills/`, `commands/`, `agents/` as symlinks) | Every beagle-dev / beagle-reference skill, plus campaign's `pursuit-dispatch`, `offload`, `containment`. Only stale *symlinks* are pruned. `BEAGLE_ROOT` overrides `~/beagle`. |
+| One `${CLAUDE_PLUGIN_ROOT}` per plugin | One merged root at `$TAU_HOME/beagle-plugin/` (`skills/`, `commands/`, `agents/` as symlinks) | Plugins are read from beagle's `.claude-plugin/marketplace.json` (else a scan of `plugins/*/.claude-plugin/plugin.json`); every skill of every plugin is linked, the first in manifest order winning a clash. Only stale *symlinks* are pruned. `BEAGLE_ROOT` overrides `~/beagle`. |
 | `/pursuit`, `/pursuit-run` slash commands | `tau.register_command` injecting the command text as a turn, in the same `<skill>` block `/skill:<name>` sends | `${CLAUDE_PLUGIN_ROOT}` is spelled out; the user's input follows the block; `/pursuit-run`'s body opens with a short host mapping. |
 | Task tool + `beagle-dev:*` agents, `run_in_background` | [tau-subagents](https://github.com/rian-dolphin/tau-subagents)' `agent` tool, with beagle's agents written as agent types `~/.tau/agents/beagle-dev:<agent>.md` | Needs tau-subagents installed. Completion arrives as a `<task-notification>` follow-up that starts the next turn; the driver uses the `--awaiting` tick as in Claude Code. |
 | `SendMessage` to a running agent / `TaskOutput` | tau-subagents' `steer_subagent` / `get_subagent_result` (`wait: true` blocks) | |
 | (fallback without tau-subagents) | `pursuit_dispatch`: a nested `tau -p --append-system-prompt step-executor.md` | Synchronous; its report returns in the same turn, so no `--awaiting` tick. |
 | `ScheduleWakeup` | `pursuit_wakeup` (arm / replace / `stop`) | In-process timer; interactive TUI only (refused in print mode, which the driver treats as a stopping condition). Firing re-expands `/pursuit-run`. |
 | `CLAUDE_CODE_SESSION_ID` / `CLAUDE_PID` | Tau session id exported at `session_start`; `CLAUDE_PID` removed | beagle only trusts a pid named claude/node, so without one it judges liveness by the run's own promises. |
-| `Stop` hook `loop-guard` | `agent_settled` → `beagle hook loop-guard` | Skipped for aborted/errored runs and print mode. An objection becomes one more turn; the next settle passes `stop_hook_active`. |
-| `PreToolUse` hook `commit-claims` | bash `tool_call` → `beagle hook commit-claims` | Only commands containing `commit`, only in a pursuit. |
-| `SessionStart` hook `loop-report` | Output appended to the "Beagle pursuit" prompt section at load | Extensions load before the session binds, so this (and goal discovery) uses the process cwd. |
+| `Stop` hooks `loop-guard`, `close-out`, `cadence` | `agent_settled` → `beagle hook NAME` | `loop-guard` in any pursuit; the others when installed in the project's `.claude/settings.json`, under the entry's timeout. Skipped for aborted/errored runs and print mode. Objections from one settle join into one more turn; the next settle passes `stop_hook_active` to all of them. |
+| `PreToolUse` hooks `commit-claims`, `commit-trailer` | bash `tool_call` → `beagle hook NAME` | Only commands containing `commit`; `commit-claims` in a pursuit, `commit-trailer` when installed. |
+| `SessionStart` hooks `loop-report`, `cadence-report` | Prompt sections at load ("Beagle pursuit", "Beagle cadences") | `cadence-report` when installed. Extensions load before the session binds, so this (and goal discovery) uses the process cwd. |
+| `SessionStart` `tilth-load`, `PreToolUse` `transcript-guard` | Not bridged | One note at session start if installed: tilth-load names Claude Code's ToolSearch, and transcript-guard needs a transcript path Tau does not give extensions. |
+| (host identity) | `BEAGLE_HOST=tau` in every subprocess's env | For beagle to tell Tau from Claude Code, whose `CLAUDE_*` variables the bridge borrows. beagle 0.36 does not read it yet. |
+| (none: one agent per tree) | Scope guard on the driver's `edit`/`write`/writing `bash` | While the recorded driver session waits on a worker (`loop tick --awaiting`, inside its lease), writes into an open task's `scope` are refused. Subagent sessions pass. `stop_subagent` during such a wait gets a reminder to clear it, since a cancelled run sends no notification. |
 
 Hooks are invoked as bare `beagle hook NAME` with the project root as cwd —
 beagle's fast path ignores `--root` — and a JSON payload on stdin. Every bridge
@@ -234,8 +237,11 @@ Remaining gaps versus Claude Code:
 - **No MCP.** `mcp__tilth__*` grants do nothing; tilth is CLI-only.
 - **Wakeups do not persist.** A timer dies with the process or `/reload`;
   `loop-report` and `loop-guard` will name the missed resumption next session.
-- **Only three hooks are bridged.** `cadence`, `close-out`, `commit-trailer`,
-  `transcript-guard`, `work-guard` and `tilth-load` are not.
+- **Two installed hooks are not bridged.** `tilth-load` and
+  `transcript-guard` (see the table). `beagle hooks install` is how the others
+  are switched on under Tau too.
+- **A worker cancelled from the UI leaves its wait standing** until the
+  lease runs out: tau-subagents sends no notification for a cancelled run.
 - **Campaign agents are not translated.** Only `beagle-dev` agents become
   types; campaign mode is being retired.
 
@@ -256,46 +262,15 @@ echo '{"hook_event_name":"SessionStart"}' | beagle hook loop-report
 tau          # then /pursuit-view, /pursuit-run
 ```
 
-## Hooks mapping (optional Tier-2 shim, not required for skills)
+## Hooks mapping
 
-Beagle's `.claude/settings.json` wires:
-
-| Claude hook (`matcher`)          | Command                       | Closest Tau extension seam                     |
-|----------------------------------|-------------------------------|-----------------------------------------------|
-| `SessionStart` (`startup\|resume`) | `beagle hook cadence-report`  | `tau.on("session_start", …)` shell out        |
-| `PreToolUse` (`Bash`)            | `beagle hook commit-trailer`  | `tau.on("tool_call", …)` filter `bash`         |
-| `Stop`                           | `beagle hook close-out`/`cadence` | `tau.on("turn_end", …)` (approximate)      |
-
-Sketch (add to the same extension if you want hook parity for the parts that map):
-
-```python
-import subprocess
-from tau_coding.extensions import ToolCallHookResult  # for PreToolUse rewrites
-
-
-def _run(cmd: str) -> None:
-    subprocess.run(cmd, shell=True, check=False)
-
-
-def setup(tau: ExtensionAPI) -> None:
-    # ... register_skill_dir(...) from above ...
-
-    tau.on("session_start", lambda e, c: _run("beagle hook cadence-report"))
-    tau.on("turn_end", lambda e, c: (_run("beagle hook close-out"),
-                                     _run("beagle hook cadence")))
-
-    def _commit_trailer(event, context):
-        if event.tool_name == "bash":
-            _run("beagle hook commit-trailer")
-        return None  # ToolCallHookResult: set block/arguments to interfere
-
-    tau.on("tool_call", _commit_trailer)
-```
-
-Be clear-eyed: this is a **translation layer, not lossless loading**. Tau's
-`turn_end` approximates Claude's `Stop` (which can force continuation); Tau's
-`tool_call` hook can block/rewrite but the payloads differ. Hooks are independent
-of the skill seam — install skills first, add hooks only if you miss them.
+The example extension bridges beagle's hooks itself (see the table under the
+pursuit section): Tau never reads `.claude/settings.json`, but the extension
+reads which hooks `beagle hooks install` wrote there and runs them on Tau's
+seams — Stop on `agent_settled`, SessionStart at load, Bash PreToolUse on
+`tool_call`. It is a translation layer, not lossless loading: a Tau
+`agent_settled` stands in for Claude's `Stop`, and the payloads carry only the
+fields the hooks read.
 
 ## Out of scope (and why)
 
