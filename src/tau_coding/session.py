@@ -3323,8 +3323,6 @@ class CodingSession:
             elif route_failure_message is not None:
                 async for failover_event in self._run_huggingface_route_failover(context=context):
                     yield failover_event
-            else:
-                await self._try_auto_compact(context=context, phase="auto_compact_after_prompt")
         except Exception as exc:
             self._last_diagnostic_log_path = self._diagnostic_logger.log_exception(
                 context=context,
@@ -3346,6 +3344,7 @@ class CodingSession:
         context = self._diagnostic_context()
         await self._flush_pending_message_writes(context=context)
         await self._refresh_runtime_model_limits()
+        await self._try_auto_compact(context=context, phase="auto_compact_before_continue")
         # id() values can be reused once earlier message objects are freed.
         self._ended_message_ids.clear()
         self._persisted_message_ids.clear()
@@ -3380,7 +3379,6 @@ class CodingSession:
             if route_failure_message is not None:
                 async for failover_event in self._run_huggingface_route_failover(context=context):
                     yield failover_event
-            await self._try_auto_compact(context=context, phase="auto_compact_after_continue")
         except Exception as exc:
             self._last_diagnostic_log_path = self._diagnostic_logger.log_exception(
                 context=context,
@@ -3832,6 +3830,18 @@ class CodingSession:
         )
 
     async def _maybe_auto_compact(self) -> bool:
+        """Compact when the context is over the threshold; run only at a turn start.
+
+        Threshold compaction runs when a prompt or continue is about to start a
+        run, never after a run ends. A run that ends has handed control back to
+        the user (or to an extension's next wakeup), and a summary generated
+        then would occupy the provider while the session looks idle: on a
+        single-slot local server that blocks any background subagent and delays
+        the very next turn, and the summary is written before the user's reply
+        to the last assistant message exists. Deferring to the next turn start
+        spends the same work only when the context is actually about to be
+        sent again. Overflow compaction is separate and still runs mid-run.
+        """
         threshold = self.auto_compact_token_threshold
         if threshold is None or threshold <= 0:
             return False

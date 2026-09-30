@@ -3839,7 +3839,7 @@ async def test_session_compact_persists_summary_and_rebuilds_context(
 
 
 @pytest.mark.anyio
-async def test_session_auto_compacts_after_response_when_threshold_is_exceeded(
+async def test_session_auto_compacts_at_next_turn_start_when_threshold_is_exceeded(
     tmp_path: Path,
 ) -> None:
     storage = JsonlSessionStorage(tmp_path / "session.jsonl")
@@ -3877,6 +3877,10 @@ async def test_session_auto_compacts_after_response_when_threshold_is_exceeded(
     _first_events = await _collect_session_events(session.prompt(large_prompt))
 
     _second_events = await _collect_session_events(session.prompt("Continue."))
+    # Over the threshold now, but the session is idle: nothing is summarized
+    # until the next turn is about to send the context again.
+    assert len(provider.calls) == 2
+    assert not [entry for entry in await storage.read_all() if entry.type == "compaction"]
     _third_events = await _collect_session_events(session.prompt("Next."))
 
     entries = await storage.read_all()
@@ -3898,6 +3902,53 @@ async def test_session_auto_compacts_after_response_when_threshold_is_exceeded(
             UserMessage(content="Next."),
         ],
     )
+
+
+@pytest.mark.anyio
+async def test_session_continue_auto_compacts_before_the_run_not_after(
+    tmp_path: Path,
+) -> None:
+    storage = JsonlSessionStorage(tmp_path / "session.jsonl")
+    await storage.append(
+        MessageEntry(id="old", message=UserMessage(content="Old " + ("context " * 12_000)))
+    )
+    await storage.append(
+        MessageEntry(id="answer", parent_id="old", message=AssistantMessage(content="Answer"))
+    )
+    await storage.append(
+        MessageEntry(id="user", parent_id="answer", message=UserMessage(content="Continue me"))
+    )
+    provider = FakeProvider(
+        [
+            [
+                assistant_start(model="fake"),
+                assistant_done(message=AssistantMessage(content="Continue summary")),
+            ],
+            [
+                assistant_start(model="fake"),
+                assistant_done(message=AssistantMessage(content="Continued")),
+            ],
+        ]
+    )
+    session = await CodingSession.load(
+        CodingSessionConfig(
+            provider=provider,
+            model="fake",
+            system="You are Tau.",
+            storage=storage,
+            cwd=tmp_path,
+            auto_compact_token_threshold=1,
+        )
+    )
+
+    _events = await _collect_session_events(session.continue_())
+
+    # One summary before the run, and none after it although the context is
+    # still over the threshold.
+    assert len(provider.calls) == 2
+    assert provider.calls[0][1].startswith("You are a context summarization assistant.")
+    compactions = [entry for entry in await storage.read_all() if entry.type == "compaction"]
+    assert [entry.summary for entry in compactions] == ["Continue summary"]
 
 
 @pytest.mark.anyio
@@ -3931,6 +3982,10 @@ async def test_session_auto_compacts_from_provider_reported_usage(
                 assistant_start(model="fake"),
                 assistant_done(message=AssistantMessage(content="Provider-usage summary")),
             ],
+            [
+                assistant_start(model="fake"),
+                assistant_done(message=AssistantMessage(content="Third answer")),
+            ],
         ]
     )
     session = await CodingSession.load(
@@ -3950,6 +4005,7 @@ async def test_session_auto_compacts_from_provider_reported_usage(
     assert session.context_usage.provider_tokens == 1_000
     assert session.has_provider_context_usage is True
     await _collect_session_events(session.prompt("Second short prompt."))
+    await _collect_session_events(session.prompt("Third short prompt."))
 
     compactions = [entry for entry in await storage.read_all() if entry.type == "compaction"]
     assert len(compactions) == 1
@@ -3975,6 +4031,10 @@ async def test_session_auto_compacts_with_pi_style_default_threshold(
             [
                 assistant_start(model="fake"),
                 assistant_done(message=AssistantMessage(content="Default threshold summary")),
+            ],
+            [
+                assistant_start(model="fake"),
+                assistant_done(message=AssistantMessage(content="Third answer")),
             ],
         ]
     )
@@ -4006,6 +4066,7 @@ async def test_session_auto_compacts_with_pi_style_default_threshold(
 
     _first_events = await _collect_session_events(session.prompt(large_prompt))
     _second_events = await _collect_session_events(session.prompt("Continue."))
+    _third_events = await _collect_session_events(session.prompt("Next."))
 
     compactions = [entry for entry in await storage.read_all() if entry.type == "compaction"]
 

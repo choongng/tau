@@ -45,12 +45,17 @@ not expected to match.
 ## Automatic compaction
 
 By default, Tau compacts automatically when the estimate gets close to the
-model's context window. It checks three moments:
+model's context window. It checks two moments:
 
-- before a new prompt (to catch context added out-of-band),
-- after a successful turn (to compact before your next turn), and
+- when a turn is about to start — a new prompt, an extension's message that
+  starts a turn, or a continue — and
 - after a context-overflow error (force compaction regardless of the local estimate,
   then retry once).
+
+Tau does not compact after a turn ends. A session waiting for your reply stays
+idle: no summary request occupies the provider (which matters on a single-slot
+local server shared with background subagents), and the summary is written
+only once your reply to the last message exists.
 
 When it compacts, Tau asks the model to summarize older messages, keeps a recent
 suffix of the conversation, and continues. The original session file is never
