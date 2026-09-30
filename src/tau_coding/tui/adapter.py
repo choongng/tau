@@ -17,6 +17,7 @@ from tau_coding.events import (
     CodingSessionEvent,
     CompactionEndEvent,
     CompactionStartEvent,
+    PromptCacheMissEvent,
     QueueUpdateEvent,
     SessionAgentEndEvent,
 )
@@ -150,6 +151,9 @@ class TuiEventAdapter:
                 self.state.items.pop()
             self.state.error = None
             self.state.add_item("status", f"… {event.error_message}")
+            return
+        if isinstance(event, PromptCacheMissEvent):
+            self.state.add_item("status", f"… {event.status_text}")
 
     def _flush(self) -> None:
         if self.state.assistant_buffer:

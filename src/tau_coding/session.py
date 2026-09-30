@@ -100,6 +100,7 @@ from tau_coding.project_trust import (
     TrustPrompt,
     format_trust_diagnostic,
 )
+from tau_coding.prompt_cache import PromptCacheMissDetector
 from tau_coding.prompt_templates import (
     PromptTemplate,
     expand_prompt_template_command,
@@ -488,6 +489,7 @@ class CodingSession:
         self._persisted_message_ids: set[int] = set()
         self._ended_message_ids: set[int] = set()
         self._pending_message_writes: dict[int, _PendingMessageWrite] = {}
+        self._prompt_cache_misses = PromptCacheMissDetector()
         self._message_origins: dict[int, tuple[AgentMessage, MessageDelivery, MessageSource]] = {}
         self._attach_persistence_listener()
 
@@ -1549,6 +1551,14 @@ class CodingSession:
         self._message_origins.pop(id(message), None)
         return message_text(message)
 
+    async def _signals_after(self, event: AgentEvent) -> AsyncIterator[CodingSessionEvent]:
+        """Yield session diagnostics that one agent event gives rise to."""
+        if isinstance(event, MessageEndEvent) and isinstance(event.message, AssistantMessage):
+            cache_miss = self._prompt_cache_misses.observe(event.message)
+            if cache_miss is not None:
+                await self._extension_runtime.emit_event(cache_miss)
+                yield cache_miss
+
     def _record_message_origin(
         self, message: AgentMessage, *, delivery: MessageDelivery, source: MessageSource
     ) -> None:
@@ -2195,6 +2205,8 @@ class CodingSession:
                     )
                 else:
                     yield retry_event
+                async for signal in self._signals_after(retry_event):
+                    yield signal
         finally:
             aclose = getattr(retry_events, "aclose", None)
             if aclose is not None:
@@ -3287,6 +3299,8 @@ class CodingSession:
                     )
                 else:
                     yield event
+                async for signal in self._signals_after(event):
+                    yield signal
                 # Let frontends render the confirmed, expanded prompt before
                 # session naming performs its separate provider request.
                 if auto_name_message is not None:
@@ -3343,6 +3357,8 @@ class CodingSession:
                             )
                         else:
                             yield retry_event
+                        async for signal in self._signals_after(retry_event):
+                            yield signal
                     session_event_4 = AutoRetryEndEvent(
                         success=overflow_retry_error is None,
                         attempt=1,
@@ -3406,6 +3422,8 @@ class CodingSession:
                     )
                 else:
                     yield event
+                async for signal in self._signals_after(event):
+                    yield signal
             if route_failure_message is not None:
                 async for failover_event in self._run_huggingface_route_failover(context=context):
                     yield failover_event

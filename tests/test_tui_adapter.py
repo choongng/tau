@@ -25,6 +25,7 @@ from tau_coding.events import (
     AutoRetryStartEvent,
     CompactionEndEvent,
     CompactionStartEvent,
+    PromptCacheMissEvent,
     QueueUpdateEvent,
     SessionAgentEndEvent,
 )
@@ -893,3 +894,18 @@ def test_tui_adapter_uses_canonical_result_details_for_patch() -> None:
     )
 
     assert "Patch:\n--- a.py\n+++ a.py" in (state.items[0].tool_result_text or "")
+
+
+def test_tui_adapter_records_prompt_cache_miss_status() -> None:
+    state = TuiState()
+    adapter = TuiEventAdapter(state)
+
+    adapter.apply(PromptCacheMissEvent(provider="krang", model="qwen", prompt_tokens=41_250))
+
+    assert [(item.role, item.text) for item in state.items] == [
+        (
+            "status",
+            "… Prompt cache miss: 41,250 prompt tokens reprocessed "
+            "(earlier krang turns were served from cache)",
+        )
+    ]
