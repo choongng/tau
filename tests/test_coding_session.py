@@ -4,6 +4,7 @@ import sys
 from collections.abc import AsyncIterator
 from io import BytesIO
 from pathlib import Path
+from typing import Literal
 
 import pytest
 from PIL import Image
@@ -4010,6 +4011,54 @@ async def test_session_continue_auto_compacts_before_the_run_not_after(
     assert provider.calls[0][1].startswith("You are a context summarization assistant.")
     compactions = [entry for entry in await storage.read_all() if entry.type == "compaction"]
     assert [entry.summary for entry in compactions] == ["Continue summary"]
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(("reply_source", "carried"), [("extension", True), ("interactive", False)])
+async def test_compaction_carries_forward_an_unanswered_assistant_question_verbatim(
+    tmp_path: Path, reply_source: Literal["interactive", "extension"], carried: bool
+) -> None:
+    question = "I can delete `old-branch` or archive it.\n\nWhich do you want?"
+    storage = JsonlSessionStorage(tmp_path / "session.jsonl")
+    await storage.append(MessageEntry(id="ask", message=UserMessage(content="Tidy branches")))
+    await storage.append(
+        MessageEntry(id="question", parent_id="ask", message=AssistantMessage(content=question))
+    )
+    await storage.append(
+        MessageEntry(
+            id="injected",
+            parent_id="question",
+            message=UserMessage(content="Job report " + ("context " * 13_000)),
+            delivery="follow_up",
+            source=reply_source,
+        )
+    )
+    await storage.append(
+        MessageEntry(id="ack", parent_id="injected", message=AssistantMessage(content="Noted."))
+    )
+    provider = FakeProvider(
+        [
+            [
+                assistant_start(model="fake"),
+                assistant_done(message=AssistantMessage(content="## Goal\nTidy branches")),
+            ]
+        ]
+    )
+    session = await CodingSession.load(_config(tmp_path, provider, storage))
+
+    result = await session.compact_detailed()
+
+    assert result.first_kept_entry_id == "injected"
+    compaction = next(entry for entry in await storage.read_all() if entry.type == "compaction")
+    assert compaction.summary == result.summary
+    if carried:
+        assert compaction.summary == (
+            "## Goal\nTidy branches\n\n## Open Question to User\n"
+            "The assistant asked this and the user has not answered yet (verbatim):\n\n"
+            f"{question}"
+        )
+    else:
+        assert compaction.summary == "## Goal\nTidy branches"
 
 
 @pytest.mark.anyio

@@ -61,6 +61,15 @@ When it compacts, Tau asks the model to summarize older messages, keeps a recent
 suffix of the conversation, and continues. The original session file is never
 edited — only the *active context* sent to the provider changes.
 
+The summarizer is told that the conversation is chronological and that later
+messages supersede earlier ones, so a requirement you changed or a plan the
+agent abandoned is recorded in its final form rather than alongside the version
+it replaced. If the assistant's last question to you (its last message ending in
+`?` with no reply from you after it) falls in the summarized part, Tau appends it
+verbatim to the summary under `## Open Question to User`, so the answer you type
+next still has the question it answers. Messages that extensions inject do not
+count as your reply. This applies to automatic and manual compaction alike.
+
 The default threshold follows the model's context window minus a reserve. Providers
 that advertise an explicit runtime threshold can override that default. In particular,
 Codex subscription sessions discover account/rollout-specific limits from Codex's

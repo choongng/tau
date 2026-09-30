@@ -63,6 +63,8 @@ from tau_coding.context_window import (
     estimate_context_usage,
     estimate_message_tokens,
     summarize_messages_for_compaction,
+    unanswered_assistant_question,
+    with_open_question,
 )
 from tau_coding.credentials import FileCredentialStore, credentials_path
 from tau_coding.diagnostics import (
@@ -3002,7 +3004,7 @@ class CodingSession:
             plan.messages_to_summarize,
             custom_instructions=instructions,
         )
-        await self._append_compaction(
+        compaction = await self._append_compaction(
             generated.text,
             first_kept_entry_id=plan.first_kept_entry_id,
             tokens_before=tokens_before,
@@ -3012,7 +3014,7 @@ class CodingSession:
             response_provider=generated.response_provider,
         )
         return ManualCompactionResult(
-            summary=generated.text,
+            summary=compaction.summary,
             first_kept_entry_id=plan.first_kept_entry_id,
             tokens_before=tokens_before,
             estimated_tokens_after=self.context_token_estimate,
@@ -4012,6 +4014,9 @@ class CodingSession:
         if first_kept_entry_id not in self._state.context_entry_ids:
             raise ValueError("First kept entry is not in the active context")
 
+        open_question = self._open_question_before(first_kept_entry_id)
+        if open_question is not None:
+            summary = with_open_question(summary, open_question)
         compaction = CompactionEntry(
             parent_id=self._last_parent_id,
             summary=summary,
@@ -4029,6 +4034,30 @@ class CodingSession:
         self._harness.replace_messages(self._state.messages)
         self._invalidate_context_usage_cache()
         return compaction
+
+    def _open_question_before(self, first_kept_entry_id: str) -> str | None:
+        """Return the unanswered assistant question a compaction would summarize away.
+
+        Only messages typed by the person count as an answer; custom messages
+        and user messages an extension sent are skipped. A question at or after
+        the kept boundary stays in context verbatim and needs no carrying.
+        """
+        entries_by_id = {entry.id: entry for entry in self._state.entries}
+        rows: list[tuple[int, AgentMessage]] = []
+        for index, (entry_id, message) in enumerate(self._active_context_rows()):
+            entry = entries_by_id.get(entry_id)
+            if isinstance(message, CustomMessage):
+                continue
+            if isinstance(entry, MessageEntry) and entry.source == "extension":
+                continue
+            rows.append((index, message))
+        found = unanswered_assistant_question(tuple(message for _index, message in rows))
+        if found is None:
+            return None
+        context_index, question = rows[found]
+        if context_index >= self._state.context_entry_ids.index(first_kept_entry_id):
+            return None
+        return message_text(question)
 
 
 def _first_recent_context_index(
