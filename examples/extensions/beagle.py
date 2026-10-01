@@ -1378,6 +1378,26 @@ FOUND_PARAMETERS: dict[str, Any] = {
 }
 
 
+def _add_children(task: str, parts: list[str], root: Path) -> tuple[int, str]:
+    """Add each `title::intent` part under `task`; stops at the first refusal.
+
+    `add --parent` reads no `title::intent`, so the intent goes in its own
+    flag. It takes a child under a container or the root task, but refuses a
+    pending leaf, which only `split` decomposes.
+    """
+    rc, lines = 0, []
+    for part in parts:
+        title, _, intent = part.partition("::")
+        argv = ["add", title.strip(), "--parent", task]
+        if intent.strip():
+            argv += ["--intent", intent.strip()]
+        rc, added = _pursuit(argv, root)
+        lines.append(added)
+        if rc != 0:
+            break
+    return rc, "\n".join(lines)
+
+
 def make_found_tool() -> Any:
     """Build `pursuit_found`: write the goal, root the tree, split it into milestones.
 
@@ -1437,10 +1457,15 @@ def make_found_tool() -> Any:
                 f"failed (exit {rc}):\n{out}"
             )
         root_task = found.group(0)
-        split = ["split", root_task, *milestones]
-        if arguments.get("ordered", True) is not False:
-            split.append("--ordered")
-        rc, out = _pursuit(split, root)
+        if len(milestones) == 1:
+            # beagle refuses a one-part split as a rename; one milestone is
+            # one child of the root, which `add --parent` takes.
+            rc, out = _add_children(root_task, milestones, root)
+        else:
+            split = ["split", root_task, *milestones]
+            if arguments.get("ordered", True) is not False:
+                split.append("--ordered")
+            rc, out = _pursuit(split, root)
         if rc != 0:
             return _step_result(
                 f"pursuit_found: founded {goal} with root task {root_task}, but the "
@@ -1494,22 +1519,22 @@ def make_plan_tool() -> Any:
         parts = _strings(arguments.get("parts"))
         if not task or not parts:
             return _step_result("pursuit_plan: 'task' and 'parts' are both required.")
-        ordered = arguments.get("ordered", True) is not False
-        rc, out = _pursuit(["split", task, *parts, *(["--ordered"] if ordered else [])], root)
-        if rc != 0 and "already has children" in out:
-            # A container takes more parts through `add --parent`, which reads
-            # no `title::intent`: the intent goes in its own flag.
-            lines = []
-            for part in parts:
-                title, _, intent = part.partition("::")
-                argv = ["add", title.strip(), "--parent", task]
-                if intent.strip():
-                    argv += ["--intent", intent.strip()]
-                rc, added = _pursuit(argv, root)
-                lines.append(added)
-                if rc != 0:
-                    break
-            out = "\n".join(lines)
+        if len(parts) == 1:
+            # beagle refuses a one-part split as a rename. A container or the
+            # root still takes one more child; a leaf with one part is
+            # already a single step, which is the model's to work, not split.
+            rc, out = _add_children(task, parts, root)
+            if rc != 0 and "pending leaf" in out:
+                return _step_result(
+                    f"pursuit_plan: {task} is already one step, so one part does not "
+                    f"break it down. Work it with pursuit_step task={task}, or give two "
+                    "or more parts."
+                )
+        else:
+            ordered = arguments.get("ordered", True) is not False
+            rc, out = _pursuit(["split", task, *parts, *(["--ordered"] if ordered else [])], root)
+            if rc != 0 and "already has children" in out:
+                rc, out = _add_children(task, parts, root)
         if rc != 0:
             return _step_result(f"pursuit_plan: beagle refused (exit {rc}):\n{out}")
         return _step_result(f"{out}\n\n{_tree(root)}\n\nNext: pursuit_step.")

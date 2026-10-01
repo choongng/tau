@@ -1418,6 +1418,71 @@ async def test_pursuit_plan_adds_to_a_container_it_cannot_split(
     assert "pursuit_step" in result.text
 
 
+@pytest.mark.anyio
+async def test_pursuit_found_adds_a_lone_milestone_beagle_would_not_split(
+    tmp_path: Path, beagle: Path, fake_beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    monkeypatch.chdir(project)
+    (fake_beagle / "add.out").write_text("T0001  Greet\n")
+    runtime, _ = _bound(tmp_path)
+
+    result = await _tool(runtime, "pursuit_found").execute(
+        "c1",
+        {
+            "statement": "Greet",
+            "criteria": ["hello.txt says hi"],
+            "milestones": ["Write::make hello.txt"],
+            "user_confirmed": True,
+        },
+    )
+
+    assert _pursuit_calls(fake_beagle, "split") == []
+    assert _pursuit_calls(fake_beagle, "add")[1] == [
+        "Write",
+        "--parent",
+        "T0001",
+        "--intent",
+        "make hello.txt",
+    ]
+    assert "Founded the pursuit" in result.text
+
+
+@pytest.mark.anyio
+async def test_pursuit_plan_adds_one_part_to_a_container(
+    tmp_path: Path, beagle: Path, fake_beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(_pursuit_project(tmp_path))
+    runtime, _ = _bound(tmp_path)
+
+    result = await _tool(runtime, "pursuit_plan").execute(
+        "c1", {"task": "T0001", "parts": ["Docs::so people can use it"]}
+    )
+
+    assert _pursuit_calls(fake_beagle, "split") == []
+    assert _pursuit_calls(fake_beagle, "add") == [
+        ["Docs", "--parent", "T0001", "--intent", "so people can use it"]
+    ]
+    assert "pursuit_step" in result.text
+
+
+@pytest.mark.anyio
+async def test_pursuit_plan_with_one_part_on_a_leaf_says_to_step_it(
+    tmp_path: Path, beagle: Path, fake_beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(_pursuit_project(tmp_path))
+    (fake_beagle / "add.out").write_text("beagle: T0002 is a pending leaf with work of its own.")
+    (fake_beagle / "add.rc").write_text("4")
+    runtime, _ = _bound(tmp_path)
+
+    result = await _tool(runtime, "pursuit_plan").execute(
+        "c1", {"task": "T0002", "parts": ["Parser::reads input"]}
+    )
+
+    assert "already one step" in result.text and "pursuit_step task=T0002" in result.text
+
+
 def _ready_task(fake: Path, check: str = "test -f done.txt") -> None:
     ready = {"open": [], "ready": [{"id": "T0002", "title": "Parser"}], "ready_total": 1}
     (fake / "next.out").write_text(json.dumps(ready))
