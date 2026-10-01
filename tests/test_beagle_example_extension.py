@@ -101,6 +101,8 @@ def beagle(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "claude-session")
     monkeypatch.setenv("CLAUDE_PID", "4242")
     monkeypatch.setenv("BEAGLE_HOST", "inherited")
+    # Recorded so teardown restores it; setup may put the checkout's bin/ first.
+    monkeypatch.setenv("PATH", os.environ.get("PATH", ""))
     monkeypatch.delenv("BEAGLE_TAU_WORKER", raising=False)
     # Never the real beagle: a test that wants one takes `fake_beagle`.
     monkeypatch.setenv("BEAGLE_BIN", str(tmp_path / "no-beagle-bin"))
@@ -365,6 +367,84 @@ def test_pursuit_driver_spells_out_plugin_root(tmp_path: Path, beagle: Path) -> 
     assert f"Read {root}/commands/pursuit.md" in invocation.content
     assert "${CLAUDE_PLUGIN_ROOT}" not in turn
     assert "description: driver" not in turn
+
+
+def _ship_cli(beagle: Path) -> Path:
+    shim = beagle / "plugins" / "beagle-pursuit" / "bin" / "beagle"
+    shim.parent.mkdir()
+    shim.write_text("#!/bin/sh\necho beagle 0.0.0\n", encoding="utf-8")
+    shim.chmod(0o755)
+    return shim
+
+
+def test_checkout_cli_is_linked_and_first_on_path(
+    tmp_path: Path, beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    shim = _ship_cli(beagle)
+    stale = tmp_path / "stale-bin"
+    monkeypatch.setenv("PATH", os.pathsep.join([str(stale), os.environ["PATH"]]))
+
+    _load(tmp_path)
+    _load(tmp_path)  # a reload does not stack a second entry
+
+    bin_dir = tmp_path / "home-tau" / "beagle-plugin" / "bin"
+    assert (bin_dir / "beagle").resolve() == shim
+    entries = os.environ["PATH"].split(os.pathsep)
+    assert entries[0] == str(bin_dir) and entries.count(str(bin_dir)) == 1
+    assert shutil.which("beagle") == str(bin_dir / "beagle")
+
+
+def test_checkout_without_a_cli_leaves_path_alone(tmp_path: Path, beagle: Path) -> None:
+    before = os.environ["PATH"]
+
+    _load(tmp_path)
+
+    assert os.environ["PATH"] == before
+    assert not (tmp_path / "home-tau" / "beagle-plugin" / "bin").exists()
+
+
+@pytest.mark.anyio
+async def test_pursuit_driver_tool_returns_the_driver(tmp_path: Path, beagle: Path) -> None:
+    runtime, session = _bound(tmp_path)
+    driver = _tool(runtime, "pursuit_driver")
+    root = tmp_path / "home-tau" / "beagle-plugin"
+
+    found = await driver.execute("c1", {"command": "pursuit", "args": "found it"})
+    run = await driver.execute("c2", {"command": "pursuit-run"})
+    bad = await driver.execute("c3", {"command": "campaign"})
+
+    invocation = parse_skill_invocation(found.text)
+    assert invocation is not None and invocation.name == "pursuit"
+    assert invocation.additional_instructions == "found it"
+    assert f"Read {root}/commands/pursuit.md" in invocation.content
+    run_invocation = parse_skill_invocation(run.text)
+    assert run_invocation is not None and "Host mapping" in run_invocation.content
+    assert "must be 'pursuit' or 'pursuit-run'" in bad.text
+    assert session.followed_up == []  # returned in-turn, not queued as a new turn
+
+
+def test_unfounded_project_is_told_how_to_found_one(tmp_path: Path, beagle: Path) -> None:
+    _ship_cli(beagle)
+
+    runtime = _load(tmp_path)
+
+    [section] = [s for s in runtime.prompt_sections if s.title == "Beagle"]
+    assert "not a beagle pursuit yet" in section.body
+    assert "`pursuit_driver`" in section.body
+    assert str(tmp_path / "home-tau" / "beagle-plugin" / "bin" / "beagle") in section.body
+    assert "~/.claude/plugins/cache" in section.body
+    assert not [s for s in runtime.prompt_sections if s.title == "Beagle pursuit"]
+
+
+def test_founded_project_gets_no_unfounded_section(
+    tmp_path: Path, beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(_pursuit_project(tmp_path))
+
+    runtime = _load(tmp_path)
+
+    titles = [s.title for s in runtime.prompt_sections]
+    assert "Beagle pursuit" in titles and "Beagle" not in titles
 
 
 def test_missing_checkout_registers_no_skills(
@@ -662,6 +742,9 @@ async def test_loop_guard_skips_interrupted_runs_and_print_mode(
     runtime, session = _bound(tmp_path)
 
     await runtime.emit_event(_end("aborted"))
+    await runtime.emit_event(AgentSettledEvent())
+    # Cut off at the output limit: an objection would land on a full context.
+    await runtime.emit_event(_end("length"))
     await runtime.emit_event(AgentSettledEvent())
     headless, headless_session = _bound(tmp_path, ui=False)
     await headless.emit_event(_end())

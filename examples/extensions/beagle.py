@@ -28,7 +28,12 @@ because a specific part of that model has no Tau equivalent:
 - **`/pursuit`** — the driver. Injects the command's own text as the turn, in
   the `<skill>` block `/skill:<name>` sends, with `${CLAUDE_PLUGIN_ROOT}`
   spelled out as the merged root. Registered only when the checkout has the
-  driver file.
+  driver file. The `pursuit_driver` tool returns the same text for `/pursuit`
+  or `/pursuit-run`, since Tau shows commands to no model and a user who asks
+  for the loop in prose otherwise gets a model that cannot reach it.
+- **`beagle` on PATH** — the pursuit plugin's `bin/` is linked into the merged
+  root and put first on PATH, so the CLI is the checkout's own release, never
+  a stale one a plugin cache left in `~/.local/bin`.
 - **`pursuit_dispatch`** — a headless `step-executor`. Tau has no Task tool, so
   delegation is a nested `tau -p` run: the step-executor persona appended, the
   target dir set with `--cwd`, and the model inherited from the session unless
@@ -56,7 +61,9 @@ because a specific part of that model has no Tau equivalent:
 - **orientation** — when the project is a pursuit, its goal and criteria are
   added to the system prompt at load, so the driver re-reads the goal every
   session without anything triggering a turn. It is a frame, not an order.
-  Beagle's `loop-report` SessionStart hook output rides along with it.
+  Beagle's `loop-report` SessionStart hook output rides along with it. A
+  project with no pursuit yet gets a few lines instead: the CLI is already on
+  PATH, and founding one goes through `pursuit_driver`.
 - **`/pursuit-run`** — the uncounted loop around `/pursuit`, which needs three
   things Claude Code gives it: a session id beagle records as the run's driver
   (exported as `CLAUDE_CODE_SESSION_ID`), a way to arm the next turn
@@ -134,6 +141,9 @@ PLUGIN_MANIFEST = Path(".claude-plugin") / "plugin.json"
 #: What makes a plugin the pursuit plugin, and which one ships the worker.
 DRIVER_DIR = Path("commands")
 STEP_EXECUTOR_REL = Path("agents") / "step-executor.md"
+#: The CLI shim. Its plugin's `bin/` is linked into the merged root and put
+#: first on PATH, so the CLI always matches the skills loaded beside it.
+BIN_REL = Path("bin") / "beagle"
 #: The merged plugin root, under the Tau home (so `TAU_HOME` profiles each
 #: get their own).
 MERGED_ROOT_NAME = "beagle-plugin"
@@ -225,7 +235,8 @@ _WAKEUP: _Wakeup | None = None
 #: Whether the run now settling was started by a Stop-hook objection — the
 #: hooks' `stop_hook_active`, which lets the next stop through.
 _STOP_BLOCKED = False
-#: Whether the last run ended on its own, rather than aborted or errored.
+#: Whether the last run ended on its own, rather than aborted, errored or cut
+#: off at the output limit.
 _LAST_RUN_CLEAN = True
 #: The driver records' directory, once the Tau home is known.
 _DRIVERS_DIR: Path | None = None
@@ -304,6 +315,12 @@ class Layout:
         """The `agents/` holding the step-executor, else the first there is."""
         found = self.step_executor
         return found.parent if found is not None else self.first(Path("agents"))
+
+    @property
+    def bin_dir(self) -> Path | None:
+        """The `bin/` holding the `beagle` CLI shim this checkout ships."""
+        found = self.first(BIN_REL)
+        return found.parent if found is not None else None
 
     def skills(self) -> tuple[dict[str, Path], list[str]]:
         """Every plugin's skills, name -> directory; and the clashes, described.
@@ -1380,7 +1397,9 @@ def _note_run_end(event: Any, context: ExtensionContext) -> None:
     del context
     stops = [getattr(m, "stop_reason", None) for m in getattr(event, "messages", ())]
     stops = [stop for stop in stops if stop is not None]
-    _LAST_RUN_CLEAN = not stops or stops[-1] not in ("aborted", "error")
+    # `length` is the model running out of room, not choosing to stop: an
+    # objection then lands on a full context and the next request overflows.
+    _LAST_RUN_CLEAN = not stops or stops[-1] not in ("aborted", "error", "length")
 
 
 def make_stop_hooks(tau: ExtensionAPI) -> Any:
@@ -1926,6 +1945,64 @@ def _command_pursuit_run(args: str, context: Any) -> str:
     return "/pursuit-run: loaded the pursuit loop driver as this turn."
 
 
+DRIVER_PARAMETERS: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "command": {
+            "type": "string",
+            "enum": ["pursuit", "pursuit-run"],
+            "description": (
+                "`pursuit` to found a pursuit or work its tree in this session; "
+                "`pursuit-run` to run it task after task across turns."
+            ),
+        },
+        "args": {
+            "type": "string",
+            "description": "What the user asked for, passed to the driver as its arguments.",
+        },
+    },
+    "required": ["command"],
+}
+
+
+def make_driver_tool() -> Any:
+    """Build the `pursuit_driver` tool: `/pursuit` and `/pursuit-run`, model-callable.
+
+    The commands are the user's to type; under Claude Code the model reaches
+    the same text as a skill. Tau lists commands to no model, so without this a
+    user who asks in prose for the pursuit loop gets a model that cannot find
+    it. The driver comes back as the result, in the block the command sends.
+    """
+
+    async def execute(
+        tool_call_id: str,
+        arguments: Mapping[str, Any],
+        signal: ToolCancellationToken | None = None,
+        on_update: ToolUpdateCallback | None = None,
+    ) -> AgentToolResult:
+        del tool_call_id, signal, on_update
+        command = arguments.get("command")
+        args = arguments.get("args")
+        args = args if isinstance(args, str) else ""
+        if command == "pursuit-run" and _is_worker():
+            return _make_dispatch_result(
+                "pursuit_driver: a worker runs one step of its parent's loop, never its own."
+            )
+        if command == "pursuit":
+            text, name = _pursuit_turn(args), PURSUIT_COMMAND
+        elif command == "pursuit-run":
+            text, name = _pursuit_run_turn(args), PURSUIT_RUN_COMMAND
+        else:
+            return _make_dispatch_result(
+                "pursuit_driver: 'command' must be 'pursuit' or 'pursuit-run'."
+            )
+        if text is None:
+            return _make_dispatch_result(f"pursuit_driver: {_driver_missing(name)}")
+        return _make_dispatch_result(text)
+
+    return execute
+
+
 def _command_pursuit_view(args: str, context: Any) -> str:
     """Print the pursuit's current state without spending a model on it."""
     cwd = _SEEN_CWD or Path.cwd()
@@ -1972,7 +2049,34 @@ def _goal_section(goal_file: Path) -> str | None:
         "grinding it here; YOU run the close, not the worker. `/pursuit` loads the full "
         "driver, `/pursuit-run` runs it task after task (arming turns with "
         "`pursuit_wakeup`), and `/pursuit-view` shows counts and the ready set without "
-        "a model.",
+        "a model. Those are the user's commands; the `pursuit_driver` tool loads either "
+        "driver for you.",
+    ]
+    return "\n".join(lines)
+
+
+def _unfounded_section(root: Path) -> str | None:
+    """Orientation for a project with no pursuit yet, or None with no driver.
+
+    Without it a model asked to set beagle up gets no frame at all until the
+    goal file exists — and the setup skill, written for Claude Code, has it
+    hunt for a CLI shim and look for a `/pursuit` it cannot type.
+    """
+    if _driver_file(PURSUIT_COMMAND) is None:
+        return None
+    lines = ["This project is not a beagle pursuit yet."]
+    if (root / BIN_REL).exists():
+        lines.append(
+            f"- `beagle` on PATH is already this checkout's CLI ({root / BIN_REL}); skip "
+            "the setup skill's step that links it. Never link or run a `beagle` from "
+            "`~/.claude/plugins/cache/...`: that is another release, with other commands."
+        )
+    lines += [
+        "- To found one, or when the user asks for the pursuit or pursuit-run loop, call "
+        "the `pursuit_driver` tool and follow what it returns. The goal and its criteria "
+        "are the user's: the driver reads them back to the user before "
+        "`.beagle/pursuit.toml` is written.",
+        "- `beagle init` places templates; read one when you need it, not all of them.",
     ]
     return "\n".join(lines)
 
@@ -1994,6 +2098,12 @@ def _sync_link(link: Path, target: Path) -> None:
         link.symlink_to(target, target_is_directory=True)
     except OSError:
         return
+
+
+def _prepend_path(directory: Path) -> None:
+    """Put `directory` first on PATH, once, for this process and its children."""
+    entries = [p for p in os.environ.get("PATH", "").split(os.pathsep) if p and p != str(directory)]
+    os.environ["PATH"] = os.pathsep.join([str(directory), *entries])
 
 
 def build_plugin_root(root: Path) -> Path | None:
@@ -2020,7 +2130,12 @@ def build_plugin_root(root: Path) -> Path | None:
                 entry.unlink()
     for name, src in wanted.items():
         _sync_link(skills_dir / name, src)
-    for name, target in (("commands", _LAYOUT.commands_dir), ("agents", _LAYOUT.agents_dir)):
+    trees = (
+        ("commands", _LAYOUT.commands_dir),
+        ("agents", _LAYOUT.agents_dir),
+        ("bin", _LAYOUT.bin_dir),
+    )
+    for name, target in trees:
         if target is not None:
             _sync_link(root / name, target)
         elif (root / name).is_symlink():
@@ -2171,6 +2286,12 @@ def setup(tau: ExtensionAPI) -> None:
             tau.register_skill_dir(skills_dir)
             _PLUGIN_ROOT = root
             os.environ["CLAUDE_PLUGIN_ROOT"] = str(root)
+            # The checkout's own CLI goes first on PATH, ahead of any `beagle`
+            # a stale plugin cache left linked in ~/.local/bin, so the skills
+            # and the CLI they name are always the same release — and no
+            # model has to find and link a shim before its first command.
+            if (root / BIN_REL).exists():
+                _prepend_path(root / "bin")
         # Beagle's agents as tau-subagents agent types, for background
         # dispatch. Harmless without that extension: nothing reads the dir.
         sync_agent_types(AGENTS_DIR)
@@ -2188,6 +2309,27 @@ def setup(tau: ExtensionAPI) -> None:
         )
     elif _LAYOUT.plugins:
         problems.append(f"/pursuit is not registered: {_driver_missing(PURSUIT_COMMAND)}")
+    if _driver_file(PURSUIT_COMMAND) is not None and not _is_worker():
+        tau.register_tool(
+            AgentTool(
+                name="pursuit_driver",
+                label="pursuit_driver",
+                description=(
+                    "Load beagle's pursuit driver — what the user's `/pursuit` or `/pursuit-run` "
+                    "command sends — and follow it. Call this when the user asks in prose to "
+                    "found a pursuit, work one, or use the pursuit or pursuit-run loop. Slash "
+                    "commands are not shell commands: never run `/pursuit` through bash."
+                ),
+                parameters=DRIVER_PARAMETERS,
+                execute_fn=make_driver_tool(),
+                prompt_snippet="Load the /pursuit or /pursuit-run driver when asked for a pursuit.",
+                prompt_guidelines=(
+                    "Founding a pursuit is pursuit_driver with command 'pursuit'; its goal and "
+                    "criteria are the user's, read back to them before .beagle/pursuit.toml is "
+                    "written.",
+                ),
+            )
+        )
     tau.register_command(
         "pursuit-view",
         _command_pursuit_view,
@@ -2313,3 +2455,7 @@ def setup(tau: ExtensionAPI) -> None:
             section = f"{section}\n\nAt session start, `beagle hook loop-report` said:\n\n{report}"
         if section:
             tau.add_prompt_section("Beagle pursuit", section)
+    elif _PLUGIN_ROOT is not None and not _is_worker():
+        section = _unfounded_section(_PLUGIN_ROOT)
+        if section:
+            tau.add_prompt_section("Beagle", section)
