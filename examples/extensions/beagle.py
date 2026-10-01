@@ -2868,10 +2868,10 @@ def make_driver_tool() -> Any:
 def _command_pursuit_view(args: str, context: Any) -> str:
     """Print the pursuit's current state without spending a model on it."""
     cwd = _SEEN_CWD or Path.cwd()
-    rc, out = _run([BEAGLE_BIN, "status", "--root", str(cwd)], cwd, timeout=15.0)
+    rc, out = _run([BEAGLE_BIN, "pursuit", "status", "--root", str(cwd)], cwd, timeout=15.0)
     if rc == 127:
         return "/pursuit-view: beagle not found on PATH."
-    return out or f"(beagle status exited {rc})"
+    return out or f"(beagle pursuit status exited {rc})"
 
 
 # --------------------------------------------------------------------------- #
