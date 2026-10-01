@@ -12,13 +12,14 @@ import os
 import shutil
 import subprocess
 import sys
+import tomllib
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
 import pytest
 
-from tau_agent.events import AgentEndEvent
+from tau_agent.events import AgentEndEvent, AgentStartEvent
 from tau_agent.messages import AssistantMessage, TextContent, UserMessage
 from tau_agent.tools import AgentTool, AgentToolResult
 from tau_coding.commands import CommandContext
@@ -743,6 +744,10 @@ async def test_loop_guard_skips_interrupted_runs_and_print_mode(
 
     await runtime.emit_event(_end("aborted"))
     await runtime.emit_event(AgentSettledEvent())
+    # Aborted mid-stream: the run settles without ever reaching `agent_end`.
+    await runtime.emit_event(_end())
+    await runtime.emit_event(AgentStartEvent())
+    await runtime.emit_event(AgentSettledEvent())
     # Cut off at the output limit: an objection would land on a full context.
     await runtime.emit_event(_end("length"))
     await runtime.emit_event(AgentSettledEvent())
@@ -1310,3 +1315,401 @@ async def test_a_session_that_ends_retires_its_run_at_the_next_start(
     [stop] = _stops(fake_beagle)
     assert "closed, replaced or reloaded" in stop[stop.index("--reason") + 1]
     assert json.loads(entry.read_text())["ended"] is False  # re-recorded as live
+
+
+FAKE_TAU = """\
+import json, os, sys
+from pathlib import Path
+
+here = Path(os.environ["FAKE_TAU_DIR"])
+brief = sys.stdin.read()
+runs = here / "runs.jsonl"
+with runs.open("a") as log:
+    log.write(json.dumps({"argv": sys.argv[1:], "stdin": brief}) + "\\n")
+attempt = len(runs.read_text().splitlines())
+if attempt >= int(os.environ.get("FAKE_TAU_SUCCEEDS_ON", "1")):
+    Path("done.txt").write_text("done")
+message = {
+    "role": "assistant",
+    "content": [{"type": "text", "text": f"attempt {attempt}: wrote done.txt"}],
+    "usage": {"totalTokens": 1000},
+    "stopReason": "stop",
+}
+print(json.dumps({"type": "message_end", "message": {"role": "user", "content": brief}}))
+print(json.dumps({"type": "message_end", "message": message}))
+"""
+
+
+@pytest.fixture
+def fake_tau(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """A `tau` worker that writes `done.txt` from attempt `FAKE_TAU_SUCCEEDS_ON` on."""
+    here = tmp_path / "fake-tau"
+    here.mkdir()
+    script = here / "tau"
+    script.write_text(f"#!{sys.executable}\n{FAKE_TAU}", encoding="utf-8")
+    script.chmod(0o755)
+    monkeypatch.setenv("TAU_BIN", str(script))
+    monkeypatch.setenv("FAKE_TAU_DIR", str(here))
+    return here
+
+
+def _runs(fake: Path) -> list[dict[str, Any]]:
+    log = fake / "runs.jsonl"
+    return [json.loads(line) for line in log.read_text().splitlines()] if log.exists() else []
+
+
+def _pursuit_calls(fake: Path, verb: str) -> list[list[str]]:
+    return [c["argv"][2:] for c in _calls(fake) if c["argv"][:2] == ["pursuit", verb]]
+
+
+@pytest.mark.anyio
+async def test_pursuit_found_waits_for_the_user_then_roots_and_splits(
+    tmp_path: Path, beagle: Path, fake_beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    monkeypatch.chdir(project)
+    (fake_beagle / "add.out").write_text('T0001  Ship the "tool"\n')
+    runtime, _ = _bound(tmp_path)
+    found = _tool(runtime, "pursuit_found")
+    args = {
+        "statement": 'Ship the "tool"',
+        "criteria": ["`make test` exits 0", "README documents usage"],
+        "milestones": ["Parser::reads input", "CLI::wires it up"],
+    }
+
+    unconfirmed = await found.execute("c1", {**args, "user_confirmed": False})
+    assert "nothing written" in unconfirmed.text and "README documents usage" in unconfirmed.text
+    assert not (project / ".beagle").exists() and _calls(fake_beagle) == []
+
+    result = await found.execute("c2", {**args, "user_confirmed": True})
+
+    goal = tomllib.loads((project / ".beagle" / "pursuit.toml").read_text())["goal"]
+    assert goal["statement"] == 'Ship the "tool"'
+    assert goal["criteria"] == args["criteria"]
+    assert _pursuit_calls(fake_beagle, "add") == [
+        ['Ship the "tool"', "--root-task", "--intent", 'Ship the "tool"']
+    ]
+    assert _pursuit_calls(fake_beagle, "split") == [
+        ["T0001", "Parser::reads input", "CLI::wires it up", "--ordered"]
+    ]
+    assert "root task T0001" in result.text and "pursuit_step" in result.text
+    again = await found.execute("c3", {**args, "user_confirmed": True})
+    assert "already exists" in again.text
+
+
+@pytest.mark.anyio
+async def test_pursuit_plan_adds_to_a_container_it_cannot_split(
+    tmp_path: Path, beagle: Path, fake_beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(_pursuit_project(tmp_path))
+    (fake_beagle / "split.out").write_text("beagle: T0001 already has children")
+    (fake_beagle / "split.rc").write_text("4")
+    runtime, _ = _bound(tmp_path)
+
+    result = await _tool(runtime, "pursuit_plan").execute(
+        "c1", {"task": "T0001", "parts": ["Docs::so people can use it", "Release"]}
+    )
+
+    assert _pursuit_calls(fake_beagle, "add") == [
+        ["Docs", "--parent", "T0001", "--intent", "so people can use it"],
+        ["Release", "--parent", "T0001"],
+    ]
+    assert "pursuit_step" in result.text
+
+
+def _ready_task(fake: Path, check: str = "test -f done.txt") -> None:
+    ready = {"open": [], "ready": [{"id": "T0002", "title": "Parser"}], "ready_total": 1}
+    (fake / "next.out").write_text(json.dumps(ready))
+    record = {"id": "T0002", "title": "Parser", "intent": "reads input", "status": "pending"}
+    (fake / "show.out").write_text(json.dumps({**record, "done_when": check}))
+    (fake / "brief.out").write_text("# T0002: Parser\nDo the parser.\n")
+
+
+@pytest.mark.anyio
+async def test_pursuit_step_shows_the_next_task_before_opening_it(
+    tmp_path: Path, beagle: Path, fake_beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(_pursuit_project(tmp_path))
+    _ready_task(fake_beagle)
+    runtime, _ = _bound(tmp_path)
+
+    result = await _tool(runtime, "pursuit_step").execute("c1", {})
+
+    assert "Next task: T0002 — Parser" in result.text and "reads input" in result.text
+    assert _pursuit_calls(fake_beagle, "open") == []
+
+
+@pytest.mark.anyio
+async def test_pursuit_step_will_not_offer_a_container(
+    tmp_path: Path, beagle: Path, fake_beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # With the leaves done, a 9B driver reached for the root next.
+    monkeypatch.chdir(_pursuit_project(tmp_path))
+    _ready_task(fake_beagle)
+    runtime, _ = _bound(tmp_path)
+    step = _tool(runtime, "pursuit_step")
+
+    root = await step.execute("c1", {"task": "T0001"})
+    (fake_beagle / "next.out").write_text(json.dumps({"open": [], "ready": []}))
+    (fake_beagle / "next.rc").write_text("3")
+    finished = await step.execute("c2", {"task": "T0001"})
+
+    assert "not a task to work now" in root.text and "Workable now: T0002" in root.text
+    assert "tell the user the pursuit is done" in finished.text
+    assert _pursuit_calls(fake_beagle, "open") == []
+
+
+@pytest.mark.anyio
+async def test_pursuit_step_runs_a_worker_until_the_check_passes_then_closes(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project = _pursuit_project(tmp_path)
+    monkeypatch.chdir(project)
+    monkeypatch.setenv("FAKE_TAU_SUCCEEDS_ON", "2")
+    _ready_task(fake_beagle)
+    runtime, _ = _bound(tmp_path)
+
+    result = await _tool(runtime, "pursuit_step").execute(
+        "c1",
+        {
+            "task": "T0002",
+            "criteria": "done.txt exists",
+            "done_when": "test -f done.txt",
+            "scope": ["done.txt"],
+            "notes": "Start in the project root.",
+        },
+    )
+
+    assert _pursuit_calls(fake_beagle, "open") == [
+        [
+            "T0002",
+            "--criteria",
+            "done.txt exists",
+            "--done-when",
+            "test -f done.txt",
+            "--scope",
+            "done.txt",
+        ]
+    ]
+    first, second = _runs(fake_tau)
+    assert first["argv"][:3] == ["-p", "--mode", "json"]
+    assert "Do the parser." in first["stdin"] and "Start in the project root." in first["stdin"]
+    assert "the check still fails (exit 1)" in second["stdin"]
+    [close] = _pursuit_calls(fake_beagle, "close")
+    assert close[:3] == ["T0002", "--outcome", "done"]
+    assert close[close.index("--spent") + 1] == "2000"
+    assert close[close.index("--body") + 1] == "attempt 2: wrote done.txt"
+    assert "closed done" in result.text and "pursuit_step with no arguments" in result.text
+
+
+@pytest.mark.anyio
+async def test_pursuit_step_says_why_a_measured_spend_overran(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.chdir(_pursuit_project(tmp_path))
+    monkeypatch.setenv("FAKE_TAU_SUCCEEDS_ON", "1")
+    _ready_task(fake_beagle)
+    (fake_beagle / "next.out").write_text(json.dumps({"open": ["T0002"], "ready": []}))
+    (fake_beagle / "close.out").write_text(
+        "beagle: T0002 spent 226760 tokens against a budget of 100000 (2.3x). Say what "
+        'the estimate missed with --spent 226760 --spent-because "...", then close.'
+    )
+    (fake_beagle / "close.rc").write_text("4")
+    runtime, _ = _bound(tmp_path)
+
+    await _tool(runtime, "pursuit_step").execute("c1", {})
+
+    first, second = _pursuit_calls(fake_beagle, "close")
+    assert "--spent-because" not in first
+    assert second[: len(first)] == first
+    assert "peak context" in second[second.index("--spent-because") + 1]
+
+
+@pytest.mark.anyio
+async def test_pursuit_step_keeps_a_task_open_while_its_check_fails(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.chdir(_pursuit_project(tmp_path))
+    monkeypatch.setenv("FAKE_TAU_SUCCEEDS_ON", "99")
+    _ready_task(fake_beagle)
+    open_task = {"open": ["T0002"], "ready": [], "ready_total": 0}
+    (fake_beagle / "next.out").write_text(json.dumps(open_task))
+    runtime, _ = _bound(tmp_path)
+
+    # An open task needs no criteria: they were bound when it opened.
+    result = await _tool(runtime, "pursuit_step").execute("c1", {"attempts": 1})
+
+    assert len(_runs(fake_tau)) == 1
+    assert _pursuit_calls(fake_beagle, "open") == []
+    # A done close the check refuses would block the task for good.
+    assert _pursuit_calls(fake_beagle, "close") == []
+    assert "stays open" in result.text and "--outcome blocked" in result.text
+
+
+@pytest.mark.anyio
+async def test_pursuit_step_amends_an_open_task_whose_check_cannot_judge(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A 9B driver bound prose as the check; beagle runs it as words, so it
+    # failed whatever the work did, and the old done_when was all it could send.
+    monkeypatch.chdir(_pursuit_project(tmp_path))
+    monkeypatch.setenv("FAKE_TAU_SUCCEEDS_ON", "1")
+    _ready_task(fake_beagle, check="test -f done.txt exits 0 and is good")
+    open_task = {"open": ["T0002"], "ready": [], "ready_total": 0}
+    (fake_beagle / "next.out").write_text(json.dumps(open_task))
+    runtime, _ = _bound(tmp_path)
+
+    stuck = await _tool(runtime, "pursuit_step").execute("c0", {"task": "T0002"})
+    assert "cannot pass" in stuck.text and len(_runs(fake_tau)) == 0
+
+    result = await _tool(runtime, "pursuit_step").execute(
+        "c1", {"task": "T0002", "done_when": "test -f done.txt"}
+    )
+
+    [amend] = _pursuit_calls(fake_beagle, "amend")
+    assert amend[:3] == ["T0002", "--done-when", "test -f done.txt"] and "--reason" in amend
+    assert "closed done" in result.text
+
+
+@pytest.mark.anyio
+async def test_pursuit_step_refuses_a_check_written_as_a_sentence(
+    tmp_path: Path, beagle: Path, fake_beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(_pursuit_project(tmp_path))
+    _ready_task(fake_beagle)
+    runtime, _ = _bound(tmp_path)
+    step = _tool(runtime, "pursuit_step")
+    args = {"task": "T0002", "criteria": "greets"}
+
+    prose = await step.execute(
+        "c1", {**args, "done_when": 'python3 -m pytest -q exits 0 and a test asserts "x"'}
+    )
+    beagle_check = await step.execute("c3", {**args, "done_when": "beagle pursuit close T0002"})
+    quoted = await step.execute(
+        "c2", {**args, "done_when": "python3 -c 'import sys; sys.exit(0 and 1)'"}
+    )
+
+    assert "reads as a sentence" in prose.text and "'exits'" in prose.text
+    assert "runs beagle itself" in beagle_check.text
+    [opened] = _pursuit_calls(fake_beagle, "open")
+    assert opened[opened.index("--done-when") + 1].startswith("python3 -c")
+    assert "reads as a sentence" not in quoted.text
+
+
+@pytest.mark.anyio
+async def test_pursuit_step_runs_the_check_as_words_like_beagle(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Under `bash -c` this passes once done.txt exists; beagle's close would
+    # hand `&&` to `test` and refuse it, blocking the task for good.
+    monkeypatch.chdir(_pursuit_project(tmp_path))
+    monkeypatch.setenv("FAKE_TAU_SUCCEEDS_ON", "1")
+    _ready_task(fake_beagle, check="test -f done.txt && true")
+    open_task = {"open": ["T0002"], "ready": [], "ready_total": 0}
+    (fake_beagle / "next.out").write_text(json.dumps(open_task))
+    runtime, _ = _bound(tmp_path)
+
+    result = await _tool(runtime, "pursuit_step").execute("c1", {"attempts": 1})
+
+    assert _pursuit_calls(fake_beagle, "close") == []
+    assert "stays open" in result.text and "corrected done_when" in result.text
+
+
+@pytest.mark.anyio
+async def test_driving_session_edits_only_the_pursuit_store(
+    tmp_path: Path, beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project = _pursuit_project(tmp_path)
+    monkeypatch.chdir(project)
+    runtime, session = _bound(tmp_path)
+    write = _tool_with_hooks(runtime, "write")
+    before_start = await write.execute("c0", {"path": "src/app.py", "content": "x"})
+    await runtime.emit_session_start("startup")
+
+    blocked = await write.execute("c1", {"path": "src/app.py", "content": "x"})
+    store = await write.execute("c2", {"path": ".beagle/notes.md", "content": "x"})
+    session.session_id = "subagent-session"  # an in-process subagent's own runtime
+    subagent = await write.execute("c3", {"path": "src/app.py", "content": "x"})
+    session.session_id = "session-1"
+    monkeypatch.setenv("BEAGLE_TAU_DRIVER_EDITS", "1")
+    opted_out = await write.execute("c4", {"path": "src/app.py", "content": "x"})
+
+    assert "from the driving session" in blocked.text and "pursuit_step" in blocked.text
+    assert [before_start.text, store.text, subagent.text, opted_out.text] == ["ran"] * 4
+
+
+@pytest.mark.parametrize(
+    ("command", "found"),
+    [
+        ("git reset --hard 781924a", "reset --hard"),
+        ("cd sub && git -C .. reset --keep HEAD~1", "reset --hard"),
+        ("git clean -xdf", "clean"),
+        ("git checkout -- .", "checkout ."),
+        ("git stash", "stash"),
+        ("git commit --amend --no-edit", "commit --amend"),
+        ("git push -f origin main", "push --force"),
+        ("bash -c 'git rebase -i HEAD~3'", "rebase"),
+        ("git status --short && git diff", None),
+        ("git reset HEAD greet.py", None),
+        ("git restore greet.py", None),
+        ("git stash list", None),
+        ("git rebase --abort", None),
+        ("echo 'git reset --hard'", None),
+    ],
+)
+@pytest.mark.anyio
+async def test_history_guard_names_what_discards_work(
+    tmp_path: Path, beagle: Path, command: str, found: str | None
+) -> None:
+    _pursuit_project(tmp_path)
+    runtime, _ = _bound(tmp_path)
+
+    result = await _tool_with_hooks(runtime, "bash").execute("c1", {"command": command})
+
+    if found is None:
+        assert result.text == "ran"
+    else:
+        assert f"refusing `git {found}` in a pursuit" in result.text
+
+
+@pytest.mark.anyio
+async def test_history_guard_holds_every_session_in_a_pursuit(
+    tmp_path: Path, beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project = _pursuit_project(tmp_path)
+    monkeypatch.chdir(project)
+    runtime, session = _bound(tmp_path)
+    bash = _tool_with_hooks(runtime, "bash")
+
+    blocked = await bash.execute("c1", {"command": "git reset --hard 781924a"})
+    session.session_id = "subagent-session"
+    worker = await bash.execute("c2", {"command": "git clean -fd"})
+    fine = await bash.execute("c3", {"command": "git rm --cached -r __pycache__"})
+    (tmp_path / "bare" / "project").mkdir(parents=True)
+    bare, _ = _bound(tmp_path / "bare")  # a project with no pursuit
+    unfounded = await _tool_with_hooks(bare, "bash").execute("c4", {"command": "git stash"})
+
+    assert "refusing `git reset --hard`" in blocked.text and "Fix forward" in blocked.text
+    assert "refusing `git clean`" in worker.text
+    assert [fine.text, unfounded.text] == ["ran"] * 2

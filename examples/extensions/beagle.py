@@ -41,6 +41,20 @@ because a specific part of that model has no Tau equivalent:
   ground-truth guard stays live inside it — a sub-agent is not a way around it.
   The driver still runs `pursuit close`; this tool only does the work and
   returns the report.
+- **steering** — `pursuit_found`, `pursuit_plan` and `pursuit_step` carry a
+  session through the pursuit without the driver text, which runs to tens of
+  thousands of tokens a small model cannot hold: found the goal (the user's
+  words, confirmed) and split it into milestones; split a milestone into
+  steps; and work one task — `next`, `open` with the criteria and check the
+  model writes, a step-executor run on `beagle pursuit brief`, the check run
+  before the close (a done close the check refuses blocks the task for
+  good), then `close` with the worker's measured spend. While a pursuit is
+  founded, the session the host started may edit only `.beagle/`; the work
+  is the sub-agents' (`BEAGLE_TAU_DRIVER_EDITS=1` lifts that).
+- **history guard** — in a founded pursuit no session runs the `git` verbs
+  that discard the tree or rewrite commits (`reset --hard`, `clean -f`,
+  `checkout .`, `stash`, `rebase`, `commit --amend`, `push --force`): the
+  claims and checks stand on both, so a mistake is fixed forward.
 - **ground-truth guard** — the one invariant a hook can enforce: `.beagle/
   pursuit.toml` is the user's, and criteria the agent can edit are criteria the
   agent can meet by editing them. The founding write is allowed (the file does
@@ -63,7 +77,7 @@ because a specific part of that model has no Tau equivalent:
   session without anything triggering a turn. It is a frame, not an order.
   Beagle's `loop-report` SessionStart hook output rides along with it. A
   project with no pursuit yet gets a few lines instead: the CLI is already on
-  PATH, and founding one goes through `pursuit_driver`.
+  PATH, and founding one goes through `pursuit_found`.
 - **`/pursuit-run`** — the uncounted loop around `/pursuit`, which needs three
   things Claude Code gives it: a session id beagle records as the run's driver
   (exported as `CLAUDE_CODE_SESSION_ID`), a way to arm the next turn
@@ -242,6 +256,9 @@ _LAST_RUN_CLEAN = True
 _DRIVERS_DIR: Path | None = None
 #: The session this process last registered as a possible driver.
 _DRIVER_SESSION: str | None = None
+#: The session whose `session_start` this extension saw: the host's, never an
+#: in-process subagent's.
+_STARTED_SESSION: str | None = None
 #: What the next `/pursuit-run` turn is told about a run stopped because its
 #: Tau driver had ended, until one is sent.
 _ENDED_RUN_NOTE: str | None = None
@@ -1033,6 +1050,142 @@ def _make_dispatch_result(text: str) -> AgentToolResult:
     return AgentToolResult(content=[TextContent(text=text)])
 
 
+@dataclass(frozen=True)
+class _WorkerRun:
+    """What one headless step-executor run came back with."""
+
+    returncode: int | None = None
+    report: str = ""
+    #: The worker's peak context: its largest request's tokens, from its JSON events.
+    spent: int | None = None
+    #: Why no report came back (no persona, no `tau`, timeout, cancelled).
+    problem: str | None = None
+
+
+#: How often a running worker is checked for the caller's cancellation.
+_WORKER_POLL_SECONDS = 0.5
+
+
+def _worker_events(stdout: str) -> tuple[str, int | None]:
+    """The final assistant text and the peak token usage of a `--mode json` run."""
+    report = ""
+    spent: int | None = None
+    for line in stdout.splitlines():
+        try:
+            event = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(event, dict) or event.get("type") != "message_end":
+            continue
+        message = event.get("message")
+        if not isinstance(message, dict) or message.get("role") != "assistant":
+            continue
+        usage = message.get("usage")
+        total = usage.get("totalTokens") if isinstance(usage, dict) else None
+        if isinstance(total, int):
+            # Each request re-sends the conversation, so a sum counts the start
+            # of the run once per turn. The largest request is what the run
+            # held at its peak, which is how Claude Code reports a subagent.
+            spent = max(spent or 0, total)
+        content = message.get("content")
+        if isinstance(content, list):
+            text = "\n".join(
+                str(block.get("text", ""))
+                for block in content
+                if isinstance(block, dict) and block.get("type") == "text"
+            ).strip()
+            if text:
+                report = text
+        if message.get("stopReason") == "error" and message.get("errorMessage"):
+            report = f"{report}\n\n(worker error: {message['errorMessage']})".strip()
+    return report, spent
+
+
+async def _run_worker(
+    brief: str,
+    cwd: Path,
+    model: str,
+    provider: str,
+    timeout: float,
+    signal: ToolCancellationToken | None = None,
+) -> _WorkerRun:
+    """Run one step-executor as a nested `tau -p --mode json` and read its report.
+
+    The brief rides on stdin (tau prepends it to the prompt); the persona is
+    appended to tau's base system prompt, not swapped for it, so the worker
+    keeps the built-in tool guidance and only gains the persona. JSON mode is
+    for the usage figures: `pursuit close --spent` wants what the work cost,
+    and beagle cannot see it from a subprocess.
+    """
+    step_executor = _LAYOUT.step_executor
+    if step_executor is None:
+        return _WorkerRun(
+            problem=f"no beagle plugin ships {STEP_EXECUTOR_REL} "
+            f"(looked in {_LAYOUT.found_by or BEAGLE})."
+        )
+    cmd = [
+        TAU_BIN,
+        "-p",
+        "--mode",
+        "json",
+        "--cwd",
+        str(cwd),
+        "--append-system-prompt",
+        str(step_executor),
+    ]
+    if provider:
+        cmd += ["--provider", provider]
+    if model:
+        cmd += ["--model", model]
+
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            cwd=str(cwd),
+            env={**os.environ, WORKER_ENV: "1"},
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+    except FileNotFoundError:
+        return _WorkerRun(
+            problem=f"{TAU_BIN!r} not found on PATH; cannot delegate. "
+            "Do the work inline, or set TAU_BIN."
+        )
+
+    talk = asyncio.ensure_future(proc.communicate(brief.encode("utf-8")))
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    problem: str | None = None
+    while not talk.done():
+        if signal is not None and signal.is_cancelled():
+            problem = "cancelled; the worker was killed and its partial work is in the tree."
+            break
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            problem = (
+                f"the step-executor exceeded its wall-clock budget of {timeout:.0f}s and "
+                "was killed. Budget the worker in wall-clock, not tokens; raise 'timeout' "
+                "or split the task."
+            )
+            break
+        await asyncio.wait({talk}, timeout=min(_WORKER_POLL_SECONDS, remaining))
+    if problem is not None:
+        with contextlib.suppress(ProcessLookupError):
+            proc.kill()
+        with contextlib.suppress(Exception):
+            await talk
+        return _WorkerRun(returncode=proc.returncode, problem=problem)
+
+    stdout, stderr = talk.result()
+    out = (stdout or b"").decode("utf-8", "replace")
+    err = (stderr or b"").decode("utf-8", "replace").strip()
+    report, spent = _worker_events(out)
+    if not report:
+        report = out.strip() or (f"(no stdout)\nstderr:\n{err}" if err else "(no output)")
+    return _WorkerRun(returncode=proc.returncode, report=report, spent=spent)
+
+
 def make_dispatch() -> Any:
     """Build the `pursuit_dispatch` tool executor."""
 
@@ -1057,13 +1210,6 @@ def make_dispatch() -> Any:
             else _SEEN_CWD or Path.cwd()
         )
 
-        step_executor = _LAYOUT.step_executor
-        if step_executor is None:
-            return _make_dispatch_result(
-                "pursuit_dispatch: no beagle plugin ships "
-                f"{STEP_EXECUTOR_REL} (looked in {_LAYOUT.found_by or BEAGLE})."
-            )
-
         model = _worker_model(arguments.get("model"))
         provider = _worker_provider(arguments.get("provider"))
         try:
@@ -1071,64 +1217,19 @@ def make_dispatch() -> Any:
         except (TypeError, ValueError):
             timeout = DEFAULT_DISPATCH_TIMEOUT
 
-        # The brief rides on stdin (tau prepends it to the prompt); the persona
-        # is appended to tau's base system prompt, not swapped for it, so the
-        # worker keeps the built-in tool guidance and only gains the persona.
-        cmd = [
-            TAU_BIN,
-            "-p",
-            "--cwd",
-            str(cwd),
-            "--append-system-prompt",
-            str(step_executor),
-        ]
-        if provider:
-            cmd += ["--provider", provider]
-        if model:
-            cmd += ["--model", model]
-
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                *cmd,
-                cwd=str(cwd),
-                env={**os.environ, WORKER_ENV: "1"},
-                stdin=asyncio.subprocess.PIPE,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-        except FileNotFoundError:
-            return _make_dispatch_result(
-                f"pursuit_dispatch: {TAU_BIN!r} not found on PATH; cannot delegate. "
-                "Do the work inline, or set TAU_BIN."
-            )
-
-        try:
-            stdout, stderr = await asyncio.wait_for(
-                proc.communicate(brief.encode("utf-8")), timeout=timeout
-            )
-        except TimeoutError:
-            with contextlib.suppress(ProcessLookupError):
-                proc.kill()
-            await proc.wait()
-            return _make_dispatch_result(
-                f"pursuit_dispatch: step-executor exceeded its wall-clock budget of "
-                f"{timeout:.0f}s and was killed. Budget the worker in wall-clock, not "
-                "tokens; raise 'timeout' or split the task."
-            )
-
-        out = (stdout or b"").decode("utf-8", "replace").strip()
-        err = (stderr or b"").decode("utf-8", "replace").strip()
+        run = await _run_worker(brief, cwd, model, provider, timeout, signal)
+        if run.problem is not None:
+            return _make_dispatch_result(f"pursuit_dispatch: {run.problem}")
         header = (
             f"[pursuit_dispatch] step-executor "
             f"(model={model or 'inherit'} provider={provider or 'inherit'}) "
-            f"cwd={cwd} rc={proc.returncode}\n\n"
+            f"cwd={cwd} rc={run.returncode}\n\n"
         )
-        body = out or (f"(no stdout)\nstderr:\n{err}" if err else "(no output)")
         footer = (
             "\n\n— YOU run the close, not the worker: `beagle pursuit close <task> "
             "--outcome done --spent <n>`, after running its --done-when yourself."
         )
-        return _make_dispatch_result(header + body + footer)
+        return _make_dispatch_result(header + run.report + footer)
 
     return execute
 
@@ -1175,6 +1276,755 @@ DISPATCH_PARAMETERS = {
 
 
 # --------------------------------------------------------------------------- #
+# steering: found, plan and step a pursuit through tools, not the driver text
+# --------------------------------------------------------------------------- #
+
+#: Opts the driver session back into editing project files itself.
+DRIVER_EDITS_ENV = "BEAGLE_TAU_DRIVER_EDITS"
+#: Default budget written at founding: roughly one focused task's worth.
+FOUNDING_BUDGET_TOKENS = 100_000
+#: Worker attempts `pursuit_step` makes before handing a failing check back.
+DEFAULT_STEP_ATTEMPTS = 2
+#: Cap on a done close's `--body`, which beagle refuses past 4000 characters.
+CLOSE_BODY_CHARS = 3_900
+#: How much of a failing check's output goes back to the next attempt.
+CHECK_TAIL_CHARS = 1_500
+#: Fallback for a check with no recorded timeout.
+DEFAULT_CHECK_TIMEOUT = 600.0
+
+_TASK_ID = re.compile(r"\bT\d{4,}\b")
+
+
+def _step_result(text: str) -> AgentToolResult:
+    return AgentToolResult(content=[TextContent(text=text)])
+
+
+def _project_root() -> tuple[Path, Path | None]:
+    """The project root and its goal file (None when nothing is founded)."""
+    cwd = _SEEN_CWD or Path.cwd()
+    goal = _find_goal(cwd)
+    return (goal.parent.parent if goal is not None else cwd), goal
+
+
+def _pursuit(args: list[str], root: Path, timeout: float = 60.0) -> tuple[int, str]:
+    return _run([BEAGLE_BIN, "pursuit", *args], root, timeout=timeout)
+
+
+def _json_reply(out: str) -> Any:
+    """The JSON object in a beagle reply, which may carry a stderr line after it."""
+    start = out.find("{")
+    if start < 0:
+        return None
+    try:
+        return json.JSONDecoder().raw_decode(out[start:])[0]
+    except ValueError:
+        return None
+
+
+def _strings(value: Any) -> list[str]:
+    if isinstance(value, str):
+        value = [value]
+    if not isinstance(value, list):
+        return []
+    return [str(item).strip() for item in value if str(item).strip()]
+
+
+def _toml_string(text: str) -> str:
+    # A JSON string is a valid TOML basic string: same quotes, same escapes.
+    return json.dumps(text)
+
+
+def _tree(root: Path) -> str:
+    rc, out = _pursuit(["tree"], root)
+    return out if rc == 0 else ""
+
+
+FOUND_PARAMETERS: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "statement": {
+            "type": "string",
+            "description": "One sentence, in the user's words: what this pursuit is for.",
+        },
+        "criteria": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": (
+                "Two to six acceptance criteria, the user's: each about the product, "
+                "checkable by someone else (a command that exits 0, a file that exists)."
+            ),
+        },
+        "milestones": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": (
+                "The parts of the goal you can already name, in order, each "
+                "'<title>::<what it is for>'. Three to seven is typical."
+            ),
+        },
+        "ordered": {
+            "type": "boolean",
+            "description": "Each milestone waits on the one before. Default true.",
+        },
+        "user_confirmed": {
+            "type": "boolean",
+            "description": (
+                "True only when the user gave or approved this statement and these "
+                "criteria, word for word, in this conversation."
+            ),
+        },
+    },
+    "required": ["statement", "criteria", "milestones", "user_confirmed"],
+}
+
+
+def make_found_tool() -> Any:
+    """Build `pursuit_found`: write the goal, root the tree, split it into milestones.
+
+    The driver text spends pages on founding; a small model loses the thread
+    long before the file is written. The judgement it guards — the goal and
+    the criteria are the user's — stays, as `user_confirmed`; the mechanics
+    (the TOML shape, the root task, the split) are done here.
+    """
+
+    async def execute(
+        tool_call_id: str,
+        arguments: Mapping[str, Any],
+        signal: ToolCancellationToken | None = None,
+        on_update: ToolUpdateCallback | None = None,
+    ) -> AgentToolResult:
+        del tool_call_id, signal, on_update
+        root, goal = _project_root()
+        if goal is not None:
+            return _step_result(
+                f"pursuit_found: {goal} already exists, so the pursuit is founded. Add "
+                "work with pursuit_plan, and work it with pursuit_step."
+            )
+        statement = str(arguments.get("statement") or "").strip()
+        criteria = _strings(arguments.get("criteria"))
+        milestones = _strings(arguments.get("milestones"))
+        if not statement or not criteria:
+            return _step_result("pursuit_found: 'statement' and 'criteria' are both required.")
+        if not milestones:
+            return _step_result(
+                "pursuit_found: name the milestones: the parts of the goal you can "
+                "already see, each '<title>::<what it is for>'."
+            )
+        if arguments.get("user_confirmed") is not True:
+            listed = "\n".join(f"  - {c}" for c in criteria)
+            return _step_result(
+                "pursuit_found: nothing written. The goal and its criteria are the user's: "
+                "read them back word for word and ask the user to confirm or correct them:\n\n"
+                f"Goal: {statement}\nCriteria:\n{listed}\n\n"
+                "Then call pursuit_found again with what they approved and "
+                "user_confirmed=true."
+            )
+
+        goal = root / ".beagle" / GOAL_BASENAME
+        goal.parent.mkdir(parents=True, exist_ok=True)
+        goal.write_text(
+            "[goal]\n"
+            f"statement = {_toml_string(statement)}\n"
+            f"criteria = [{', '.join(_toml_string(c) for c in criteria)}]\n"
+            f"default_budget_tokens = {FOUNDING_BUDGET_TOKENS}\n",
+            encoding="utf-8",
+        )
+        rc, out = _pursuit(["add", statement, "--root-task", "--intent", statement], root)
+        found = _TASK_ID.search(out) if rc == 0 else None
+        if found is None:
+            return _step_result(
+                f"pursuit_found: wrote {goal}, but `beagle pursuit add --root-task` "
+                f"failed (exit {rc}):\n{out}"
+            )
+        root_task = found.group(0)
+        split = ["split", root_task, *milestones]
+        if arguments.get("ordered", True) is not False:
+            split.append("--ordered")
+        rc, out = _pursuit(split, root)
+        if rc != 0:
+            return _step_result(
+                f"pursuit_found: founded {goal} with root task {root_task}, but the "
+                f"milestone split failed (exit {rc}):\n{out}\n\nAdd them with pursuit_plan."
+            )
+        return _step_result(
+            f"Founded the pursuit in {goal}, root task {root_task}.\n\n{_tree(root)}\n\n"
+            "Next: call pursuit_step with no arguments to see the first ready task. A "
+            "milestone too big for one sub-agent's sitting: split it into steps with "
+            "pursuit_plan first. The goal file is now the user's; never edit it."
+        )
+
+    return execute
+
+
+PLAN_PARAMETERS: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "task": {
+            "type": "string",
+            "description": "The task to break down (T0002), or the root task to add to.",
+        },
+        "parts": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": "Its steps, each '<title>::<what it is for>'.",
+        },
+        "ordered": {
+            "type": "boolean",
+            "description": "Each step waits on the one before. Default true.",
+        },
+    },
+    "required": ["task", "parts"],
+}
+
+
+def make_plan_tool() -> Any:
+    """Build `pursuit_plan`: split a task into steps, or add steps to a container."""
+
+    async def execute(
+        tool_call_id: str,
+        arguments: Mapping[str, Any],
+        signal: ToolCancellationToken | None = None,
+        on_update: ToolUpdateCallback | None = None,
+    ) -> AgentToolResult:
+        del tool_call_id, signal, on_update
+        root, goal = _project_root()
+        if goal is None:
+            return _step_result("pursuit_plan: no pursuit here yet; call pursuit_found first.")
+        task = str(arguments.get("task") or "").strip()
+        parts = _strings(arguments.get("parts"))
+        if not task or not parts:
+            return _step_result("pursuit_plan: 'task' and 'parts' are both required.")
+        ordered = arguments.get("ordered", True) is not False
+        rc, out = _pursuit(["split", task, *parts, *(["--ordered"] if ordered else [])], root)
+        if rc != 0 and "already has children" in out:
+            # A container takes more parts through `add --parent`, which reads
+            # no `title::intent`: the intent goes in its own flag.
+            lines = []
+            for part in parts:
+                title, _, intent = part.partition("::")
+                argv = ["add", title.strip(), "--parent", task]
+                if intent.strip():
+                    argv += ["--intent", intent.strip()]
+                rc, added = _pursuit(argv, root)
+                lines.append(added)
+                if rc != 0:
+                    break
+            out = "\n".join(lines)
+        if rc != 0:
+            return _step_result(f"pursuit_plan: beagle refused (exit {rc}):\n{out}")
+        return _step_result(f"{out}\n\n{_tree(root)}\n\nNext: pursuit_step.")
+
+    return execute
+
+
+STEP_PARAMETERS: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "task": {
+            "type": "string",
+            "description": "The task to work. Omit to be shown the next ready one.",
+        },
+        "criteria": {
+            "type": "string",
+            "description": "What will be true when this task is done, in one or two sentences.",
+        },
+        "done_when": {
+            "type": "string",
+            "description": (
+                "ONE command that exits 0 only when the task is done: a targeted test or a "
+                "check, e.g. `python3 -m pytest -q tests/test_x.py`. It is split into words "
+                "and run without a shell, so no prose and no &&, |, > or $(...); for more, "
+                "write a script and run that. It must fail now, before the work. On an open "
+                "task, a new done_when replaces a check that cannot judge the work."
+            ),
+        },
+        "scope": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": "The paths the work will touch.",
+        },
+        "notes": {
+            "type": "string",
+            "description": (
+                "What the sub-agent should know that the task record does not: where to "
+                "start, what to leave alone, what a previous attempt got wrong."
+            ),
+        },
+        "budget": {
+            "type": "string",
+            "description": "Token budget, as 40k or 100000. Default: the goal's.",
+        },
+        "attempts": {
+            "type": "integer",
+            "description": (
+                f"Sub-agent runs before a failing check comes back to you. "
+                f"Default {DEFAULT_STEP_ATTEMPTS}."
+            ),
+        },
+        "timeout": {
+            "type": "number",
+            "description": (
+                f"Wall-clock seconds per sub-agent run. Default {DEFAULT_DISPATCH_TIMEOUT:.0f}."
+            ),
+        },
+    },
+}
+
+
+#: Bare words that mark a `done_when` as a sentence about a check, not a check.
+_PROSE_WORDS = frozenset(
+    {"exits", "exit", "and", "or", "passes", "succeeds", "should", "must", "covers", "asserts"}
+)
+
+
+def _prose_check(command: str) -> str | None:
+    """Why `command` cannot be a task's check — a sentence, or beagle — or None.
+
+    `python3 -m pytest -q exits 0 and a test asserts ...` is what a small model
+    writes for done_when; beagle splits it into words and binds it, and then it
+    fails whatever the work does. Words inside quotes are data, so only bare
+    ones count, and only past the program name.
+    """
+    try:
+        words = shlex.split(command)
+    except ValueError:
+        return None  # beagle says why it will not split
+    if words and Path(words[0]).name == "beagle":
+        # Seen too: `beagle pursuit close T0002` as T0002's own check. The
+        # close runs the check, so it can only ever answer how it was called.
+        return (
+            "done_when runs beagle itself, which cannot say whether the work is done. "
+            "It must be ONE command over the project that exits 0 exactly when the task "
+            "is done, such as `python3 -m pytest -q tests/test_greet.py`; pursuit_step "
+            "does the close. Call pursuit_step again with that."
+        )
+    found = [w for w in words[1:] if w.lower() in _PROSE_WORDS]
+    if not found:
+        return None
+    return (
+        f"done_when reads as a sentence (bare {', '.join(repr(w) for w in found[:3])}), not "
+        "a command. It is split into words and run as-is, so it must be ONE command "
+        "that exits 0 exactly when the task is done, such as `python3 -m pytest -q "
+        "tests/test_greet.py`. Put what the test must assert in criteria and notes, "
+        "and call pursuit_step again."
+    )
+
+
+def _check_argv(command: str, root: Path) -> list[str]:
+    """The argv beagle's close runs a `done_when` as: split into words, no shell.
+
+    A launcher declared under `[run] contain` in the goal file goes in front,
+    as beagle's `contained()` puts it. Raises ValueError for a command that
+    will not split.
+    """
+    prefix = ""
+    with contextlib.suppress(Exception):
+        goal = tomllib.loads((root / ".beagle" / GOAL_BASENAME).read_text(encoding="utf-8"))
+        contain = goal.get("run", {}).get("contain")
+        prefix = contain.strip() if isinstance(contain, str) else ""
+    return shlex.split(f"{prefix} {command}" if prefix else command)
+
+
+async def _run_check(command: str, root: Path, timeout: float) -> tuple[int, str]:
+    """Run a task's `done_when` the way its close will, before the close does.
+
+    A done close that the check refuses blocks the task for good, so the step
+    learns the verdict first and keeps a failing task open for another try.
+    Beagle runs the check as words, not through a shell, and so does this: a
+    check that only passes under `bash -c` would pass here and block there.
+    """
+    try:
+        argv = _check_argv(command, root)
+    except ValueError as exc:
+        return 2, f"the check will not split into arguments ({exc})"
+    if not argv:
+        return 2, "the check is empty"
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *argv,
+            cwd=str(root),
+            stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+        )
+    except OSError as exc:
+        return 127, f"the check could not start: {exc}"
+    try:
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+    except TimeoutError:
+        with contextlib.suppress(ProcessLookupError):
+            proc.kill()
+        await proc.wait()
+        return 124, f"the check timed out after {timeout:.0f}s"
+    return proc.returncode or 0, (stdout or b"").decode("utf-8", "replace").strip()
+
+
+def _next_ready(root: Path) -> tuple[int, Any, str]:
+    rc, out = _pursuit(["next", "--json"], root)
+    return rc, _json_reply(out), out
+
+
+def _ids(entries: Any) -> list[str]:
+    ids = []
+    for entry in entries if isinstance(entries, list) else []:
+        task = entry.get("id") if isinstance(entry, dict) else entry
+        if isinstance(task, str):
+            ids.append(task)
+    return ids
+
+
+def make_step_tool() -> Any:
+    """Build `pursuit_step`: one task, opened, done by a sub-agent, checked and closed.
+
+    A pursuit task is `next`, `open`, a dispatch, then `close`, with rules at
+    every step that the driver text explains at length. Here the model brings
+    only the judgement — the criteria and the check, written before the work
+    — and the rest is mechanical: the brief comes from beagle, a nested `tau
+    -p` step-executor does the work, the check runs before the close (a done
+    close the check refuses would block the task for good), and the close
+    carries the worker's measured spend.
+    """
+
+    async def execute(
+        tool_call_id: str,
+        arguments: Mapping[str, Any],
+        signal: ToolCancellationToken | None = None,
+        on_update: ToolUpdateCallback | None = None,
+    ) -> AgentToolResult:
+        del tool_call_id
+        root, goal = _project_root()
+        if goal is None:
+            return _step_result("pursuit_step: no pursuit here yet; call pursuit_found first.")
+        rc, ready, raw = _next_ready(root)
+        if rc == 4 or rc not in (0, 3) or not isinstance(ready, dict):
+            return _step_result(
+                f"pursuit_step: beagle cannot hand out work now (exit {rc}):\n{raw}\n\n"
+                "Stop here and tell the user what it said."
+            )
+        open_ids = _ids(ready.get("open"))
+        ready_ids = _ids(ready.get("ready"))
+        nothing_ready = (
+            "Nothing is ready to work.\n\n"
+            f"{_tree(root)}\n\n"
+            "If every criterion of the goal now holds, tell the user the pursuit is "
+            "done. If work remains, add it with pursuit_plan. A blocked task needs a "
+            "different route: `beagle pursuit spawn <task>`."
+        )
+        task = str(arguments.get("task") or "").strip()
+        if not task:
+            task = (open_ids or ready_ids or [""])[0]
+            if not task:
+                return _step_result(nothing_ready)
+        elif task not in open_ids and task not in ready_ids:
+            # A container (done when its parts are) or a task still waiting on
+            # one: opening it is refused, and offering to is where a model
+            # that finished the leaves goes next.
+            if open_ids or ready_ids:
+                workable = ", ".join(open_ids + ready_ids)
+                return _step_result(
+                    f"{task} is not a task to work now: it is a container, done when its "
+                    f"parts are, or it waits on another task. Workable now: {workable}. "
+                    "Call pursuit_step with no arguments."
+                )
+            return _step_result(f"{task} is not a task to work now. {nothing_ready}")
+
+        rc, out = _pursuit(["show", task], root)
+        record = _json_reply(out) if rc == 0 else None
+        if not isinstance(record, dict):
+            return _step_result(f"pursuit_step: cannot read {task} (exit {rc}):\n{out}")
+        title = str(record.get("title") or "")
+        criteria = str(arguments.get("criteria") or "").strip()
+        done_when = str(arguments.get("done_when") or "").strip()
+        opened = ""
+        if task not in open_ids and record.get("status") != "open":
+            if not criteria or not done_when:
+                why = str(record.get("intent") or "").strip()
+                return _step_result(
+                    f"Next task: {task} — {title}\n"
+                    + (f"Why: {why}\n" if why else "")
+                    + "\nCall pursuit_step again with:\n"
+                    f'  task: "{task}"\n'
+                    "  criteria: what will be true when it is done\n"
+                    "  done_when: ONE command that exits 0 only then, e.g. `python3 -m "
+                    "pytest -q tests/test_x.py`. It is split into words and run without a "
+                    "shell: no prose, no &&, |, > or $(...). It should fail now.\n"
+                    "  scope: the paths it will touch\n"
+                    "  notes: where to start, what to leave alone\n"
+                    "A sub-agent does the work and the check decides. If you cannot write "
+                    "the criteria yet, the task is too big: split it with pursuit_plan."
+                )
+            prose = _prose_check(done_when)
+            if prose is not None:
+                return _step_result(f"pursuit_step: {task} not opened — {prose}")
+            argv = ["open", task, "--criteria", criteria, "--done-when", done_when]
+            scope = _strings(arguments.get("scope"))
+            if scope:
+                argv += ["--scope", *scope]
+            budget = str(arguments.get("budget") or "").strip()
+            if budget:
+                argv += ["--budget", budget]
+            rc, opened = _pursuit(argv, root)
+            if rc != 0:
+                return _step_result(
+                    f"pursuit_step: `beagle pursuit open` refused (exit {rc}):\n{opened}"
+                )
+            rc, out = _pursuit(["show", task], root)
+            record = _json_reply(out) if rc == 0 else record
+        elif done_when and done_when != str(record.get("done_when") or "").strip():
+            # Open already, with a check the model now writes differently: the
+            # bound one could not judge the work (prose, a usage error), and
+            # repeating the old one forever is the loop this breaks.
+            prose = _prose_check(done_when)
+            if prose is not None:
+                return _step_result(f"pursuit_step: {task}'s check not changed — {prose}")
+            argv = ["amend", task, "--done-when", done_when]
+            if criteria and criteria != str(record.get("criteria") or "").strip():
+                argv += ["--criteria", criteria]
+            argv += ["--reason", "the bound check could not judge the work; rewritten"]
+            rc, amended = _pursuit(argv, root)
+            if rc != 0:
+                return _step_result(
+                    f"pursuit_step: `beagle pursuit amend` refused the new check (exit {rc}):"
+                    f"\n{amended}"
+                )
+            opened = amended
+            record = {**record, "done_when": done_when}
+        check = str(record.get("done_when") or done_when).strip()
+        prose = _prose_check(check) if check else None
+        if prose is not None:
+            # Bound before this guard, or by hand: no worker can make it pass.
+            return _step_result(
+                f"pursuit_step: {task} is open, but its bound check `{check}` cannot pass "
+                f"whatever the work does — {prose} Pass the corrected done_when with "
+                f'task="{task}"; it is amended.'
+            )
+
+        rc, brief = _pursuit(["brief", task], root)
+        if rc != 0:
+            return _step_result(f"pursuit_step: `beagle pursuit brief {task}` failed:\n{brief}")
+        notes = str(arguments.get("notes") or "").strip()
+        if notes:
+            brief = f"{brief}\n\nFrom the driver:\n{notes}"
+        try:
+            attempts = max(1, int(arguments.get("attempts") or DEFAULT_STEP_ATTEMPTS))
+            timeout = float(arguments.get("timeout") or DEFAULT_DISPATCH_TIMEOUT)
+        except (TypeError, ValueError):
+            attempts, timeout = DEFAULT_STEP_ATTEMPTS, DEFAULT_DISPATCH_TIMEOUT
+        check_timeout = float(record.get("check_timeout") or DEFAULT_CHECK_TIMEOUT)
+
+        spent: int | None = None
+        report = ""
+        verdict: tuple[int, str] = (1, "")
+        model = _worker_model(None)
+        provider = _worker_provider(None)
+        retry_note = ""
+        for attempt in range(1, attempts + 1):
+            if on_update is not None:
+                with contextlib.suppress(Exception):
+                    on_update(_step_result(f"{task}: sub-agent attempt {attempt} of {attempts}"))
+            run = await _run_worker(brief + retry_note, root, model, provider, timeout, signal)
+            if run.spent is not None:
+                spent = (spent or 0) + run.spent
+            if run.problem is not None:
+                return _step_result(
+                    f"pursuit_step: {task} stays open — {run.problem}\n\n"
+                    f'Call pursuit_step with task="{task}" to send it again.'
+                )
+            report = run.report
+            if not check:
+                break
+            verdict = await _run_check(check, root, check_timeout)
+            if verdict[0] == 0:
+                break
+            retry_note = (
+                f"\n\nAn earlier attempt reported back, but the check still fails (exit "
+                f"{verdict[0]}). Its output ends:\n{verdict[1][-CHECK_TAIL_CHARS:]}\n"
+                "Fix the work, not the check."
+            )
+
+        if check and verdict[0] != 0:
+            return _step_result(
+                f"{task} — {title}: the check still fails after {attempts} sub-agent "
+                f"run(s), so the task stays open.\n\n`{check}` exit {verdict[0]}:\n"
+                f"{verdict[1][-CHECK_TAIL_CHARS:]}\n\nLast report:\n{report}\n\n"
+                f'Next: pursuit_step with task="{task}" and notes saying what to fix. If '
+                "the check itself is wrong — it says how it was called (a usage error, a "
+                "file it treats as an argument) rather than what is missing — pass a "
+                "corrected done_when too; it is amended. If this route is wrong, "
+                f"`beagle pursuit close {task} --outcome blocked --reason '<why>'`."
+            )
+        argv = ["close", task, "--outcome", "done", "--body", report[:CLOSE_BODY_CHARS] or "-"]
+        if spent is not None:
+            argv += ["--spent", str(spent)]
+        rc, closed = _pursuit(argv, root, timeout=check_timeout + 60)
+        if rc != 0 and spent is not None and "--spent-because" in closed:
+            # An overrun of the task's budget: allowed, but beagle wants it said.
+            because = (
+                f"measured, not estimated: the peak context of each of the "
+                f"{attempt} sub-agent run(s) it took, summed"
+            )
+            rc, closed = _pursuit(
+                [*argv, "--spent-because", because], root, timeout=check_timeout + 60
+            )
+        state = "closed done" if rc == 0 else f"close exited {rc}"
+        return _step_result(
+            f"{task} — {title}: {state}.\n\n{closed}\n\nSub-agent report:\n{report}\n\n"
+            "Next: call pursuit_step with no arguments for the next task."
+        )
+
+    return execute
+
+
+def make_driver_edit_guard() -> Any:
+    """Build the `tool_call` guard that keeps the driver session's hands off the work.
+
+    In a founded pursuit the driving session plans, opens, dispatches and
+    closes; the work is a sub-agent's. A driver that edits project files
+    itself writes code no brief described and no check was bound for, and
+    spends the context the loop needs to keep going. Its own `.beagle/`
+    store is the exception. `BEAGLE_TAU_DRIVER_EDITS=1` lets it edit.
+    """
+
+    async def guard(event: Any, context: ExtensionContext) -> ToolCallHookResult | None:
+        if os.environ.get(DRIVER_EDITS_ENV):
+            return None
+        try:
+            # Only the session the host started: an in-process subagent loads
+            # this extension into a runtime of its own that never sees a
+            # `session_start`, and its edits are the work.
+            if event.tool_name not in ("write", "edit") or _STARTED_SESSION is None:
+                return None
+            if context.session_id != _STARTED_SESSION:
+                return None
+            cwd = Path(context.cwd)
+            goal = _find_goal(cwd)
+            target = _goal_path_from_args(event.arguments or {}, cwd)
+            if goal is None or target is None:
+                return None
+            store = _resolved(goal.parent)
+            if target == store or store in target.parents:
+                return None
+        except Exception:  # noqa: BLE001 - fail open, never block on a guard bug
+            return None
+        return ToolCallHookResult(
+            block=True,
+            reason=(
+                f"refusing to {event.tool_name} {target} from the driving session: in a "
+                "pursuit the work is done by sub-agents. Call pursuit_step, with what you "
+                "meant to change in its notes; a sub-agent does it and the task's check "
+                f"decides. (If the user wants this session to edit, they set "
+                f"{DRIVER_EDITS_ENV}=1.)"
+            ),
+        )
+
+    return guard
+
+
+#: `git` options that take a value before the subcommand (`git -C dir reset`).
+_GIT_VALUE_OPTIONS = frozenset({"-C", "-c", "--git-dir", "--work-tree", "--namespace"})
+#: Subcommands of `git stash` and `git rebase` that keep or finish work.
+_STASH_KEEPS = frozenset({"list", "show", "pop", "apply", "branch"})
+_REBASE_ENDS = frozenset({"--abort", "--continue", "--skip", "--quit"})
+
+
+def _git_discard(argv: list[str]) -> str | None:
+    """What a `git` argv throws away or rewrites, or None when it does neither."""
+    args = argv[1:]
+    while args and args[0].startswith("-"):
+        args = args[2:] if args[0] in _GIT_VALUE_OPTIONS else args[1:]
+    if not args:
+        return None
+    sub, rest = args[0], args[1:]
+    flags = [a for a in rest if a.startswith("-") and a != "--"]
+    short = "".join(a[1:] for a in flags if not a.startswith("--"))
+    if sub == "reset" and {"--hard", "--merge", "--keep"} & set(flags):
+        return "reset --hard"
+    if sub == "clean" and ("f" in short or "--force" in flags):
+        return "clean"
+    if sub in ("checkout", "restore") and "." in rest:
+        return f"{sub} ."
+    if sub == "checkout" and ("f" in short or "--force" in flags):
+        return "checkout --force"
+    if sub == "stash" and not (rest and rest[0] in _STASH_KEEPS):
+        return "stash"
+    if sub == "rebase" and not _REBASE_ENDS & set(flags):
+        return "rebase"
+    if sub == "commit" and "--amend" in flags:
+        return "commit --amend"
+    if sub == "push" and ("f" in short or any(f.startswith("--force") for f in flags)):
+        return "push --force"
+    if sub in ("filter-branch", "filter-repo"):
+        return sub
+    return None
+
+
+def _bash_git_discard(command: str) -> str | None:
+    """The first work-discarding `git` call in a bash command, or None.
+
+    Read like `_bash_write_targets`: per simple command, wrappers skipped,
+    `bash -c '...'` one level down. A command too broken to parse is None.
+    """
+    tokens = _shell_tokens(command)
+    if tokens is None:
+        return None
+    segment: list[str] = []
+    for token in [*tokens, ";"]:
+        if not _is_operator(token):
+            segment.append(token)
+            continue
+        argv = segment
+        segment = []
+        while argv and ("=" in argv[0] and not argv[0].startswith("=") or argv[0] in _WRAPPERS):
+            argv = argv[1:]
+        if not argv:
+            continue
+        if Path(argv[0]).name in _SHELLS and "-c" in argv[1:]:
+            script_at = argv.index("-c") + 1
+            found = _bash_git_discard(argv[script_at]) if script_at < len(argv) else None
+        elif Path(argv[0]).name == "git":
+            found = _git_discard(argv)
+        else:
+            found = None
+        if found is not None:
+            return found
+    return None
+
+
+def make_history_guard() -> Any:
+    """Build the `tool_call` guard that keeps a pursuit's history and tree.
+
+    A pursuit's ground truth is this repository: commits carry the claims a
+    close is judged by, and the work tree is what a check runs on. A model
+    that tidies up a mistake with `git reset --hard <old commit>` throws away
+    every task's work since, the store with it — a 9B worker did exactly that
+    after committing a stray `__pycache__`. In a founded pursuit every
+    session, driver and worker, fixes forward instead. Fails open.
+    """
+
+    async def guard(event: Any, context: ExtensionContext) -> ToolCallHookResult | None:
+        try:
+            if event.tool_name != "bash":
+                return None
+            found = _bash_git_discard(str((event.arguments or {}).get("command", "")))
+            if found is None or _find_goal(Path(context.cwd)) is None:
+                return None
+        except Exception:  # noqa: BLE001 - fail open, never block on a guard bug
+            return None
+        return ToolCallHookResult(
+            block=True,
+            reason=(
+                f"refusing `git {found}` in a pursuit: it throws away work or rewrites "
+                "commits, and the pursuit's claims and checks stand on both. Fix forward: "
+                "`git rm --cached <path>` for a file committed by mistake, an ignore rule, "
+                "`git restore <path>` for one file, or a new commit that undoes the last. "
+                "If the tree is wrong beyond that, say so in your report and stop."
+            ),
+        )
+
+    return guard
+
+
+# --------------------------------------------------------------------------- #
 # host bridge: what Claude Code gives /pursuit-run that Tau does not
 # --------------------------------------------------------------------------- #
 
@@ -1205,9 +2055,10 @@ def _adopt_session(context: ExtensionContext) -> None:
 
 
 def _on_session_start(event: Any, context: ExtensionContext) -> None:
-    global _SEEN_CWD
+    global _SEEN_CWD, _STARTED_SESSION
     del event
     _SEEN_CWD = context.cwd
+    _STARTED_SESSION = context.session_id
     _adopt_session(context)
 
 
@@ -1389,6 +2240,17 @@ def make_bash_hooks() -> Any:
         return ToolCallHookResult(block=True, reason="\n\n".join(reasons))
 
     return bash_hooks
+
+
+def _note_run_start(event: Any, context: ExtensionContext) -> None:
+    """Count a run as unclean until its `agent_end` says otherwise.
+
+    An aborted run can settle without ever emitting `agent_end`, and the flag
+    left over from the run before would then let the Stop hooks object to it.
+    """
+    global _LAST_RUN_CLEAN
+    del event, context
+    _LAST_RUN_CLEAN = False
 
 
 def _note_run_end(event: Any, context: ExtensionContext) -> None:
@@ -2043,14 +2905,20 @@ def _goal_section(goal_file: Path) -> str | None:
         lines += [f"  - {str(c).strip()}" for c in criteria if str(c).strip()]
     lines += [
         "",
-        "The loop is `beagle pursuit next` / `open` / `close` — the `done_when` bound at "
-        "`open`, before the work, stands in for a verifier. Delegate a chunky step to the "
-        "`pursuit_dispatch` tool (a headless step-executor sub-agent) instead of "
-        "grinding it here; YOU run the close, not the worker. `/pursuit` loads the full "
-        "driver, `/pursuit-run` runs it task after task (arming turns with "
-        "`pursuit_wakeup`), and `/pursuit-view` shows counts and the ready set without "
-        "a model. Those are the user's commands; the `pursuit_driver` tool loads either "
-        "driver for you.",
+        "How to work it — this session steers, sub-agents do the work:",
+        "1. `pursuit_step` with no arguments shows the next ready task.",
+        "2. `pursuit_step` again with that task, its `criteria`, a `done_when` (one "
+        "command, no shell operators, that exits 0 only when the task is done, such as "
+        "`python3 -m pytest -q tests/test_x.py`), and its `scope`: a sub-agent does the "
+        "work, the check runs, and the task closes when it passes.",
+        "3. Repeat until nothing is ready. A task too big for one sub-agent: split it "
+        "into steps with `pursuit_plan` first.",
+        "Do not edit project files in this session; put what you want changed in the "
+        "step's `notes`.",
+        "",
+        "`/pursuit-view` shows counts and the ready set without a model. The full "
+        "drivers (`pursuit_driver` tool, `/pursuit`, `/pursuit-run`) cover the rarer "
+        "moves: spawning another route, binding a container's check, gates.",
     ]
     return "\n".join(lines)
 
@@ -2072,10 +2940,12 @@ def _unfounded_section(root: Path) -> str | None:
             "`~/.claude/plugins/cache/...`: that is another release, with other commands."
         )
     lines += [
-        "- To found one, or when the user asks for the pursuit or pursuit-run loop, call "
-        "the `pursuit_driver` tool and follow what it returns. The goal and its criteria "
-        "are the user's: the driver reads them back to the user before "
-        "`.beagle/pursuit.toml` is written.",
+        "- To found one, call `pursuit_found` with the user's goal, their acceptance "
+        "criteria and the milestones you can already name. The goal and the criteria are "
+        "the user's: use their words, and if they have not given criteria, ask.",
+        "- Then work it with `pursuit_step`, which runs each task in a sub-agent.",
+        "- The `pursuit_driver` tool loads the full written procedure, for what these "
+        "tools do not cover.",
         "- `beagle init` places templates; read one when you need it, not all of them.",
     ]
     return "\n".join(lines)
@@ -2360,6 +3230,62 @@ def setup(tau: ExtensionAPI) -> None:
         )
     )
 
+    # 4b. The steering tools: found, plan and step a pursuit without reading
+    #     the driver text, each step's work done by a step-executor. The
+    #     driver session keeps its hands off the work; a worker is the work.
+    if not _is_worker():
+        tau.register_tool(
+            AgentTool(
+                name="pursuit_found",
+                label="pursuit_found",
+                description=(
+                    "Found a beagle pursuit: write the user's goal and acceptance criteria, "
+                    "and split the goal into milestone tasks. Call it once, when the user asks "
+                    "for a pursuit or for beagle to run their project."
+                ),
+                parameters=FOUND_PARAMETERS,
+                execute_fn=make_found_tool(),
+                prompt_snippet="Found a pursuit: goal, criteria, milestones.",
+                prompt_guidelines=(
+                    "The pursuit's goal and criteria are the user's: use their words, and set "
+                    "user_confirmed only when they gave or approved them.",
+                ),
+            )
+        )
+        tau.register_tool(
+            AgentTool(
+                name="pursuit_plan",
+                label="pursuit_plan",
+                description=(
+                    "Break a pursuit task into steps (each '<title>::<why>'), or add steps "
+                    "under a milestone. Use it when a task is too big for one sub-agent."
+                ),
+                parameters=PLAN_PARAMETERS,
+                execute_fn=make_plan_tool(),
+                prompt_snippet="Split a pursuit task into steps.",
+            )
+        )
+        tau.register_tool(
+            AgentTool(
+                name="pursuit_step",
+                label="pursuit_step",
+                description=(
+                    "Work the pursuit one task at a time. With no arguments: shows the next "
+                    "ready task. With task, criteria, done_when and scope: opens it, has a "
+                    "sub-agent do the work, runs the check, and closes the task when the check "
+                    "passes. Call it again until nothing is ready."
+                ),
+                parameters=STEP_PARAMETERS,
+                execute_fn=make_step_tool(),
+                prompt_snippet="Run the next pursuit task in a sub-agent; close it on its check.",
+                prompt_guidelines=(
+                    "In a pursuit, project work goes through pursuit_step; this session plans "
+                    "and checks, sub-agents edit.",
+                ),
+            )
+        )
+        tau.on("tool_call", make_driver_edit_guard())
+
     # 5. Enforce the pursuit ground truth on every tool call, and bridge
     #    beagle's Bash PreToolUse hooks onto the same seam.
     tau.on("tool_call", make_guard())
@@ -2367,6 +3293,8 @@ def setup(tau: ExtensionAPI) -> None:
     if not _is_worker():
         tau.on("tool_call", make_scope_guard())
         tau.on("tool_result", make_stopped_worker_note())
+    # After the scope guard: a reset in a worker's scope is a race first.
+    tau.on("tool_call", make_history_guard())
 
     # 6. What /pursuit-run needs from its host: a session id beagle can record
     #    as the driver, a wakeup, and the Stop hook. A worker runs none of the
@@ -2404,6 +3332,7 @@ def setup(tau: ExtensionAPI) -> None:
                 ),
             )
         )
+        tau.on("agent_start", _note_run_start)
         tau.on("agent_end", _note_run_end)
         tau.on("agent_settled", make_stop_hooks(tau))
         tau.on("agent_settled", make_wakeup_delivery(tau))
