@@ -11,7 +11,13 @@ from os import environ
 from pathlib import Path
 from typing import Literal
 
-from tau_agent.events import AgentEndEvent, AgentEvent, MessageEndEvent, ToolExecutionEndEvent
+from tau_agent.events import (
+    AgentEndEvent,
+    AgentEvent,
+    MessageEndEvent,
+    ToolExecutionEndEvent,
+    TurnEndEvent,
+)
 from tau_agent.harness import AgentHarness, AgentHarnessConfig, QueuedMessages
 from tau_agent.messages import (
     AgentMessage,
@@ -1560,6 +1566,42 @@ class CodingSession:
             if cache_miss is not None:
                 await self._extension_runtime.emit_event(cache_miss)
                 yield cache_miss
+        if isinstance(event, TurnEndEvent) and self._run_continues_after(event):
+            async for signal in self._compact_between_turns():
+                yield signal
+
+    def _run_continues_after(self, event: TurnEndEvent) -> bool:
+        """Whether the loop will send another request in this run."""
+        message = event.message
+        if isinstance(message, AssistantMessage) and message.stop_reason in {"error", "aborted"}:
+            return False
+        has_tool_calls = isinstance(message, AssistantMessage) and bool(message.tool_calls)
+        return has_tool_calls or self._harness.has_queued_messages()
+
+    async def _compact_between_turns(self) -> AsyncIterator[CodingSessionEvent]:
+        """Compact over the threshold while the loop waits between two turns.
+
+        A run with tool calls can go on unattended for hours; checking only
+        when a prompt starts would let one run grow until the provider refuses
+        it. Every message of the finished turn is persisted before its turn-end
+        event reaches here, and the loop reads its message list afresh for the
+        next request, so a compaction made now is what that request sends.
+        """
+        if not self._over_auto_compact_threshold():
+            return
+        start = CompactionStartEvent(reason="threshold")
+        await self._extension_runtime.emit_event(start)
+        yield start
+        compacted = await self._try_auto_compact(
+            context=self._diagnostic_context(), phase="auto_compact_between_turns"
+        )
+        end = CompactionEndEvent(
+            reason="threshold",
+            aborted=not compacted,
+            error_message=None if compacted else "Threshold compaction did not run",
+        )
+        await self._extension_runtime.emit_event(end)
+        yield end
 
     def _record_message_origin(
         self, message: AgentMessage, *, delivery: MessageDelivery, source: MessageSource
@@ -3896,12 +3938,22 @@ class CodingSession:
             if self._provider_is_usable(provider)
         )
 
+    def _over_auto_compact_threshold(self) -> bool:
+        threshold = self.auto_compact_token_threshold
+        if threshold is None or threshold <= 0:
+            return False
+        if len(self._state.context_entry_ids) < 2:
+            return False
+        return self.context_token_estimate > threshold
+
     async def _maybe_auto_compact(self) -> bool:
         """Compact when the context is over the threshold; run only at a turn start.
 
         Threshold compaction runs when a prompt or continue is about to start a
-        run, never after a run ends. A run that ends has handed control back to
-        the user (or to an extension's next wakeup), and a summary generated
+        run, and between two turns of a run that is going on
+        (`_compact_between_turns`), never after a run ends. A run that ends has
+        handed control back to the user (or to an extension's next wakeup), and
+        a summary generated
         then would occupy the provider while the session looks idle: on a
         single-slot local server that blocks any background subagent and delays
         the very next turn, and the summary is written before the user's reply
@@ -3909,12 +3961,7 @@ class CodingSession:
         spends the same work only when the context is actually about to be
         sent again. Overflow compaction is separate and still runs mid-run.
         """
-        threshold = self.auto_compact_token_threshold
-        if threshold is None or threshold <= 0:
-            return False
-        if len(self._state.context_entry_ids) < 2:
-            return False
-        if self.context_token_estimate <= threshold:
+        if not self._over_auto_compact_threshold():
             return False
         plan = self._recent_preserving_compaction_plan()
         if plan is None:
@@ -4156,6 +4203,8 @@ def is_context_overflow_error(message: AssistantMessage) -> bool:
         "token limit",
         "exceeds the limit",
         "exceeded the limit",
+        # llama.cpp: "request (N tokens) exceeds the available context size".
+        "context size",
     )
     return any(marker in normalized for marker in markers)
 

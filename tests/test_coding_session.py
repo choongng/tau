@@ -84,6 +84,7 @@ from tau_coding.provider_config import ProviderModelMetadata, provider_thinking_
 from tau_coding.session import (
     _ordered_tree_entries,
     _tree_branch_indents,
+    is_context_overflow_error,
     is_retryable_huggingface_route_error,
     parse_terminal_command,
 )
@@ -4614,6 +4615,105 @@ async def test_session_falls_back_when_live_model_limit_discovery_fails(
     assert session.auto_compact_token_threshold == 255_616
     assert session.context_window_source == "configured catalog"
     assert session.model_limits_discovery_error == "RuntimeError: catalog unavailable"
+
+
+def _fetch_tool(text: str) -> AgentTool:
+    async def fetch(
+        tool_call_id: object,
+        arguments: object,
+        signal: object = None,
+        on_update: object = None,
+    ) -> AgentToolResult:
+        return AgentToolResult(content=[TextContent(text=text)])
+
+    return AgentTool(
+        name="fetch",
+        label="Fetch",
+        description="Return a large document.",
+        parameters={"type": "object"},
+        execute_fn=fetch,
+    )
+
+
+@pytest.mark.anyio
+async def test_session_auto_compacts_between_turns_of_a_long_run(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    # An unattended run is one prompt and many tool turns: a threshold checked
+    # only at prompt start let it grow until the provider refused it.
+    storage = JsonlSessionStorage(tmp_path / "session.jsonl")
+    tool_call = ToolCall(id="call-1", name="fetch", arguments={})
+    provider = FakeProvider(
+        [
+            [
+                assistant_start(model="fake"),
+                assistant_done(message=AssistantMessage(content="First answer")),
+            ],
+            [
+                assistant_start(model="fake"),
+                assistant_done(
+                    message=AssistantMessage(
+                        content=assistant_content("Fetching.", [tool_call]),
+                        stop_reason="toolUse",
+                    )
+                ),
+            ],
+            [
+                assistant_start(model="fake"),
+                assistant_done(message=AssistantMessage(content="Mid-run summary")),
+            ],
+            [
+                assistant_start(model="fake"),
+                assistant_done(message=AssistantMessage(content="Done")),
+            ],
+        ]
+    )
+    session = await CodingSession.load(
+        CodingSessionConfig(
+            provider=provider,
+            model="fake",
+            system="You are Tau.",
+            storage=storage,
+            cwd=tmp_path,
+            tools=[_fetch_tool("fetched " * 6_000)],
+            auto_compact_token_threshold=45_000,
+        )
+    )
+    extension_events = _record_extension_events(session, monkeypatch)
+    _first_events = await _collect_session_events(
+        session.prompt("Explain.\n" + ("old context " * 12_000))
+    )
+    assert not [entry for entry in await storage.read_all() if entry.type == "compaction"]
+    extension_events.clear()
+
+    events = await _collect_session_events(session.prompt("Fetch it."))
+
+    compactions = [entry for entry in await storage.read_all() if entry.type == "compaction"]
+    assert [entry.summary for entry in compactions] == ["Mid-run summary"]
+    assert provider.calls[2][1].startswith("You are a context summarization assistant.")
+    sent = provider.calls[3][2]
+    assert sent[0].text == "Previous conversation summary:\nMid-run summary"
+    assert [message.role for message in sent[1:]] == ["user", "assistant", "toolResult"]
+    assert sent[1].text == "Fetch it."
+    assert [getattr(event, "type", None) for event in events].count("compaction_end") == 1
+    types = [getattr(event, "type", None) for event in extension_events]
+    assert types.index("compaction_start") < types.index("compaction_end")
+    assert types.index("compaction_end") < types.index("agent_end")
+    # The harness kept every message of the run, after the compaction too.
+    assert session.messages[-1].text == "Done"
+
+
+def test_llama_cpp_context_size_error_is_an_overflow() -> None:
+    message = AssistantMessage(
+        stop_reason="error",
+        error_message=(
+            "bane request failed with status 400 for model m: request (98498 tokens) "
+            "exceeds the available context size (98304 tokens), try increasing it"
+        ),
+    )
+
+    assert is_context_overflow_error(message)
 
 
 @pytest.mark.anyio
