@@ -12,7 +12,7 @@ These are the default keys in the interactive [TUI]({{< relref "../guides/tui.md
 | Key | Action |
 | --- | --- |
 | `Enter` | Accept a highlighted non-file completion; otherwise submit the prompt exactly as typed (including `@` file-reference text) |
-| `Shift+Enter` | Insert a newline |
+| `Ctrl+J` | Insert a newline |
 | `Esc` | Cancel the active run |
 | `Enter` (while running) | Queue text as steering for the current run |
 | `Alt+Enter` | Queue a follow-up that waits until the run would stop |
@@ -52,13 +52,14 @@ Keys use Textual's syntax (`ctrl+k`, `shift+tab`, `down`, `f2`, …). Tau reject
 unknown names, empty keys, and duplicate assignments so mistakes fail early. Any
 key you don't set keeps its default. `Ctrl+B` is also tmux's prefix, where only
 `Ctrl+B Ctrl+B` reaches Tau, so tmux users may prefer another `"toggle_sidebar"`
-key in `~/.tau/tui.json`. If your terminal cannot distinguish `Shift+Enter` from
-`Enter`, choose a key it can report separately:
+key in `~/.tau/tui.json`. `Ctrl+J` inserts a newline in every terminal, tmux
+included. To use `Shift+Enter` instead, your terminal must report it separately
+from `Enter` (under tmux, set `extended-keys` to `always`):
 
 ```json
 {
   "keybindings": {
-    "insert_newline": "f2"
+    "insert_newline": "shift+enter"
   }
 }
 ```

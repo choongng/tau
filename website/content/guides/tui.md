@@ -12,8 +12,8 @@ see [Keyboard shortcuts]({{< relref "../reference/keybindings.md" >}}).
 Type into the prompt box at the bottom and press **Enter** to submit. The editor
 keeps its padded block size and background, while a single left border changes
 color to reflect focus, shell mode, and active runs without boxing it in.
-**Shift+Enter** inserts a newline for multi-line prompts. If your terminal cannot
-distinguish it from Enter, remap `insert_newline` in `~/.tau/tui.json`; see
+**Ctrl+J** inserts a newline for multi-line prompts, in any terminal. To use
+another key, remap `insert_newline` in `~/.tau/tui.json`; see
 [Keyboard shortcuts]({{< relref "../reference/keybindings.md#prompting" >}}). Tau streams the
 assistant's reply above the prompt, showing tool calls as they run. When OpenAI
 returns several reasoning-summary parts, Tau keeps them as separate Markdown

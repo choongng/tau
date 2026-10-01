@@ -3347,7 +3347,7 @@ async def test_tui_app_omits_footer_but_keeps_shortcuts_active() -> None:
             "Clear": "ctrl+c",
             "Commands": "ctrl+k",
             "Submit": "enter",
-            "Newline": "shift+enter",
+            "Newline": "ctrl+j",
             "Sessions": "ctrl+r",
             "Thinking": "shift+tab",
             "Model": "ctrl+p",
@@ -6282,7 +6282,7 @@ async def test_tui_app_submits_multiline_prompt_with_enter() -> None:
         prompt = app.query_one("#prompt")
         prompt.value = "first"
         prompt.cursor_position = len(prompt.value)
-        await pilot.press("shift+enter")
+        await pilot.press("ctrl+j")
         prompt.value += "second"
         await pilot.press("enter")
         await pilot.pause()
@@ -8250,7 +8250,7 @@ async def test_tui_app_escape_without_running_does_not_append_transcript_status(
 async def test_tui_app_uses_configured_command_palette_keybinding() -> None:
     app = TauTuiApp(
         FakeSession(),
-        tui_settings=TuiSettings(keybindings=TuiKeybindings(command_palette="ctrl+j")),
+        tui_settings=TuiSettings(keybindings=TuiKeybindings(command_palette="ctrl+g")),
     )
 
     async with app.run_test() as pilot:
@@ -8260,7 +8260,7 @@ async def test_tui_app_uses_configured_command_palette_keybinding() -> None:
         assert prompt.value == ""
         assert app._completion_state.items == ()
 
-        await pilot.press("ctrl+j")
+        await pilot.press("ctrl+g")
 
         assert prompt.value == "/"
         assert app._completion_state.items
@@ -8271,17 +8271,17 @@ async def test_tui_app_uses_configured_command_palette_keybinding() -> None:
 async def test_tui_app_uses_configured_sidebar_toggle_keybinding() -> None:
     app = TauTuiApp(
         FakeSession(),
-        tui_settings=TuiSettings(keybindings=TuiKeybindings(toggle_sidebar="ctrl+j")),
+        tui_settings=TuiSettings(keybindings=TuiKeybindings(toggle_sidebar="ctrl+g")),
     )
 
     async with app.run_test(size=(120, 40)) as pilot:
         assert not app.has_class("-hide-sidebar")
 
-        await pilot.press("ctrl+j")
+        await pilot.press("ctrl+g")
         await pilot.pause()
         assert app.has_class("-hide-sidebar")
 
-        await pilot.press("ctrl+j")
+        await pilot.press("ctrl+g")
         await pilot.pause()
         assert not app.has_class("-hide-sidebar")
 
