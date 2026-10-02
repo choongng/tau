@@ -1348,6 +1348,9 @@ with runs.open("a") as log:
 attempt = len(runs.read_text().splitlines())
 if attempt >= int(os.environ.get("FAKE_TAU_SUCCEEDS_ON", "1")):
     Path("done.txt").write_text("done")
+tamper = os.environ.get("FAKE_TAU_TAMPERS")
+if tamper:
+    Path(tamper).write_text("tampered")
 message = {
     "role": "assistant",
     "content": [{"type": "text", "text": f"attempt {attempt}: wrote done.txt"}],
@@ -1673,6 +1676,85 @@ async def test_pursuit_step_runs_a_worker_until_the_check_passes_then_closes(
     assert close[close.index("--spent") + 1] == "2000"
     assert close[close.index("--body") + 1] == "attempt 2: wrote done.txt"
     assert "closed done" in result.text and "pursuit_step with no arguments" in result.text
+
+
+@pytest.mark.anyio
+async def test_a_step_locks_its_cases_and_later_steps_cannot_change_them(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project = _pursuit_project(tmp_path)
+    monkeypatch.chdir(project)
+    (project / "cases.json").write_text('[{"in": 1, "out": 2}]')
+    _ready_task(fake_beagle)
+    runtime, _ = _bound(tmp_path)
+    step = _tool(runtime, "pursuit_step")
+
+    first = await step.execute(
+        "c1",
+        {
+            "task": "T0002",
+            "criteria": "the cases are written",
+            "done_when": "test -f done.txt",
+            "locks": ["cases.json", "missing.json"],
+        },
+    )
+
+    assert "Locked: cases.json" in first.text
+    assert "missing.json: not a file in the project" in first.text
+    assert (project / ".beagle" / "locked" / "cases.json").read_text() == '[{"in": 1, "out": 2}]'
+
+    # A later worker that rewrites the cases has them put back before the check.
+    (project / "done.txt").unlink()
+    monkeypatch.setenv("FAKE_TAU_TAMPERS", "cases.json")
+    second = await step.execute(
+        "c2", {"task": "T0002", "criteria": "the code passes", "done_when": "test -f done.txt"}
+    )
+
+    assert (project / "cases.json").read_text() == '[{"in": 1, "out": 2}]'
+    assert "changed locked files (cases.json)" in second.text
+    assert "Locked files:" in _runs(fake_tau)[-1]["stdin"]
+    assert "- cases.json" in _runs(fake_tau)[-1]["stdin"]
+
+
+@pytest.mark.anyio
+async def test_locks_asked_for_on_opening_hold_until_the_task_closes(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project = _pursuit_project(tmp_path)
+    monkeypatch.chdir(project)
+    (project / "cases.json").write_text("[]")
+    monkeypatch.setenv("FAKE_TAU_SUCCEEDS_ON", "99")
+    _ready_task(fake_beagle)
+    runtime, _ = _bound(tmp_path)
+    step = _tool(runtime, "pursuit_step")
+
+    await step.execute(
+        "c1",
+        {
+            "task": "T0002",
+            "criteria": "c",
+            "done_when": "test -f done.txt",
+            "locks": ["cases.json"],
+            "attempts": 1,
+        },
+    )
+    assert not (project / ".beagle" / "locked").exists()
+
+    # Sent again without `locks`: the ones asked for at opening still apply.
+    (fake_beagle / "next.out").write_text(json.dumps({"open": ["T0002"], "ready": []}))
+    monkeypatch.setenv("FAKE_TAU_SUCCEEDS_ON", "1")
+    result = await step.execute("c2", {"task": "T0002"})
+
+    assert "Locked: cases.json" in result.text
+    assert (project / ".beagle" / "locked" / "cases.json").is_file()
 
 
 @pytest.mark.anyio

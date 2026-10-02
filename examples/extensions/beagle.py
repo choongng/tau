@@ -1636,6 +1636,15 @@ STEP_PARAMETERS: dict[str, Any] = {
             "items": {"type": "string"},
             "description": "The paths the work will touch.",
         },
+        "locks": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": (
+                "Files this task writes that no later task may change, such as the "
+                "known-answer cases from the reference. Locked when the task closes done; "
+                "after that a sub-agent's change to them is undone before every check."
+            ),
+        },
         "notes": {
             "type": "string",
             "description": (
@@ -1764,6 +1773,103 @@ def _ids(entries: Any) -> list[str]:
         if isinstance(task, str):
             ids.append(task)
     return ids
+
+
+#: Under `.beagle/`: the known copy of each locked file, and the locks a task
+#: asked for, held until it closes done.
+LOCKED_DIR = "locked"
+PENDING_LOCKS = "locks-pending.json"
+
+
+def _locked(goal: Path) -> list[str]:
+    """The project paths locked so far, as their known copies name them."""
+    store = goal.parent / LOCKED_DIR
+    try:
+        return sorted(str(f.relative_to(store)) for f in store.rglob("*") if f.is_file())
+    except OSError:
+        return []
+
+
+def _project_file(root: Path, entry: str) -> Path | None:
+    """`entry` as a file under the project and outside `.beagle/`, else None."""
+    try:
+        target = (root / entry).resolve()
+        base = root.resolve()
+    except (OSError, ValueError):
+        return None
+    if base not in target.parents or (base / ".beagle") in (target, *target.parents):
+        return None
+    return target
+
+
+def _lock(goal: Path, root: Path, entries: list[str]) -> tuple[list[str], list[str]]:
+    """Copy each named file to the locked store; (locked, why the rest were not)."""
+    store = goal.parent / LOCKED_DIR
+    held = set(_locked(goal))
+    locked: list[str] = []
+    skipped: list[str] = []
+    for entry in entries:
+        target = _project_file(root, entry)
+        if target is None or not target.is_file():
+            skipped.append(f"{entry}: not a file in the project")
+            continue
+        rel = str(target.relative_to(root.resolve()))
+        if rel in held:
+            skipped.append(f"{rel}: already locked")
+            continue
+        copy = store / rel
+        try:
+            copy.parent.mkdir(parents=True, exist_ok=True)
+            copy.write_bytes(target.read_bytes())
+        except OSError as exc:
+            skipped.append(f"{rel}: {exc}")
+            continue
+        locked.append(rel)
+    return locked, skipped
+
+
+def _restore_locked(goal: Path, root: Path) -> list[str]:
+    """Put back every locked file a worker changed or removed; the ones it did."""
+    store = goal.parent / LOCKED_DIR
+    restored = []
+    for rel in _locked(goal):
+        target = root / rel
+        try:
+            known = (store / rel).read_bytes()
+            if target.is_file() and target.read_bytes() == known:
+                continue
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(known)
+        except OSError:
+            continue
+        restored.append(rel)
+    return restored
+
+
+def _pending_locks(goal: Path, task: str, add: list[str] | None = None) -> list[str]:
+    """The locks `task` asked for, adding `add`; kept until the task closes done."""
+    path = goal.parent / PENDING_LOCKS
+    try:
+        pending = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        pending = {}
+    if not isinstance(pending, dict):
+        pending = {}
+    entries = [e for e in pending.get(task) or [] if isinstance(e, str)]
+    if add:
+        entries += [e for e in add if e not in entries]
+        pending[task] = entries
+        with contextlib.suppress(OSError):
+            path.write_text(json.dumps(pending, indent=1), encoding="utf-8")
+    return entries
+
+
+def _drop_pending_locks(goal: Path, task: str) -> None:
+    path = goal.parent / PENDING_LOCKS
+    with contextlib.suppress(OSError, ValueError, AttributeError):
+        pending = json.loads(path.read_text(encoding="utf-8"))
+        if pending.pop(task, None) is not None:
+            path.write_text(json.dumps(pending, indent=1), encoding="utf-8")
 
 
 def make_step_tool() -> Any:
@@ -1898,6 +2004,15 @@ def make_step_tool() -> Any:
         notes = str(arguments.get("notes") or "").strip()
         if notes:
             brief = f"{brief}\n\nFrom the driver:\n{notes}"
+        locks = _pending_locks(goal, task, _strings(arguments.get("locks")))
+        locked = _locked(goal)
+        if locked:
+            brief += (
+                "\n\nLocked files: known-answer cases an earlier task wrote from the "
+                "reference. Read them; do not edit them. Any change is undone before the "
+                "check runs, so make the code pass them as they are:\n"
+                + "\n".join(f"- {rel}" for rel in locked)
+            )
         try:
             attempts = max(1, int(arguments.get("attempts") or DEFAULT_STEP_ATTEMPTS))
             timeout = float(arguments.get("timeout") or DEFAULT_DISPATCH_TIMEOUT)
@@ -1911,11 +2026,14 @@ def make_step_tool() -> Any:
         model = _worker_model(None)
         provider = _worker_provider(None)
         retry_note = ""
+        restored: set[str] = set()
         for attempt in range(1, attempts + 1):
             if on_update is not None:
                 with contextlib.suppress(Exception):
                     on_update(_step_result(f"{task}: sub-agent attempt {attempt} of {attempts}"))
             run = await _run_worker(brief + retry_note, root, model, provider, timeout, signal)
+            undone = _restore_locked(goal, root)
+            restored.update(undone)
             if run.spent is not None:
                 spent = (spent or 0) + run.spent
             if run.problem is not None:
@@ -1934,10 +2052,21 @@ def make_step_tool() -> Any:
                 f"{verdict[0]}). Its output ends:\n{verdict[1][-CHECK_TAIL_CHARS:]}\n"
                 "Fix the work, not the check."
             )
+            if undone:
+                retry_note += (
+                    f" It also changed locked files ({', '.join(undone)}); they were put "
+                    "back. Make the code pass them as they are."
+                )
+        undid = (
+            f"The sub-agent changed locked files ({', '.join(sorted(restored))}); they "
+            "were put back before the check.\n\n"
+            if restored
+            else ""
+        )
 
         if check and verdict[0] != 0:
             return _step_result(
-                f"{task} — {title}: the check still fails after {attempts} sub-agent "
+                f"{undid}{task} — {title}: the check still fails after {attempts} sub-agent "
                 f"run(s), so the task stays open.\n\n`{check}` exit {verdict[0]}:\n"
                 f"{verdict[1][-CHECK_TAIL_CHARS:]}\n\nLast report:\n{report}\n\n"
                 f'Next: pursuit_step with task="{task}" and notes saying what to fix. If '
@@ -1960,8 +2089,20 @@ def make_step_tool() -> Any:
                 [*argv, "--spent-because", because], root, timeout=check_timeout + 60
             )
         state = "closed done" if rc == 0 else f"close exited {rc}"
+        lock_note = ""
+        if rc == 0 and locks:
+            now, skipped = _lock(goal, root, locks)
+            _drop_pending_locks(goal, task)
+            if now:
+                lock_note += (
+                    f"Locked: {', '.join(now)}. No later sub-agent can change them; make "
+                    "the later tasks' done_when run them.\n\n"
+                )
+            if skipped:
+                lock_note += f"Not locked: {'; '.join(skipped)}.\n\n"
         return _step_result(
-            f"{task} — {title}: {state}.\n\n{closed}\n\nSub-agent report:\n{report}\n\n"
+            f"{task} — {title}: {state}.\n\n{closed}\n\n{undid}{lock_note}"
+            f"Sub-agent report:\n{report}\n\n"
             "Next: call pursuit_step with no arguments for the next task."
         )
 
