@@ -976,6 +976,25 @@ def test_loop_report_joins_the_pursuit_section(
     assert json.loads(call["stdin"])["hook_event_name"] == "SessionStart"
 
 
+def test_driver_is_told_to_steer_and_a_worker_to_go_piece_by_piece(
+    tmp_path: Path, beagle: Path, fake_beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project = _pursuit_project(tmp_path)
+    monkeypatch.chdir(project)
+
+    [driver] = [s for s in _load(tmp_path).prompt_sections if s.title == "Beagle pursuit"]
+    monkeypatch.setenv("BEAGLE_TAU_WORKER", "1")
+    [worker] = [s for s in _load(tmp_path).prompt_sections if s.title == "Beagle pursuit"]
+
+    assert "Do not fetch or read the reference" in driver.body
+    assert "one piece per turn" not in driver.body
+    assert "Ship it" in worker.body and "Write the concrete cases first" in worker.body
+    assert "this session steers" not in worker.body
+    assert "Cases first" in driver.body and "Cases first" not in worker.body
+    assert "Never set a git identity" in driver.body
+    assert "Never set a git identity" in worker.body
+
+
 @pytest.mark.anyio
 async def test_worker_runs_no_loop_and_keeps_parent_session(
     tmp_path: Path, beagle: Path, monkeypatch: pytest.MonkeyPatch
@@ -1399,6 +1418,90 @@ async def test_pursuit_found_waits_for_the_user_then_roots_and_splits(
 
 
 @pytest.mark.anyio
+async def test_a_request_to_set_beagle_up_is_steered_to_found_first(
+    tmp_path: Path, beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The prompt section alone did not hold a 9B driver: it read the reference
+    # and spent whole turns designing in its head before founding anything.
+    runtime, session = _bound(tmp_path)
+    monkeypatch.chdir(tmp_path / "project")
+    session.is_running = True
+
+    await runtime.emit_session_start("startup")
+    bash = _tool_with_hooks(runtime, "bash")
+    await runtime.run_input_hooks("set this project up for beagle pursuit, then build it")
+    await runtime.emit_event(AgentStartEvent())
+    await runtime.emit_event(AgentStartEvent())
+
+    assert len(session.steered) == 1 and "pursuit_found" in session.steered[0]
+    # Then the steer has teeth: a few calls for setup, and no more.
+    setup = [await bash.execute(f"c{i}", {"command": "beagle doctor"}) for i in range(6)]
+    assert [r.text for r in setup] == ["ran"] * 6
+    refused = await bash.execute("c7", {"command": "curl -o /tmp/ref.html https://x"})
+    assert "Call pursuit_found now" in refused.text
+    found = await _tool(runtime, "pursuit_found").execute("c8", {})
+    assert "refusing" not in found.text and "required" in found.text
+
+
+@pytest.mark.anyio
+async def test_an_unrelated_prompt_is_not_steered_to_found(
+    tmp_path: Path, beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runtime, session = _bound(tmp_path)
+    monkeypatch.chdir(tmp_path / "project")
+    session.is_running = True
+
+    await runtime.run_input_hooks("fix the typo in README")
+    await runtime.emit_event(AgentStartEvent())
+
+    assert session.steered == []
+
+
+@pytest.mark.anyio
+async def test_pursuit_found_takes_a_delegated_goal_and_makes_a_repo(
+    tmp_path: Path, beagle: Path, fake_beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # "Use your judgement, without further discussion": asking would stall an
+    # unattended run, and a bare directory has no git for the guards to use.
+    project = tmp_path / "project"
+    project.mkdir()
+    monkeypatch.chdir(project)
+    # No git identity anywhere: the model must say so, not make one up.
+    gitconfig = tmp_path / "gitconfig"
+    gitconfig.write_text("[user]\n\tuseConfigOnly = true\n")  # no guessing from the host
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(gitconfig))
+    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+    for key in (
+        "GIT_AUTHOR_NAME",
+        "GIT_AUTHOR_EMAIL",
+        "GIT_COMMITTER_NAME",
+        "GIT_COMMITTER_EMAIL",
+        "EMAIL",
+    ):
+        monkeypatch.delenv(key, raising=False)
+    (fake_beagle / "add.out").write_text("T0001  Build ITC\n")
+    runtime, _ = _bound(tmp_path)
+
+    result = await _tool(runtime, "pursuit_found").execute(
+        "c1",
+        {
+            "statement": "Build ITC",
+            "criteria": ["`uv run pytest` exits 0"],
+            "milestones": ["Read::the reference", "Core::fork, join, event"],
+            "user_confirmed": False,
+            "user_delegated": True,
+        },
+    )
+
+    assert (project / ".beagle" / "pursuit.toml").exists()
+    assert (project / ".git").is_dir()
+    assert "git init" in result.text and "criteria you chose" in result.text
+    assert "Do not fetch or read the reference" in result.text
+    assert "Cases first" in result.text
+    assert "git has no user.name or user.email" in result.text
+
+
+@pytest.mark.anyio
 async def test_pursuit_plan_adds_to_a_container_it_cannot_split(
     tmp_path: Path, beagle: Path, fake_beagle: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1778,3 +1881,31 @@ async def test_history_guard_holds_every_session_in_a_pursuit(
     assert "refusing `git reset --hard`" in blocked.text and "Fix forward" in blocked.text
     assert "refusing `git clean`" in worker.text
     assert [fine.text, unfounded.text] == ["ran"] * 2
+
+
+@pytest.mark.anyio
+async def test_a_long_goal_statement_is_cut_to_a_root_task_title(
+    tmp_path: Path, beagle: Path, fake_beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # beagle refuses a title over 200 characters; the statement is not one.
+    project = tmp_path / "project"
+    project.mkdir()
+    monkeypatch.chdir(project)
+    (fake_beagle / "add.out").write_text("T0001  Implement\n")
+    runtime, _ = _bound(tmp_path)
+    statement = "Implement interval tree clocks " + "in modern Python " * 20
+
+    await _tool(runtime, "pursuit_found").execute(
+        "c1",
+        {
+            "statement": statement,
+            "criteria": ["`uv run pytest` exits 0"],
+            "milestones": ["Core::fork, join, event"],
+            "user_delegated": True,
+        },
+    )
+
+    [add] = [c["argv"] for c in _calls(fake_beagle) if c["argv"][:2] == ["pursuit", "add"]][:1]
+    title = add[2]
+    assert len(title) <= 200 and title.endswith("…")
+    assert add[add.index("--intent") + 1] == statement.strip()

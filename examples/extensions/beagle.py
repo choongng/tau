@@ -252,6 +252,11 @@ _STOP_BLOCKED = False
 #: Whether the last run ended on its own, rather than aborted, errored or cut
 #: off at the output limit.
 _LAST_RUN_CLEAN = True
+# The last prompt the user typed, and whether this session has already been
+# told to found before it does the work: see `make_found_first_steer`.
+_LAST_PROMPT = ""
+_FOUND_FIRST_SENT = False
+_SETUP_CALLS = 0
 #: The driver records' directory, once the Tau home is known.
 _DRIVERS_DIR: Path | None = None
 #: The session this process last registered as a possible driver.
@@ -1306,6 +1311,40 @@ def _project_root() -> tuple[Path, Path | None]:
     return (goal.parent.parent if goal is not None else cwd), goal
 
 
+#: beagle refuses a task title longer than this.
+MAX_TASK_TITLE = 200
+
+
+def _task_title(statement: str) -> str:
+    """The root task's title: the statement's first line, cut at a word to fit."""
+    line = statement.strip().splitlines()[0].strip()
+    if len(line) <= MAX_TASK_TITLE:
+        return line
+    cut = line[: MAX_TASK_TITLE - 1].rsplit(" ", 1)[0].rstrip(" ,;:")
+    return f"{cut}…"
+
+
+def _ensure_git_repo(root: Path) -> bool:
+    """`git init` a project that is in no repository; True if it ran.
+
+    The history guard, `commit-claims` and every step's diff stand on git; a
+    model founding a pursuit in a bare directory never thinks to make one.
+    """
+    rc, _ = _run(["git", "rev-parse", "--git-dir"], root, timeout=10.0)
+    if rc == 0:
+        return False
+    rc, _ = _run(["git", "init", "--quiet"], root, timeout=10.0)
+    return rc == 0
+
+
+def _git_identity(root: Path) -> bool:
+    """Whether a commit in `root` would know who made it (config, env or host)."""
+    return all(
+        _run(["git", "var", ident], root, timeout=10.0)[0] == 0
+        for ident in ("GIT_AUTHOR_IDENT", "GIT_COMMITTER_IDENT")
+    )
+
+
 def _pursuit(args: list[str], root: Path, timeout: float = 60.0) -> tuple[int, str]:
     return _run([BEAGLE_BIN, "pursuit", *args], root, timeout=timeout)
 
@@ -1373,6 +1412,14 @@ FOUND_PARAMETERS: dict[str, Any] = {
                 "criteria, word for word, in this conversation."
             ),
         },
+        "user_delegated": {
+            "type": "boolean",
+            "description": (
+                "True when the user told you to decide the details yourself ('use your "
+                "judgement', 'without further discussion'): the criteria are then your "
+                "draft from their request, and you found without asking."
+            ),
+        },
     },
     "required": ["statement", "criteria", "milestones", "user_confirmed"],
 }
@@ -1430,15 +1477,18 @@ def make_found_tool() -> Any:
                 "pursuit_found: name the milestones: the parts of the goal you can "
                 "already see, each '<title>::<what it is for>'."
             )
-        if arguments.get("user_confirmed") is not True:
+        delegated = arguments.get("user_delegated") is True
+        if arguments.get("user_confirmed") is not True and not delegated:
             listed = "\n".join(f"  - {c}" for c in criteria)
             return _step_result(
                 "pursuit_found: nothing written. The goal and its criteria are the user's: "
                 "read them back word for word and ask the user to confirm or correct them:\n\n"
                 f"Goal: {statement}\nCriteria:\n{listed}\n\n"
                 "Then call pursuit_found again with what they approved and "
-                "user_confirmed=true."
+                "user_confirmed=true. If the user already told you to decide this "
+                "yourself, call it again with user_delegated=true instead."
             )
+        initialized = _ensure_git_repo(root)
 
         goal = root / ".beagle" / GOAL_BASENAME
         goal.parent.mkdir(parents=True, exist_ok=True)
@@ -1449,11 +1499,14 @@ def make_found_tool() -> Any:
             f"default_budget_tokens = {FOUNDING_BUDGET_TOKENS}\n",
             encoding="utf-8",
         )
-        rc, out = _pursuit(["add", statement, "--root-task", "--intent", statement], root)
+        title = _task_title(statement)
+        rc, out = _pursuit(["add", title, "--root-task", "--intent", statement], root)
         found = _TASK_ID.search(out) if rc == 0 else None
         if found is None:
+            # Unwritten, so a corrected call founds afresh.
+            goal.unlink(missing_ok=True)
             return _step_result(
-                f"pursuit_found: wrote {goal}, but `beagle pursuit add --root-task` "
+                f"pursuit_found: nothing founded; `beagle pursuit add --root-task` "
                 f"failed (exit {rc}):\n{out}"
             )
         root_task = found.group(0)
@@ -1471,8 +1524,23 @@ def make_found_tool() -> Any:
                 f"pursuit_found: founded {goal} with root task {root_task}, but the "
                 f"milestone split failed (exit {rc}):\n{out}\n\nAdd them with pursuit_plan."
             )
+        notes = []
+        if initialized:
+            notes.append(f"{root} was not a git repository; ran `git init` there.")
+        if not _git_identity(root):
+            notes.append(
+                "git has no user.name or user.email here, so commits will fail. Tell the "
+                "user now; do not set one yourself."
+            )
+        if delegated:
+            notes.append(
+                "The user delegated the details: in your reply, tell them the criteria "
+                "you chose, so they can correct them."
+            )
+        noted = "".join(f"{note}\n\n" for note in notes)
         return _step_result(
             f"Founded the pursuit in {goal}, root task {root_task}.\n\n{_tree(root)}\n\n"
+            f"{noted}{DRIVER_STEERS_NOTE}\n\n{CASES_FIRST_NOTE}\n\n"
             "Next: call pursuit_step with no arguments to see the first ready task. A "
             "milestone too big for one sub-agent's sitting: split it into steps with "
             "pursuit_plan first. The goal file is now the user's; never edit it."
@@ -2290,6 +2358,85 @@ def _note_run_end(event: Any, context: ExtensionContext) -> None:
     _LAST_RUN_CLEAN = not stops or stops[-1] not in ("aborted", "error", "length")
 
 
+#: Tool calls a steered driver may spend on setup before it must found.
+FOUND_FIRST_SETUP_CALLS = 6
+
+FOUND_FIRST_NOTE = (
+    "Beagle: this project is not a pursuit yet. Found it before anything else: "
+    "`beagle init` if `.beagle/` is missing, then `pursuit_found`. Do not read "
+    "references or design the solution first; reading the reference and choosing "
+    "a design are milestones, which `pursuit_step` sub-agents do. Name the "
+    f"reference (URL) in the milestones. After {FOUND_FIRST_SETUP_CALLS} setup "
+    "tool calls, every tool but the pursuit tools is refused until it is founded."
+)
+
+
+def _note_prompt(event: Any, context: ExtensionContext) -> None:
+    """Keep the user's prompt for the `agent_start` that follows it."""
+    global _LAST_PROMPT
+    del context
+    if getattr(event, "source", "interactive") == "interactive":
+        _LAST_PROMPT = str(getattr(event, "text", "") or "")
+
+
+def make_found_first_steer(tau: ExtensionAPI) -> Any:
+    """Steer a request to set beagle up toward `pursuit_found`, once.
+
+    The prompt section says to found first, and a 9B model still reads the
+    reference and spends whole turns designing the solution in the driver.
+    A note right after the user's request, before the first model call, is
+    the part of the context such a model follows.
+    """
+
+    def steer(event: Any, context: ExtensionContext) -> None:
+        global _FOUND_FIRST_SENT
+        del event, context
+        if _FOUND_FIRST_SENT or not re.search(r"(?i)\b(beagle|pursuit)", _LAST_PROMPT):
+            return
+        if _project_root()[1] is not None:
+            return
+        _FOUND_FIRST_SENT = True
+        tau.send_custom_message(FOUND_FIRST_NOTE, custom_type="beagle", deliver_as="steer")
+
+    return steer
+
+
+def make_found_first_gate() -> Any:
+    """Build the `tool_call` gate behind the found-first steer.
+
+    The steer alone was not enough: a 9B driver acknowledged nothing, fetched
+    the reference, thought itself out of output room and then began building
+    the project in the driver. Once steered, the driver gets a few calls for
+    setup; after them only the pursuit tools run until the goal exists.
+    """
+
+    async def gate(event: Any, context: ExtensionContext) -> ToolCallHookResult | None:
+        global _SETUP_CALLS
+        try:
+            if not _FOUND_FIRST_SENT or event.tool_name.startswith("pursuit_"):
+                return None
+            if _STARTED_SESSION is None or context.session_id != _STARTED_SESSION:
+                return None
+            if _find_goal(Path(context.cwd)) is not None:
+                return None
+        except Exception:  # noqa: BLE001 - fail open, never block on a guard bug
+            return None
+        _SETUP_CALLS += 1
+        if _SETUP_CALLS <= FOUND_FIRST_SETUP_CALLS:
+            return None
+        return ToolCallHookResult(
+            block=True,
+            reason=(
+                f"refusing {event.tool_name}: setup is done and the pursuit is not founded. "
+                "Call pursuit_found now with the user's goal, criteria and milestones "
+                "(user_delegated=true if they told you to decide). Reading references, "
+                "designing and building are milestones for pursuit_step's sub-agents."
+            ),
+        )
+
+    return gate
+
+
 def make_stop_hooks(tau: ExtensionAPI) -> Any:
     """Build the `agent_settled` bridge for beagle's Stop hooks.
 
@@ -2905,7 +3052,58 @@ def _command_pursuit_view(args: str, context: Any) -> str:
 # --------------------------------------------------------------------------- #
 
 
-def _goal_section(goal_file: Path) -> str | None:
+#: How the driving session spends its turns. A small model that reads the
+#: reference or works out the design here thinks itself past its output limit
+#: (30K characters of reasoning, then nothing, in every ITC trial); a worker
+#: that does it burns only its own step's budget.
+DRIVER_STEERS_NOTE = (
+    "You steer; sub-agents think. Do not fetch or read the reference, and do not "
+    "work out the design or the algorithm in this session: a question you would "
+    "have to think hard about is a task. Send it as a step, with the reference (its "
+    "URL) and the one question in the step's notes, or split it with pursuit_plan. "
+    "Keep your turns short: pick the next task, write its check, dispatch it, read "
+    "the verdict."
+)
+
+#: Where a worker's tests come from. A small model that writes the code and its
+#: tests in one sitting makes them agree with each other, not with the reference
+#: (the ITC trial with qwen: wrong fork, join and event, and every test passed).
+CASES_FIRST_NOTE = (
+    "Cases first. Make the first milestone after the reference the known answers: a "
+    "sub-agent reads the reference and writes, without any implementation, (a) a data "
+    "file of small inputs and the exact results the reference gives for them, each "
+    "citing where in the reference it comes from (e.g. `tests/cases.json`), and (b) "
+    "a test that runs every case against the code (e.g. `tests/test_cases.py`; it "
+    "fails until the code exists). Its done_when checks only the data, e.g. `python3 "
+    "-m json.tool tests/cases.json`, and it passes `locks` with both files. Once it "
+    "closes they are locked, and every later task's done_when runs that test."
+)
+
+#: Commits need an identity; a model that meets "Please tell me who you are"
+#: makes one up (the qwen trial set "Developer <dev@example.com>").
+GIT_IDENTITY_NOTE = (
+    "Never set a git identity (`git config user.name` / `user.email`, in the repo or "
+    "globally). If a commit fails for want of one, stop and tell the user."
+)
+
+#: How a worker takes on a hard part. Its reasoning is lost when a reply runs
+#: out of room, so a thought only survives once it is written to a file.
+PIECE_BY_PIECE_NOTE = (
+    "Hard parts, one piece per turn. When the task needs real working out (an "
+    "algorithm, an encoding, an invariant), do not try to solve it whole in one "
+    "reply: that runs out of room and loses all of it. Instead:\n"
+    "1. Write the concrete cases first: the smallest inputs and their exact "
+    "expected results, as test cases or a table in a file, simplest first.\n"
+    "2. In a new turn, read them back and find the rule that produces them; write "
+    "the rule down, as code or a comment.\n"
+    "3. Run the cases against it, and fix the rule from the first failure.\n"
+    "If you find yourself going round the same question, stop: write down what you "
+    "know and the one open question, and answer only that in your next turn.\n"
+    "Stay inside your task: build what its brief asks, not the rest of the goal."
+)
+
+
+def _goal_section(goal_file: Path, *, worker: bool = False) -> str | None:
     """A compact orientation block from `pursuit.toml`, or None if unreadable.
 
     Read straight from the goal file rather than shelling out to `beagle`, so
@@ -2929,6 +3127,9 @@ def _goal_section(goal_file: Path) -> str | None:
     if isinstance(criteria, list) and criteria:
         lines.append("Acceptance criteria (the user's; do not edit them to fit the work):")
         lines += [f"  - {str(c).strip()}" for c in criteria if str(c).strip()]
+    if worker:
+        lines += ["", "You are a sub-agent doing one task of it; your brief says which.", ""]
+        return "\n".join([*lines, PIECE_BY_PIECE_NOTE, GIT_IDENTITY_NOTE])
     lines += [
         "",
         "How to work it — this session steers, sub-agents do the work:",
@@ -2941,6 +3142,9 @@ def _goal_section(goal_file: Path) -> str | None:
         "into steps with `pursuit_plan` first.",
         "Do not edit project files in this session; put what you want changed in the "
         "step's `notes`.",
+        DRIVER_STEERS_NOTE,
+        CASES_FIRST_NOTE,
+        GIT_IDENTITY_NOTE,
         "",
         "`/pursuit-view` shows counts and the ready set without a model. The full "
         "drivers (`pursuit_driver` tool, `/pursuit`, `/pursuit-run`) cover the rarer "
@@ -2966,10 +3170,22 @@ def _unfounded_section(root: Path) -> str | None:
             "`~/.claude/plugins/cache/...`: that is another release, with other commands."
         )
     lines += [
-        "- To found one, call `pursuit_found` with the user's goal, their acceptance "
-        "criteria and the milestones you can already name. The goal and the criteria are "
-        "the user's: use their words, and if they have not given criteria, ask.",
-        "- Then work it with `pursuit_step`, which runs each task in a sub-agent.",
+        "- Found it first. Asked to set beagle up and build something, call "
+        "`pursuit_found` as your first move, before you read any reference or design "
+        "anything: reading the reference and choosing a design are themselves "
+        "milestones, which sub-agents do. Your part is to steer, a few steps at a time.",
+        "- Pass `pursuit_found` the user's goal, their acceptance criteria and the "
+        "milestones you can already name. The goal and the criteria are the user's: use "
+        "their words. If they gave none, ask, unless they told you to decide yourself "
+        "('use your judgement', 'without further discussion'). Then draft the criteria "
+        "from their request and set `user_delegated`.",
+        "- It runs `git init` if the project is not a repository yet.",
+        "- Then work it with `pursuit_step`, which runs each task in a sub-agent. A "
+        "reference the work needs (a URL, a paper) goes in the step's notes, or is "
+        "saved inside the project; a sub-agent cannot see your context.",
+        f"- {DRIVER_STEERS_NOTE}",
+        f"- {CASES_FIRST_NOTE}",
+        f"- {GIT_IDENTITY_NOTE}",
         "- The `pursuit_driver` tool loads the full written procedure, for what these "
         "tools do not cover.",
         "- `beagle init` places templates; read one when you need it, not all of them.",
@@ -3274,7 +3490,9 @@ def setup(tau: ExtensionAPI) -> None:
                 prompt_snippet="Found a pursuit: goal, criteria, milestones.",
                 prompt_guidelines=(
                     "The pursuit's goal and criteria are the user's: use their words, and set "
-                    "user_confirmed only when they gave or approved them.",
+                    "user_confirmed only when they gave or approved them. When they told you "
+                    "to decide the details yourself, draft the criteria from their request "
+                    "and set user_delegated instead of asking.",
                 ),
             )
         )
@@ -3358,6 +3576,9 @@ def setup(tau: ExtensionAPI) -> None:
                 ),
             )
         )
+        tau.on("input", _note_prompt)
+        tau.on("agent_start", make_found_first_steer(tau))
+        tau.on("tool_call", make_found_first_gate())
         tau.on("agent_start", _note_run_start)
         tau.on("agent_end", _note_run_end)
         tau.on("agent_settled", make_stop_hooks(tau))
@@ -3394,7 +3615,7 @@ def setup(tau: ExtensionAPI) -> None:
         _bridge_session_start_hooks(tau, cwd)
     goal = _find_goal(cwd)
     if goal is not None:
-        section = _goal_section(goal)
+        section = _goal_section(goal, worker=_is_worker())
         # loop-report is the SessionStart hook: what a run left in flight, and
         # the driver's core while one is. The system prompt outlives
         # compaction, so this also covers what the hook re-prints after one.
