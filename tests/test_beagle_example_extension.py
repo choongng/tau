@@ -1370,7 +1370,12 @@ if tamper:
     Path(tamper).write_text("tampered")
 message = {
     "role": "assistant",
-    "content": [{"type": "text", "text": f"attempt {attempt}: wrote done.txt"}],
+    "content": [
+        {
+            "type": "text",
+            "text": os.environ.get("FAKE_TAU_REPORT") or f"attempt {attempt}: wrote done.txt",
+        }
+    ],
     "usage": {"totalTokens": 1000},
     "stopReason": "stop",
 }
@@ -2041,6 +2046,70 @@ async def test_pursuit_step_will_not_open_a_task_whose_check_already_passes(
 
     assert "already passes" in result.text and "abandon=" in result.text
     assert _pursuit_calls(fake_beagle, "open") == [] and _runs(fake_tau) == []
+
+
+def _audit_due(fake: Path) -> None:
+    ready = {"open": [], "ready": [{"id": "T0005", "title": "Impl"}], "ready_total": 1}
+    (fake / "next.out").write_text(json.dumps({**ready, "audit_due": {"closes": ["T0002"]}}))
+    (fake / "audit.out").write_text(
+        "# Audit of 16 close(s)\nReport MEETS or SHORT per task.\n\n"
+        "For the driver: `beagle pursuit audit --record --verdict sound|defects`\n"
+    )
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("report", "verdict"),
+    [
+        ("T0002 MEETS.\nT0003 MEETS.\nSOUND", "sound"),
+        ("T0002 MEETS.\nT0003 SHORT: no test of join.\nDEFECTS 1", "defects"),
+    ],
+)
+async def test_pursuit_step_has_a_sub_agent_do_a_due_audit(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    report: str,
+    verdict: str,
+) -> None:
+    # Run 9: with an audit due, open was refused with bash advice; the
+    # driver recorded a verdict by hand, read nothing, and lost the thread.
+    monkeypatch.chdir(_pursuit_project(tmp_path))
+    monkeypatch.setenv("FAKE_TAU_REPORT", report)
+    _audit_due(fake_beagle)
+    runtime, _ = _bound(tmp_path)
+
+    result = await _tool(runtime, "pursuit_step").execute("c1", {"task": "T0005"})
+
+    [run] = _runs(fake_tau)
+    assert "Audit of 16" in run["stdin"] and "For the driver" not in run["stdin"]
+    assert _pursuit_calls(fake_beagle, "audit") == [
+        [],
+        ["--record", "--verdict", verdict, "--note", report],
+    ]
+    assert _pursuit_calls(fake_beagle, "open") == []
+    assert f": {verdict}." in result.text and "pursuit_step" in result.text
+
+
+@pytest.mark.anyio
+async def test_a_due_audit_with_no_report_is_not_recorded(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.chdir(_pursuit_project(tmp_path))
+    monkeypatch.setenv("FAKE_TAU_REPORT", " ")
+    _audit_due(fake_beagle)
+    runtime, _ = _bound(tmp_path)
+
+    result = await _tool(runtime, "pursuit_step").execute("c1", {})
+
+    assert _pursuit_calls(fake_beagle, "audit") == [[]]
+    assert "did not finish" in result.text and "send it again" in result.text
 
 
 @pytest.mark.parametrize(

@@ -1087,6 +1087,8 @@ class _WorkerRun:
         return f"{self.report}\n\n(Worker transcript: {self.transcript})"
 
 
+#: How the stub a worker that wrote no report gets in its place begins.
+NO_REPORT = "(The worker wrote no report"
 #: How often a running worker is checked for the caller's cancellation.
 _WORKER_POLL_SECONDS = 0.5
 
@@ -1163,7 +1165,7 @@ class _WorkerEvents:
                 if self.stop_reason
                 else "produced no assistant message"
             )
-            report = f"(The worker wrote no report: it {ended}.)"
+            report = f"{NO_REPORT}: it {ended}.)"
             if self.stop_reason == "length" and self.thinking:
                 report += (
                     "\nIt spent its output on reasoning. The reasoning ended:\n"
@@ -2324,6 +2326,77 @@ def _blocked_brief(task: str, record: Mapping[str, Any]) -> str:
     return "\n".join(lines)
 
 
+#: What the auditing sub-agent is told beyond beagle's audit brief.
+AUDIT_NOTE = (
+    "\n\nRead the work and the checks; change nothing. Do not run `beagle pursuit "
+    "audit`: the session that sent you records what you report. End your report with "
+    "one line: SOUND, or DEFECTS and how many."
+)
+#: Most of the auditor's report beagle keeps with the audit.
+AUDIT_NOTE_CHARS = 2_000
+
+
+async def _audit(
+    root: Path, signal: ToolCancellationToken | None, on_update: ToolUpdateCallback | None
+) -> str:
+    """Run a due audit by a sub-agent and record its verdict; what the driver is told.
+
+    While one is due beagle opens nothing, and its refusal names bash verbs: in
+    run 9 the driver recorded a verdict by hand without reading anything, then
+    lost the thread. The auditor is a fresh sub-agent, which closed none of
+    the tasks it reads.
+    """
+    rc, brief = _pursuit(["audit"], root)
+    if rc != 0:
+        return (
+            f"pursuit_step: an audit is due, but `beagle pursuit audit` failed (exit {rc}):"
+            f"\n{brief}"
+        )
+    brief = brief.split("\nFor the driver:")[0].rstrip()
+    if on_update is not None:
+        with contextlib.suppress(Exception):
+            on_update(_step_result("An audit is due: a sub-agent is reading the closes."))
+    run = await _run_worker(
+        brief + AUDIT_NOTE,
+        root,
+        _worker_model(None),
+        _worker_provider(None),
+        DEFAULT_DISPATCH_TIMEOUT,
+        signal,
+    )
+    if run.problem is not None or run.report.startswith(NO_REPORT):
+        why = run.problem or "it wrote no report"
+        return (
+            f"pursuit_step: an audit is due, and nothing opens until one is kept, but its "
+            f"sub-agent did not finish — {why}\n\nCall pursuit_step again to send it again."
+        )
+    lines = [line for line in run.report.splitlines() if line.strip()]
+    last = lines[-1].upper() if lines else ""
+    sound = "SOUND" in last and "DEFECT" not in last
+    verdict = "defects" if not sound and re.search(r"\b(DEFECTS?|SHORT)\b", run.report) else "sound"
+    rc, kept = _pursuit(
+        ["audit", "--record", "--verdict", verdict, "--note", run.report[:AUDIT_NOTE_CHARS]],
+        root,
+    )
+    if rc != 0:
+        return (
+            f"pursuit_step: an audit is due; its sub-agent reported, but `beagle pursuit "
+            f"audit --record` refused (exit {rc}):\n{kept}\n\nReport:\n{run.shown_report}"
+        )
+    then = (
+        "Each defect becomes work before more is opened: for each task the report finds "
+        "SHORT, add what is missing with pursuit_plan, or rework the task with "
+        "pursuit_step and notes saying what to fix. Then call pursuit_step with no "
+        "arguments."
+        if verdict == "defects"
+        else "Next: call pursuit_step with no arguments for the next task."
+    )
+    return (
+        f"An audit came due, and a sub-agent read the closes since the last one: "
+        f"{verdict}.\n\n{kept}\n\nAuditor's report:\n{run.shown_report}\n\n{then}"
+    )
+
+
 def make_step_tool() -> Any:
     """Build `pursuit_step`: one task, opened, done by a sub-agent, checked and closed.
 
@@ -2378,6 +2451,8 @@ def make_step_tool() -> Any:
                 f"{out.splitlines()[0] if out else task + ' abandoned'}\n\n{_tree(root)}\n\n"
                 "Next: call pursuit_step with no arguments for the next task."
             )
+        if ready.get("audit_due"):
+            return _step_result(await _audit(root, signal, on_update))
         if not task:
             task = (open_ids or ready_ids or [""])[0]
             if not task:
@@ -2789,7 +2864,7 @@ def _named(argv: list[str], program: str) -> bool:
 #: The `beagle pursuit` verbs that only read the pursuit. A worker may run
 #: these; every other verb changes the tree or the log.
 _PURSUIT_READ_VERBS = frozenset(
-    {"next", "brief", "show", "status", "view", "tree", "findings", "rules"}
+    {"next", "brief", "show", "status", "view", "tree", "findings", "rules", "review-check"}
 )
 
 
@@ -2893,6 +2968,7 @@ _STEERED_VERBS = {
     "amend": "pursuit_step on the open task, with the new done_when",
     "bind": "pursuit_step (with criteria and done_when)",
     "spend": "pursuit_step, which records each sub-agent's measured spend",
+    "audit": "pursuit_step, which has a sub-agent do a due audit and records it",
     "split": "pursuit_plan",
     "add": "pursuit_plan",
 }
