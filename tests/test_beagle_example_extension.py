@@ -25,7 +25,7 @@ from tau_agent.events import AgentEndEvent, AgentStartEvent
 from tau_agent.messages import AssistantMessage, TextContent, UserMessage
 from tau_agent.tools import AgentTool, AgentToolResult
 from tau_coding.commands import CommandContext
-from tau_coding.events import AgentSettledEvent
+from tau_coding.events import AgentSettledEvent, CompactionEndEvent
 from tau_coding.extensions import ExtensionRuntime
 from tau_coding.resources import TauResourcePaths, parse_markdown_resource
 from tau_coding.skills import parse_skill_invocation
@@ -1453,6 +1453,60 @@ async def test_pursuit_found_waits_for_the_user_then_roots_and_splits(
     assert "root task T0001" in result.text and "pursuit_step" in result.text
     again = await found.execute("c3", {**args, "user_confirmed": True})
     assert "already exists" in again.text
+
+
+@pytest.mark.anyio
+async def test_founding_mid_session_swaps_in_the_pursuit_prompt(
+    tmp_path: Path, beagle: Path, fake_beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Run 10 founded in the session it ran in, and kept the "nothing founded
+    # yet" orientation all along: after each compaction nothing said how to
+    # work the pursuit.
+    project = tmp_path / "project"
+    project.mkdir()
+    monkeypatch.chdir(project)
+    (fake_beagle / "add.out").write_text("T0001  Ship it\n")
+    runtime, session = _bound(tmp_path)
+    assert [s.title for s in runtime.prompt_sections if s.title == "Beagle"] == ["Beagle"]
+
+    await _tool(runtime, "pursuit_found").execute(
+        "c1",
+        {
+            "statement": "Ship it",
+            "criteria": ["`make test` exits 0"],
+            "milestones": ["Parser::reads input", "CLI::wires it up"],
+            "user_confirmed": True,
+        },
+    )
+
+    sections = {s.title: s.body for s in runtime.prompt_sections}
+    assert "Beagle" not in sections
+    assert "**pursuit**: Ship it" in sections["Beagle pursuit"]
+    assert "How to work it" in sections["Beagle pursuit"]
+    assert session.prompt_refreshes == 2
+
+
+@pytest.mark.anyio
+async def test_a_compaction_is_followed_by_the_pursuit_state_from_beagle(
+    tmp_path: Path, beagle: Path, fake_beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Run 10's summaries said nothing was ready while T0014 was, and listed
+    # the driver's own commands as done tasks.
+    monkeypatch.chdir(_pursuit_project(tmp_path))
+    _ready_task(fake_beagle)
+    (fake_beagle / "tree.out").write_text("T0001 Ship it\n  T0002 Parser  pending\n")
+    runtime, session = _bound(tmp_path)
+    session.is_running = True
+
+    await runtime.emit_event(CompactionEndEvent(reason="threshold", aborted=True))
+    assert session.steered == []
+    await runtime.emit_event(CompactionEndEvent(reason="threshold"))
+
+    [note] = session.steered
+    assert "T0002 Parser  pending" in note and "Ready now: T0002." in note
+    assert "trust this over the summary" in note and "call pursuit_step" in note
+    focus = runtime.compaction_instructions
+    assert any("only from beagle's own output" in text for text in focus)
 
 
 @pytest.mark.anyio

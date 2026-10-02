@@ -1675,13 +1675,14 @@ ABANDON_HINT = (
 )
 
 
-def make_found_tool() -> Any:
+def make_found_tool(on_founded: Callable[[Path], None] | None = None) -> Any:
     """Build `pursuit_found`: write the goal, root the tree, split it into milestones.
 
     The driver text spends pages on founding; a small model loses the thread
     long before the file is written. The judgement it guards — the goal and
     the criteria are the user's — stays, as `user_confirmed`; the mechanics
-    (the TOML shape, the root task, the split) are done here.
+    (the TOML shape, the root task, the split) are done here. `on_founded`
+    gets the goal file once the root task exists.
     """
 
     async def execute(
@@ -1743,6 +1744,8 @@ def make_found_tool() -> Any:
                 f"failed (exit {rc}):\n{out}"
             )
         root_task = found.group(0)
+        if on_founded is not None:
+            on_founded(goal)
         if len(milestones) == 1:
             # beagle refuses a one-part split as a rename; one milestone is
             # one child of the root, which `add --parent` takes.
@@ -3484,6 +3487,76 @@ def make_found_first_steer(tau: ExtensionAPI) -> Any:
     return steer
 
 
+def _pin_founded(tau: ExtensionAPI) -> Callable[[Path], None]:
+    """Swap the not-yet-founded orientation for the pursuit's own, once founded.
+
+    The prompt sections are set at load, so a pursuit founded mid-session
+    kept "nothing founded yet" for the rest of it. Every tool result that
+    said how to work the pursuit was compacted away in time, and run 10's
+    driver was left with only a summary's account of the loop.
+    """
+
+    def pin(goal: Path) -> None:
+        section = _goal_section(goal)
+        if section:
+            tau.set_prompt_section("Beagle pursuit", section)
+            tau.set_prompt_section("Beagle", None)
+
+    return pin
+
+
+#: Focus for the summarizer when this session drives a pursuit. Run 10's
+#: summaries listed the driver's own commands as done tasks (T0015-T0022,
+#: none of them beagle's), dropped the task that was ready, and carried a
+#: search the driver had repeated 78 times forward as the next step.
+PURSUIT_COMPACTION_FOCUS = (
+    "If this session drives a beagle pursuit: task ids (T0001, ...) and their status come "
+    "only from beagle's own output: pursuit_found, pursuit_plan, pursuit_step, and "
+    "`beagle pursuit tree` or `next`. Never record this session's own commands, checks "
+    "or investigations as tasks or as finished work. Keep, by id, the tasks beagle "
+    "still shows open or ready. The next step is pursuit_step: do not carry a side "
+    "investigation (a gate, a lint run, a search) forward as a next step, and leave out "
+    "how many times a command was run."
+)
+
+
+def make_state_after_compaction(tau: ExtensionAPI) -> Any:
+    """After a compaction, tell the driver where the pursuit stands, from beagle.
+
+    A summary is a model's account of the record, and a small model's account
+    drifts: run 10's said nothing was ready while a task was. The ledger is
+    one command away, so the driver gets it, not the summary's version.
+    """
+
+    def note(event: Any, context: ExtensionContext) -> None:
+        del context
+        if getattr(event, "aborted", False):
+            return
+        root, goal = _project_root()
+        if goal is None:
+            return
+        rc, ready, _raw = _next_ready(root)
+        ready_ids = _ids(ready.get("ready")) if isinstance(ready, dict) else []
+        open_ids = _ids(ready.get("open")) if isinstance(ready, dict) else []
+        if ready_ids:
+            now = f"Ready now: {', '.join(ready_ids)}."
+        elif open_ids:
+            now = f"Open now: {', '.join(open_ids)}."
+        else:
+            now = "Nothing is ready now."
+        tree = _tree(root)
+        tau.send_custom_message(
+            "The conversation was just compacted. Where the pursuit stands, from beagle "
+            f"itself (trust this over the summary):\n\n{tree}\n\n{now} Next: call "
+            "pursuit_step with no arguments. Work no task covers goes in with "
+            "pursuit_plan; this session does not do it itself.",
+            custom_type="beagle",
+            deliver_as="steer",
+        )
+
+    return note
+
+
 def make_found_first_gate() -> Any:
     """Build the `tool_call` gate behind the found-first steer.
 
@@ -4573,7 +4646,7 @@ def setup(tau: ExtensionAPI) -> None:
                     "for a pursuit or for beagle to run their project."
                 ),
                 parameters=FOUND_PARAMETERS,
-                execute_fn=make_found_tool(),
+                execute_fn=make_found_tool(on_founded=_pin_founded(tau)),
                 prompt_snippet="Found a pursuit: goal, criteria, milestones.",
                 prompt_guidelines=(
                     "The pursuit's goal and criteria are the user's: use their words, and set "
@@ -4669,6 +4742,8 @@ def setup(tau: ExtensionAPI) -> None:
         )
         tau.on("input", _note_prompt)
         tau.on("agent_start", make_found_first_steer(tau))
+        tau.on("compaction_end", make_state_after_compaction(tau))
+        tau.add_compaction_instructions(PURSUIT_COMPACTION_FOCUS)
         tau.on("tool_call", make_found_first_gate())
         tau.on("agent_start", _note_run_start)
         tau.on("agent_end", _note_run_end)

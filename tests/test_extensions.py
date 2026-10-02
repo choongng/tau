@@ -138,6 +138,7 @@ class RecordingSession:
         self.custom_entries: list[tuple[str, dict[str, JSONValue]]] = []
         self.labels: list[tuple[str, str | None]] = []
         self.queued_custom: list[tuple[str, str | None, dict[str, JSONValue] | None]] = []
+        self.prompt_refreshes = 0
 
     def queue_steering_message(
         self,
@@ -169,6 +170,9 @@ class RecordingSession:
         self.inference_provider = route
         self.inference_provider_mode = "fixed" if route is not None else "automatic"
         return route or "automatic (will pin after the next successful response)"
+
+    def refresh_system_prompt(self) -> None:
+        self.prompt_refreshes += 1
 
 
 # -- discovery and loading ----------------------------------------------------
