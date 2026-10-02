@@ -24,6 +24,7 @@ from tau_agent.messages import (
     AgentMessage,
     AssistantMessage,
     CustomMessage,
+    ToolCall,
     Usage,
     UserMessage,
     message_text,
@@ -49,7 +50,7 @@ from tau_agent.session.entries import MessageDelivery, MessageSource, SessionEnt
 from tau_agent.session.jsonl import entry_to_json_line
 from tau_agent.session.tree import SessionTreeError, path_to_entry
 from tau_agent.tool_history import ToolHistoryRepair, repair_tool_history
-from tau_agent.tools import AgentTool
+from tau_agent.tools import AgentTool, AgentToolResult
 from tau_agent.types import JSONValue
 from tau_ai.model_catalog import ModelCatalogProvider, RuntimeModel, RuntimeModelCatalog
 from tau_ai.model_limits import ModelLimitsProvider, RuntimeModelLimits
@@ -178,6 +179,7 @@ from tau_coding.thinking import (
     next_thinking_level,
     normalize_thinking_level,
 )
+from tau_coding.tool_buffers import BufferLimits, buffer_tool_result, default_buffer_dir
 from tau_coding.tools import ImageSupportState, create_bash_tool, create_coding_tools
 
 StreamingBehavior = Literal["steer", "follow_up"]
@@ -788,6 +790,7 @@ class CodingSession:
             image_support=image_support,
             project_trust_resolution=trust_resolution,
         )
+        harness.config.after_tool_call = session._buffer_tool_result
         if config.owns_initial_provider:
             # Ownership starts before any repair/discovery work so every
             # failure path has exactly one closer for the candidate.
@@ -1315,6 +1318,24 @@ class CodingSession:
         if provider is None:
             return DEFAULT_CONTEXT_WINDOW_TOKENS
         return provider.context_windows.get(self.model, DEFAULT_CONTEXT_WINDOW_TOKENS)
+
+    async def _buffer_tool_result(
+        self, call: ToolCall, result: AgentToolResult, is_error: bool
+    ) -> tuple[AgentToolResult, bool]:
+        return self._buffer_result(result, tool_name=call.name), is_error
+
+    def _buffer_result(self, result: AgentToolResult, *, tool_name: str) -> AgentToolResult:
+        """Window an oversized result; its full text goes beside the session file."""
+        session_path = _storage_path(self._config.storage)
+        buffer_dir = (
+            session_path.parent / "buffers" if session_path is not None else default_buffer_dir()
+        )
+        return buffer_tool_result(
+            result,
+            tool_name=tool_name,
+            buffer_dir=buffer_dir,
+            limits=BufferLimits.for_context_window(self.context_window_tokens),
+        )
 
     @property
     def context_window_source(self) -> str:

@@ -4636,6 +4636,52 @@ def _fetch_tool(text: str) -> AgentTool:
 
 
 @pytest.mark.anyio
+async def test_session_buffers_an_oversized_tool_result_beside_the_session(
+    tmp_path: Path,
+) -> None:
+    storage = JsonlSessionStorage(tmp_path / "session.jsonl")
+    tool_call = ToolCall(id="call-1", name="fetch", arguments={})
+    provider = FakeProvider(
+        [
+            [
+                assistant_start(model="fake"),
+                assistant_done(
+                    message=AssistantMessage(
+                        content=assistant_content("Fetching.", [tool_call]),
+                        stop_reason="toolUse",
+                    )
+                ),
+            ],
+            [
+                assistant_start(model="fake"),
+                assistant_done(message=AssistantMessage(content="Done")),
+            ],
+        ]
+    )
+    output = "\n".join(f"event {i}" for i in range(100_000))
+    session = await CodingSession.load(
+        CodingSessionConfig(
+            provider=provider,
+            model="fake",
+            system="You are Tau.",
+            storage=storage,
+            cwd=tmp_path,
+            tools=[_fetch_tool(output)],
+        )
+    )
+
+    await _collect_session_events(session.prompt("Fetch it."))
+
+    [buffer] = list((tmp_path / "buffers").iterdir())
+    assert buffer.read_text() == output
+    [result] = [m for m in provider.calls[1][2] if m.role == "toolResult"]
+    assert "event 99999" in result.text and "event 0\n" not in result.text
+    assert f"Full output: {buffer}" in result.text
+    assert len(result.text) < 60_000
+    assert "event 0\n" not in (tmp_path / "session.jsonl").read_text()
+
+
+@pytest.mark.anyio
 async def test_session_auto_compacts_between_turns_of_a_long_run(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -4676,8 +4722,10 @@ async def test_session_auto_compacts_between_turns_of_a_long_run(
             system="You are Tau.",
             storage=storage,
             cwd=tmp_path,
+            # The fetch is buffered down to a window, so the threshold sits just
+            # above the first prompt rather than counting on the whole result.
             tools=[_fetch_tool("fetched " * 6_000)],
-            auto_compact_token_threshold=45_000,
+            auto_compact_token_threshold=37_000,
         )
     )
     extension_events = _record_extension_events(session, monkeypatch)
