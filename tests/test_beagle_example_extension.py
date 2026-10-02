@@ -1974,6 +1974,61 @@ def test_a_check_that_cannot_judge_the_work_is_refused(check: str, problem: str 
 
 
 @pytest.mark.anyio
+async def test_founding_refuses_a_milestone_that_sets_the_pursuit_up(
+    tmp_path: Path, beagle: Path, fake_beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    monkeypatch.chdir(project)
+    runtime, _ = _bound(tmp_path)
+    args = {
+        "statement": "Implement interval tree clocks",
+        "criteria": ["`python3 -m pytest -q` exits 0"],
+        "user_confirmed": True,
+    }
+
+    # Run 8's first milestone: a task with no work and a check over .beagle/.
+    setup = await _tool(runtime, "pursuit_found").execute(
+        "c1", {**args, "milestones": ["setup", "reference", "impl"]}
+    )
+    named = await _tool(runtime, "pursuit_found").execute(
+        "c2", {**args, "milestones": ["configure beagle::doctor and skills.toml", "impl"]}
+    )
+
+    assert "nothing written" in setup.text and "'setup'" in setup.text
+    assert "nothing written" in named.text
+    assert _calls(fake_beagle) == [] and not (project / ".beagle").exists()
+    assert _module()._setup_milestone(["package layout::pyproject.toml and src/"]) is None
+
+
+@pytest.mark.anyio
+async def test_planning_refuses_a_setup_part_and_a_step_its_store_scope(
+    tmp_path: Path, beagle: Path, fake_beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(_pursuit_project(tmp_path))
+    _ready_task(fake_beagle)
+    runtime, _ = _bound(tmp_path)
+
+    plan = await _tool(runtime, "pursuit_plan").execute(
+        "c1", {"task": "T0001", "parts": ["project setup", "impl"]}
+    )
+    step = await _tool(runtime, "pursuit_step").execute(
+        "c2",
+        {
+            "task": "T0002",
+            "criteria": "beagle is configured",
+            "done_when": "python3 -m pytest -q",
+            "scope": [".beagle/"],
+        },
+    )
+
+    assert "nothing added" in plan.text and "'project setup'" in plan.text
+    assert "not opened" in step.text and "scope names .beagle/" in step.text
+    assert _pursuit_calls(fake_beagle, "split") == []
+    assert _pursuit_calls(fake_beagle, "open") == []
+
+
+@pytest.mark.anyio
 async def test_driving_session_edits_only_the_pursuit_store(
     tmp_path: Path, beagle: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

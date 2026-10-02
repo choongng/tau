@@ -1658,6 +1658,9 @@ def make_found_tool() -> Any:
                 "pursuit_found: name the milestones: the parts of the goal you can "
                 "already see, each '<title>::<what it is for>'."
             )
+        setup = _setup_milestone(milestones)
+        if setup is not None:
+            return _step_result(f"pursuit_found: nothing written — {setup}")
         delegated = arguments.get("user_delegated") is True
         if arguments.get("user_confirmed") is not True and not delegated:
             listed = "\n".join(f"  - {c}" for c in criteria)
@@ -1768,6 +1771,9 @@ def make_plan_tool() -> Any:
         parts = _strings(arguments.get("parts"))
         if not task or not parts:
             return _step_result("pursuit_plan: 'task' and 'parts' are both required.")
+        setup = _setup_milestone(parts)
+        if setup is not None:
+            return _step_result(f"pursuit_plan: nothing added — {setup}")
         if len(parts) == 1:
             # beagle refuses a one-part split as a rename. A container or the
             # root still takes one more child; a leaf with one part is
@@ -1926,6 +1932,64 @@ def _bare_operators(command: str) -> list[str]:
         return [token for token in lexer if _is_operator(token)]
     except ValueError:
         return []
+
+
+def _scope_problem(scope: list[str]) -> str | None:
+    """Why a task's scope is wrong, or None: it names beagle's own store."""
+    store = [path for path in scope if Path(path).parts[:1] == (".beagle",)]
+    if not store:
+        return None
+    return (
+        f"scope names {store[0]}, beagle's own record of the pursuit. pursuit_found "
+        "already set the pursuit up, and the tools keep its record; a task's work and "
+        "scope are in the project. Name the project paths the task will touch."
+    )
+
+
+#: Words a milestone about setting the pursuit up is made of, and nothing else.
+_SETUP_WORDS = frozenset(
+    {
+        "setup",
+        "set",
+        "up",
+        "init",
+        "initial",
+        "initialize",
+        "initialise",
+        "configure",
+        "config",
+        "configuration",
+        "install",
+        "bootstrap",
+        "project",
+        "pursuit",
+        "beagle",
+        "the",
+        "for",
+        "and",
+    }
+)
+
+
+def _setup_milestone(parts: list[str]) -> str | None:
+    """Why one of `parts` is not work toward the goal, or None.
+
+    Asked to "set this project up for beagle pursuit, and then implement X",
+    a small model made `setup` its first milestone: a task with no work in the
+    project, a check over `.beagle/`, and every later milestone ordered behind
+    it. Founding is the setup.
+    """
+    for part in parts:
+        title = part.partition("::")[0]
+        words = re.findall(r"[a-z]+", title.lower())
+        if (words and set(words) <= _SETUP_WORDS) or ".beagle" in part:
+            return (
+                f"{title.strip()!r} is not part of the goal's work: pursuit_found is what "
+                "sets the pursuit up, and it is done once it is founded. Leave it out. If "
+                "the project itself needs scaffolding, name what, e.g. 'package layout::"
+                "pyproject.toml, src/ and tests/ so the later parts have a home'."
+            )
+    return None
 
 
 def _check_argv(command: str, root: Path) -> list[str]:
@@ -2174,8 +2238,11 @@ def make_step_tool() -> Any:
             prose = _check_problem(done_when)
             if prose is not None:
                 return _step_result(f"pursuit_step: {task} not opened — {prose}")
-            argv = ["open", task, "--criteria", criteria, "--done-when", done_when]
             scope = _strings(arguments.get("scope"))
+            scoped = _scope_problem(scope)
+            if scoped is not None:
+                return _step_result(f"pursuit_step: {task} not opened — {scoped}")
+            argv = ["open", task, "--criteria", criteria, "--done-when", done_when]
             if scope:
                 argv += ["--scope", *scope]
             budget = str(arguments.get("budget") or "").strip()
