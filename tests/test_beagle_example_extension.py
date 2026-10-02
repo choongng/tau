@@ -1619,6 +1619,71 @@ async def test_pursuit_plan_with_one_part_on_a_leaf_says_to_step_it(
     assert "already one step" in result.text and "pursuit_step task=T0002" in result.text
 
 
+def _children_of(fake: Path, task: str, *titles: str) -> None:
+    nodes = [{"id": task, "status": "pending", "container": True}] + [
+        {"id": f"T00{i}", "parent": task, "title": title, "status": "pending"}
+        for i, title in enumerate(titles, start=10)
+    ]
+    (fake / "tree.out").write_text(json.dumps({"goal": "Ship it", "nodes": nodes}))
+
+
+@pytest.mark.anyio
+async def test_pursuit_plan_does_not_add_a_part_the_task_already_has(
+    tmp_path: Path, beagle: Path, fake_beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Run 9: a 9B driver re-sent a plan it had made, and every part was added
+    # again under the same container, then worked twice.
+    monkeypatch.chdir(_pursuit_project(tmp_path))
+    _children_of(fake_beagle, "T0004", "interval-tree", "event-counter")
+    (fake_beagle / "add.out").write_text(
+        "T0012  serializer\n  it reads like T0011. `beagle pursuit close T0012 --outcome "
+        'abandoned --reason "duplicate"` retires this one.'
+    )
+    runtime, _ = _bound(tmp_path)
+    plan = _tool(runtime, "pursuit_plan")
+
+    again = await plan.execute(
+        "c1", {"task": "T0004", "parts": ["interval-tree::store it", "Event-Counter::count"]}
+    )
+    one_new = await plan.execute(
+        "c2", {"task": "T0004", "parts": ["interval-tree::store it", "serializer::save it"]}
+    )
+
+    assert "nothing added" in again.text and "interval-tree (T0010)" in again.text
+    assert _pursuit_calls(fake_beagle, "split") == []
+    assert _pursuit_calls(fake_beagle, "add") == [
+        ["serializer", "--parent", "T0004", "--intent", "save it"]
+    ]
+    assert "Not added again" in one_new.text and "abandon='duplicate of" in one_new.text
+
+
+@pytest.mark.anyio
+async def test_pursuit_step_abandons_a_task_without_a_worker(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Refused the bash close, the run 9 driver "abandoned" duplicates by
+    # opening them with `true` as the check, and sent a worker at each.
+    monkeypatch.chdir(_pursuit_project(tmp_path))
+    _ready_task(fake_beagle)
+    (fake_beagle / "close.out").write_text("T0021 abandoned — duplicate of T0006\n  finding N1\n")
+    runtime, _ = _bound(tmp_path)
+    step = _tool(runtime, "pursuit_step")
+
+    nameless = await step.execute("c1", {"abandon": "duplicate"})
+    result = await step.execute("c2", {"task": "T0021", "abandon": "duplicate of T0006"})
+
+    assert "pass task too" in nameless.text
+    assert _pursuit_calls(fake_beagle, "close") == [
+        ["T0021", "--outcome", "abandoned", "--reason", "duplicate of T0006"]
+    ]
+    assert _pursuit_calls(fake_beagle, "open") == [] and _runs(fake_tau) == []
+    assert "T0021 abandoned" in result.text and "finding" not in result.text
+
+
 def _ready_task(fake: Path, check: str = "test -f done.txt") -> None:
     ready = {"open": [], "ready": [{"id": "T0002", "title": "Parser"}], "ready_total": 1}
     (fake / "next.out").write_text(json.dumps(ready))

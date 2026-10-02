@@ -1626,6 +1626,34 @@ def _add_children(task: str, parts: list[str], root: Path) -> tuple[int, str]:
     return rc, "\n".join(lines)
 
 
+def _children(task: str, root: Path) -> dict[str, str]:
+    """`task`'s children by lower-cased title, each its id; ended-undone ones left out."""
+    rc, out = _pursuit(["tree", "--json"], root)
+    tree = _json_reply(out) if rc == 0 else None
+    nodes = tree.get("nodes") if isinstance(tree, dict) else None
+    if not isinstance(nodes, list):
+        return {}
+    return {
+        str(node.get("title") or "").strip().lower(): str(node["id"])
+        for node in nodes
+        if isinstance(node, dict)
+        and node.get("parent") == task
+        and node.get("id")
+        and node.get("status") not in ("abandoned", "superseded")
+    }
+
+
+def _part_title(part: str) -> str:
+    return part.partition("::")[0].strip()
+
+
+#: What the driver is told to do with a task that should not be worked.
+ABANDON_HINT = (
+    "To drop a task that repeats another or whose work is already done, call "
+    "pursuit_step with its task and abandon='<why>', e.g. abandon='duplicate of T0014'."
+)
+
+
 def make_found_tool() -> Any:
     """Build `pursuit_found`: write the goal, root the tree, split it into milestones.
 
@@ -1774,6 +1802,20 @@ def make_plan_tool() -> Any:
         setup = _setup_milestone(parts)
         if setup is not None:
             return _step_result(f"pursuit_plan: nothing added — {setup}")
+        # A small model re-sends the plan it already made; beagle adds every
+        # part again, and the copies are then worked twice.
+        existing = _children(task, root)
+        repeated = [
+            f"{_part_title(part)} ({existing[_part_title(part).lower()]})"
+            for part in parts
+            if _part_title(part).lower() in existing
+        ]
+        parts = [part for part in parts if _part_title(part).lower() not in existing]
+        if not parts:
+            return _step_result(
+                f"pursuit_plan: nothing added — {task} already has {', '.join(repeated)}. "
+                "Work them with pursuit_step; call it with no arguments for the next ready one."
+            )
         if len(parts) == 1:
             # beagle refuses a one-part split as a rename. A container or the
             # root still takes one more child; a leaf with one part is
@@ -1792,7 +1834,12 @@ def make_plan_tool() -> Any:
                 rc, out = _add_children(task, parts, root)
         if rc != 0:
             return _step_result(f"pursuit_plan: beagle refused (exit {rc}):\n{out}")
-        return _step_result(f"{out}\n\n{_tree(root)}\n\nNext: pursuit_step.")
+        notes = ""
+        if repeated:
+            notes += f"Not added again, {task} already has: {', '.join(repeated)}.\n\n"
+        if "--outcome abandoned" in out:
+            notes += f"{ABANDON_HINT}\n\n"
+        return _step_result(f"{out}\n\n{_tree(root)}\n\n{notes}Next: pursuit_step.")
 
     return execute
 
@@ -1837,6 +1884,13 @@ STEP_PARAMETERS: dict[str, Any] = {
             "description": (
                 "What the sub-agent should know that the task record does not: where to "
                 "start, what to leave alone, what a previous attempt got wrong."
+            ),
+        },
+        "abandon": {
+            "type": "string",
+            "description": (
+                "Drop this task instead of working it, saying why: 'duplicate of T0014', "
+                "'already done by T0013'. No sub-agent runs."
             ),
         },
         "new_route": {
@@ -2287,6 +2341,22 @@ def make_step_tool() -> Any:
             "is done. If work remains, add it with pursuit_plan."
         )
         task = str(arguments.get("task") or "").strip()
+        abandon = str(arguments.get("abandon") or "").strip()
+        if abandon:
+            if not task:
+                return _step_result("pursuit_step: abandon names the task to drop; pass task too.")
+            argv = ["close", task, "--outcome", "abandoned", "--reason", abandon[:500]]
+            rc, out = _pursuit(argv, root)
+            if rc != 0:
+                return _step_result(
+                    f"pursuit_step: `beagle pursuit close {task} --outcome abandoned` refused "
+                    f"(exit {rc}):\n{out}"
+                )
+            _drop_pending_locks(goal, task)
+            return _step_result(
+                f"{out.splitlines()[0] if out else task + ' abandoned'}\n\n{_tree(root)}\n\n"
+                "Next: call pursuit_step with no arguments for the next task."
+            )
         if not task:
             task = (open_ids or ready_ids or [""])[0]
             if not task:
@@ -2784,7 +2854,10 @@ def make_worker_pursuit_guard() -> Any:
 #: The `beagle pursuit` verbs the driver's tools run, and the tool for each.
 _STEERED_VERBS = {
     "open": "pursuit_step (with criteria and done_when)",
-    "close": "pursuit_step, which closes a task on its check",
+    "close": (
+        "pursuit_step, which closes a task on its check; to drop one, pursuit_step with "
+        "its task and abandon='<why>'"
+    ),
     "retry": "pursuit_step on the blocked task, with notes saying what to fix",
     "spawn": "pursuit_step with new_route=true and notes saying what to do instead",
     "amend": "pursuit_step on the open task, with the new done_when",
