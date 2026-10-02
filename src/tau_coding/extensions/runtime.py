@@ -248,6 +248,7 @@ class ExtensionRuntime:
         self._commands: dict[str, ExtensionCommand] = {}
         self._prompt_guidelines: list[tuple[str, str, str]] = []
         self._prompt_sections: list[tuple[str, str, PromptSection]] = []
+        self._compaction_instructions: list[tuple[str, str, str]] = []
         self._skill_dirs: list[tuple[str, str, Path]] = []
         self._message_renderers: dict[str, tuple[str, str, MessageRenderer]] = {}
         self._renderer_failures_reported: set[str] = set()
@@ -342,6 +343,7 @@ class ExtensionRuntime:
         self._commands.clear()
         self._prompt_guidelines.clear()
         self._prompt_sections.clear()
+        self._compaction_instructions.clear()
         self._skill_dirs.clear()
         self._message_renderers.clear()
         self._renderer_failures_reported.clear()
@@ -418,6 +420,7 @@ class ExtensionRuntime:
         self._commands.clear()
         self._prompt_guidelines.clear()
         self._prompt_sections.clear()
+        self._compaction_instructions.clear()
         self._skill_dirs.clear()
         self._message_renderers.clear()
         self._renderer_failures_reported.clear()
@@ -490,6 +493,11 @@ class ExtensionRuntime:
         self._prompt_sections = [
             (owner, extension, section)
             for owner, extension, section in self._prompt_sections
+            if owner != source_id
+        ]
+        self._compaction_instructions = [
+            (owner, extension, text)
+            for owner, extension, text in self._compaction_instructions
             if owner != source_id
         ]
         self._skill_dirs = [
@@ -803,6 +811,14 @@ class ExtensionRuntime:
         if self._session is not None:
             self._session.refresh_system_prompt()
 
+    def register_compaction_instruction(
+        self, source_id: str, extension_name: str, instruction: str
+    ) -> None:
+        """Register extra focus for the compaction summarizer."""
+        normalized = instruction.strip()
+        if normalized:
+            self._compaction_instructions.append((source_id, extension_name, normalized))
+
     def register_skill_dir(self, source_id: str, extension_name: str, path: str | Path) -> None:
         """Register a skills directory contributed by an extension.
 
@@ -1008,6 +1024,11 @@ class ExtensionRuntime:
     def prompt_sections(self) -> tuple[PromptSection, ...]:
         """Return free-form prompt sections in registration order."""
         return tuple(section for _, _, section in self._prompt_sections)
+
+    @property
+    def compaction_instructions(self) -> tuple[str, ...]:
+        """Return extension focus for the compaction summarizer, in registration order."""
+        return tuple(text for _, _, text in self._compaction_instructions)
 
     @property
     def sourced_prompt_sections(self) -> tuple[PromptSection, ...]:

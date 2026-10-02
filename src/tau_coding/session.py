@@ -4068,9 +4068,14 @@ class CodingSession:
         *,
         custom_instructions: str | None = None,
     ) -> _GeneratedSummary:
+        focus = [
+            text
+            for text in (custom_instructions, *self._extension_runtime.compaction_instructions)
+            if text is not None and text.strip()
+        ]
         prompt = build_compaction_summary_prompt(
             messages,
-            custom_instructions=custom_instructions,
+            custom_instructions="\n\n".join(focus) or None,
         )
         text_parts: list[str] = []
         final_text: str | None = None

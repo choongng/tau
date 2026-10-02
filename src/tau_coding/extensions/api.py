@@ -1107,6 +1107,18 @@ class ExtensionAPI:
         self._generation.assert_active()
         self._runtime.set_prompt_section(self._source_id, self._extension_name, title, body)
 
+    def add_compaction_instructions(self, instructions: str) -> None:
+        """Add focus for the summarizer that writes compaction summaries.
+
+        The text joins any instructions a manual `/compact` gives. Use it for
+        state the summary must carry or must not invent, such as which records
+        are authoritative.
+        """
+        self._generation.assert_active()
+        self._runtime.register_compaction_instruction(
+            self._source_id, self._extension_name, instructions
+        )
+
     def register_skill_dir(self, path: str | Path) -> None:
         """Contribute a directory of skills, loaded from disk without copying.
 

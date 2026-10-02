@@ -3622,3 +3622,30 @@ def test_prompt_section_set_to_nothing_is_removed(tmp_path: Path) -> None:
     api.set_prompt_section("Absent", None)
 
     assert runtime.prompt_sections == ()
+
+
+async def test_compaction_instructions_reach_the_summarizer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import tau_coding.session as coding_session_module
+
+    monkeypatch.setattr(coding_session_module, "DEFAULT_COMPACTION_KEEP_RECENT_TOKENS", 1)
+    provider = FakeProvider(
+        [
+            [assistant_start(model="fake"), assistant_done(message=AssistantMessage(content="A"))],
+            [assistant_start(model="fake"), assistant_done(message=AssistantMessage(content="B"))],
+            [
+                assistant_start(model="fake"),
+                assistant_done(message=AssistantMessage(content="Summary")),
+            ],
+        ]
+    )
+    body = "def setup(tau):\n    tau.add_compaction_instructions('Task ids come from the ledger.')"
+    session = await CodingSession.load(_session_config(tmp_path, provider, extension_body=body))
+    _ = [event async for event in session.prompt("Explain.")]
+    _ = [event async for event in session.prompt("Go on.")]
+
+    await session.compact("Keep the open question.")
+
+    ask = provider.calls[2][2][0].text
+    assert "Additional focus: Keep the open question.\n\nTask ids come from the ledger." in ask
