@@ -1928,7 +1928,7 @@ async def test_pursuit_step_refuses_a_check_written_as_a_sentence(
 
 
 @pytest.mark.anyio
-async def test_pursuit_step_runs_the_check_as_words_like_beagle(
+async def test_pursuit_step_refuses_a_bound_check_with_a_bare_operator(
     tmp_path: Path,
     beagle: Path,
     fake_beagle: Path,
@@ -1936,7 +1936,8 @@ async def test_pursuit_step_runs_the_check_as_words_like_beagle(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     # Under `bash -c` this passes once done.txt exists; beagle's close would
-    # hand `&&` to `test` and refuse it, blocking the task for good.
+    # hand `&&` to `test` and refuse it, blocking the task for good. No
+    # sub-agent is spent on it.
     monkeypatch.chdir(_pursuit_project(tmp_path))
     monkeypatch.setenv("FAKE_TAU_SUCCEEDS_ON", "1")
     _ready_task(fake_beagle, check="test -f done.txt && true")
@@ -1946,8 +1947,30 @@ async def test_pursuit_step_runs_the_check_as_words_like_beagle(
 
     result = await _tool(runtime, "pursuit_step").execute("c1", {"attempts": 1})
 
+    assert _runs(fake_tau) == []
     assert _pursuit_calls(fake_beagle, "close") == []
-    assert "stays open" in result.text and "corrected done_when" in result.text
+    assert "bare '&&'" in result.text and "corrected done_when" in result.text
+
+
+@pytest.mark.parametrize(
+    ("check", "problem"),
+    [
+        # Checks a 9B driver bound in runs 7 and 8.
+        ('grep -q "interval tree clocks" .beagle/tree/T0008.md', "reads .beagle/"),
+        ("bash -c 'beagle doctor && test -d tests'", "runs beagle itself"),
+        ("/home/u/.tau/beagle-plugin/bin/beagle pursuit close T0002", "runs beagle itself"),
+        ("test -d src/itc && test -f pyproject.toml", "bare '&&'"),
+        ("python3 -m pytest -q tests/ | tail -1", "bare '|'"),
+        ("python3 -m pytest -q exits 0 and passes", "reads as a sentence"),
+        ("python3 -m pytest -q tests/test_itc.py", None),
+        ("bash -c 'test -d tests && python3 -m pytest -q'", None),
+        ("grep -q '&&' notes.txt", None),
+    ],
+)
+def test_a_check_that_cannot_judge_the_work_is_refused(check: str, problem: str | None) -> None:
+    found = _module()._check_problem(check)
+
+    assert found is None if problem is None else problem in found
 
 
 @pytest.mark.anyio

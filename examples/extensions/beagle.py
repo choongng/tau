@@ -1860,26 +1860,51 @@ _PROSE_WORDS = frozenset(
 )
 
 
-def _prose_check(command: str) -> str | None:
-    """Why `command` cannot be a task's check — a sentence, or beagle — or None.
+def _check_problem(command: str) -> str | None:
+    """Why `command` cannot be a task's check, or None.
 
-    `python3 -m pytest -q exits 0 and a test asserts ...` is what a small model
-    writes for done_when; beagle splits it into words and binds it, and then it
-    fails whatever the work does. Words inside quotes are data, so only bare
-    ones count, and only past the program name.
+    beagle splits a `done_when` into words and runs it with no shell, so the
+    checks a small model writes go wrong in a few known ways:
+
+    - a sentence: `python3 -m pytest -q exits 0 and a test asserts ...` is
+      bound and then fails whatever the work does. Words inside quotes are
+      data, so only bare ones past the program name count;
+    - beagle itself, even inside `bash -c '...'`: `beagle pursuit close T0002`
+      as T0002's own check, or `beagle doctor`, which hung a run for good;
+    - beagle's own store: `grep -q X .beagle/tree/T0008.md` reads what was
+      recorded about the task, and passes once the notes say so;
+    - a bare `&&`, `|` or `>`, which reaches the program as an argument.
     """
     try:
         words = shlex.split(command)
     except ValueError:
         return None  # beagle says why it will not split
-    if words and Path(words[0]).name == "beagle":
-        # Seen too: `beagle pursuit close T0002` as T0002's own check. The
-        # close runs the check, so it can only ever answer how it was called.
+    if not words:
+        return None
+    one_command = (
+        "It must be ONE command over the project that exits 0 exactly when the task is "
+        "done, such as `python3 -m pytest -q tests/test_greet.py`"
+    )
+    if _bash_find(command, lambda argv: "beagle" if _named(argv, "beagle") else None):
+        # The close runs the check, so a check that runs beagle can only ever
+        # answer how it was called, never whether the work is done.
         return (
-            "done_when runs beagle itself, which cannot say whether the work is done. "
-            "It must be ONE command over the project that exits 0 exactly when the task "
-            "is done, such as `python3 -m pytest -q tests/test_greet.py`; pursuit_step "
-            "does the close. Call pursuit_step again with that."
+            f"done_when runs beagle itself, which cannot say whether the work is done. "
+            f"{one_command}; pursuit_step does the close. Call pursuit_step again with that."
+        )
+    if any(".beagle" in word for word in words):
+        return (
+            "done_when reads .beagle/, beagle's record of the pursuit, which says what was "
+            "written about the work, not what was built: a grep of a task's notes passes "
+            f"as soon as the notes say so. {one_command}. Call pursuit_step again with that."
+        )
+    operators = _bare_operators(command)
+    if operators:
+        return (
+            f"done_when has a bare {operators[0]!r}, but it runs without a shell, so "
+            f"{operators[0]!r} reaches {words[0]!r} as an argument. {one_command}; for "
+            "more than one thing, write a test that checks them all and run that. Call "
+            "pursuit_step again with it."
         )
     found = [w for w in words[1:] if w.lower() in _PROSE_WORDS]
     if not found:
@@ -1891,6 +1916,16 @@ def _prose_check(command: str) -> str | None:
         "tests/test_greet.py`. Put what the test must assert in criteria and notes, "
         "and call pursuit_step again."
     )
+
+
+def _bare_operators(command: str) -> list[str]:
+    """The unquoted shell operators in `command`, in order."""
+    lexer = shlex.shlex(command, posix=False, punctuation_chars=True)
+    lexer.whitespace_split = True
+    try:
+        return [token for token in lexer if _is_operator(token)]
+    except ValueError:
+        return []
 
 
 def _check_argv(command: str, root: Path) -> list[str]:
@@ -2136,7 +2171,7 @@ def make_step_tool() -> Any:
                     "A sub-agent does the work and the check decides. If you cannot write "
                     "the criteria yet, the task is too big: split it with pursuit_plan."
                 )
-            prose = _prose_check(done_when)
+            prose = _check_problem(done_when)
             if prose is not None:
                 return _step_result(f"pursuit_step: {task} not opened — {prose}")
             argv = ["open", task, "--criteria", criteria, "--done-when", done_when]
@@ -2157,7 +2192,7 @@ def make_step_tool() -> Any:
             # Open already, with a check the model now writes differently: the
             # bound one could not judge the work (prose, a usage error), and
             # repeating the old one forever is the loop this breaks.
-            prose = _prose_check(done_when)
+            prose = _check_problem(done_when)
             if prose is not None:
                 return _step_result(f"pursuit_step: {task}'s check not changed — {prose}")
             argv = ["amend", task, "--done-when", done_when]
@@ -2173,7 +2208,7 @@ def make_step_tool() -> Any:
             opened = amended
             record = {**record, "done_when": done_when}
         check = str(record.get("done_when") or done_when).strip()
-        prose = _prose_check(check) if check else None
+        prose = _check_problem(check) if check else None
         if prose is not None:
             # Bound before this guard, or by hand: no worker can make it pass.
             return _step_result(
