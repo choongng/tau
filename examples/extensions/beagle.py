@@ -2574,8 +2574,11 @@ def make_step_tool() -> Any:
             if (await _run_check(done_when, root, DEFAULT_CHECK_TIMEOUT))[0] == 0:
                 return _step_result(
                     f"pursuit_step: {task} not opened — `{done_when}` already passes, "
-                    "before any work, so it cannot tell this task's work from none. Write "
-                    "a check that fails now: a test of what this task adds. " + ABANDON_HINT
+                    "before any work, so it cannot tell this task's work from none. Bind "
+                    "a check that fails now: name a new test file for what this task adds, "
+                    "e.g. `python3 -m pytest -q tests/test_<this task>.py`, put it in scope, "
+                    "and say in the notes what it should test. It fails until the sub-agent "
+                    "writes it; do not write it yourself. " + ABANDON_HINT
                 )
             argv = ["open", task, "--criteria", criteria, "--done-when", done_when]
             if scope:

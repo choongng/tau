@@ -2052,6 +2052,7 @@ async def test_pursuit_step_will_not_open_a_task_whose_check_already_passes(
     )
 
     assert "already passes" in result.text and "abandon=" in result.text
+    assert "do not write it yourself" in result.text
     assert _pursuit_calls(fake_beagle, "open") == [] and _runs(fake_tau) == []
 
 
