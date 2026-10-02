@@ -1645,6 +1645,25 @@ def _children(task: str, root: Path) -> dict[str, str]:
     }
 
 
+def _release_waiters(task: str, why: str, root: Path) -> list[str]:
+    """Drop every edge that waits on `task`, now abandoned; the tasks released.
+
+    beagle counts an abandoned task as never done, so a task waiting on one
+    waits for ever: run 10's driver abandoned T0005 and found nothing ready.
+    """
+    rc, out = _pursuit(["tree", "--json"], root)
+    tree = _json_reply(out) if rc == 0 else None
+    nodes = tree.get("nodes") if isinstance(tree, dict) else None
+    released = []
+    for node in nodes if isinstance(nodes, list) else []:
+        if isinstance(node, dict) and task in (node.get("waiting_on") or []):
+            waiter = str(node.get("id"))
+            reason = f"{task} abandoned: {why}"[:500]
+            if _pursuit(["depend", waiter, task, "--drop", "--reason", reason], root)[0] == 0:
+                released.append(waiter)
+    return released
+
+
 def _part_title(part: str) -> str:
     return part.partition("::")[0].strip()
 
@@ -2447,9 +2466,11 @@ def make_step_tool() -> Any:
                     f"(exit {rc}):\n{out}"
                 )
             _drop_pending_locks(goal, task)
+            released = _release_waiters(task, abandon, root)
+            freed = f"\nNo longer waiting on it: {', '.join(released)}." if released else ""
             return _step_result(
-                f"{out.splitlines()[0] if out else task + ' abandoned'}\n\n{_tree(root)}\n\n"
-                "Next: call pursuit_step with no arguments for the next task."
+                f"{out.splitlines()[0] if out else task + ' abandoned'}{freed}\n\n"
+                f"{_tree(root)}\n\nNext: call pursuit_step with no arguments for the next task."
             )
         if ready.get("audit_due"):
             return _step_result(await _audit(root, signal, on_update))

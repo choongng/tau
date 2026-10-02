@@ -1675,6 +1675,9 @@ async def test_pursuit_step_abandons_a_task_without_a_worker(
     monkeypatch.chdir(_pursuit_project(tmp_path))
     _ready_task(fake_beagle)
     (fake_beagle / "close.out").write_text("T0021 abandoned — duplicate of T0006\n  finding N1\n")
+    # Run 10: what waited on an abandoned task waited for ever.
+    waits = [{"id": "T0022", "waiting_on": ["T0021"]}, {"id": "T0023", "waiting_on": ["T0022"]}]
+    (fake_beagle / "tree.out").write_text(json.dumps({"nodes": waits}))
     runtime, _ = _bound(tmp_path)
     step = _tool(runtime, "pursuit_step")
 
@@ -1685,8 +1688,12 @@ async def test_pursuit_step_abandons_a_task_without_a_worker(
     assert _pursuit_calls(fake_beagle, "close") == [
         ["T0021", "--outcome", "abandoned", "--reason", "duplicate of T0006"]
     ]
+    assert _pursuit_calls(fake_beagle, "depend") == [
+        ["T0022", "T0021", "--drop", "--reason", "T0021 abandoned: duplicate of T0006"]
+    ]
     assert _pursuit_calls(fake_beagle, "open") == [] and _runs(fake_tau) == []
     assert "T0021 abandoned" in result.text and "finding" not in result.text
+    assert "No longer waiting on it: T0022." in result.text
 
 
 def _ready_task(fake: Path, check: str = "test -f done.txt") -> None:
