@@ -2365,6 +2365,25 @@ async def test_driving_session_edits_only_the_pursuit_store(
     assert [before_start.text, store.text, subagent.text, opted_out.text] == ["ran"] * 4
 
 
+@pytest.mark.anyio
+async def test_driving_session_spawns_no_sub_agent_of_its_own(
+    tmp_path: Path, beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Run 10: refused its own writes, the driver had an `agent` sub-agent,
+    # whose session the edit guard does not hold, write the file instead.
+    monkeypatch.chdir(_pursuit_project(tmp_path))
+    runtime, session = _bound(tmp_path)
+    agent = _tool_with_hooks(runtime, "agent")
+    await runtime.emit_session_start("startup")
+
+    blocked = await agent.execute("c1", {"prompt": "Write tests/test_gate.py"})
+    session.session_id = "subagent-session"
+    nested = await agent.execute("c2", {"prompt": "Write tests/test_gate.py"})
+
+    assert "refusing to spawn a sub-agent" in blocked.text and "pursuit_step" in blocked.text
+    assert nested.text == "ran"
+
+
 @pytest.mark.parametrize(
     ("command", "found"),
     [

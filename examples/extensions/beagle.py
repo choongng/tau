@@ -2832,7 +2832,9 @@ def make_driver_edit_guard() -> Any:
     spends the context the loop needs to keep going. In run 9, with the
     write and edit tools refused, the driver did it through bash instead:
     `sed -i`, `cat > justfile`, Python heredocs, `ruff --fix`, `git add`.
-    Its `.beagle/` store is left to `make_record_guard`.
+    In run 10, with those refused, it had the `agent` tool's sub-agent write
+    the file: that sub-agent's session is its own, so only refusing the
+    spawn keeps it out. Its `.beagle/` store is left to `make_record_guard`.
     `BEAGLE_TAU_DRIVER_EDITS=1` lets it edit.
     """
 
@@ -2844,7 +2846,7 @@ def make_driver_edit_guard() -> Any:
             # this extension into a runtime of its own that never sees a
             # `session_start`, and its edits are the work.
             tool = event.tool_name
-            if tool not in ("write", "edit", "bash") or _STARTED_SESSION is None:
+            if tool not in ("write", "edit", "bash", "agent") or _STARTED_SESSION is None:
                 return None
             if context.session_id != _STARTED_SESSION:
                 return None
@@ -2859,6 +2861,8 @@ def make_driver_edit_guard() -> Any:
                 what = _driver_bash_change(command, cwd, store.parent, store)
                 if what is None:
                     return None
+            elif tool == "agent":
+                what = "spawn a sub-agent with the agent tool"
             else:
                 target = _goal_path_from_args(args, cwd)
                 if target is None or target == store or store in target.parents:
