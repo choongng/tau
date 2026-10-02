@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import string
+from collections import deque
 from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from contextlib import suppress
 from dataclasses import dataclass, field, replace
@@ -25,6 +26,7 @@ from tau_agent.messages import (
     AgentMessage,
     AssistantMessage,
     CustomMessage,
+    TextContent,
     ToolCall,
     Usage,
     UserMessage,
@@ -188,9 +190,13 @@ SESSION_NAME_SYSTEM_PROMPT = (
     "You write concise coding-agent session names. Reply with only a short title, "
     "maximum four words, no quotes, no punctuation-only output."
 )
-#: Identical tool calls in a row that run; the next identical one is refused.
+#: Runs of one tool call, with the same result each time, after which the
+#: next run of it is refused...
 REPEATED_CALL_LIMIT = 2
-#: Refused repeats in a row after which the run is stopped.
+#: ...counted over this many of the latest calls, so two calls taken in
+#: turn repeat as surely as one call taken twice.
+REPEATED_CALL_WINDOW = 10
+#: Refusals in a row after which the run is stopped.
 REPEATED_CALL_STOP = 8
 MAX_OUTPUT_LIMIT_CONTINUATIONS = 2
 MAX_OUTPUT_LIMIT_CONTINUATIONS_PER_RUN = 6
@@ -514,8 +520,10 @@ class CodingSession:
         self._prompt_cache_misses = PromptCacheMissDetector()
         self._length_continuations = 0
         self._run_length_continuations = 0
-        self._last_call_key: str | None = None
-        self._repeated_calls = 0
+        #: The latest tool calls that ran, each with a digest of its result.
+        self._recent_calls: deque[tuple[str, int]] = deque(maxlen=REPEATED_CALL_WINDOW)
+        self._refused_in_a_row = 0
+        self._refused_call_ids: set[str] = set()
         self._message_origins: dict[int, tuple[AgentMessage, MessageDelivery, MessageSource]] = {}
         self._attach_persistence_listener()
         self._stop_observing_queued_requests = observe_queued_requests(self._report_queued_request)
@@ -797,7 +805,7 @@ class CodingSession:
             image_support=image_support,
             project_trust_resolution=trust_resolution,
         )
-        harness.config.after_tool_call = session._buffer_tool_result
+        harness.config.after_tool_call = session._after_tool_call
         harness.config.before_tool_call = session._refuse_repeated_call
         if config.owns_initial_provider:
             # Ownership starts before any repair/discovery work so every
@@ -1343,38 +1351,50 @@ class CodingSession:
         return provider.context_windows.get(self.model, DEFAULT_CONTEXT_WINDOW_TOKENS)
 
     async def _refuse_repeated_call(self, call: ToolCall) -> tuple[bool, str | None]:
-        """Refuse a tool call identical to the ones just before it.
+        """Refuse a tool call that keeps giving the same result.
 
-        A small model can lock onto one call and repeat it for as long as the
-        run lasts; its result does not change, so the run makes no progress.
-        After `REPEATED_CALL_LIMIT` identical calls in a row the next is refused
-        with a note saying so, and after `REPEATED_CALL_STOP` refusals in a row
-        the run is stopped. A different call in between resets the count.
+        A small model can lock onto one call, or a pair it takes in turn, and
+        repeat it for as long as the run lasts; its result does not change, so
+        the run makes no progress. A call that ran `REPEATED_CALL_LIMIT` times
+        among the latest `REPEATED_CALL_WINDOW`, with the same result each time,
+        is refused with a note saying so, and after `REPEATED_CALL_STOP`
+        refusals in a row the run is stopped. A call whose result changes, such
+        as asking for the next task after finishing one, is not a repeat.
         """
-        key = f"{call.name}\0{json.dumps(call.arguments, sort_keys=True, default=str)}"
-        if key != self._last_call_key:
-            self._last_call_key, self._repeated_calls = key, 1
+        key = _call_key(call)
+        results = [digest for seen, digest in self._recent_calls if seen == key]
+        latest = results[-REPEATED_CALL_LIMIT:]
+        if len(latest) < REPEATED_CALL_LIMIT or len(set(latest)) > 1:
+            self._refused_in_a_row = 0
             return False, None
-        self._repeated_calls += 1
-        if self._repeated_calls <= REPEATED_CALL_LIMIT:
-            return False, None
-        refused = self._repeated_calls - REPEATED_CALL_LIMIT
-        if refused >= REPEATED_CALL_STOP:
+        self._refused_in_a_row += 1
+        self._refused_call_ids.add(call.id)
+        if self._refused_in_a_row >= REPEATED_CALL_STOP:
             self._harness.cancel()
             return True, (
-                f"Not run, and the run is stopped: {self._repeated_calls} identical "
-                f"`{call.name}` calls in a row."
+                f"Not run, and the run is stopped: {self._refused_in_a_row} tool calls in "
+                "a row repeated ones whose result had not changed."
             )
         return True, (
-            f"Not run: this `{call.name}` call is identical to the last "
-            f"{self._repeated_calls - 1}, and its result would be the same as theirs. "
-            "Use the result you already have, or take a different step. "
-            f"{REPEATED_CALL_STOP - refused} more identical calls stop the run."
+            f"Not run: this `{call.name}` call ran {len(results)} times in the last "
+            f"{len(self._recent_calls)} calls with the same result each time, and would "
+            "give it again. Use the result you already have, or take a different step. "
+            f"{REPEATED_CALL_STOP - self._refused_in_a_row} more refused calls in a row "
+            "stop the run."
         )
 
-    async def _buffer_tool_result(
+    async def _after_tool_call(
         self, call: ToolCall, result: AgentToolResult, is_error: bool
     ) -> tuple[AgentToolResult, bool]:
+        if call.id in self._refused_call_ids:
+            # Refused, so it did not run: its refusal is not a result.
+            self._refused_call_ids.discard(call.id)
+            return result, is_error
+        # The text alone: details such as a duration differ between runs whose
+        # output, which is all the model sees, is the same.
+        text = "\n".join(b.text for b in result.content if isinstance(b, TextContent))
+        digest = hash((is_error, text))
+        self._recent_calls.append((_call_key(call), digest))
         return self._buffer_result(result, tool_name=call.name), is_error
 
     def _buffer_result(self, result: AgentToolResult, *, tool_name: str) -> AgentToolResult:
@@ -1652,7 +1672,9 @@ class CodingSession:
                 yield cache_miss
         if isinstance(event, AgentStartEvent):
             self._length_continuations = self._run_length_continuations = 0
-            self._last_call_key, self._repeated_calls = None, 0
+            self._recent_calls.clear()
+            self._refused_in_a_row = 0
+            self._refused_call_ids.clear()
         if isinstance(event, TurnEndEvent):
             self._continue_after_output_limit(event)
         if isinstance(event, TurnEndEvent) and self._run_continues_after(event):
@@ -5409,3 +5431,8 @@ def _append_session_entry_sync(storage: SessionStorage, entry: SessionEntry) -> 
             file.write(entry_to_json_line(entry))
         return
     raise RuntimeError("Session storage does not support synchronous initialization")
+
+
+def _call_key(call: ToolCall) -> str:
+    """What makes two tool calls the same call: the tool and its arguments."""
+    return f"{call.name}\0{json.dumps(call.arguments, sort_keys=True, default=str)}"
