@@ -42,6 +42,7 @@ from tau_agent.session import (
     ThinkingLevelChangeEntry,
 )
 from tau_agent.session.jsonl import entry_to_json_line
+from tau_agent.types import JSONValue
 from tau_ai import (
     CancellationToken,
     FakeProvider,
@@ -7284,3 +7285,95 @@ async def test_session_notifies_when_its_request_waits_for_a_concurrency_limited
     await session.aclose()
     _notify(RequestQueued(provider_name="krang", session_id="session-1", limit=1, ahead=1))
     assert len(ui.notices) == 1
+
+
+def _counting_tool(calls: list[object]) -> AgentTool:
+    async def look(
+        tool_call_id: object,
+        arguments: object,
+        signal: object = None,
+        on_update: object = None,
+    ) -> AgentToolResult:
+        calls.append(arguments)
+        return AgentToolResult(content=[TextContent(text="nothing found")])
+
+    return AgentTool(
+        name="look",
+        label="Look",
+        description="Look for something.",
+        parameters={"type": "object"},
+        execute_fn=look,
+    )
+
+
+def _calling(*arguments: dict[str, JSONValue]) -> list[list[object]]:
+    turns: list[list[object]] = [
+        [
+            assistant_start(model="fake"),
+            assistant_done(
+                message=AssistantMessage(
+                    content=assistant_content(
+                        "Looking.", [ToolCall(id=f"call-{i}", name="look", arguments=args)]
+                    ),
+                    stop_reason="toolUse",
+                )
+            ),
+        ]
+        for i, args in enumerate(arguments)
+    ]
+    return [
+        *turns,
+        [assistant_start(model="fake"), assistant_done(message=AssistantMessage(content="Done"))],
+    ]
+
+
+@pytest.mark.anyio
+async def test_session_refuses_a_tool_call_repeated_identically(tmp_path: Path) -> None:
+    # Run 10 of the ITC trial: one identical bash call, 350 times in a row.
+    same: dict[str, JSONValue] = {"where": ".beagle/log"}
+    ran: list[object] = []
+    provider = FakeProvider(_calling(same, same, same, {"where": "tests"}, same))
+    session = await CodingSession.load(
+        CodingSessionConfig(
+            provider=provider,
+            model="fake",
+            system="You are Tau.",
+            storage=JsonlSessionStorage(tmp_path / "session.jsonl"),
+            cwd=tmp_path,
+            tools=[_counting_tool(ran)],
+        )
+    )
+
+    await _collect_session_events(session.prompt("Find it."))
+
+    # The third identical call is refused; a different one in between resets.
+    assert ran == [same, same, {"where": "tests"}, same]
+    results = [m for m in session.messages if m.role == "toolResult"]
+    assert results[2].text.startswith("Not run: this `look` call is identical to the last 2")
+    assert [r.text for r in results[3:]] == ["nothing found", "nothing found"]
+    assert session.messages[-1].text == "Done"
+
+
+@pytest.mark.anyio
+async def test_session_stops_a_run_that_keeps_repeating_a_call(tmp_path: Path) -> None:
+    same: dict[str, JSONValue] = {"where": ".beagle/log"}
+    ran: list[object] = []
+    turns = _calling(*[same] * 20)
+    provider = FakeProvider(turns)
+    session = await CodingSession.load(
+        CodingSessionConfig(
+            provider=provider,
+            model="fake",
+            system="You are Tau.",
+            storage=JsonlSessionStorage(tmp_path / "session.jsonl"),
+            cwd=tmp_path,
+            tools=[_counting_tool(ran)],
+        )
+    )
+
+    await _collect_session_events(session.prompt("Find it."))
+
+    assert len(ran) == 2
+    results = [m for m in session.messages if m.role == "toolResult"]
+    assert any("the run is stopped: 10 identical `look` calls" in r.text for r in results)
+    assert len(provider.calls) < len(turns)

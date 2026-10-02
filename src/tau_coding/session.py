@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import string
 from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from contextlib import suppress
@@ -187,6 +188,10 @@ SESSION_NAME_SYSTEM_PROMPT = (
     "You write concise coding-agent session names. Reply with only a short title, "
     "maximum four words, no quotes, no punctuation-only output."
 )
+#: Identical tool calls in a row that run; the next identical one is refused.
+REPEATED_CALL_LIMIT = 2
+#: Refused repeats in a row after which the run is stopped.
+REPEATED_CALL_STOP = 8
 MAX_OUTPUT_LIMIT_CONTINUATIONS = 2
 MAX_OUTPUT_LIMIT_CONTINUATIONS_PER_RUN = 6
 OUTPUT_LIMIT_NUDGE = (
@@ -509,6 +514,8 @@ class CodingSession:
         self._prompt_cache_misses = PromptCacheMissDetector()
         self._length_continuations = 0
         self._run_length_continuations = 0
+        self._last_call_key: str | None = None
+        self._repeated_calls = 0
         self._message_origins: dict[int, tuple[AgentMessage, MessageDelivery, MessageSource]] = {}
         self._attach_persistence_listener()
         self._stop_observing_queued_requests = observe_queued_requests(self._report_queued_request)
@@ -791,6 +798,7 @@ class CodingSession:
             project_trust_resolution=trust_resolution,
         )
         harness.config.after_tool_call = session._buffer_tool_result
+        harness.config.before_tool_call = session._refuse_repeated_call
         if config.owns_initial_provider:
             # Ownership starts before any repair/discovery work so every
             # failure path has exactly one closer for the candidate.
@@ -1334,6 +1342,36 @@ class CodingSession:
             return DEFAULT_CONTEXT_WINDOW_TOKENS
         return provider.context_windows.get(self.model, DEFAULT_CONTEXT_WINDOW_TOKENS)
 
+    async def _refuse_repeated_call(self, call: ToolCall) -> tuple[bool, str | None]:
+        """Refuse a tool call identical to the ones just before it.
+
+        A small model can lock onto one call and repeat it for as long as the
+        run lasts; its result does not change, so the run makes no progress.
+        After `REPEATED_CALL_LIMIT` identical calls in a row the next is refused
+        with a note saying so, and after `REPEATED_CALL_STOP` refusals in a row
+        the run is stopped. A different call in between resets the count.
+        """
+        key = f"{call.name}\0{json.dumps(call.arguments, sort_keys=True, default=str)}"
+        if key != self._last_call_key:
+            self._last_call_key, self._repeated_calls = key, 1
+            return False, None
+        self._repeated_calls += 1
+        if self._repeated_calls <= REPEATED_CALL_LIMIT:
+            return False, None
+        refused = self._repeated_calls - REPEATED_CALL_LIMIT
+        if refused >= REPEATED_CALL_STOP:
+            self._harness.cancel()
+            return True, (
+                f"Not run, and the run is stopped: {self._repeated_calls} identical "
+                f"`{call.name}` calls in a row."
+            )
+        return True, (
+            f"Not run: this `{call.name}` call is identical to the last "
+            f"{self._repeated_calls - 1}, and its result would be the same as theirs. "
+            "Use the result you already have, or take a different step. "
+            f"{REPEATED_CALL_STOP - refused} more identical calls stop the run."
+        )
+
     async def _buffer_tool_result(
         self, call: ToolCall, result: AgentToolResult, is_error: bool
     ) -> tuple[AgentToolResult, bool]:
@@ -1614,6 +1652,7 @@ class CodingSession:
                 yield cache_miss
         if isinstance(event, AgentStartEvent):
             self._length_continuations = self._run_length_continuations = 0
+            self._last_call_key, self._repeated_calls = None, 0
         if isinstance(event, TurnEndEvent):
             self._continue_after_output_limit(event)
         if isinstance(event, TurnEndEvent) and self._run_continues_after(event):
