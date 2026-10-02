@@ -188,6 +188,7 @@ class AgentHarness:
                 get_follow_up_messages=self._drain_follow_up_messages,
                 before_tool_call=self._config.before_tool_call,
                 after_tool_call=self._config.after_tool_call,
+                get_system=lambda: self._config.system,
             ):
                 await self._notify(event)
                 yield event

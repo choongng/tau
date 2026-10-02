@@ -1231,6 +1231,44 @@ class CodingSession:
         """Return the effective system prompt sent to the model."""
         return self._harness.config.system
 
+    def refresh_system_prompt(self) -> None:
+        """Rebuild the system prompt from the live resources and extension sections.
+
+        An extension that changes its prompt section after load calls this
+        through its runtime; a run going on sends the new prompt with its next
+        request. An explicit `system` override is left alone.
+        """
+        if self._config.system is not None:
+            return
+        system = build_system_prompt(self._system_prompt_options())
+        if system != self._harness.config.system:
+            self._harness.config.system = system
+            self._invalidate_context_usage_cache()
+
+    def _system_prompt_options(self) -> BuildSystemPromptOptions:
+        return BuildSystemPromptOptions(
+            cwd=self.cwd,
+            tools=self.tools,
+            skills=self.skills,
+            custom_prompt=(
+                self._config.custom_system_prompt
+                if self._config.custom_system_prompt is not None
+                else self._custom_system_prompt
+            ),
+            append_sections=_append_prompt_sections(
+                self._append_system_prompts,
+                self._append_system_prompt_paths,
+                self._config.append_system_prompt,
+            ),
+            context_files=self.context_files,
+            extra_guidelines=self._extension_runtime.prompt_guidelines,
+            extra_sections=self._extension_runtime.sourced_prompt_sections,
+            custom_prompt_source=_custom_prompt_source(
+                explicit=self._config.custom_system_prompt is not None,
+                path=self._custom_system_prompt_path,
+            ),
+        )
+
     @property
     def system_prompt_inspection(self) -> SystemPromptInspection:
         """Return the effective prompt with source attribution for local inspection."""
@@ -1246,30 +1284,7 @@ class CodingSession:
                     ),
                 ),
             )
-        inspection = build_system_prompt_inspection(
-            BuildSystemPromptOptions(
-                cwd=self.cwd,
-                tools=self.tools,
-                skills=self.skills,
-                custom_prompt=(
-                    self._config.custom_system_prompt
-                    if self._config.custom_system_prompt is not None
-                    else self._custom_system_prompt
-                ),
-                append_sections=_append_prompt_sections(
-                    self._append_system_prompts,
-                    self._append_system_prompt_paths,
-                    self._config.append_system_prompt,
-                ),
-                context_files=self.context_files,
-                extra_guidelines=self._extension_runtime.prompt_guidelines,
-                extra_sections=self._extension_runtime.sourced_prompt_sections,
-                custom_prompt_source=_custom_prompt_source(
-                    explicit=self._config.custom_system_prompt is not None,
-                    path=self._custom_system_prompt_path,
-                ),
-            )
-        )
+        inspection = build_system_prompt_inspection(self._system_prompt_options())
         if inspection.text == self.system_prompt:
             return inspection
         return SystemPromptInspection(

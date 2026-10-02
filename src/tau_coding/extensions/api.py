@@ -1095,6 +1095,18 @@ class ExtensionAPI:
             body,
         )
 
+    def set_prompt_section(self, title: str, body: str | None) -> None:
+        """Replace this extension's prompt section titled `title`; no body removes it.
+
+        Unlike :meth:`add_prompt_section` this may be called after load, from a
+        tool or an event handler: the session rebuilds its system prompt, and a
+        run going on sends the new one with its next request. Use it for
+        context whose truth changes mid-session, such as a project set up by a
+        tool the model just called.
+        """
+        self._generation.assert_active()
+        self._runtime.set_prompt_section(self._source_id, self._extension_name, title, body)
+
     def register_skill_dir(self, path: str | Path) -> None:
         """Contribute a directory of skills, loaded from disk without copying.
 

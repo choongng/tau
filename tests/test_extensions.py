@@ -3555,3 +3555,70 @@ async def test_session_reload_keeps_extension_skill_dir(tmp_path: Path) -> None:
 
     assert "campaign-run" in {skill.name for skill in session.skills}
     await session.aclose()
+
+
+FOUND_TOOL_EXTENSION = """
+from tau_agent.tools import AgentTool, AgentToolResult
+
+
+def setup(tau):
+    tau.add_prompt_section('Project', 'Nothing is set up yet.')
+    tau.add_prompt_section('Other', 'Kept as it is.')
+
+    async def _run(tool_call_id, arguments, signal=None, on_update=None):
+        tau.set_prompt_section('Project', 'Set up: call step next.')
+        return AgentToolResult(content='set up')
+
+    tau.register_tool(
+        AgentTool(
+            name='found',
+            label='Found',
+            description='Set the project up.',
+            parameters={'type': 'object'},
+            execute_fn=_run,
+        )
+    )
+"""
+
+
+async def test_prompt_section_set_mid_run_reaches_the_next_request(tmp_path: Path) -> None:
+    # A project set up by a tool call mid-session used to keep the prompt it
+    # had at load until the next reload.
+    provider = FakeProvider(
+        [
+            [
+                assistant_start(model="fake"),
+                assistant_done(
+                    message=AssistantMessage(
+                        content=assistant_content(
+                            "Setting up.", [ToolCall(id="call-1", name="found", arguments={})]
+                        ),
+                        stop_reason="toolUse",
+                    )
+                ),
+            ],
+            [assistant_start(model="fake"), assistant_done(message=AssistantMessage(content="Ok"))],
+        ]
+    )
+    config = _session_config(tmp_path, provider, extension_body=FOUND_TOOL_EXTENSION)
+    session = await CodingSession.load(config)
+
+    _ = [event async for event in session.prompt("Set it up.")]
+
+    first, second = provider.calls[0][1], provider.calls[1][1]
+    assert "## Project\n\nNothing is set up yet." in first
+    assert "Nothing is set up yet." not in second
+    assert "## Project\n\nSet up: call step next." in second
+    # Replaced in place, so the sections keep their order.
+    assert second.index("## Project") < second.index("## Other")
+    assert session.system_prompt == second
+
+
+def test_prompt_section_set_to_nothing_is_removed(tmp_path: Path) -> None:
+    runtime = ExtensionRuntime()
+    api = _register_inline_extension(runtime, "sections")
+    api.add_prompt_section("Project", "Nothing is set up yet.")
+    api.set_prompt_section("Project", None)
+    api.set_prompt_section("Absent", None)
+
+    assert runtime.prompt_sections == ()

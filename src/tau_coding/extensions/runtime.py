@@ -146,6 +146,8 @@ class BoundSession(Protocol):
 
     def set_inference_provider(self, route: str | None) -> str: ...
 
+    def refresh_system_prompt(self) -> None: ...
+
 
 @dataclass(frozen=True, slots=True)
 class ExtensionCommand:
@@ -762,6 +764,44 @@ class ExtensionRuntime:
                 PromptSection(title=normalized_title, body=normalized_body),
             )
         )
+
+    def set_prompt_section(
+        self,
+        source_id: str,
+        extension_name: str,
+        title: str,
+        body: str | None,
+    ) -> None:
+        """Replace this extension's section titled `title`, or remove it with no body.
+
+        Unlike registration, this may run after load: the bound session rebuilds
+        its system prompt, and a run going on sends it with its next request.
+        """
+        normalized_title = title.strip()
+        normalized_body = body.strip() if body is not None else ""
+        index = next(
+            (
+                i
+                for i, (owner, _extension, section) in enumerate(self._prompt_sections)
+                if owner == source_id and section.title == normalized_title
+            ),
+            None,
+        )
+        if index is not None:
+            del self._prompt_sections[index]
+        if normalized_body:
+            entry = (
+                source_id,
+                extension_name,
+                PromptSection(title=normalized_title or None, body=normalized_body),
+            )
+            self._prompt_sections.insert(
+                index if index is not None else len(self._prompt_sections), entry
+            )
+        elif index is None:
+            return
+        if self._session is not None:
+            self._session.refresh_system_prompt()
 
     def register_skill_dir(self, source_id: str, extension_name: str, path: str | Path) -> None:
         """Register a skills directory contributed by an extension.

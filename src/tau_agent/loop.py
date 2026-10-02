@@ -66,8 +66,14 @@ async def run_agent_loop(
     get_follow_up_messages: Callable[[], Sequence[AgentMessage]] | None = None,
     before_tool_call: BeforeToolCall | None = None,
     after_tool_call: AfterToolCall | None = None,
+    get_system: Callable[[], str] | None = None,
 ) -> AsyncIterator[AgentEvent]:
-    """Run the provider/tool loop and emit Pi-compatible agent events."""
+    """Run the provider/tool loop and emit Pi-compatible agent events.
+
+    With `get_system`, each request reads the system prompt afresh, so a change
+    made while the run goes on (an extension's prompt section) reaches the next
+    request rather than the next run.
+    """
     new_messages = list(prompts)
     if prompts:
         messages.extend(prompts)
@@ -127,7 +133,7 @@ async def run_agent_loop(
             async for event in _assistant_events(
                 provider=provider,
                 model=model,
-                system=system,
+                system=get_system() if get_system is not None else system,
                 messages=_provider_context(messages),
                 tools=tools,
                 signal=signal,
