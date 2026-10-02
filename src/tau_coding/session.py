@@ -14,6 +14,7 @@ from typing import Literal
 from tau_agent.events import (
     AgentEndEvent,
     AgentEvent,
+    AgentStartEvent,
     MessageEndEvent,
     ToolExecutionEndEvent,
     TurnEndEvent,
@@ -183,6 +184,13 @@ StreamingBehavior = Literal["steer", "follow_up"]
 SESSION_NAME_SYSTEM_PROMPT = (
     "You write concise coding-agent session names. Reply with only a short title, "
     "maximum four words, no quotes, no punctuation-only output."
+)
+MAX_OUTPUT_LIMIT_CONTINUATIONS = 2
+MAX_OUTPUT_LIMIT_CONTINUATIONS_PER_RUN = 6
+OUTPUT_LIMIT_NUDGE = (
+    "Your last reply hit the output limit before you acted, and its reasoning was "
+    "dropped. Do not work the whole problem out again in your head: take the next "
+    "concrete step now with a tool call, or answer briefly."
 )
 TREE_RUNNING_MESSAGE = "Tau is still working. Press Escape to interrupt before using /tree."
 
@@ -497,6 +505,8 @@ class CodingSession:
         self._ended_message_ids: set[int] = set()
         self._pending_message_writes: dict[int, _PendingMessageWrite] = {}
         self._prompt_cache_misses = PromptCacheMissDetector()
+        self._length_continuations = 0
+        self._run_length_continuations = 0
         self._message_origins: dict[int, tuple[AgentMessage, MessageDelivery, MessageSource]] = {}
         self._attach_persistence_listener()
         self._stop_observing_queued_requests = observe_queued_requests(self._report_queued_request)
@@ -1566,9 +1576,42 @@ class CodingSession:
             if cache_miss is not None:
                 await self._extension_runtime.emit_event(cache_miss)
                 yield cache_miss
+        if isinstance(event, AgentStartEvent):
+            self._length_continuations = self._run_length_continuations = 0
+        if isinstance(event, TurnEndEvent):
+            self._continue_after_output_limit(event)
         if isinstance(event, TurnEndEvent) and self._run_continues_after(event):
             async for signal in self._compact_between_turns():
                 yield signal
+
+    def _continue_after_output_limit(self, event: TurnEndEvent) -> None:
+        """Ask once more when a turn hit the output limit before it acted.
+
+        A reasoning model can spend the whole output budget thinking and stop
+        with no reply and no tool call; the loop would end the run there, and
+        an unattended run would sit idle. The nudge goes in as a follow-up, so
+        the loop sends one more request (the truncated reasoning is left out
+        of it), and the between-turn compaction still applies. Bounded in a
+        row and per run, so a model that keeps thinking itself out of room,
+        acting just enough in between, does stop.
+        """
+        message = event.message
+        if not isinstance(message, AssistantMessage):
+            return
+        if message.stop_reason != "length" or message.tool_calls:
+            self._length_continuations = 0
+            return
+        if (
+            self._length_continuations >= MAX_OUTPUT_LIMIT_CONTINUATIONS
+            or self._run_length_continuations >= MAX_OUTPUT_LIMIT_CONTINUATIONS_PER_RUN
+        ):
+            self._length_continuations = 0
+            return
+        self._length_continuations += 1
+        self._run_length_continuations += 1
+        nudge = UserMessage(content=OUTPUT_LIMIT_NUDGE)
+        self._record_message_origin(nudge, delivery="follow_up", source="extension")
+        self._harness.follow_up_message(nudge)
 
     def _run_continues_after(self, event: TurnEndEvent) -> bool:
         """Whether the loop will send another request in this run."""

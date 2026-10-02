@@ -4704,6 +4704,96 @@ async def test_session_auto_compacts_between_turns_of_a_long_run(
     assert session.messages[-1].text == "Done"
 
 
+@pytest.mark.anyio
+async def test_session_continues_a_turn_cut_off_at_the_output_limit(tmp_path: Path) -> None:
+    # A reasoning model spent its whole output budget thinking: no reply, no
+    # tool call. The run used to end there and sit idle.
+    def truncated() -> list[object]:
+        return [
+            assistant_start(model="fake"),
+            assistant_done(
+                message=AssistantMessage(
+                    content=[ThinkingContent(thinking="Going in circles. " * 50)],
+                ),
+                finish_reason="length",
+            ),
+        ]
+
+    provider = FakeProvider([truncated(), truncated(), truncated(), truncated()])
+    session = await CodingSession.load(
+        CodingSessionConfig(
+            provider=provider,
+            model="fake",
+            system="You are Tau.",
+            storage=JsonlSessionStorage(tmp_path / "session.jsonl"),
+            cwd=tmp_path,
+        )
+    )
+
+    await _collect_session_events(session.prompt("Design it."))
+
+    # Two nudges, then the run stops rather than looping on a model that
+    # keeps running out.
+    assert len(provider.calls) == 3
+    sent = provider.calls[1][2]
+    assert [message.role for message in sent] == ["user", "user"]
+    assert sent[1].text.startswith("Your last reply hit the output limit")
+    # The truncated reasoning stays in history but is not replayed.
+    assert all(
+        not isinstance(block, ThinkingContent)
+        for message in provider.calls[2][2]
+        if isinstance(message, AssistantMessage)
+        for block in message.content
+    )
+    assert isinstance(session.messages[1].content[0], ThinkingContent)
+
+
+@pytest.mark.anyio
+async def test_output_limit_nudges_are_capped_per_run(tmp_path: Path) -> None:
+    # Thinking itself out of room, then one tool call, over and over, would
+    # reset a count of nudges in a row forever.
+    call = ToolCall(id="call-1", name="fetch", arguments={})
+
+    def truncated() -> list[object]:
+        return [
+            assistant_start(model="fake"),
+            assistant_done(
+                message=AssistantMessage(content=[ThinkingContent(thinking="Hmm. " * 50)]),
+                finish_reason="length",
+            ),
+        ]
+
+    def acts() -> list[object]:
+        return [
+            assistant_start(model="fake"),
+            assistant_done(
+                message=AssistantMessage(content=assistant_content("", [call])),
+            ),
+        ]
+
+    script = [truncated(), acts()] * 10
+    provider = FakeProvider(script)
+    session = await CodingSession.load(
+        CodingSessionConfig(
+            provider=provider,
+            model="fake",
+            system="You are Tau.",
+            storage=JsonlSessionStorage(tmp_path / "session.jsonl"),
+            cwd=tmp_path,
+            tools=[_fetch_tool("fetched")],
+        )
+    )
+
+    await _collect_session_events(session.prompt("Design it."))
+
+    nudged = [
+        message
+        for message in session.messages
+        if isinstance(message, UserMessage) and message.text.startswith("Your last reply hit")
+    ]
+    assert len(nudged) == 6
+
+
 def test_llama_cpp_context_size_error_is_an_overflow() -> None:
     message = AssistantMessage(
         stop_reason="error",

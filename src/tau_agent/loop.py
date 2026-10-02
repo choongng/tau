@@ -24,6 +24,7 @@ from tau_agent.messages import (
     AssistantMessage,
     ResponseTiming,
     TextContent,
+    ThinkingContent,
     ToolCall,
     ToolResultMessage,
 )
@@ -188,17 +189,31 @@ def _provider_context(messages: list[AgentMessage]) -> list[AgentMessage]:
     Providers cannot consistently accept an assistant turn with no content. Tau
     persists terminal failures for diagnostics, but an empty failed or aborted
     turn is not model context and must not poison the next request.
+
+    A turn cut off at the output limit keeps its reasoning in history but not
+    in the replay: a model that ran out mid-thought, handed its own unfinished
+    reasoning, tends to pick the same thread up and run out again.
     """
     replayable = tuple(
         message
-        for message in messages
+        for message in map(_without_truncated_thinking, messages)
         if not (
             isinstance(message, AssistantMessage)
-            and message.stop_reason in {"error", "aborted"}
+            and message.stop_reason in {"error", "aborted", "length"}
             and not message.content
         )
     )
     return list(repair_tool_history(replayable).messages)
+
+
+def _without_truncated_thinking(message: AgentMessage) -> AgentMessage:
+    """Drop the reasoning of a turn that stopped at the output limit."""
+    if not isinstance(message, AssistantMessage) or message.stop_reason != "length":
+        return message
+    content = [block for block in message.content if not isinstance(block, ThinkingContent)]
+    if len(content) == len(message.content):
+        return message
+    return message.model_copy(update={"content": content})
 
 
 async def _assistant_events(

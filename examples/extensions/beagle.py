@@ -2284,8 +2284,9 @@ def _note_run_end(event: Any, context: ExtensionContext) -> None:
     del context
     stops = [getattr(m, "stop_reason", None) for m in getattr(event, "messages", ())]
     stops = [stop for stop in stops if stop is not None]
-    # `length` is the model running out of room, not choosing to stop: an
-    # objection then lands on a full context and the next request overflows.
+    # `length` is the model running out of room, not choosing to stop. The
+    # session already nudges a turn cut off at the output limit; a run that
+    # still ends there needs a person, not another objection.
     _LAST_RUN_CLEAN = not stops or stops[-1] not in ("aborted", "error", "length")
 
 
