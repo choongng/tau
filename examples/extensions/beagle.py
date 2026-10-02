@@ -4320,9 +4320,10 @@ def _goal_section(goal_file: Path, *, worker: bool = False) -> str | None:
         CASES_FIRST_NOTE,
         GIT_IDENTITY_NOTE,
         "",
-        "`/pursuit-view` shows counts and the ready set without a model. The full "
-        "drivers (`pursuit_driver` tool, `/pursuit`, `/pursuit-run`) cover the rarer "
-        "moves: spawning another route, binding a container's check, gates.",
+        # No slash commands here: run 11c's driver read `/pursuit-run` in this
+        # line as something to run, and ran it through bash.
+        "For the rarer moves — spawning another route, binding a container's check, "
+        "gates — call the `pursuit_driver` tool.",
     ]
     return "\n".join(lines)
 

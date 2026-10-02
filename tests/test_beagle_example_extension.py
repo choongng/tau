@@ -1010,6 +1010,8 @@ def test_driver_is_told_to_steer_and_a_worker_to_go_piece_by_piece(
     assert "Cases first" in driver.body and "Cases first" not in worker.body
     assert "Never set a git identity" in driver.body
     assert "Never set a git identity" in worker.body
+    # Run 11c ran `/pursuit-run`, named here, through bash.
+    assert "/pursuit" not in driver.body and "call the `pursuit_driver` tool" in driver.body
 
 
 @pytest.mark.anyio
