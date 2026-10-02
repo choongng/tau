@@ -441,6 +441,17 @@ async def test_bash_tool_applies_opt_in_shell_command_prefix(tmp_path: Path) -> 
 
 
 @pytest.mark.anyio
+async def test_bash_tool_returns_long_output_whole_for_the_session_to_buffer(
+    tmp_path: Path,
+) -> None:
+    tool = create_bash_tool(cwd=tmp_path)
+
+    result = await tool.execute("test-call", {"command": "seq 1 100000"})
+
+    assert result.text.splitlines() == [str(n) for n in range(1, 100_001)]
+
+
+@pytest.mark.anyio
 @pytest.mark.skipif(shutil.which("bash") is None, reason="bash is not installed")
 async def test_bash_tool_runs_bash_so_bashisms_work(tmp_path: Path) -> None:
     tool = create_bash_tool(cwd=tmp_path)

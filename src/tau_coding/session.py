@@ -3274,7 +3274,10 @@ class CodingSession:
             # need a bound to get control back.
             default_timeout=None,
         )
-        result = await bash_tool.execute("terminal-command", {"command": normalized_command})
+        result = self._buffer_result(
+            await bash_tool.execute("terminal-command", {"command": normalized_command}),
+            tool_name="bash",
+        )
         exit_code = None
         if isinstance(result.details, dict):
             raw_exit_code = result.details.get("exit_code")

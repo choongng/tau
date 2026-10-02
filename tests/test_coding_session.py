@@ -1296,6 +1296,22 @@ async def test_terminal_command_can_persist_output_to_context(tmp_path: Path) ->
 
 
 @pytest.mark.anyio
+async def test_terminal_command_output_is_buffered_like_a_tool_result(tmp_path: Path) -> None:
+    storage = JsonlSessionStorage(tmp_path / "session.jsonl")
+    session = await CodingSession.load(_config(tmp_path, FakeProvider([]), storage))
+
+    result = await session.run_terminal_command("seq 1 100000", add_to_context=True)
+
+    [buffer] = list((tmp_path / "buffers").iterdir())
+    assert buffer.read_text().splitlines()[-1] == "100000"
+    assert result.output.rstrip().endswith(
+        f"Full output: {buffer} — page it with read (offset/limit) or grep it.]"
+    )
+    assert "\n99999\n100000\n" in result.output and "\n1\n2\n" not in result.output
+    assert len((tmp_path / "session.jsonl").read_text()) < 100_000
+
+
+@pytest.mark.anyio
 async def test_terminal_command_can_run_without_context(tmp_path: Path) -> None:
     storage = JsonlSessionStorage(tmp_path / "session.jsonl")
     session = await CodingSession.load(_config(tmp_path, FakeProvider([]), storage))
