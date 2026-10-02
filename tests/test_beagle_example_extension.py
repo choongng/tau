@@ -1005,7 +1005,7 @@ async def test_worker_runs_no_loop_and_keeps_parent_session(
     await runtime.emit_session_start("startup")
 
     assert runtime.build_command_registry().get("pursuit-run") is None
-    assert [t.name for t in runtime.compose_tools([])] == ["pursuit_dispatch"]
+    assert runtime.compose_tools([]) == []  # one step does not dispatch another
     assert os.environ["CLAUDE_CODE_SESSION_ID"] == "claude-session"
 
 
@@ -2012,6 +2012,51 @@ async def test_history_guard_holds_every_session_in_a_pursuit(
     assert "refusing `git reset --hard`" in blocked.text and "Fix forward" in blocked.text
     assert "refusing `git clean`" in worker.text
     assert [fine.text, unfounded.text] == ["ran"] * 2
+
+
+@pytest.mark.parametrize(
+    ("command", "verb"),
+    [
+        ("beagle pursuit close T0003 --done", "close"),
+        ("beagle pursuit open T0004", "open"),
+        ("beagle --root /p pursuit add 'Next piece'", "add"),
+        ("cd /p && bash -c 'beagle pursuit retry T0002'", "retry"),
+        ("BEAGLE_ROOT=/p beagle pursuit split T0003 a b", "split"),
+        ("beagle pursuit brief T0003", None),
+        ("beagle pursuit show T0003 && beagle pursuit tree", None),
+        ("beagle --root /p pursuit status", None),
+        ("beagle doctor", None),
+        ("echo 'beagle pursuit close T0003'", None),
+    ],
+)
+@pytest.mark.anyio
+async def test_a_worker_may_read_the_pursuit_but_not_change_it(
+    tmp_path: Path,
+    beagle: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    command: str,
+    verb: str | None,
+) -> None:
+    monkeypatch.setenv("BEAGLE_TAU_WORKER", "1")
+    runtime, _ = _bound(tmp_path)
+
+    result = await _tool_with_hooks(runtime, "bash").execute("c1", {"command": command})
+
+    if verb is None:
+        assert result.text == "ran"
+    else:
+        assert f"refusing `beagle pursuit {verb}` in a sub-agent" in result.text
+
+
+@pytest.mark.anyio
+async def test_the_driver_keeps_its_pursuit_verbs(tmp_path: Path, beagle: Path) -> None:
+    runtime, _ = _bound(tmp_path)
+
+    result = await _tool_with_hooks(runtime, "bash").execute(
+        "c1", {"command": "beagle pursuit open T0004"}
+    )
+
+    assert result.text == "ran"
 
 
 @pytest.mark.anyio

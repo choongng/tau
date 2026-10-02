@@ -122,7 +122,7 @@ import shlex
 import subprocess
 import tomllib
 import uuid
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -2304,8 +2304,8 @@ def _git_discard(argv: list[str]) -> str | None:
     return None
 
 
-def _bash_git_discard(command: str) -> str | None:
-    """The first work-discarding `git` call in a bash command, or None.
+def _bash_find(command: str, match: Callable[[list[str]], str | None]) -> str | None:
+    """The first simple command in a bash command that `match` names, or None.
 
     Read like `_bash_write_targets`: per simple command, wrappers skipped,
     `bash -c '...'` one level down. A command too broken to parse is None.
@@ -2326,14 +2326,44 @@ def _bash_git_discard(command: str) -> str | None:
             continue
         if Path(argv[0]).name in _SHELLS and "-c" in argv[1:]:
             script_at = argv.index("-c") + 1
-            found = _bash_git_discard(argv[script_at]) if script_at < len(argv) else None
-        elif Path(argv[0]).name == "git":
-            found = _git_discard(argv)
+            found = _bash_find(argv[script_at], match) if script_at < len(argv) else None
         else:
-            found = None
+            found = match(argv)
         if found is not None:
             return found
     return None
+
+
+def _bash_git_discard(command: str) -> str | None:
+    """The first work-discarding `git` call in a bash command, or None."""
+    return _bash_find(command, lambda argv: _git_discard(argv) if _named(argv, "git") else None)
+
+
+def _named(argv: list[str], program: str) -> bool:
+    return Path(argv[0]).name == program
+
+
+#: The `beagle pursuit` verbs that only read the pursuit. A worker may run
+#: these; every other verb changes the tree or the log.
+_PURSUIT_READ_VERBS = frozenset(
+    {"next", "brief", "show", "status", "view", "tree", "findings", "rules"}
+)
+
+
+def _pursuit_write_verb(argv: list[str]) -> str | None:
+    """The verb of a `beagle pursuit <verb>` argv that changes the pursuit, or None."""
+    if not _named(argv, "beagle"):
+        return None
+    words: list[str] = []
+    args = iter(argv[1:])
+    for arg in args:
+        if arg == "--root":  # the one option before the verb that takes a value
+            next(args, None)
+        elif not arg.startswith("-"):
+            words.append(arg)
+    if len(words) < 2 or words[0] != "pursuit" or words[1] in _PURSUIT_READ_VERBS:
+        return None
+    return words[1]
 
 
 def make_history_guard() -> Any:
@@ -2364,6 +2394,38 @@ def make_history_guard() -> Any:
                 "`git rm --cached <path>` for a file committed by mistake, an ignore rule, "
                 "`git restore <path>` for one file, or a new commit that undoes the last. "
                 "If the tree is wrong beyond that, say so in your report and stop."
+            ),
+        )
+
+    return guard
+
+
+def make_worker_pursuit_guard() -> Any:
+    """Build the `tool_call` guard that keeps a worker out of the pursuit's books.
+
+    A worker is one step of its parent's pursuit: the parent opens the task,
+    runs its check and closes it. A worker that opens, closes or dispatches
+    tasks itself runs a pursuit nobody is driving — in run 7 a worker opened
+    the next task and sent a nested worker at it, which ate its whole budget.
+    Reading the pursuit (`brief`, `show`, `status` …) stays allowed. Fails open.
+    """
+
+    async def guard(event: Any, context: ExtensionContext) -> ToolCallHookResult | None:
+        del context
+        try:
+            if event.tool_name != "bash":
+                return None
+            verb = _bash_find(str((event.arguments or {}).get("command", "")), _pursuit_write_verb)
+            if verb is None:
+                return None
+        except Exception:  # noqa: BLE001 - fail open, never block on a guard bug
+            return None
+        return ToolCallHookResult(
+            block=True,
+            reason=(
+                f"refusing `beagle pursuit {verb}` in a sub-agent: the session that sent "
+                "you opens, checks and closes the pursuit's tasks. Do the work in your "
+                "brief, then end with a report of what you changed and what is left."
             ),
         )
 
@@ -3702,28 +3764,32 @@ def setup(tau: ExtensionAPI) -> None:
     )
 
     # 4. The headless step-executor: the blocking fallback for when the
-    #    tau-subagents extension (background `agent` tool) is not loaded.
-    tau.register_tool(
-        AgentTool(
-            name="pursuit_dispatch",
-            label="pursuit_dispatch",
-            description=(
-                "Delegate one well-specified pursuit task to a headless step-executor (a nested "
-                "`tau -p`, inheriting this session's model unless a Tau model id is given). Pass "
-                "the brief ('run `beagle pursuit brief <task>` and do what it says'). Returns "
-                "the executor's report; the caller still runs `beagle pursuit close`. Use for "
-                "roughly ten tool calls or more of mechanical work, not one-line edits or "
-                "open-ended exploration."
-            ),
-            parameters=DISPATCH_PARAMETERS,
-            execute_fn=make_dispatch(),
-            prompt_snippet="Delegate one pursuit task to a headless step-executor sub-agent.",
-            prompt_guidelines=(
-                "Hand pursuit_dispatch a self-contained brief; the worker sees no conversation.",
-                "The worker does the work; YOU run `beagle pursuit close` after its --done-when.",
-            ),
+    #    tau-subagents extension (background `agent` tool) is not loaded. A
+    #    worker is never given it: one step does not start another.
+    if not _is_worker():
+        tau.register_tool(
+            AgentTool(
+                name="pursuit_dispatch",
+                label="pursuit_dispatch",
+                description=(
+                    "Delegate one well-specified pursuit task to a headless step-executor (a "
+                    "nested `tau -p`, inheriting this session's model unless a Tau model id is "
+                    "given). Pass the brief ('run `beagle pursuit brief <task>` and do what it "
+                    "says'). Returns the executor's report; the caller still runs `beagle "
+                    "pursuit close`. Use for roughly ten tool calls or more of mechanical work, "
+                    "not one-line edits or open-ended exploration."
+                ),
+                parameters=DISPATCH_PARAMETERS,
+                execute_fn=make_dispatch(),
+                prompt_snippet="Delegate one pursuit task to a headless step-executor sub-agent.",
+                prompt_guidelines=(
+                    "Hand pursuit_dispatch a self-contained brief; the worker sees no "
+                    "conversation.",
+                    "The worker does the work; YOU run `beagle pursuit close` after its "
+                    "--done-when.",
+                ),
+            )
         )
-    )
 
     # 4b. The steering tools: found, plan and step a pursuit without reading
     #     the driver text, each step's work done by a step-executor. The
@@ -3787,7 +3853,9 @@ def setup(tau: ExtensionAPI) -> None:
     #    beagle's Bash PreToolUse hooks onto the same seam.
     tau.on("tool_call", make_guard())
     tau.on("tool_call", make_bash_hooks())
-    if not _is_worker():
+    if _is_worker():
+        tau.on("tool_call", make_worker_pursuit_guard())
+    else:
         tau.on("tool_call", make_scope_guard())
         tau.on("tool_result", make_stopped_worker_note())
     # After the scope guard: a reset in a worker's scope is a race first.
