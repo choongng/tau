@@ -1662,6 +1662,7 @@ class CodingSession:
         end = CompactionEndEvent(
             reason="threshold",
             aborted=not compacted,
+            will_retry=False,
             error_message=None if compacted else "Threshold compaction did not run",
         )
         await self._extension_runtime.emit_event(end)
@@ -4127,7 +4128,7 @@ class CodingSession:
 
         first_kept_index = _first_recent_context_index(
             rows,
-            keep_recent_tokens=DEFAULT_COMPACTION_KEEP_RECENT_TOKENS,
+            keep_recent_tokens=_keep_recent_tokens(self.auto_compact_token_threshold),
         )
         if first_kept_index <= 0:
             return None
@@ -4203,6 +4204,20 @@ class CodingSession:
         if context_index >= self._state.context_entry_ids.index(first_kept_entry_id):
             return None
         return message_text(question)
+
+
+def _keep_recent_tokens(threshold: int | None) -> int:
+    """How much recent context a compaction keeps verbatim.
+
+    A fixed amount does not fit a small window: with a 34k threshold, 20k kept
+    plus the system prompt, tools and summary is already over it, so every turn
+    compacted again and summarized only the last few messages. A quarter of the
+    threshold leaves room for the run to go on before the next compaction; the
+    floor still keeps the latest exchange.
+    """
+    if threshold is None or threshold <= 0:
+        return DEFAULT_COMPACTION_KEEP_RECENT_TOKENS
+    return min(DEFAULT_COMPACTION_KEEP_RECENT_TOKENS, max(2_000, threshold // 4))
 
 
 def _first_recent_context_index(

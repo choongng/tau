@@ -3984,6 +3984,48 @@ async def test_session_auto_compacts_at_next_turn_start_when_threshold_is_exceed
 
 
 @pytest.mark.anyio
+async def test_session_compaction_on_a_small_window_lands_under_the_threshold(
+    tmp_path: Path,
+) -> None:
+    # Run 8: with a 34k threshold and 20k of recent context always kept, each
+    # compaction left the context over the threshold, so it ran again every turn.
+    storage = JsonlSessionStorage(tmp_path / "session.jsonl")
+    parent: str | None = None
+    for index in range(20):
+        role_message = (
+            UserMessage(content=f"ask {index} " + "word " * 1_600)
+            if index % 2 == 0
+            else AssistantMessage(content=f"answer {index} " + "word " * 1_600)
+        )
+        await storage.append(MessageEntry(id=f"m{index}", parent_id=parent, message=role_message))
+        parent = f"m{index}"
+    provider = FakeProvider(
+        [
+            [assistant_start(model="fake"), assistant_done(message=AssistantMessage(content="S"))],
+            [assistant_start(model="fake"), assistant_done(message=AssistantMessage(content="Ok"))],
+        ]
+    )
+    session = await CodingSession.load(
+        CodingSessionConfig(
+            provider=provider,
+            model="fake",
+            # The system prompt and tools are kept by every compaction.
+            system="You are Tau.\n" + "rule " * 9_600,
+            storage=storage,
+            cwd=tmp_path,
+            auto_compact_token_threshold=34_000,
+        )
+    )
+    assert session.context_token_estimate > 34_000
+
+    await _collect_session_events(session.prompt("Next."))
+
+    compactions = [entry for entry in await storage.read_all() if entry.type == "compaction"]
+    assert len(compactions) == 1
+    assert session.context_token_estimate < 34_000 * 3 // 4
+
+
+@pytest.mark.anyio
 async def test_session_continue_auto_compacts_before_the_run_not_after(
     tmp_path: Path,
 ) -> None:
