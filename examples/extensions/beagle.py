@@ -1997,7 +1997,9 @@ def _check_problem(command: str) -> str | None:
         return (
             "done_when reads .beagle/, beagle's record of the pursuit, which says what was "
             "written about the work, not what was built: a grep of a task's notes passes "
-            f"as soon as the notes say so. {one_command}. Call pursuit_step again with that."
+            f"as soon as the notes say so. {one_command}. A file the task writes goes in the "
+            "project, not in .beagle/: a note or summary in docs/, checked with `grep -q "
+            "'<a phrase it must contain>' docs/<name>.md`. Call pursuit_step again with that."
         )
     operators = _bare_operators(command)
     if operators:

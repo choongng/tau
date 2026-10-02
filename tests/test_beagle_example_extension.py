@@ -2179,6 +2179,8 @@ async def test_a_due_audit_with_no_report_is_not_recorded(
     [
         # Checks a 9B driver bound in runs 7 and 8.
         ('grep -q "interval tree clocks" .beagle/tree/T0008.md', "reads .beagle/"),
+        # Run 11b's summary went into .beagle/memory/, so its check read it there.
+        ("test -f .beagle/memory/reference-summary.md", "in the project, not in .beagle/"),
         ("bash -c 'beagle doctor && test -d tests'", "runs beagle itself"),
         ("/home/u/.tau/beagle-plugin/bin/beagle pursuit close T0002", "runs beagle itself"),
         ("test -d src/itc && test -f pyproject.toml", "bare '&&'"),
