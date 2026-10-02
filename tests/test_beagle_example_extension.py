@@ -1984,7 +1984,7 @@ async def test_pursuit_step_refuses_a_check_written_as_a_sentence(
     )
     beagle_check = await step.execute("c3", {**args, "done_when": "beagle pursuit close T0002"})
     quoted = await step.execute(
-        "c2", {**args, "done_when": "python3 -c 'import sys; sys.exit(0 and 1)'"}
+        "c2", {**args, "done_when": "python3 -c 'import sys; sys.exit(1 and 1)'"}
     )
 
     assert "reads as a sentence" in prose.text and "'exits'" in prose.text
@@ -2019,6 +2019,30 @@ async def test_pursuit_step_refuses_a_bound_check_with_a_bare_operator(
     assert "bare '&&'" in result.text and "corrected done_when" in result.text
 
 
+@pytest.mark.anyio
+async def test_pursuit_step_will_not_open_a_task_whose_check_already_passes(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Run 9 bound a test an earlier task had already made pass: the task
+    # closed done on whatever its worker did, or nothing.
+    project = _pursuit_project(tmp_path)
+    monkeypatch.chdir(project)
+    (project / "done.txt").write_text("made by T0001")
+    _ready_task(fake_beagle)
+    runtime, _ = _bound(tmp_path)
+
+    result = await _tool(runtime, "pursuit_step").execute(
+        "c1", {"task": "T0002", "criteria": "done.txt exists", "done_when": "test -f done.txt"}
+    )
+
+    assert "already passes" in result.text and "abandon=" in result.text
+    assert _pursuit_calls(fake_beagle, "open") == [] and _runs(fake_tau) == []
+
+
 @pytest.mark.parametrize(
     ("check", "problem"),
     [
@@ -2029,7 +2053,12 @@ async def test_pursuit_step_refuses_a_bound_check_with_a_bare_operator(
         ("test -d src/itc && test -f pyproject.toml", "bare '&&'"),
         ("python3 -m pytest -q tests/ | tail -1", "bare '|'"),
         ("python3 -m pytest -q exits 0 and passes", "reads as a sentence"),
+        # Checks it bound in run 9, each passing whatever the work said.
+        ("true", "exits 0 whatever"),
+        ("cat docs/design.md", "as soon as the file is there"),
+        ("python3 -m json.tool tests/cases.json", "as soon as the file is there"),
         ("python3 -m pytest -q tests/test_itc.py", None),
+        ("grep -q 'join' docs/design.md", None),
         ("bash -c 'test -d tests && python3 -m pytest -q'", None),
         ("grep -q '&&' notes.txt", None),
     ],

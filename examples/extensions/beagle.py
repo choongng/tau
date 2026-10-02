@@ -1928,6 +1928,12 @@ _PROSE_WORDS = frozenset(
 )
 
 
+#: Programs that exit 0 whatever the work did.
+_ALWAYS_PASSES = frozenset({"true", ":", "echo", "printf", "yes"})
+#: Programs that pass once a file is there, whatever is in it.
+_SHOWS_A_FILE = frozenset({"cat", "ls", "head", "tail", "wc", "stat", "file"})
+
+
 def _check_problem(command: str) -> str | None:
     """Why `command` cannot be a task's check, or None.
 
@@ -1941,7 +1947,10 @@ def _check_problem(command: str) -> str | None:
       as T0002's own check, or `beagle doctor`, which hung a run for good;
     - beagle's own store: `grep -q X .beagle/tree/T0008.md` reads what was
       recorded about the task, and passes once the notes say so;
-    - a bare `&&`, `|` or `>`, which reaches the program as an argument.
+    - a bare `&&`, `|` or `>`, which reaches the program as an argument;
+    - a check that cannot fail: `true`, which run 9 bound to "abandon" a
+      duplicate, or one that only shows a file is there (`cat docs/x.md`,
+      `python3 -m json.tool cases.json`) and passes whatever it says.
     """
     try:
         words = shlex.split(command)
@@ -1973,6 +1982,18 @@ def _check_problem(command: str) -> str | None:
             f"{operators[0]!r} reaches {words[0]!r} as an argument. {one_command}; for "
             "more than one thing, write a test that checks them all and run that. Call "
             "pursuit_step again with it."
+        )
+    program = Path(words[0]).name
+    if program in _ALWAYS_PASSES:
+        return (
+            f"done_when `{command}` exits 0 whatever the work does, so it cannot judge it. "
+            f"{one_command}. {ABANDON_HINT}"
+        )
+    if program in _SHOWS_A_FILE or (program.startswith("python") and "json.tool" in words[1:3]):
+        return (
+            f"done_when `{command}` passes as soon as the file is there, whatever it says. "
+            f"{one_command}, testing what the file must hold; for a document, `grep -q "
+            "'<a phrase it must contain>' <path>`. Call pursuit_step again with that."
         )
     found = [w for w in words[1:] if w.lower() in _PROSE_WORDS]
     if not found:
@@ -2451,6 +2472,15 @@ def make_step_tool() -> Any:
             scoped = _scope_problem(scope)
             if scoped is not None:
                 return _step_result(f"pursuit_step: {task} not opened — {scoped}")
+            # A check bound once it already passes closes the task on no work:
+            # run 9 bound `cat docs/design.md` and a test an earlier task had
+            # made pass.
+            if (await _run_check(done_when, root, DEFAULT_CHECK_TIMEOUT))[0] == 0:
+                return _step_result(
+                    f"pursuit_step: {task} not opened — `{done_when}` already passes, "
+                    "before any work, so it cannot tell this task's work from none. Write "
+                    "a check that fails now: a test of what this task adds. " + ABANDON_HINT
+                )
             argv = ["open", task, "--criteria", criteria, "--done-when", done_when]
             if scope:
                 argv += ["--scope", *scope]
