@@ -2570,8 +2570,8 @@ def make_driver_edit_guard() -> Any:
     In a founded pursuit the driving session plans, opens, dispatches and
     closes; the work is a sub-agent's. A driver that edits project files
     itself writes code no brief described and no check was bound for, and
-    spends the context the loop needs to keep going. Its own `.beagle/`
-    store is the exception. `BEAGLE_TAU_DRIVER_EDITS=1` lets it edit.
+    spends the context the loop needs to keep going. Its `.beagle/` store is
+    left to `make_record_guard`. `BEAGLE_TAU_DRIVER_EDITS=1` lets it edit.
     """
 
     async def guard(event: Any, context: ExtensionContext) -> ToolCallHookResult | None:
@@ -2693,8 +2693,8 @@ _PURSUIT_READ_VERBS = frozenset(
 )
 
 
-def _pursuit_write_verb(argv: list[str]) -> str | None:
-    """The verb of a `beagle pursuit <verb>` argv that changes the pursuit, or None."""
+def _pursuit_verb(argv: list[str]) -> str | None:
+    """The verb of a `beagle pursuit <verb>` argv, or None for any other command."""
     if not _named(argv, "beagle"):
         return None
     words: list[str] = []
@@ -2704,9 +2704,15 @@ def _pursuit_write_verb(argv: list[str]) -> str | None:
             next(args, None)
         elif not arg.startswith("-"):
             words.append(arg)
-    if len(words) < 2 or words[0] != "pursuit" or words[1] in _PURSUIT_READ_VERBS:
+    if len(words) < 2 or words[0] != "pursuit":
         return None
     return words[1]
+
+
+def _pursuit_write_verb(argv: list[str]) -> str | None:
+    """The verb of a `beagle pursuit <verb>` argv that changes the pursuit, or None."""
+    verb = _pursuit_verb(argv)
+    return None if verb in _PURSUIT_READ_VERBS else verb
 
 
 def make_history_guard() -> Any:
@@ -2769,6 +2775,138 @@ def make_worker_pursuit_guard() -> Any:
                 f"refusing `beagle pursuit {verb}` in a sub-agent: the session that sent "
                 "you opens, checks and closes the pursuit's tasks. Do the work in your "
                 "brief, then end with a report of what you changed and what is left."
+            ),
+        )
+
+    return guard
+
+
+#: The `beagle pursuit` verbs the driver's tools run, and the tool for each.
+_STEERED_VERBS = {
+    "open": "pursuit_step (with criteria and done_when)",
+    "close": "pursuit_step, which closes a task on its check",
+    "retry": "pursuit_step on the blocked task, with notes saying what to fix",
+    "spawn": "pursuit_step with new_route=true and notes saying what to do instead",
+    "amend": "pursuit_step on the open task, with the new done_when",
+    "bind": "pursuit_step (with criteria and done_when)",
+    "spend": "pursuit_step, which records each sub-agent's measured spend",
+    "split": "pursuit_plan",
+    "add": "pursuit_plan",
+}
+
+
+def make_driver_pursuit_guard() -> Any:
+    """Build the `tool_call` guard that steers the driver's pursuit verbs to its tools.
+
+    pursuit_found, pursuit_plan and pursuit_step run beagle's verbs with the
+    rules around them: a check screened before it is bound and run before a
+    close, a spend measured, a blocked task retried or spawned anew. A driver
+    that runs `beagle pursuit close` from bash skips all of it — in run 8 it
+    closed, spawned, opened and re-split one task over and over by hand. The
+    verbs no tool runs (`retire`, `depend`, `rebudget` …) stay allowed, and so
+    does reading. Only the host-started session, and only in a founded
+    pursuit. Fails open.
+    """
+
+    async def guard(event: Any, context: ExtensionContext) -> ToolCallHookResult | None:
+        if os.environ.get(DRIVER_EDITS_ENV):
+            return None
+        try:
+            if event.tool_name != "bash" or _STARTED_SESSION is None:
+                return None
+            if context.session_id != _STARTED_SESSION:
+                return None
+            verb = _bash_find(
+                str((event.arguments or {}).get("command", "")),
+                lambda argv: v if (v := _pursuit_verb(argv)) in _STEERED_VERBS else None,
+            )
+            if verb is None or _find_goal(Path(context.cwd)) is None:
+                return None
+        except Exception:  # noqa: BLE001 - fail open, never block on a guard bug
+            return None
+        return ToolCallHookResult(
+            block=True,
+            reason=(
+                f"refusing `beagle pursuit {verb}` from bash: use {_STEERED_VERBS[verb]}. "
+                "The tool runs it with the checks around it that the bare verb skips. "
+                f"(If the user wants this session to run it by hand, they set "
+                f"{DRIVER_EDITS_ENV}=1.)"
+            ),
+        )
+
+    return guard
+
+
+#: What beagle keeps under `.beagle/` as its record of the pursuit, and the
+#: cases this extension locks. Only beagle and this extension write them;
+#: the `*.toml` beside them is configuration, and editable.
+_STORE_RECORDS = frozenset(
+    {
+        "tree",
+        "log",
+        "findings",
+        "state.json",
+        "LOG.md",
+        "STATUS.md",
+        "cadence-runs.json",
+        "hook-trace.json",
+        ".lock",
+        ".gate.lock",
+        LOCKED_DIR,
+        PENDING_LOCKS,
+    }
+)
+
+
+def _store_record(path: Path, store: Path) -> str | None:
+    """`path` relative to `store` if it is one of beagle's records, else None."""
+    try:
+        rel = _resolved(path).relative_to(store)
+    except ValueError:
+        return None
+    return str(rel) if rel.parts and rel.parts[0] in _STORE_RECORDS else None
+
+
+def make_record_guard() -> Any:
+    """Build the `tool_call` guard that keeps every session's hands off beagle's records.
+
+    A task's file, the log and the state are beagle's account of what was
+    opened, checked and closed; a check that greps them, or a model that
+    edits them, makes that account say whatever it was told. In run 8 the
+    driver `sed -i`'d a check into a task file and two log notes. Write and
+    edit tools and the bash writes `_bash_write_targets` sees are refused;
+    `BEAGLE_TAU_DRIVER_EDITS=1` lets them through. Fails open.
+    """
+
+    async def guard(event: Any, context: ExtensionContext) -> ToolCallHookResult | None:
+        if os.environ.get(DRIVER_EDITS_ENV):
+            return None
+        try:
+            cwd = Path(context.cwd)
+            args = event.arguments or {}
+            if event.tool_name in ("write", "edit"):
+                target = _goal_path_from_args(args, cwd)
+                targets = [target] if target is not None else []
+            elif event.tool_name == "bash":
+                targets = _bash_write_targets(str(args.get("command", "")), cwd) or []
+            else:
+                return None
+            goal = _find_goal(cwd) if targets else None
+            if goal is None:
+                return None
+            store = _resolved(goal.parent)
+            record = next((rel for rel in (_store_record(t, store) for t in targets) if rel), None)
+            if record is None:
+                return None
+        except Exception:  # noqa: BLE001 - fail open, never block on a guard bug
+            return None
+        return ToolCallHookResult(
+            block=True,
+            reason=(
+                f"refusing to change .beagle/{record}: it is beagle's record of the "
+                "pursuit, and only beagle writes it. What a sub-agent should know goes in "
+                "pursuit_step's notes; a check that cannot judge the work is replaced by "
+                "pursuit_step with a new done_when."
             ),
         )
 
@@ -4191,10 +4329,12 @@ def setup(tau: ExtensionAPI) -> None:
             )
         )
         tau.on("tool_call", make_driver_edit_guard())
+        tau.on("tool_call", make_driver_pursuit_guard())
 
     # 5. Enforce the pursuit ground truth on every tool call, and bridge
     #    beagle's Bash PreToolUse hooks onto the same seam.
     tau.on("tool_call", make_guard())
+    tau.on("tool_call", make_record_guard())
     tau.on("tool_call", make_bash_hooks())
     if _is_worker():
         tau.on("tool_call", make_worker_pursuit_guard())

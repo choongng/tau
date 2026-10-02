@@ -2284,15 +2284,97 @@ async def test_a_worker_may_read_the_pursuit_but_not_change_it(
         assert f"refusing `beagle pursuit {verb}` in a sub-agent" in result.text
 
 
+@pytest.mark.parametrize(
+    ("command", "tool"),
+    [
+        # Run 8's driver, steering T0002 and T0003 by hand.
+        ("cd /home/choong/itc && beagle pursuit spawn T0002", "new_route=true"),
+        ('beagle pursuit retry T0002 --because "fixed"', "on the blocked task"),
+        ("/home/u/.tau/beagle-plugin/bin/beagle pursuit close T0003 --outcome done", "closes"),
+        ("beagle pursuit add --parent T0001 --sibling-of T0002 x", "pursuit_plan"),
+        ("bash -c 'beagle pursuit split T0003 a b'", "pursuit_plan"),
+        ("beagle pursuit show T0003 && beagle pursuit tree", None),
+        ("beagle pursuit retire T0002 --reason 'not part of the goal'", None),
+    ],
+)
 @pytest.mark.anyio
-async def test_the_driver_keeps_its_pursuit_verbs(tmp_path: Path, beagle: Path) -> None:
+async def test_the_driver_steers_through_its_tools_not_bash_verbs(
+    tmp_path: Path,
+    beagle: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    command: str,
+    tool: str | None,
+) -> None:
+    monkeypatch.chdir(_pursuit_project(tmp_path))
     runtime, _ = _bound(tmp_path)
+    bash = _tool_with_hooks(runtime, "bash")
+    await runtime.emit_session_start("startup")
+
+    result = await bash.execute("c1", {"command": command})
+    monkeypatch.setenv("BEAGLE_TAU_DRIVER_EDITS", "1")
+    opted_out = await bash.execute("c2", {"command": command})
+
+    if tool is None:
+        assert result.text == "ran"
+    else:
+        assert "refusing `beagle pursuit" in result.text and tool in result.text
+    assert opted_out.text == "ran"
+
+
+@pytest.mark.anyio
+async def test_the_driver_runs_pursuit_verbs_outside_a_pursuit(
+    tmp_path: Path, beagle: Path
+) -> None:
+    runtime, _ = _bound(tmp_path)
+    await runtime.emit_session_start("startup")
 
     result = await _tool_with_hooks(runtime, "bash").execute(
         "c1", {"command": "beagle pursuit open T0004"}
     )
 
     assert result.text == "ran"
+
+
+@pytest.mark.parametrize(
+    ("tool", "arguments", "refused"),
+    [
+        # Run 8's driver, rewriting a check into the task file and the log.
+        (
+            "bash",
+            {"command": "sed -i '/^done_when/a metric_command = x' .beagle/tree/T0002.md"},
+            "tree/T0002.md",
+        ),
+        (
+            "bash",
+            {"command": "sed -i '/^metric/d' .beagle/log/000000-000499/000007-note.md"},
+            "log/000000-000499/000007-note.md",
+        ),
+        ("write", {"path": ".beagle/state.json", "content": "{}"}, "state.json"),
+        ("edit", {"path": ".beagle/locked/tests/cases.json"}, "locked/tests/cases.json"),
+        ("bash", {"command": "cat >> .beagle/skills.toml << 'EOF'\n[x]\nEOF"}, None),
+        ("bash", {"command": "cat .beagle/tree/T0002.md > notes.md"}, None),
+        ("write", {"path": ".beagle/notes.md", "content": "x"}, None),
+    ],
+)
+@pytest.mark.anyio
+async def test_no_session_writes_beagles_records(
+    tmp_path: Path,
+    beagle: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    tool: str,
+    arguments: dict[str, Any],
+    refused: str | None,
+) -> None:
+    monkeypatch.chdir(_pursuit_project(tmp_path))
+    monkeypatch.setenv("BEAGLE_TAU_WORKER", "1")  # a worker too, not only the driver
+    runtime, _ = _bound(tmp_path)
+
+    result = await _tool_with_hooks(runtime, tool).execute("c1", arguments)
+
+    if refused is None:
+        assert result.text == "ran"
+    else:
+        assert f"refusing to change .beagle/{refused}" in result.text
 
 
 def test_the_memory_cap_wraps_a_command_in_a_systemd_scope(
