@@ -2419,6 +2419,24 @@ async def _audit(
     )
 
 
+def _abandon(task: str, why: str, root: Path, goal: Path) -> str:
+    """Close `task` as abandoned and release what waited on it; what happened."""
+    argv = ["close", task, "--outcome", "abandoned", "--reason", why[:500]]
+    rc, out = _pursuit(argv, root)
+    if rc != 0:
+        return (
+            f"pursuit_step: `beagle pursuit close {task} --outcome abandoned` refused "
+            f"(exit {rc}):\n{out}"
+        )
+    _drop_pending_locks(goal, task)
+    released = _release_waiters(task, why, root)
+    freed = f"\nNo longer waiting on it: {', '.join(released)}." if released else ""
+    return (
+        f"{out.splitlines()[0] if out else task + ' abandoned'}{freed}\n\n"
+        f"{_tree(root)}\n\nNext: call pursuit_step with no arguments for the next task."
+    )
+
+
 def make_step_tool() -> Any:
     """Build `pursuit_step`: one task, opened, done by a sub-agent, checked and closed.
 
@@ -2461,20 +2479,7 @@ def make_step_tool() -> Any:
         if abandon:
             if not task:
                 return _step_result("pursuit_step: abandon names the task to drop; pass task too.")
-            argv = ["close", task, "--outcome", "abandoned", "--reason", abandon[:500]]
-            rc, out = _pursuit(argv, root)
-            if rc != 0:
-                return _step_result(
-                    f"pursuit_step: `beagle pursuit close {task} --outcome abandoned` refused "
-                    f"(exit {rc}):\n{out}"
-                )
-            _drop_pending_locks(goal, task)
-            released = _release_waiters(task, abandon, root)
-            freed = f"\nNo longer waiting on it: {', '.join(released)}." if released else ""
-            return _step_result(
-                f"{out.splitlines()[0] if out else task + ' abandoned'}{freed}\n\n"
-                f"{_tree(root)}\n\nNext: call pursuit_step with no arguments for the next task."
-            )
+            return _step_result(_abandon(task, abandon, root, goal))
         if ready.get("audit_due"):
             return _step_result(await _audit(root, signal, on_update))
         if not task:
