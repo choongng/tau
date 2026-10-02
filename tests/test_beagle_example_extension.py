@@ -7,6 +7,8 @@ checkout, so these exercise its wiring without a beagle install.
 from __future__ import annotations
 
 import asyncio
+import functools
+import importlib.util
 import json
 import os
 import shutil
@@ -105,6 +107,8 @@ def beagle(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     # Recorded so teardown restores it; setup may put the checkout's bin/ first.
     monkeypatch.setenv("PATH", os.environ.get("PATH", ""))
     monkeypatch.delenv("BEAGLE_TAU_WORKER", raising=False)
+    # Workers and checks run uncapped unless a test turns the cap on.
+    monkeypatch.setenv("BEAGLE_TAU_MEMORY_MAX", "off")
     # Never the real beagle: a test that wants one takes `fake_beagle`.
     monkeypatch.setenv("BEAGLE_BIN", str(tmp_path / "no-beagle-bin"))
     monkeypatch.chdir(tmp_path)  # the process cwd is not a pursuit unless a test says so
@@ -178,6 +182,17 @@ def _bound(tmp_path: Path, *, ui: bool = True) -> tuple[ExtensionRuntime, Record
 def _tool(runtime: ExtensionRuntime, name: str) -> Any:
     [tool] = [t for t in runtime.compose_tools([]) if t.name == name]
     return tool
+
+
+@functools.cache
+def _module() -> Any:
+    """The extension module itself, for the helpers no tool reaches."""
+    spec = importlib.util.spec_from_file_location("beagle_extension_under_test", EXTENSION)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module  # dataclasses look their module up
+    spec.loader.exec_module(module)
+    return module
 
 
 def _load(tmp_path: Path) -> ExtensionRuntime:
@@ -2057,6 +2072,44 @@ async def test_the_driver_keeps_its_pursuit_verbs(tmp_path: Path, beagle: Path) 
     )
 
     assert result.text == "ran"
+
+
+def test_the_memory_cap_wraps_a_command_in_a_systemd_scope(
+    beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ext = _module()
+    monkeypatch.setattr(ext, "_scopes_work", lambda: True)
+    monkeypatch.setenv("BEAGLE_TAU_MEMORY_MAX", "2G")
+    capped = ext._capped(["pytest", "-q"], ext._memory_max())
+    monkeypatch.setenv("BEAGLE_TAU_MEMORY_MAX", "off")
+    off = ext._memory_max()
+    monkeypatch.setattr(ext, "_scopes_work", lambda: False)
+    monkeypatch.setenv("BEAGLE_TAU_MEMORY_MAX", "2G")
+    unavailable = ext._memory_max()
+
+    assert capped[:4] == ["systemd-run", "--user", "--scope", "-q"]
+    assert "MemoryMax=2G" in capped and "MemorySwapMax=0" in capped
+    assert capped[-3:] == ["--", "pytest", "-q"]
+    assert off is None and unavailable is None
+    assert ext._capped(["pytest"], None) == ["pytest"]
+
+
+@pytest.mark.anyio
+async def test_a_check_over_the_memory_cap_is_killed_and_says_why(
+    tmp_path: Path, beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ext = _module()
+    if not ext._scopes_work():
+        pytest.skip("no systemd user scopes here")
+    monkeypatch.setenv("BEAGLE_TAU_MEMORY_MAX", "64M")
+    hog = f"{sys.executable} -c 'x = bytearray(512 << 20); print(len(x))'"
+
+    rc, out = await ext._run_check(hog, tmp_path, timeout=60)
+    monkeypatch.setenv("BEAGLE_TAU_MEMORY_MAX", "1G")
+    ok_rc, ok_out = await ext._run_check(hog, tmp_path, timeout=60)
+
+    assert rc == -9 and "64M memory cap" in out
+    assert (ok_rc, ok_out) == (0, str(512 << 20))
 
 
 @pytest.mark.anyio

@@ -114,11 +114,13 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import fnmatch
+import functools
 import json
 import math
 import os
 import re
 import shlex
+import shutil
 import subprocess
 import tomllib
 import uuid
@@ -201,6 +203,13 @@ GUARD_DISABLE_ENV = "BEAGLE_TAU_ALLOW_PURSUIT_EDIT"
 #: Set in a `pursuit_dispatch` worker's environment. A worker acts for its
 #: parent: it keeps the parent's session id and runs no loop of its own.
 WORKER_ENV = "BEAGLE_TAU_WORKER"
+
+#: The memory cap a worker and a pre-close check run under, as a systemd size
+#: (`4G`, `512M`); `off` runs them uncapped. Applied through a systemd user
+#: scope with swap shut off, so a runaway is killed rather than left to drag
+#: the machine into swap; without systemd the cap is skipped.
+MEMORY_MAX_ENV = "BEAGLE_TAU_MEMORY_MAX"
+DEFAULT_MEMORY_MAX = "4G"
 
 #: Wall-clock cap on one bridged-by-default `beagle hook` call; a hook that
 #: hangs fails open. An installed hook gets its own entry's timeout instead.
@@ -1255,9 +1264,10 @@ async def _run_worker(
     if model:
         cmd += ["--model", model]
 
+    limit = _memory_max()
     try:
         proc = await asyncio.create_subprocess_exec(
-            *cmd,
+            *_capped(cmd, limit),
             cwd=str(cwd),
             env={**os.environ, WORKER_ENV: "1"},
             stdin=asyncio.subprocess.PIPE,
@@ -1295,9 +1305,11 @@ async def _run_worker(
             await talk
         return _WorkerRun(returncode=proc.returncode, problem=problem, transcript=transcript)
 
+    stderr = talk.result()
+    note = _killed_note(proc.returncode, limit)
     return _WorkerRun(
         returncode=proc.returncode,
-        report=events.final_report(talk.result()),
+        report=events.final_report(f"{stderr}\n{note}".strip() if note else stderr),
         spent=events.spent,
         transcript=transcript,
     )
@@ -1454,6 +1466,63 @@ def _git_identity(root: Path) -> bool:
     return all(
         _run(["git", "var", ident], root, timeout=10.0)[0] == 0
         for ident in ("GIT_AUTHOR_IDENT", "GIT_COMMITTER_IDENT")
+    )
+
+
+@functools.cache
+def _scopes_work() -> bool:
+    """Whether `systemd-run --user --scope` can start a process here."""
+    if shutil.which("systemd-run") is None:
+        return False
+    try:
+        probe = subprocess.run(
+            ["systemd-run", "--user", "--scope", "-q", "true"],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return probe.returncode == 0
+
+
+def _memory_max() -> str | None:
+    """The memory cap to run a worker or check under, or None for none."""
+    limit = os.environ.get(MEMORY_MAX_ENV, DEFAULT_MEMORY_MAX).strip()
+    if limit.lower() in {"", "off", "0", "infinity"} or not _scopes_work():
+        return None
+    return limit
+
+
+def _capped(argv: list[str], limit: str | None) -> list[str]:
+    """`argv` run in its own systemd scope under `limit`, or as is for no limit.
+
+    A scope execs the command in place, so the pid is the command's own and
+    killing it kills the command; an over-cap kill shows as SIGKILL.
+    """
+    if limit is None:
+        return argv
+    return [
+        "systemd-run",
+        "--user",
+        "--scope",
+        "-q",
+        "-p",
+        f"MemoryMax={limit}",
+        "-p",
+        "MemorySwapMax=0",
+        "--",
+        *argv,
+    ]
+
+
+def _killed_note(returncode: int | None, limit: str | None) -> str:
+    """Why a capped process may have died, for a SIGKILL nobody here sent."""
+    if limit is None or returncode != -9:
+        return ""
+    return (
+        f"(It was killed with SIGKILL, most likely for going over its {limit} memory cap; "
+        f"{MEMORY_MAX_ENV} sets the cap.)"
     )
 
 
@@ -1853,9 +1922,10 @@ async def _run_check(command: str, root: Path, timeout: float) -> tuple[int, str
         return 2, f"the check will not split into arguments ({exc})"
     if not argv:
         return 2, "the check is empty"
+    limit = _memory_max()
     try:
         proc = await asyncio.create_subprocess_exec(
-            *argv,
+            *_capped(argv, limit),
             cwd=str(root),
             stdin=asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE,
@@ -1870,7 +1940,9 @@ async def _run_check(command: str, root: Path, timeout: float) -> tuple[int, str
             proc.kill()
         await proc.wait()
         return 124, f"the check timed out after {timeout:.0f}s"
-    return proc.returncode or 0, (stdout or b"").decode("utf-8", "replace").strip()
+    out = (stdout or b"").decode("utf-8", "replace").strip()
+    note = _killed_note(proc.returncode, limit)
+    return proc.returncode or 0, f"{out}\n{note}".strip() if note else out
 
 
 def _next_ready(root: Path) -> tuple[int, Any, str]:
