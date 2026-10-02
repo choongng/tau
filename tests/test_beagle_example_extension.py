@@ -2226,6 +2226,9 @@ async def test_founding_refuses_a_milestone_that_sets_the_pursuit_up(
     assert "nothing written" in named.text
     assert _calls(fake_beagle) == [] and not (project / ".beagle").exists()
     assert _module()._setup_milestone(["package layout::pyproject.toml and src/"]) is None
+    # Run 11 wrote `title: purpose`, and the purpose's words hid the title.
+    run_11 = "setup beagle pursuit: configure gates, cadences, skills, and dispatch"
+    assert _module()._setup_milestone([run_11]) is not None
 
 
 @pytest.mark.anyio
@@ -2253,6 +2256,33 @@ async def test_planning_refuses_a_setup_part_and_a_step_its_store_scope(
     assert "not opened" in step.text and "scope names .beagle/" in step.text
     assert _pursuit_calls(fake_beagle, "split") == []
     assert _pursuit_calls(fake_beagle, "open") == []
+
+
+@pytest.mark.anyio
+async def test_pursuit_step_drops_a_setup_task_instead_of_working_it(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Run 11's setup milestone got past founding, and every check the driver
+    # wrote for it ran beagle or read .beagle/, so each was refused.
+    monkeypatch.chdir(_pursuit_project(tmp_path))
+    _ready_task(fake_beagle)
+    setup = {"id": "T0002", "title": "setup beagle pursuit", "status": "pending"}
+    (fake_beagle / "show.out").write_text(json.dumps(setup))
+    (fake_beagle / "close.out").write_text("T0002 abandoned\n")
+    runtime, _ = _bound(tmp_path)
+
+    result = await _tool(runtime, "pursuit_step").execute("c1", {})
+
+    assert _pursuit_calls(fake_beagle, "close") == [
+        ["T0002", "--outcome", "abandoned", "--reason", "founding set the pursuit up"]
+    ]
+    assert _pursuit_calls(fake_beagle, "open") == [] and _runs(fake_tau) == []
+    assert "pursuit_found already did" in result.text
+    assert "call pursuit_step with no arguments" in result.text
 
 
 def _blocked_task(fake: Path, **record: Any) -> None:

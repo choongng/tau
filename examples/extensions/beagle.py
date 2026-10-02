@@ -2087,7 +2087,8 @@ def _setup_milestone(parts: list[str]) -> str | None:
     it. Founding is the setup.
     """
     for part in parts:
-        title = part.partition("::")[0]
+        # `title::purpose` is asked for, but `title: purpose` is what came.
+        title = part.split(":", 1)[0]
         words = re.findall(r"[a-z]+", title.lower())
         if (words and set(words) <= _SETUP_WORDS) or ".beagle" in part:
             return (
@@ -2504,6 +2505,16 @@ def make_step_tool() -> Any:
         if not isinstance(record, dict):
             return _step_result(f"pursuit_step: cannot read {task} (exit {rc}):\n{out}")
         title = str(record.get("title") or "")
+        if record.get("status") != "open" and _setup_milestone([title]) is not None:
+            # Founding set the pursuit up, so a set-up task has no work in the
+            # project and no check that can pass: run 11's driver spent its
+            # first turns writing checks over .beagle/ for one. It is dropped
+            # here, since a hint to abandon it is one a small model ignores.
+            return _step_result(
+                f"{task} ({title}) is setting the pursuit up, which pursuit_found already "
+                f"did, so it is not worked.\n"
+                + _abandon(task, "founding set the pursuit up", root, goal)
+            )
         criteria = str(arguments.get("criteria") or "").strip()
         done_when = str(arguments.get("done_when") or "").strip()
         scope = _strings(arguments.get("scope"))
