@@ -2360,6 +2360,52 @@ async def test_driving_session_edits_only_the_pursuit_store(
 @pytest.mark.parametrize(
     ("command", "found"),
     [
+        # What the run 9 driver did to the project through bash.
+        ("sed -i 's/a/b/' interval_tree_clocks.py", "change interval_tree_clocks.py"),
+        ("cat > justfile << 'EOF'\ntest:\n\tpytest\nEOF", "change justfile"),
+        ("git add justfile && git status", "run `git add`"),
+        ("git -C . commit -m wip", "run `git commit`"),
+        ("ruff check . --fix", "run `ruff check .`"),
+        ("uv run ruff format .", "run `ruff format .`"),
+        (
+            "python3 << 'EOF'\nwith open('x.py', 'w') as f:\n    f.write('')\nEOF",
+            "run a python3 script that writes files",
+        ),
+        ("python3 -c \"open('x.py','a').write('')\"", "run a python3 script that writes"),
+        # Reading, running, and what is not the project's work.
+        ("ruff check .", None),
+        ("uv run pytest tests/ -v 2>&1 | head -50", None),
+        ("python3 -c \"print(open('x.py').read())\"", None),
+        ("git status --short && git log --oneline", None),
+        ("rm -rf __pycache__ tests/__pycache__ .pytest_cache", None),
+        ("python3 -m pytest -q > /tmp/out.txt", None),
+        ("beagle pursuit tree > .beagle/notes.txt", None),
+    ],
+)
+@pytest.mark.anyio
+async def test_driving_session_changes_no_project_file_through_bash(
+    tmp_path: Path, beagle: Path, monkeypatch: pytest.MonkeyPatch, command: str, found: str | None
+) -> None:
+    project = _pursuit_project(tmp_path)
+    monkeypatch.chdir(project)
+    runtime, session = _bound(tmp_path)
+    bash = _tool_with_hooks(runtime, "bash")
+    await runtime.emit_session_start("startup")
+
+    result = await bash.execute("c1", {"command": command})
+    session.session_id = "subagent-session"
+    worker = await bash.execute("c2", {"command": command})
+
+    if found is None:
+        assert result.text == "ran"
+    else:
+        assert f"refusing to {found}" in result.text and "pursuit_plan" in result.text
+    assert worker.text == "ran"
+
+
+@pytest.mark.parametrize(
+    ("command", "found"),
+    [
         ("git reset --hard 781924a", "reset --hard"),
         ("cd sub && git -C .. reset --keep HEAD~1", "reset --hard"),
         ("git clean -xdf", "clean"),

@@ -2739,14 +2739,77 @@ def make_step_tool() -> Any:
     return execute
 
 
+#: Caches a tool run leaves in the project; clearing one changes no work.
+_CACHE_DIRS = frozenset({"__pycache__", ".pytest_cache", ".ruff_cache", ".mypy_cache"})
+#: `git` subcommands that change what the project's history holds.
+_GIT_CHANGES = frozenset(
+    {"add", "commit", "mv", "rm", "apply", "am", "cherry-pick", "merge", "revert", "stage"}
+)
+#: Formatters that rewrite files, and the flag that makes a linter one.
+_FORMATTERS = frozenset({"black", "isort", "autopep8", "yapf", "prettier"})
+#: Interpreters a driver writes files through with an inline script.
+_INTERPRETERS = ("python", "node", "perl", "ruby")
+#: What an inline script that writes a file says.
+_SCRIPT_WRITE = re.compile(
+    r"""open\([^)]*['"][wax]b?\+?['"]|\.write_(?:text|bytes)\(|shutil\.(?:copy|move|rmtree)"""
+    r"""|os\.(?:remove|rename|replace|unlink)\(|\.unlink\(|writeFileSync"""
+)
+
+
+def _driver_change(argv: list[str]) -> str | None:
+    """What one simple command changes in the project that a write target misses."""
+    if argv[:2] == ["uv", "run"]:
+        argv = argv[2:]
+        while argv and argv[0].startswith("-"):
+            argv = argv[1:]
+    if not argv:
+        return None
+    name = Path(argv[0]).name
+    if name.startswith("python") and argv[1:2] == ["-m"] and len(argv) > 2:
+        name, argv = argv[2], argv[2:]
+    if name == "git":
+        args = _git_args(argv)
+        return f"git {args[0]}" if args and args[0] in _GIT_CHANGES else None
+    if name in _FORMATTERS or (name == "ruff" and ("format" in argv or "--fix" in argv)):
+        return " ".join(argv[:3])
+    if name.startswith(_INTERPRETERS):
+        return name
+    return None
+
+
+def _driver_bash_change(command: str, cwd: Path, root: Path, store: Path) -> str | None:
+    """What a driver's bash command would do to the project, as "change X" or
+    "run `Y`", or None.
+
+    The write targets `_bash_write_targets` sees (beagle's store and caches
+    aside, and anything outside the project), then what it does not: `git
+    add`/`commit`, a formatter, and an inline script that writes a file.
+    """
+    for target in _bash_write_targets(command, cwd) or []:
+        path = _resolved(target)
+        inside = path == root or root in path.parents
+        stored = path == store or store in path.parents
+        if inside and not stored and not _CACHE_DIRS & set(path.parts):
+            return f"change {path.relative_to(root) if path != root else target}"
+    found = _bash_find(command, _driver_change)
+    if found is None:
+        return None
+    if found.startswith(_INTERPRETERS):
+        return f"run a {found} script that writes files" if _SCRIPT_WRITE.search(command) else None
+    return f"run `{found}`"
+
+
 def make_driver_edit_guard() -> Any:
     """Build the `tool_call` guard that keeps the driver session's hands off the work.
 
     In a founded pursuit the driving session plans, opens, dispatches and
     closes; the work is a sub-agent's. A driver that edits project files
     itself writes code no brief described and no check was bound for, and
-    spends the context the loop needs to keep going. Its `.beagle/` store is
-    left to `make_record_guard`. `BEAGLE_TAU_DRIVER_EDITS=1` lets it edit.
+    spends the context the loop needs to keep going. In run 9, with the
+    write and edit tools refused, the driver did it through bash instead:
+    `sed -i`, `cat > justfile`, Python heredocs, `ruff --fix`, `git add`.
+    Its `.beagle/` store is left to `make_record_guard`.
+    `BEAGLE_TAU_DRIVER_EDITS=1` lets it edit.
     """
 
     async def guard(event: Any, context: ExtensionContext) -> ToolCallHookResult | None:
@@ -2756,27 +2819,38 @@ def make_driver_edit_guard() -> Any:
             # Only the session the host started: an in-process subagent loads
             # this extension into a runtime of its own that never sees a
             # `session_start`, and its edits are the work.
-            if event.tool_name not in ("write", "edit") or _STARTED_SESSION is None:
+            tool = event.tool_name
+            if tool not in ("write", "edit", "bash") or _STARTED_SESSION is None:
                 return None
             if context.session_id != _STARTED_SESSION:
                 return None
             cwd = Path(context.cwd)
             goal = _find_goal(cwd)
-            target = _goal_path_from_args(event.arguments or {}, cwd)
-            if goal is None or target is None:
+            if goal is None:
                 return None
             store = _resolved(goal.parent)
-            if target == store or store in target.parents:
-                return None
+            args = event.arguments or {}
+            if tool == "bash":
+                command = str(args.get("command", ""))
+                what = _driver_bash_change(command, cwd, store.parent, store)
+                if what is None:
+                    return None
+            else:
+                target = _goal_path_from_args(args, cwd)
+                if target is None or target == store or store in target.parents:
+                    return None
+                what = f"{tool} {target}"
         except Exception:  # noqa: BLE001 - fail open, never block on a guard bug
             return None
         return ToolCallHookResult(
             block=True,
             reason=(
-                f"refusing to {event.tool_name} {target} from the driving session: in a "
-                "pursuit the work is done by sub-agents. Call pursuit_step, with what you "
+                f"refusing to {what} from the driving session: in a pursuit the work, and "
+                "its commits, are done by sub-agents. Call pursuit_step, with what you "
                 "meant to change in its notes; a sub-agent does it and the task's check "
-                f"decides. (If the user wants this session to edit, they set "
+                "decides. For work no task covers (a failing gate, a lint fix), add a task "
+                "with pursuit_plan. Reading and running (tests, `ruff check`, `git status`) "
+                f"is fine. (If the user wants this session to edit, they set "
                 f"{DRIVER_EDITS_ENV}=1.)"
             ),
         )
@@ -2791,11 +2865,17 @@ _STASH_KEEPS = frozenset({"list", "show", "pop", "apply", "branch"})
 _REBASE_ENDS = frozenset({"--abort", "--continue", "--skip", "--quit"})
 
 
-def _git_discard(argv: list[str]) -> str | None:
-    """What a `git` argv throws away or rewrites, or None when it does neither."""
+def _git_args(argv: list[str]) -> list[str]:
+    """A `git` argv from its subcommand on, past the options before it."""
     args = argv[1:]
     while args and args[0].startswith("-"):
         args = args[2:] if args[0] in _GIT_VALUE_OPTIONS else args[1:]
+    return args
+
+
+def _git_discard(argv: list[str]) -> str | None:
+    """What a `git` argv throws away or rewrites, or None when it does neither."""
+    args = _git_args(argv)
     if not args:
         return None
     sub, rest = args[0], args[1:]
