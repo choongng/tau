@@ -121,6 +121,7 @@ import re
 import shlex
 import subprocess
 import tomllib
+import uuid
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -140,6 +141,7 @@ from tau_coding.extensions import (
     ToolCallHookResult,
     ToolResultHookResult,
 )
+from tau_coding.paths import TauPaths
 from tau_coding.resources import parse_markdown_resource
 from tau_coding.skills import Skill, format_skill_invocation
 
@@ -1065,45 +1067,151 @@ class _WorkerRun:
     spent: int | None = None
     #: Why no report came back (no persona, no `tau`, timeout, cancelled).
     problem: str | None = None
+    #: The worker's session file, for reading what it did beyond its report.
+    transcript: Path | None = None
+
+    @property
+    def shown_report(self) -> str:
+        """The report as the driver reads it, with the transcript's path."""
+        if self.transcript is None:
+            return self.report
+        return f"{self.report}\n\n(Worker transcript: {self.transcript})"
 
 
 #: How often a running worker is checked for the caller's cancellation.
 _WORKER_POLL_SECONDS = 0.5
 
 
-def _worker_events(stdout: str) -> tuple[str, int | None]:
-    """The final assistant text and the peak token usage of a `--mode json` run."""
-    report = ""
+#: The worker's stdout is read in chunks this size...
+_READ_CHUNK = 1 << 16
+#: ...and a line longer than this is dropped unparsed. Only `message_end` lines
+#: are kept, and one message is far smaller; the long lines are the
+#: `message_update` events, which repeat the whole partial message every time.
+_MAX_EVENT_LINE = 16 << 20
+#: How much of a worker's stderr, and of its last thinking, a report quotes.
+_WORKER_TAIL_CHARS = 2000
+
+
+@dataclass
+class _WorkerEvents:
+    """What a `--mode json` run's `message_end` events say, read as they stream."""
+
+    #: The last non-empty assistant text.
+    report: str = ""
+    #: The largest request's tokens: the run's peak context.
     spent: int | None = None
-    for line in stdout.splitlines():
+    #: How the last assistant message ended, and its thinking.
+    stop_reason: str | None = None
+    thinking: str = ""
+    error: str | None = None
+
+    def feed(self, line: bytes) -> None:
+        if b'"message_end"' not in line[:64]:
+            return
         try:
             event = json.loads(line)
         except ValueError:
-            continue
+            return
         if not isinstance(event, dict) or event.get("type") != "message_end":
-            continue
+            return
         message = event.get("message")
         if not isinstance(message, dict) or message.get("role") != "assistant":
-            continue
+            return
         usage = message.get("usage")
         total = usage.get("totalTokens") if isinstance(usage, dict) else None
         if isinstance(total, int):
             # Each request re-sends the conversation, so a sum counts the start
             # of the run once per turn. The largest request is what the run
             # held at its peak, which is how Claude Code reports a subagent.
-            spent = max(spent or 0, total)
+            self.spent = max(self.spent or 0, total)
         content = message.get("content")
-        if isinstance(content, list):
-            text = "\n".join(
-                str(block.get("text", ""))
-                for block in content
-                if isinstance(block, dict) and block.get("type") == "text"
-            ).strip()
-            if text:
-                report = text
-        if message.get("stopReason") == "error" and message.get("errorMessage"):
-            report = f"{report}\n\n(worker error: {message['errorMessage']})".strip()
-    return report, spent
+        blocks = (
+            [block for block in content if isinstance(block, dict)]
+            if isinstance(content, list)
+            else []
+        )
+        text = "\n".join(
+            str(block.get("text", "")) for block in blocks if block.get("type") == "text"
+        ).strip()
+        if text:
+            self.report = text
+        self.thinking = "\n".join(
+            str(block.get("thinking", "")) for block in blocks if block.get("type") == "thinking"
+        ).strip()
+        stop = message.get("stopReason")
+        self.stop_reason = stop if isinstance(stop, str) else None
+        error = message.get("errorMessage")
+        self.error = str(error) if stop == "error" and error else None
+
+    def final_report(self, stderr: str) -> str:
+        """The report for the driver: always short, never the raw event stream."""
+        report = self.report
+        if self.error:
+            report = f"{report}\n\n(worker error: {self.error})".strip()
+        if not report:
+            ended = (
+                f"ended on stopReason={self.stop_reason}"
+                if self.stop_reason
+                else "produced no assistant message"
+            )
+            report = f"(The worker wrote no report: it {ended}.)"
+            if self.stop_reason == "length" and self.thinking:
+                report += (
+                    "\nIt spent its output on reasoning. The reasoning ended:\n"
+                    f"{self.thinking[-_WORKER_TAIL_CHARS:]}"
+                )
+            if stderr:
+                report += f"\nstderr ended:\n{stderr[-_WORKER_TAIL_CHARS:]}"
+        return report
+
+
+async def _read_worker_events(stream: asyncio.StreamReader, events: _WorkerEvents) -> None:
+    """Feed `events` each stdout line, holding at most one line in memory."""
+    line = bytearray()
+    skipping = False
+    while chunk := await stream.read(_READ_CHUNK):
+        start = 0
+        while (end := chunk.find(b"\n", start)) != -1:
+            if not skipping:
+                line += chunk[start:end]
+                events.feed(bytes(line))
+            line.clear()
+            skipping = False
+            start = end + 1
+        if not skipping:
+            line += chunk[start:]
+            if len(line) > _MAX_EVENT_LINE:
+                line.clear()
+                skipping = True
+    if line and not skipping:
+        events.feed(bytes(line))
+
+
+async def _read_tail(stream: asyncio.StreamReader, keep: int) -> str:
+    tail = b""
+    while chunk := await stream.read(_READ_CHUNK):
+        tail = (tail + chunk)[-keep:]
+    return tail.decode("utf-8", "replace").strip()
+
+
+async def _talk(proc: asyncio.subprocess.Process, brief: str, events: _WorkerEvents) -> str:
+    """Send the brief, read the events, wait for exit; return stderr's tail."""
+    stdin, stdout, stderr = proc.stdin, proc.stdout, proc.stderr
+    assert stdin is not None and stdout is not None and stderr is not None
+
+    async def send() -> None:
+        with contextlib.suppress(BrokenPipeError, ConnectionResetError):
+            stdin.write(brief.encode("utf-8"))
+            await stdin.drain()
+        stdin.close()
+
+    _, _, err = await asyncio.gather(
+        send(),
+        _read_worker_events(stdout, events),
+        _read_tail(stderr, _WORKER_TAIL_CHARS * 2),
+    )
+    await proc.wait()
+    return err
 
 
 async def _run_worker(
@@ -1128,11 +1236,15 @@ async def _run_worker(
             problem=f"no beagle plugin ships {STEP_EXECUTOR_REL} "
             f"(looked in {_LAYOUT.found_by or BEAGLE})."
         )
+    session_id = uuid.uuid4().hex
+    transcript = TauPaths().project_session_dir(cwd) / f"{session_id}.jsonl"
     cmd = [
         TAU_BIN,
         "-p",
         "--mode",
         "json",
+        "--session-id",
+        session_id,
         "--cwd",
         str(cwd),
         "--append-system-prompt",
@@ -1158,7 +1270,8 @@ async def _run_worker(
             "Do the work inline, or set TAU_BIN."
         )
 
-    talk = asyncio.ensure_future(proc.communicate(brief.encode("utf-8")))
+    events = _WorkerEvents()
+    talk = asyncio.ensure_future(_talk(proc, brief, events))
     loop = asyncio.get_running_loop()
     deadline = loop.time() + timeout
     problem: str | None = None
@@ -1180,15 +1293,14 @@ async def _run_worker(
             proc.kill()
         with contextlib.suppress(Exception):
             await talk
-        return _WorkerRun(returncode=proc.returncode, problem=problem)
+        return _WorkerRun(returncode=proc.returncode, problem=problem, transcript=transcript)
 
-    stdout, stderr = talk.result()
-    out = (stdout or b"").decode("utf-8", "replace")
-    err = (stderr or b"").decode("utf-8", "replace").strip()
-    report, spent = _worker_events(out)
-    if not report:
-        report = out.strip() or (f"(no stdout)\nstderr:\n{err}" if err else "(no output)")
-    return _WorkerRun(returncode=proc.returncode, report=report, spent=spent)
+    return _WorkerRun(
+        returncode=proc.returncode,
+        report=events.final_report(talk.result()),
+        spent=events.spent,
+        transcript=transcript,
+    )
 
 
 def make_dispatch() -> Any:
@@ -1234,7 +1346,7 @@ def make_dispatch() -> Any:
             "\n\n— YOU run the close, not the worker: `beagle pursuit close <task> "
             "--outcome done --spent <n>`, after running its --done-when yourself."
         )
-        return _make_dispatch_result(header + run.report + footer)
+        return _make_dispatch_result(header + run.shown_report + footer)
 
     return execute
 
@@ -2021,7 +2133,7 @@ def make_step_tool() -> Any:
         check_timeout = float(record.get("check_timeout") or DEFAULT_CHECK_TIMEOUT)
 
         spent: int | None = None
-        report = ""
+        report = shown = ""
         verdict: tuple[int, str] = (1, "")
         model = _worker_model(None)
         provider = _worker_provider(None)
@@ -2041,7 +2153,7 @@ def make_step_tool() -> Any:
                     f"pursuit_step: {task} stays open — {run.problem}\n\n"
                     f'Call pursuit_step with task="{task}" to send it again.'
                 )
-            report = run.report
+            report, shown = run.report, run.shown_report
             if not check:
                 break
             verdict = await _run_check(check, root, check_timeout)
@@ -2068,7 +2180,7 @@ def make_step_tool() -> Any:
             return _step_result(
                 f"{undid}{task} — {title}: the check still fails after {attempts} sub-agent "
                 f"run(s), so the task stays open.\n\n`{check}` exit {verdict[0]}:\n"
-                f"{verdict[1][-CHECK_TAIL_CHARS:]}\n\nLast report:\n{report}\n\n"
+                f"{verdict[1][-CHECK_TAIL_CHARS:]}\n\nLast report:\n{shown}\n\n"
                 f'Next: pursuit_step with task="{task}" and notes saying what to fix. If '
                 "the check itself is wrong — it says how it was called (a usage error, a "
                 "file it treats as an argument) rather than what is missing — pass a "
@@ -2102,7 +2214,7 @@ def make_step_tool() -> Any:
                 lock_note += f"Not locked: {'; '.join(skipped)}.\n\n"
         return _step_result(
             f"{task} — {title}: {state}.\n\n{closed}\n\n{undid}{lock_note}"
-            f"Sub-agent report:\n{report}\n\n"
+            f"Sub-agent report:\n{shown}\n\n"
             "Next: call pursuit_step with no arguments for the next task."
         )
 

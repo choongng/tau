@@ -1357,6 +1357,19 @@ message = {
     "usage": {"totalTokens": 1000},
     "stopReason": "stop",
 }
+if os.environ.get("FAKE_TAU_RAMBLES"):
+    # A worker that spends its whole output on reasoning: the update events
+    # repeat the growing message, one of them past the reader's line limit.
+    for size in (1 << 20, 1 << 20, 17 << 20):
+        partial = {"role": "assistant", "content": [{"type": "thinking", "thinking": "x" * size}]}
+        print(json.dumps({"type": "message_update", "message": partial}))
+    message = {
+        "role": "assistant",
+        "content": [{"type": "thinking", "thinking": "x" * 50_000 + " so the parser"}],
+        "usage": {"totalTokens": 1000},
+        "stopReason": "length",
+    }
+    print("worker stderr line", file=sys.stderr)
 print(json.dumps({"type": "message_end", "message": {"role": "user", "content": brief}}))
 print(json.dumps({"type": "message_end", "message": message}))
 """
@@ -1676,6 +1689,42 @@ async def test_pursuit_step_runs_a_worker_until_the_check_passes_then_closes(
     assert close[close.index("--spent") + 1] == "2000"
     assert close[close.index("--body") + 1] == "attempt 2: wrote done.txt"
     assert "closed done" in result.text and "pursuit_step with no arguments" in result.text
+
+
+@pytest.mark.anyio
+async def test_a_worker_with_no_report_gets_a_short_stub_not_its_event_stream(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Run 7: a worker ended on `length` with no text, and its whole stdout --
+    # 822 MB of message_update events -- became the step's result.
+    project = _pursuit_project(tmp_path)
+    monkeypatch.chdir(project)
+    monkeypatch.setenv("FAKE_TAU_RAMBLES", "1")
+    _ready_task(fake_beagle)
+    runtime, _ = _bound(tmp_path)
+
+    result = await _tool(runtime, "pursuit_step").execute(
+        "c1",
+        {
+            "task": "T0002",
+            "criteria": "done.txt exists",
+            "done_when": "test -f done.txt",
+            "scope": ["done.txt"],
+        },
+    )
+
+    assert len(result.text) < 20_000
+    assert "wrote no report: it ended on stopReason=length" in result.text
+    assert result.text.count("so the parser") == 1  # the tail of its thinking
+    [run, *_] = _runs(fake_tau)
+    session_id = run["argv"][run["argv"].index("--session-id") + 1]
+    assert f"{session_id}.jsonl" in result.text
+    [close] = _pursuit_calls(fake_beagle, "close")
+    assert "Worker transcript" not in close[close.index("--body") + 1]
 
 
 @pytest.mark.anyio
