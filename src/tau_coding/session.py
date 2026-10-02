@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
+import shutil
 import string
 from collections import deque
 from collections.abc import AsyncIterator, Callable, Mapping, Sequence
@@ -806,7 +808,7 @@ class CodingSession:
             project_trust_resolution=trust_resolution,
         )
         harness.config.after_tool_call = session._after_tool_call
-        harness.config.before_tool_call = session._refuse_repeated_call
+        harness.config.before_tool_call = session._refuse_unproductive_call
         if config.owns_initial_provider:
             # Ownership starts before any repair/discovery work so every
             # failure path has exactly one closer for the candidate.
@@ -1350,21 +1352,15 @@ class CodingSession:
             return DEFAULT_CONTEXT_WINDOW_TOKENS
         return provider.context_windows.get(self.model, DEFAULT_CONTEXT_WINDOW_TOKENS)
 
-    async def _refuse_repeated_call(self, call: ToolCall) -> tuple[bool, str | None]:
-        """Refuse a tool call that keeps giving the same result.
+    async def _refuse_unproductive_call(self, call: ToolCall) -> tuple[bool, str | None]:
+        """Refuse a tool call that cannot move the run on, and stop a run that keeps at it.
 
-        A small model can lock onto one call, or a pair it takes in turn, and
-        repeat it for as long as the run lasts; its result does not change, so
-        the run makes no progress. A call that ran `REPEATED_CALL_LIMIT` times
-        among the latest `REPEATED_CALL_WINDOW`, with the same result each time,
-        is refused with a note saying so, and after `REPEATED_CALL_STOP`
-        refusals in a row the run is stopped. A call whose result changes, such
-        as asking for the next task after finishing one, is not a repeat.
+        Each refusal says what to do instead, and after `REPEATED_CALL_STOP`
+        refusals in a row the run is stopped: a model that ignores the note
+        that many times will not take it.
         """
-        key = _call_key(call)
-        results = [digest for seen, digest in self._recent_calls if seen == key]
-        latest = results[-REPEATED_CALL_LIMIT:]
-        if len(latest) < REPEATED_CALL_LIMIT or len(set(latest)) > 1:
+        problem = self._tool_run_as_command(call) or self._repeated_call(call)
+        if problem is None:
             self._refused_in_a_row = 0
             return False, None
         self._refused_in_a_row += 1
@@ -1373,15 +1369,55 @@ class CodingSession:
             self._harness.cancel()
             return True, (
                 f"Not run, and the run is stopped: {self._refused_in_a_row} tool calls in "
-                "a row repeated ones whose result had not changed."
+                "a row were refused."
             )
         return True, (
-            f"Not run: this `{call.name}` call ran {len(results)} times in the last "
-            f"{len(self._recent_calls)} calls with the same result each time, and would "
-            "give it again. Use the result you already have, or take a different step. "
-            f"{REPEATED_CALL_STOP - self._refused_in_a_row} more refused calls in a row "
-            "stop the run."
+            f"Not run: {problem} {REPEATED_CALL_STOP - self._refused_in_a_row} more refused "
+            "calls in a row stop the run."
         )
+
+    def _repeated_call(self, call: ToolCall) -> str | None:
+        """Why `call` repeats one that keeps giving the same result, or None.
+
+        A small model can lock onto one call, or a pair it takes in turn, and
+        repeat it for as long as the run lasts; its result does not change, so
+        the run makes no progress. A call that ran `REPEATED_CALL_LIMIT` times
+        among the latest `REPEATED_CALL_WINDOW`, with the same result each time,
+        is a repeat. A call whose result changes, such as asking for the next
+        task after finishing one, is not.
+        """
+        key = _call_key(call)
+        results = [digest for seen, digest in self._recent_calls if seen == key]
+        latest = results[-REPEATED_CALL_LIMIT:]
+        if len(latest) < REPEATED_CALL_LIMIT or len(set(latest)) > 1:
+            return None
+        return (
+            f"this `{call.name}` call ran {len(results)} times in the last "
+            f"{len(self._recent_calls)} calls with the same result each time, and would "
+            "give it again. Use the result you already have, or take a different step."
+        )
+
+    def _tool_run_as_command(self, call: ToolCall) -> str | None:
+        """Why a `bash` call runs one of this session's tools as a command, or None.
+
+        Run 11c's driver ran `pursuit_step` through bash, was told "command
+        not found", and ran it again: nothing in that says it is a tool.
+        A tool name that is also a program on PATH is left alone.
+        """
+        if call.name != "bash":
+            return None
+        command = call.arguments.get("command")
+        if not isinstance(command, str):
+            return None
+        tools = {tool.name for tool in self._harness.config.tools}
+        for segment in re.split(r"&&|\|\||[;|\n]", command):
+            words = segment.split()
+            if words and words[0] in tools and shutil.which(words[0]) is None:
+                return (
+                    f"`{words[0]}` is one of your tools, not a shell command. Call the "
+                    f"`{words[0]}` tool itself, with its arguments, instead of bash."
+                )
+        return None
 
     async def _after_tool_call(
         self, call: ToolCall, result: AgentToolResult, is_error: bool

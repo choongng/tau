@@ -7387,6 +7387,62 @@ async def test_session_runs_a_repeated_call_whose_result_changes(tmp_path: Path)
 
 
 @pytest.mark.anyio
+async def test_session_refuses_a_tool_run_through_bash(tmp_path: Path) -> None:
+    # Run 11c: `cd ~/itc && pursuit_step` through bash, "command not found" each time.
+    shell: list[object] = []
+
+    async def bash(
+        tool_call_id: object, arguments: object, signal: object = None, on_update: object = None
+    ) -> AgentToolResult:
+        shell.append(arguments)
+        return AgentToolResult(content=[TextContent(text="ran")])
+
+    commands = ["cd /tmp && look", "ls && echo hi"]
+    turns: list[list[object]] = [
+        [
+            assistant_start(model="fake"),
+            assistant_done(
+                message=AssistantMessage(
+                    content=assistant_content(
+                        "Running.",
+                        [ToolCall(id=f"call-{i}", name="bash", arguments={"command": c})],
+                    ),
+                    stop_reason="toolUse",
+                )
+            ),
+        ]
+        for i, c in enumerate(commands)
+    ]
+    turns.append(
+        [assistant_start(model="fake"), assistant_done(message=AssistantMessage(content="Done"))]
+    )
+    bash_tool = AgentTool(
+        name="bash",
+        label="Bash",
+        description="Run.",
+        parameters={"type": "object"},
+        execute_fn=bash,
+    )
+    session = await CodingSession.load(
+        CodingSessionConfig(
+            provider=FakeProvider(turns),
+            model="fake",
+            system="You are Tau.",
+            storage=JsonlSessionStorage(tmp_path / "session.jsonl"),
+            cwd=tmp_path,
+            tools=[bash_tool, _counting_tool([])],
+        )
+    )
+
+    await _collect_session_events(session.prompt("Go."))
+
+    # `look` is a tool and no program, so it is refused; `ls` and `echo` run.
+    assert shell == [{"command": "ls && echo hi"}]
+    results = [m for m in session.messages if m.role == "toolResult"]
+    assert results[0].text.startswith("Not run: `look` is one of your tools")
+
+
+@pytest.mark.anyio
 async def test_session_stops_a_run_that_keeps_repeating_a_call(tmp_path: Path) -> None:
     same: dict[str, JSONValue] = {"where": ".beagle/log"}
 
