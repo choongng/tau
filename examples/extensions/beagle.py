@@ -1839,6 +1839,14 @@ STEP_PARAMETERS: dict[str, Any] = {
                 "start, what to leave alone, what a previous attempt got wrong."
             ),
         },
+        "new_route": {
+            "type": "boolean",
+            "description": (
+                "The task's route resisted: replace it with a new attempt at the same "
+                "criteria, done the way notes says (required). A new done_when may come "
+                "with it. A blocked task with no new_route is reworked on its own check."
+            ),
+        },
         "budget": {
             "type": "string",
             "description": "Token budget, as 40k or 100000. Default: the goal's.",
@@ -2155,6 +2163,92 @@ def _drop_pending_locks(goal: Path, task: str) -> None:
             path.write_text(json.dumps(pending, indent=1), encoding="utf-8")
 
 
+#: Retries beagle allows a task its own check blocked.
+MAX_RETRIES = 3
+
+
+def _blocked_tasks(root: Path) -> dict[str, dict[str, Any]]:
+    """The pursuit's blocked tasks by id, each its `tree --json` node."""
+    rc, out = _pursuit(["tree", "--json"], root)
+    tree = _json_reply(out) if rc == 0 else None
+    nodes = tree.get("nodes") if isinstance(tree, dict) else None
+    if not isinstance(nodes, list):
+        return {}
+    return {
+        str(node["id"]): node
+        for node in nodes
+        if isinstance(node, dict) and node.get("status") == "blocked" and node.get("id")
+    }
+
+
+def _blocked_routes(blocked: Mapping[str, Mapping[str, Any]]) -> str:
+    """What the driver can do about each blocked task, for when nothing is ready."""
+    listed = "\n".join(f"- {task} — {node.get('title', '')}" for task, node in blocked.items())
+    return (
+        f"Blocked, and holding up what comes after:\n{listed}\n\n"
+        "For each, call pursuit_step with its task and:\n"
+        "- notes saying what to fix, to rework it on the same route and check; or\n"
+        "- new_route=true and notes saying what to do differently, for a route that "
+        "resisted. A done_when that could not judge the work goes with it: the new route "
+        "is checked by that instead."
+    )
+
+
+def _retryable(record: Mapping[str, Any], done_when: str, arguments: Mapping[str, Any]) -> bool:
+    """Whether a blocked task is reworked under its own check, not spawned anew.
+
+    beagle retries only a block the task's own check made, three times; a new
+    check is a new route, since the one bound at open cannot change.
+    """
+    bound = str(record.get("done_when") or "").strip()
+    return (
+        arguments.get("new_route") is not True
+        and bool(record.get("check_refused"))
+        and int(record.get("retries") or 0) < MAX_RETRIES
+        and (not done_when or done_when == bound)
+        and _check_problem(bound) is None
+    )
+
+
+def _spawn(
+    task: str, record: Mapping[str, Any], notes: str, done_when: str, root: Path
+) -> tuple[str | None, str]:
+    """Spawn a successor to `task`: its id, or None, and what beagle said."""
+    bound = str(record.get("done_when") or "").strip()
+    reason = str(record.get("reason") or "").strip() or "the route did not get the check to pass"
+    argv = ["spawn", task, "--approach-delta", notes[:500], "--reason", reason[:500]]
+    if len(notes) > 500:
+        argv += ["--body", notes]
+    if record.get("title"):
+        argv += ["--title", str(record["title"])[:200]]
+    if done_when and done_when != bound:
+        argv.append("--check-defect")
+    rc, out = _pursuit(argv, root)
+    found = re.search(rf"{re.escape(task)} superseded by ({_TASK_ID.pattern})", out)
+    if rc != 0 or found is None:
+        return None, out
+    return found.group(1), out
+
+
+def _blocked_brief(task: str, record: Mapping[str, Any]) -> str:
+    """A worker's brief for a blocked task, which `beagle pursuit brief` refuses."""
+    lines = [f"Task {task}: {record.get('title', '')}"]
+    for label, key in (("Why", "intent"), ("Done means", "criteria")):
+        value = str(record.get(key) or "").strip()
+        if value:
+            lines.append(f"{label}: {value}")
+    lines.append(f"Check (must exit 0): `{record.get('done_when', '')}`")
+    scope = _strings(record.get("scope"))
+    if scope:
+        lines.append(f"Scope: {', '.join(scope)}")
+    reason = str(record.get("reason") or record.get("check_refused") or "").strip()
+    lines.append(
+        f"\nAn earlier attempt was closed as done, but the check refused it ({reason}). "
+        "Find what is still missing and finish the work so the check passes."
+    )
+    return "\n".join(lines)
+
+
 def make_step_tool() -> Any:
     """Build `pursuit_step`: one task, opened, done by a sub-agent, checked and closed.
 
@@ -2185,19 +2279,19 @@ def make_step_tool() -> Any:
             )
         open_ids = _ids(ready.get("open"))
         ready_ids = _ids(ready.get("ready"))
-        nothing_ready = (
-            "Nothing is ready to work.\n\n"
-            f"{_tree(root)}\n\n"
-            "If every criterion of the goal now holds, tell the user the pursuit is "
-            "done. If work remains, add it with pursuit_plan. A blocked task needs a "
-            "different route: `beagle pursuit spawn <task>`."
+        blocked = _blocked_tasks(root)
+        nothing_ready = f"Nothing is ready to work.\n\n{_tree(root)}\n\n" + (
+            _blocked_routes(blocked)
+            if blocked
+            else "If every criterion of the goal now holds, tell the user the pursuit "
+            "is done. If work remains, add it with pursuit_plan."
         )
         task = str(arguments.get("task") or "").strip()
         if not task:
             task = (open_ids or ready_ids or [""])[0]
             if not task:
                 return _step_result(nothing_ready)
-        elif task not in open_ids and task not in ready_ids:
+        elif task not in open_ids and task not in ready_ids and task not in blocked:
             # A container (done when its parts are) or a task still waiting on
             # one: opening it is refused, and offering to is where a model
             # that finished the leaves goes next.
@@ -2217,8 +2311,54 @@ def make_step_tool() -> Any:
         title = str(record.get("title") or "")
         criteria = str(arguments.get("criteria") or "").strip()
         done_when = str(arguments.get("done_when") or "").strip()
-        opened = ""
-        if task not in open_ids and record.get("status") != "open":
+        scope = _strings(arguments.get("scope"))
+        notes = str(arguments.get("notes") or "").strip()
+        opened = route = ""
+        retrying = False
+        status = record.get("status")
+        if status == "blocked" or arguments.get("new_route") is True:
+            if status == "blocked" and _retryable(record, done_when, arguments):
+                retrying = True
+            else:
+                # A route that resisted, or a check that could not judge the
+                # work: a successor, with the same end and a new way there.
+                if not notes:
+                    return _step_result(
+                        f"pursuit_step: a new route for {task} needs notes saying how it "
+                        "differs from the one that failed: what the sub-agent will do "
+                        "differently, specifically. Call pursuit_step again with them."
+                    )
+                old_check = str(record.get("done_when") or "").strip()
+                problem = _check_problem(done_when or old_check)
+                if problem is not None:
+                    if not done_when:
+                        problem = f"its check `{old_check}` cannot judge the work: {problem}"
+                    return _step_result(f"pursuit_step: no new route for {task} — {problem}")
+                old_criteria = str(record.get("criteria") or "").strip()
+                if criteria and old_criteria and criteria != old_criteria:
+                    return _step_result(
+                        f"pursuit_step: no new route for {task} — a new route changes how "
+                        f"the work is done or checked, not what it is for, so it keeps the "
+                        f"criteria: {old_criteria!r}. If the end itself is wrong, that is "
+                        "the user's to change: ask them. Call pursuit_step again without "
+                        "criteria."
+                    )
+                successor, spawned = _spawn(task, record, notes, done_when, root)
+                if successor is None:
+                    return _step_result(
+                        f"pursuit_step: `beagle pursuit spawn {task}` refused:\n{spawned}\n\n"
+                        "Say more specifically in notes how this route differs."
+                    )
+                route = f"{spawned}\n\n"
+                task = successor
+                criteria = old_criteria or criteria
+                done_when = done_when or old_check
+                scope = scope or _strings(record.get("scope"))
+                rc, out = _pursuit(["show", task], root)
+                record = _json_reply(out) if rc == 0 else None
+                if not isinstance(record, dict):
+                    return _step_result(f"pursuit_step: cannot read {task} (exit {rc}):\n{out}")
+        if not retrying and task not in open_ids and record.get("status") != "open":
             if not criteria or not done_when:
                 why = str(record.get("intent") or "").strip()
                 return _step_result(
@@ -2238,7 +2378,6 @@ def make_step_tool() -> Any:
             prose = _check_problem(done_when)
             if prose is not None:
                 return _step_result(f"pursuit_step: {task} not opened — {prose}")
-            scope = _strings(arguments.get("scope"))
             scoped = _scope_problem(scope)
             if scoped is not None:
                 return _step_result(f"pursuit_step: {task} not opened — {scoped}")
@@ -2284,10 +2423,13 @@ def make_step_tool() -> Any:
                 f'task="{task}"; it is amended.'
             )
 
-        rc, brief = _pursuit(["brief", task], root)
-        if rc != 0:
-            return _step_result(f"pursuit_step: `beagle pursuit brief {task}` failed:\n{brief}")
-        notes = str(arguments.get("notes") or "").strip()
+        if retrying:
+            # beagle briefs only an open task; a blocked one is briefed from its record.
+            brief = _blocked_brief(task, record)
+        else:
+            rc, brief = _pursuit(["brief", task], root)
+            if rc != 0:
+                return _step_result(f"pursuit_step: `beagle pursuit brief {task}` failed:\n{brief}")
         if notes:
             brief = f"{brief}\n\nFrom the driver:\n{notes}"
         locks = _pending_locks(goal, task, _strings(arguments.get("locks")))
@@ -2313,7 +2455,13 @@ def make_step_tool() -> Any:
         provider = _worker_provider(None)
         retry_note = ""
         restored: set[str] = set()
+        attempt = 0
+        if retrying:
+            # The work may have been done since, under another task.
+            verdict = await _run_check(check, root, check_timeout)
         for attempt in range(1, attempts + 1):
+            if verdict[0] == 0:
+                break
             if on_update is not None:
                 with contextlib.suppress(Exception):
                     on_update(_step_result(f"{task}: sub-agent attempt {attempt} of {attempts}"))
@@ -2329,6 +2477,7 @@ def make_step_tool() -> Any:
                 )
             report, shown = run.report, run.shown_report
             if not check:
+                verdict = (0, "")
                 break
             verdict = await _run_check(check, root, check_timeout)
             if verdict[0] == 0:
@@ -2351,19 +2500,37 @@ def make_step_tool() -> Any:
         )
 
         if check and verdict[0] != 0:
+            state = "stays blocked" if retrying else "stays open"
+            fix_check = (
+                "pass a corrected done_when with notes saying what this route does "
+                "differently; a new route is spawned with it."
+                if retrying
+                else "pass a corrected done_when too; it is amended."
+            )
             return _step_result(
-                f"{undid}{task} — {title}: the check still fails after {attempts} sub-agent "
-                f"run(s), so the task stays open.\n\n`{check}` exit {verdict[0]}:\n"
+                f"{route}{undid}{task} — {title}: the check still fails after {attempts} "
+                f"sub-agent run(s), so the task {state}.\n\n`{check}` exit {verdict[0]}:\n"
                 f"{verdict[1][-CHECK_TAIL_CHARS:]}\n\nLast report:\n{shown}\n\n"
                 f'Next: pursuit_step with task="{task}" and notes saying what to fix. If '
                 "the check itself is wrong — it says how it was called (a usage error, a "
-                "file it treats as an argument) rather than what is missing — pass a "
-                "corrected done_when too; it is amended. If this route is wrong, "
-                f"`beagle pursuit close {task} --outcome blocked --reason '<why>'`."
+                "file it treats as an argument) rather than what is missing — "
+                f"{fix_check} If this route is wrong, pursuit_step with "
+                f'task="{task}", new_route=true and notes saying what to do instead.'
             )
-        argv = ["close", task, "--outcome", "done", "--body", report[:CLOSE_BODY_CHARS] or "-"]
+        if retrying:
+            because = (
+                f"a sub-agent reworked it ({attempt} run(s)) and the check now passes"
+                if attempt
+                else "the check passes now, on work done since it refused"
+            )
+            argv = ["retry", task, "--because", because]
+        else:
+            body = report[:CLOSE_BODY_CHARS] or "-"
+            argv = ["close", task, "--outcome", "done", "--body", body]
         if spent is not None:
             argv += ["--spent", str(spent)]
+        elif retrying:
+            argv += ["--spent", "0", "--spent-because", "no sub-agent ran: " + because]
         rc, closed = _pursuit(argv, root, timeout=check_timeout + 60)
         if rc != 0 and spent is not None and "--spent-because" in closed:
             # An overrun of the task's budget: allowed, but beagle wants it said.
@@ -2374,7 +2541,8 @@ def make_step_tool() -> Any:
             rc, closed = _pursuit(
                 [*argv, "--spent-because", because], root, timeout=check_timeout + 60
             )
-        state = "closed done" if rc == 0 else f"close exited {rc}"
+        verb = "retry" if retrying else "close"
+        state = "closed done" if rc == 0 else f"{verb} exited {rc}"
         lock_note = ""
         if rc == 0 and locks:
             now, skipped = _lock(goal, root, locks)
@@ -2387,7 +2555,8 @@ def make_step_tool() -> Any:
             if skipped:
                 lock_note += f"Not locked: {'; '.join(skipped)}.\n\n"
         return _step_result(
-            f"{task} — {title}: {state}.\n\n{closed}\n\n{undid}{lock_note}"
+            f"{route}{task} — {title}: {state}.\n\n{closed}\n\n"
+            f"{undid}{lock_note}"
             f"Sub-agent report:\n{shown}\n\n"
             "Next: call pursuit_step with no arguments for the next task."
         )

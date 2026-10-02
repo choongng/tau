@@ -129,6 +129,8 @@ if sys.argv[1:3] == ["loop", "stop"]:  # as beagle does: no run in flight after
 if json.loads(stdin or "{}").get("stop_hook_active"):
     sys.exit(0)  # as beagle's Stop hooks do
 reply = here / (sys.argv[2] + ".out")
+if len(sys.argv) > 3 and (here / f"{sys.argv[2]}-{sys.argv[3]}.out").exists():
+    reply = here / f"{sys.argv[2]}-{sys.argv[3]}.out"  # one task's own reply
 if len(sys.argv) > 2 and reply.exists():
     sys.stdout.write(reply.read_text())
 status = here / (sys.argv[2] + ".rc")
@@ -139,8 +141,8 @@ if len(sys.argv) > 2 and status.exists():
 
 @pytest.fixture
 def fake_beagle(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
-    """A `beagle` that logs each call, prints `<argv[2]>.out` when it exists and
-    exits with `<argv[2]>.rc`'s status (else 0)."""
+    """A `beagle` that logs each call, prints `<argv[2]>-<argv[3]>.out` or else
+    `<argv[2]>.out` when it exists, and exits with `<argv[2]>.rc`'s status (else 0)."""
     here = tmp_path / "fake-beagle"
     here.mkdir()
     script = here / "beagle"
@@ -1870,7 +1872,7 @@ async def test_pursuit_step_keeps_a_task_open_while_its_check_fails(
     assert _pursuit_calls(fake_beagle, "open") == []
     # A done close the check refuses would block the task for good.
     assert _pursuit_calls(fake_beagle, "close") == []
-    assert "stays open" in result.text and "--outcome blocked" in result.text
+    assert "stays open" in result.text and "new_route=true" in result.text
 
 
 @pytest.mark.anyio
@@ -2026,6 +2028,147 @@ async def test_planning_refuses_a_setup_part_and_a_step_its_store_scope(
     assert "not opened" in step.text and "scope names .beagle/" in step.text
     assert _pursuit_calls(fake_beagle, "split") == []
     assert _pursuit_calls(fake_beagle, "open") == []
+
+
+def _blocked_task(fake: Path, **record: Any) -> None:
+    """T0002, closed as done but refused by its own check: nothing is ready."""
+    (fake / "next.out").write_text(json.dumps({"open": [], "ready": [], "ready_total": 0}))
+    blocked = {
+        "id": "T0002",
+        "title": "Parser",
+        "intent": "reads input",
+        "status": "blocked",
+        "criteria": "the parser reads input",
+        "done_when": "test -f done.txt",
+        "scope": ["src/parser.py"],
+        "check_refused": "exit 1",
+        "reason": "closed as done, but `test -f done.txt` exit 1",
+        "retries": 0,
+        **record,
+    }
+    (fake / "show-T0002.out").write_text(json.dumps(blocked))
+    nodes = [{"id": "T0001", "status": "pending", "container": True}, blocked]
+    (fake / "tree.out").write_text(json.dumps({"goal": "Ship it", "nodes": nodes}))
+
+
+@pytest.mark.anyio
+async def test_pursuit_step_offers_the_routes_for_a_blocked_task(
+    tmp_path: Path, beagle: Path, fake_beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(_pursuit_project(tmp_path))
+    _blocked_task(fake_beagle)
+    runtime, _ = _bound(tmp_path)
+
+    result = await _tool(runtime, "pursuit_step").execute("c1", {})
+
+    assert "Nothing is ready" in result.text and "- T0002 — Parser" in result.text
+    assert "new_route=true" in result.text and "beagle pursuit" not in result.text
+
+
+@pytest.mark.anyio
+async def test_pursuit_step_reworks_a_blocked_task_and_retries_it(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.chdir(_pursuit_project(tmp_path))
+    _blocked_task(fake_beagle)
+    runtime, _ = _bound(tmp_path)
+
+    result = await _tool(runtime, "pursuit_step").execute(
+        "c1", {"task": "T0002", "notes": "the parser never wrote done.txt"}
+    )
+
+    [run] = _runs(fake_tau)
+    # beagle briefs only an open task; this one is briefed from its record.
+    assert "refused it" in run["stdin"] and "the parser never wrote done.txt" in run["stdin"]
+    assert _pursuit_calls(fake_beagle, "brief") == []
+    [retry] = _pursuit_calls(fake_beagle, "retry")
+    assert retry[0] == "T0002" and "--because" in retry and "--spent" in retry
+    assert _pursuit_calls(fake_beagle, "close") == [] == _pursuit_calls(fake_beagle, "spawn")
+    assert "T0002 — Parser: closed done" in result.text
+
+
+@pytest.mark.anyio
+async def test_pursuit_step_retries_a_blocked_task_whose_check_now_passes(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project = _pursuit_project(tmp_path)
+    monkeypatch.chdir(project)
+    _blocked_task(fake_beagle)
+    (project / "done.txt").write_text("done under another task")
+    runtime, _ = _bound(tmp_path)
+
+    await _tool(runtime, "pursuit_step").execute("c1", {"task": "T0002"})
+
+    assert _runs(fake_tau) == []
+    [retry] = _pursuit_calls(fake_beagle, "retry")
+    assert retry[retry.index("--spent") + 1] == "0" and "--spent-because" in retry
+
+
+@pytest.mark.anyio
+async def test_pursuit_step_spawns_a_new_route_for_a_blocked_task(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.chdir(_pursuit_project(tmp_path))
+    # Run 8's T0003: bound to a grep of its own task file, which no rework fixes.
+    _blocked_task(fake_beagle, done_when="grep -q parser .beagle/tree/T0002.md")
+    successor = {"id": "T0003", "title": "Parser", "status": "pending", "done_when": ""}
+    (fake_beagle / "show-T0003.out").write_text(json.dumps(successor))
+    (fake_beagle / "spawn.out").write_text("T0002 superseded by T0003\n")
+    (fake_beagle / "brief.out").write_text("# T0003: Parser\n")
+    runtime, _ = _bound(tmp_path)
+    step = _tool(runtime, "pursuit_step")
+    new_check = {"task": "T0002", "done_when": "test -f done.txt"}
+
+    no_notes = await step.execute("c1", new_check)
+    no_check = await step.execute("c0", {"task": "T0002", "notes": "x"})
+    new_end = await step.execute("c2", {**new_check, "notes": "x", "criteria": "it parses"})
+    result = await step.execute("c3", {**new_check, "notes": "check the file it writes"})
+
+    assert "needs notes" in no_notes.text and "keeps the criteria" in new_end.text
+    # Not retried on the grep, and no successor left behind with it.
+    assert "cannot judge the work" in no_check.text and "reads .beagle/" in no_check.text
+    [spawn] = _pursuit_calls(fake_beagle, "spawn")
+    assert spawn[0] == "T0002" and "--check-defect" in spawn
+    assert spawn[spawn.index("--approach-delta") + 1] == "check the file it writes"
+    [opened] = _pursuit_calls(fake_beagle, "open")
+    assert opened[0] == "T0003"
+    assert opened[opened.index("--criteria") + 1] == "the parser reads input"
+    assert opened[opened.index("--done-when") + 1] == "test -f done.txt"
+    assert opened[opened.index("--scope") + 1] == "src/parser.py"
+    [close] = _pursuit_calls(fake_beagle, "close")
+    assert close[0] == "T0003" and _pursuit_calls(fake_beagle, "retry") == []
+    assert "superseded by T0003" in result.text and "T0003 — Parser: closed done" in result.text
+
+
+@pytest.mark.anyio
+async def test_pursuit_step_spawns_from_a_blocked_task_out_of_retries(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.chdir(_pursuit_project(tmp_path))
+    _blocked_task(fake_beagle, retries=3)
+    (fake_beagle / "spawn.out").write_text("T0002 superseded by T0003\n")
+    runtime, _ = _bound(tmp_path)
+
+    await _tool(runtime, "pursuit_step").execute("c1", {"task": "T0002", "notes": "smaller"})
+
+    [spawn] = _pursuit_calls(fake_beagle, "spawn")
+    assert "--check-defect" not in spawn and _pursuit_calls(fake_beagle, "retry") == []
 
 
 @pytest.mark.anyio
