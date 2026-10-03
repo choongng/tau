@@ -2359,8 +2359,7 @@ def _commit(task: str, title: str, scope: list[str], root: Path) -> str:
     if rc != 0 and "--no-claims" in out:
         rc, out = _pursuit([*argv, "--no-claims"], root)
     if rc != 0:
-        # A refused commit leaves its paths staged; put the index back.
-        _run(["git", "reset", "--quiet", "--", *paths], root, timeout=30.0)
+        # beagle puts the index back itself when it refuses after staging.
         return f"Not committed (`pursuit commit` exit {rc}):\n{out[-PROVE_TAIL_CHARS:]}"
     return out.splitlines()[0] if out else f"Committed {len(paths)} file(s)."
 
