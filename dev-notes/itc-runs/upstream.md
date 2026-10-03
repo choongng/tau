@@ -183,3 +183,4 @@ guards and buffers, or in the model.
 
 Nothing else for beagle: the run's main failure is tau's setup-milestone
 detector (R10.md, first tau class).
+- `pursuit open` refused a check script because a *comment* in it read "…Setup beagle pursuit infrastructure…": the self-modifying-check scan matched `beagle pursuit <word>` in a comment. Suggest: skip comment lines, or only match known pursuit verbs.

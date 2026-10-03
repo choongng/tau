@@ -3252,6 +3252,24 @@ _SETUP_WORDS = frozenset(
         "and",
     }
 )
+#: A title naming beagle or the pursuit with one of `_SETUP_ACTS` sets the
+#: pursuit up, whatever else it names: R10's 'Setup beagle pursuit infrastructure'.
+_PURSUIT_NAMES = frozenset({"beagle", "pursuit"})
+_SETUP_ACTS = frozenset(
+    {
+        "setup",
+        "set",
+        "init",
+        "initialize",
+        "initialise",
+        "configure",
+        "config",
+        "configuration",
+        "infrastructure",
+        "install",
+        "bootstrap",
+    }
+)
 
 
 def _setup_milestone(parts: list[str]) -> str | None:
@@ -3263,10 +3281,12 @@ def _setup_milestone(parts: list[str]) -> str | None:
     it. Founding is the setup.
     """
     for part in parts:
-        # `title::purpose` is asked for, but `title: purpose` is what came.
-        title = part.split(":", 1)[0]
-        words = re.findall(r"[a-z]+", title.lower())
-        if (words and set(words) <= _SETUP_WORDS) or ".beagle" in part:
+        # `title::purpose` is asked for, but `title: purpose` (run 11) and
+        # `title - purpose` (R10) are what came.
+        title = re.split(r":| - | — ", _split_part(part)[0], maxsplit=1)[0]
+        words = set(re.findall(r"[a-z]+", title.lower()))
+        names_setup = bool(words & _PURSUIT_NAMES) and bool(words & _SETUP_ACTS)
+        if (words and words <= _SETUP_WORDS) or names_setup or ".beagle" in part:
             return (
                 f"{title.strip()!r} is not part of the goal's work: pursuit_found is what "
                 "sets the pursuit up, and it is done once it is founded. Leave it out. If "
