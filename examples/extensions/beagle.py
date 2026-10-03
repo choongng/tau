@@ -2055,6 +2055,7 @@ def _commit_setup(root: Path) -> str | None:
         timeout=60.0,
     )
     if rc != 0:
+        _run(["git", "reset", "-q", "--", *staged], root, timeout=30.0)
         return f"`git commit` failed: {out}"
     return None
 
