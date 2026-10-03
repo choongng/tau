@@ -6023,3 +6023,53 @@ def test_stop_gate_founded_session_gets_no_unfounded_followup(
     assert len(sent) == 1
     assert sent[0].startswith("[beagle] The pursuit is not done") and "T0002" in sent[0]
     assert not any("Nothing is founded" in s for s in sent)
+
+
+def _event_line(message: dict[str, Any]) -> bytes:
+    return json.dumps({"type": "message_end", "message": message}).encode()
+
+
+def _tool_result(text: str) -> dict[str, Any]:
+    return {
+        "role": "toolResult",
+        "toolCallId": "call-1",
+        "toolName": "bash",
+        "content": [{"type": "text", "text": text}],
+        "isError": True,
+    }
+
+
+_PROVIDER_ERROR = {
+    "role": "assistant",
+    "content": [],
+    "stopReason": "error",
+    "errorMessage": "Provider stream ended without a final response",
+}
+
+
+def test_worker_stopped_by_the_breaker_reports_the_refused_call() -> None:
+    problem = "this exact call already ran; its result has not changed."
+    events = _module()._WorkerEvents()
+    events.feed(
+        _event_line(_tool_result(f"Not run: {problem} 1 more refused calls in a row stop the run."))
+    )
+    events.feed(
+        _event_line(
+            _tool_result("Not run, and the run is stopped: 3 tool calls in a row were refused.")
+        )
+    )
+    events.feed(_event_line(_PROVIDER_ERROR))
+
+    report = events.final_report("")
+
+    assert "stopped by tau after repeated refused calls" in report
+    assert f"the last refusal: {problem})" in report
+    assert "more refused calls" not in report
+    assert "worker error" not in report
+
+    unstopped = _module()._WorkerEvents()
+    unstopped.feed(
+        _event_line(_tool_result(f"Not run: {problem} 2 more refused calls in a row stop the run."))
+    )
+    unstopped.feed(_event_line(_PROVIDER_ERROR))
+    assert "(worker error: Provider stream ended" in unstopped.final_report("")

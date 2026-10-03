@@ -1166,6 +1166,13 @@ _MAX_EVENT_LINE = 16 << 20
 _WORKER_TAIL_CHARS = 2000
 
 
+#: How tau's repeat breaker words a refused call's tool result, and the stop.
+_REFUSED = "Not run: "
+_BREAKER_STOP = "Not run, and the run is stopped"
+#: The countdown sentence tau appends to each refusal's problem.
+_REFUSAL_COUNTDOWN = re.compile(r"\s*\d+ more refused calls? in a row stop the run\.\s*$")
+
+
 @dataclass
 class _WorkerEvents:
     """What a `--mode json` run's `message_end` events say, read as they stream."""
@@ -1178,6 +1185,10 @@ class _WorkerEvents:
     stop_reason: str | None = None
     thinking: str = ""
     error: str | None = None
+    #: The problem in the last tool result tau refused a call with, if any.
+    refusal: str | None = None
+    #: Whether tau's breaker stopped the run after refused calls in a row.
+    stopped: bool = False
 
     def feed(self, line: bytes) -> None:
         if b'"message_end"' not in line[:64]:
@@ -1189,6 +1200,9 @@ class _WorkerEvents:
         if not isinstance(event, dict) or event.get("type") != "message_end":
             return
         message = event.get("message")
+        if isinstance(message, dict) and message.get("role") == "toolResult":
+            self._note_refusal(message.get("content"))
+            return
         if not isinstance(message, dict) or message.get("role") != "assistant":
             return
         usage = message.get("usage")
@@ -1217,10 +1231,33 @@ class _WorkerEvents:
         error = message.get("errorMessage")
         self.error = str(error) if stop == "error" and error else None
 
+    def _note_refusal(self, content: object) -> None:
+        """Track tau's refusals: the last one's problem, and the breaker's stop."""
+        if isinstance(content, str):
+            text = content
+        elif isinstance(content, list):
+            text = "".join(
+                str(block.get("text", ""))
+                for block in content
+                if isinstance(block, dict) and block.get("type") == "text"
+            )
+        else:
+            return
+        text = text.strip()
+        if text.startswith(_BREAKER_STOP):
+            self.stopped = True
+        elif text.startswith(_REFUSED):
+            problem = text.removeprefix(_REFUSED)
+            self.refusal = _REFUSAL_COUNTDOWN.sub("", problem).strip()
+
     def final_report(self, stderr: str) -> str:
         """The report for the driver: always short, never the raw event stream."""
         report = self.report
-        if self.error:
+        if self.stopped:
+            last = f"; the last refusal: {self.refusal}" if self.refusal else ""
+            stopped = f"(the sub-agent was stopped by tau after repeated refused calls{last})"
+            report = f"{report}\n\n{stopped}".strip()
+        elif self.error:
             report = f"{report}\n\n(worker error: {self.error})".strip()
         if not report:
             ended = (
