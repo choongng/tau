@@ -1,0 +1,4 @@
+#!/bin/bash
+set -eu
+bash .beagle/checks/fix/named_tests.sh tests/test_beagle_example_extension.py 5 test_worker_guard_refuses_beagle_commands_and_beagle_reads test_worker_guard_refuses_python_one_liner_write_out_of_scope test_check_problem_refuses_import_only_python_c test_prove_skips_witness_in_test_file test_abandon_problem_refuses_root
+echo OK
