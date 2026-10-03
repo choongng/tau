@@ -1,0 +1,4 @@
+#!/bin/bash
+set -eu
+bash .beagle/checks/fix/named_tests.sh tests/test_beagle_example_extension.py 3 test_found_first_steer_carries_reference_extracts test_found_reuses_references_fetched_before_founding test_reference_extract_is_title_and_opening
+echo OK
