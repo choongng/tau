@@ -94,3 +94,31 @@ in the per-run notes.
 ## R07
 
 Nothing for beagle. The run never reached beagle: tau's founding tool refused a milestone list that was only setup (tau T0054).
+
+## R08
+
+- **An abandoned part leaves its container stalled for good, and a wait
+  on it never resolves.** At L88 and L98, T0013 and T0014 were abandoned
+  as duplicates of their done sibling T0015, after their checks already
+  passed. T0011 became stalled, and its own check passed (L101). But
+  `_refuse_container_close` (pursuit.py ~L5816) never closes a container
+  done, and `dep_standing` (~L1846) never satisfies a wait on a stalled
+  heir. T0007 waited from 52.9 min to the end. Proposal: a container whose
+  undone parts are all abandoned as duplicates of a done sibling may close
+  done on its own check. Or `tree` prints, under a stalled container, the
+  waits it blocks and the `depend W N --drop` command for each.
+  Priority: high.
+- **Closing a container abandoned does not release waits that reach it
+  through a superseded predecessor's heir.** At L306, T0011 closed
+  abandoned, and T0007 still "waits T0011 (for T0006)", because the edge
+  is on T0006. Proposal: `close --outcome abandoned` lists those waiters,
+  or drops them as it does for direct ones. Priority: medium.
+- **The wait text shows the row status, not the subtree state.** For
+  T0011, "handed to T0011: pending" was shown while `tree` drew "✗
+  stalled" (L99, L107). Showing "stalled" in the heir's standing would
+  have told the driver the wait is dead. Priority: low.
+- **`beagle init` does not say its files need committing.** The
+  workspace-clean gate was red from the first close (T0002) to the end
+  of the run. `init` could print "commit .beagle/*.toml, memory-rubric.md
+  and .gitignore", or the gate could ignore beagle's own config until
+  the first commit. Priority: low.
