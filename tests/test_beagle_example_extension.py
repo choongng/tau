@@ -4100,6 +4100,98 @@ async def test_nothing_ready_names_each_blocking_edge(
             assert all(line in text for line in lines.values())
 
 
+#: Run R08's tree at L99, cut down: T0007 waits on T0006, superseded by
+#: T0011, a container stalled on two abandoned parts.
+STALLED_HEIR_TREE: list[dict[str, Any]] = [
+    {"id": "T0001", "parent": "", "title": "ITC", "status": "pending", "container": True},
+    {
+        "id": "T0004",
+        "parent": "T0001",
+        "title": "Impl",
+        "status": "pending",
+        "container": True,
+        "subtree": "idle",
+    },
+    {"id": "T0006", "parent": "T0004", "title": "fix-id-usage", "status": "superseded"},
+    {
+        "id": "T0007",
+        "parent": "T0004",
+        "title": "implement-fill",
+        "status": "pending",
+        "waiting_on": ["T0006"],
+        "waiting_heirs": {"T0006": "T0011"},
+    },
+    {
+        "id": "T0011",
+        "parent": "T0004",
+        "title": "fix-id-usage",
+        "status": "pending",
+        "container": True,
+        "subtree": "stalled",
+        "sibling_of": "T0006",
+    },
+    {"id": "T0013", "parent": "T0011", "title": "fix-normalization", "status": "abandoned"},
+    {"id": "T0014", "parent": "T0011", "title": "fix-grow", "status": "abandoned"},
+    {"id": "T0015", "parent": "T0011", "title": "fix-event", "status": "done"},
+]
+
+
+@pytest.mark.anyio
+async def test_abandon_releases_a_wait_routed_through_its_heir(
+    tmp_path: Path, beagle: Path, fake_beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # R08 L306: abandoning T0011 left T0007's wait on T0006, handed to T0011.
+    monkeypatch.chdir(_pursuit_project(tmp_path))
+    _ready_task(fake_beagle)
+    (fake_beagle / "tree.out").write_text(json.dumps({"nodes": STALLED_HEIR_TREE}))
+    (fake_beagle / "close.out").write_text("T0011 abandoned\n")
+    runtime, _ = _bound(tmp_path)
+    step = _tool(runtime, "pursuit_step")
+
+    result = await step.execute("c1", {"task": "T0011", "abandon": "duplicate of T0015"})
+
+    assert _pursuit_calls(fake_beagle, "close") == [
+        ["T0011", "--outcome", "abandoned", "--reason", "duplicate of T0015"]
+    ]
+    assert _pursuit_calls(fake_beagle, "depend") == [
+        ["T0007", "T0006", "--drop", "--reason", "T0011 abandoned: duplicate of T0015"]
+    ]
+    assert "No longer waiting on it: T0007." in result.text
+
+
+@pytest.mark.anyio
+async def test_nothing_ready_names_the_drop_for_a_wait_on_a_stalled_heir(
+    tmp_path: Path, beagle: Path, fake_beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # R08 L107: the text said "handed to T0011: pending" and offered plan or
+    # new_route; `depend T0007 T0006 --drop` was never named.
+    monkeypatch.chdir(_pursuit_project(tmp_path))
+    abandoned = [
+        {**n, "status": "abandoned"} if n["id"] == "T0011" else n for n in STALLED_HEIR_TREE
+    ]
+    live = [{**n, "subtree": "active"} if n["id"] == "T0011" else n for n in STALLED_HEIR_TREE]
+    for nodes, state in ((STALLED_HEIR_TREE, "stalled"), (abandoned, "stalled"), (live, None)):
+        _nothing_ready(fake_beagle, nodes)
+        runtime, _ = _bound(tmp_path)
+
+        text = (await _tool(runtime, "pursuit_step").execute("c1", {})).text
+
+        assert "Nothing is ready" in text
+        if state is None:
+            assert "--drop" not in text and "can never be met" not in text
+            assert "waits on T0006 (superseded, handed to T0011: pending)" in text
+            continue
+        assert "can never be met" in text
+        assert f"- T0007 waits on T0006 (superseded, handed to T0011: {state})" in text
+        assert "handed to T0011: pending" not in text
+        assert (
+            "beagle pursuit depend T0007 T0006 --drop --reason "
+            f'"T0006 was handed to T0011, which is {state} and will never be done"'
+        ) in text
+        assert "pursuit_plan" not in text and "new_route" not in text
+    assert _pursuit_calls(fake_beagle, "depend") == []
+
+
 def _say(text: str) -> list[Any]:
     from pi_event_helpers import assistant_done, assistant_start
 

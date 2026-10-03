@@ -2094,16 +2094,21 @@ def _release_waiters(task: str, why: str, root: Path) -> list[str]:
 
     beagle counts an abandoned task as never done, so a task waiting on one
     waits for ever: run 10's driver abandoned T0005 and found nothing ready.
+    A wait on a superseded task whose heir is `task` is dropped too: run R08's
+    T0007 waited on T0006, handed to T0011, and abandoning T0011 left it.
     """
-    rc, out = _pursuit(["tree", "--json"], root)
-    tree = _json_reply(out) if rc == 0 else None
-    nodes = tree.get("nodes") if isinstance(tree, dict) else None
+    nodes = _tree_nodes(root)
     released = []
-    for node in nodes if isinstance(nodes, list) else []:
-        if isinstance(node, dict) and task in (node.get("waiting_on") or []):
+    for node in nodes:
+        heirs = node.get("waiting_heirs")
+        heirs = heirs if isinstance(heirs, dict) else {}
+        for named in node.get("waiting_on") or []:
+            named = str(named)
+            if task not in (named, str(heirs.get(named) or ""), _heir(named, nodes)):
+                continue
             waiter = str(node.get("id"))
             reason = f"{task} abandoned: {why}"[:500]
-            if _pursuit(["depend", waiter, task, "--drop", "--reason", reason], root)[0] == 0:
+            if _pursuit(["depend", waiter, named, "--drop", "--reason", reason], root)[0] == 0:
                 released.append(waiter)
     return released
 
@@ -2174,13 +2179,63 @@ def _hard_waits(nodes: list[dict[str, Any]]) -> dict[str, list[_Wait]]:
     return waits
 
 
+def _state(task: str, nodes: list[dict[str, Any]]) -> str | None:
+    """`task`'s status, or "stalled" for a container whose subtree beagle calls stalled."""
+    for node in nodes:
+        if str(node.get("id")) == task:
+            if node.get("container") and node.get("subtree") == "stalled":
+                return "stalled"
+            return node.get("status")
+    return None
+
+
 def _wait_text(wait: _Wait, nodes: list[dict[str, Any]]) -> str:
     """One hard wait in words: `waits on T0002 (superseded, handed to T0008: pending)`."""
     _, named, now = wait
-    status = {str(n.get("id")): n.get("status") for n in nodes}
     if named != now:
-        return f"waits on {named} (superseded, handed to {now}: {status.get(now)})"
-    return f"waits on {named} ({status.get(named)})"
+        return f"waits on {named} (superseded, handed to {now}: {_state(now, nodes)})"
+    return f"waits on {named} ({_state(named, nodes)})"
+
+
+def _dead_waits(nodes: list[dict[str, Any]]) -> list[_Wait]:
+    """The hard waits of unfinished tasks that can never be met, in tree order.
+
+    A wait is dead when the task it names, or that task's heir, is abandoned or
+    a stalled container. Run R08's T0007 waited on T0006, handed to stalled
+    T0011, and nothing was ready for the last 6.7 minutes.
+    """
+    dead: list[_Wait] = []
+    for node in nodes:
+        if node.get("status") in ("done", "abandoned", "superseded"):
+            continue
+        task = str(node.get("id"))
+        heirs = node.get("waiting_heirs")
+        heirs = heirs if isinstance(heirs, dict) else {}
+        for named in node.get("waiting_on") or []:
+            named = str(named)
+            now = str(heirs.get(named) or "") or _heir(named, nodes)
+            if any(_state(t, nodes) in ("abandoned", "stalled") for t in (named, now)):
+                dead.append((task, named, now))
+    return dead
+
+
+def _dead_wait_drops(dead: list[_Wait], nodes: list[dict[str, Any]]) -> str:
+    """What to tell the driver about waits that can never be met: each one's drop."""
+
+    def reason(named: str, now: str) -> str:
+        handed = f" was handed to {now}, which" if now != named else ""
+        return f"{named}{handed} is {_state(now, nodes)} and will never be done"
+
+    drops = "\n".join(
+        f'    beagle pursuit depend {waiter} {named} --drop --reason "{reason(named, now)}"'
+        for waiter, named, now in dead
+    )
+    return (
+        "These hard waits can never be met, so the tasks that hold them can never start:\n"
+        + "\n".join(f"- {w[0]} {_wait_text(w, nodes)}" for w in dead)
+        + f"\n\nDrop each one. Run in bash, exactly:\n\n{drops}\n\n"
+        "then call pursuit_step with no arguments."
+    )
 
 
 def _wait_cycle(nodes: list[dict[str, Any]]) -> list[_Wait] | None:
@@ -3764,8 +3819,11 @@ def make_step_tool() -> Any:
         nodes = _tree_nodes(root)
         left = _unfinished(nodes)
         cycle = _wait_cycle(nodes)
+        dead = _dead_waits(nodes)
         if cycle:
             after = _cycle_break(cycle, nodes)
+        elif dead:
+            after = _dead_wait_drops(dead, nodes)
         elif blocked:
             after = _blocked_routes(blocked)
         elif left:
