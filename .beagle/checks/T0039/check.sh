@@ -1,0 +1,4 @@
+#!/bin/bash
+set -eu
+bash .beagle/checks/fix/named_tests.sh tests/test_beagle_example_extension.py 4 test_cases_task_proves_by_absent_data_file test_cases_task_locks_scope_when_none_given test_unproven_text_for_tests_only_scope_does_not_say_import test_cases_task_with_implementation_in_test_file_stays_open
+echo OK
