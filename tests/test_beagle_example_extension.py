@@ -3435,6 +3435,38 @@ async def test_found_drops_setup_milestone_and_says_so(
     ]
 
 
+@pytest.mark.anyio
+async def test_founding_drops_a_rerun_only_milestone_with_a_note(
+    tmp_path: Path, beagle: Path, fake_beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    monkeypatch.chdir(project)
+    (fake_beagle / "add.out").write_text("T0001  Implement interval tree clocks\n")
+    runtime, _ = _bound(tmp_path)
+
+    result = await _tool(runtime, "pursuit_found").execute(
+        "c1",
+        {
+            "statement": "Implement interval tree clocks",
+            "criteria": ["`python3 -m pytest -q` exits 0"],
+            "milestones": [
+                "reference::",
+                "Run all tests and confirm they pass",
+                "impl::itc.py",
+                "tests::tests/test_itc.py",
+            ],
+            "user_confirmed": True,
+        },
+    )
+
+    assert "Founded the pursuit" in result.text
+    assert "Dropped a milestone: 'Run all tests and confirm they pass' only re-runs" in result.text
+    assert _pursuit_calls(fake_beagle, "split") == [
+        ["T0001", "reference::", "impl::itc.py", "tests::tests/test_itc.py", "--ordered"]
+    ]
+
+
 R10_MILESTONES = [
     "Setup beagle pursuit infrastructure - configure project for beagle workflows",
     "Read and understand reference materials - analyze the ITC2008 paper and ferd.ca notes",

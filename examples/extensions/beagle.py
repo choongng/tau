@@ -3407,18 +3407,24 @@ def _rerun_only_part(parts: list[str]) -> str | None:
 def _repair_milestones(milestones: list[str]) -> tuple[list[str], list[str]]:
     """`milestones` with what founding can fix fixed, and a note for each fix.
 
-    A setup milestone is dropped and an over-long title is cut at a word, its
-    whole text moved after '::'. With every milestone dropped, nothing is
-    left: the list comes back empty and the one note says why.
+    A setup milestone and one that only re-runs a check are dropped, and an
+    over-long title is cut at a word, its whole text moved after '::'. With
+    every milestone dropped, nothing is left: the list comes back empty and
+    the one note says why.
     """
     kept: list[str] = []
     dropped: list[str] = []
+    reruns: list[tuple[str, str]] = []
     for part in milestones:
         if _setup_milestone([part]) is not None:
             dropped.append(part)
+        elif (why := _rerun_only_part([part])) is not None:
+            reruns.append((part, why))
         else:
             kept.append(part)
     if not kept:
+        if reruns and not dropped:
+            return [], [reruns[0][1]]
         return [], [_setup_milestone(dropped) or "every milestone sets the pursuit up."]
     notes = []
     if dropped:
@@ -3427,6 +3433,8 @@ def _repair_milestones(milestones: list[str]) -> tuple[list[str], list[str]]:
             f"Dropped the setup milestone {named}: founding is the setup, so it is not "
             "part of the goal's work. The milestones are the rest."
         )
+    for _part, why in reruns:
+        notes.append(f"Dropped a milestone: {why}")
     repaired: list[str] = []
     for index, part in enumerate(kept, 1):
         title, sep, intent = part.partition("::")
