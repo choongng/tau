@@ -3122,7 +3122,9 @@ def _scope_problem(
     )
 
 
-_SCOPE_WALK_SKIP = frozenset({".git", ".beagle", "__pycache__", ".venv", "node_modules"})
+_SCOPE_WALK_SKIP = frozenset(
+    {".git", ".beagle", "__pycache__", ".venv", "node_modules", ".tox", ".nox"}
+)
 _SCOPE_WALK_LIMIT = 2000
 
 
@@ -3130,7 +3132,9 @@ def _scope_dir_files(root: Path, rel: str) -> list[str]:
     """The files under a scope directory, relative to root, bounded and sorted."""
     found: list[str] = []
     for dirpath, dirnames, filenames in os.walk(root / rel):
-        dirnames[:] = sorted(d for d in dirnames if d not in _SCOPE_WALK_SKIP)
+        dirnames[:] = sorted(
+            d for d in dirnames if d not in _SCOPE_WALK_SKIP and not d.endswith("_cache")
+        )
         for name in sorted(filenames):
             found.append(Path(dirpath, name).relative_to(root).as_posix())
             if len(found) >= _SCOPE_WALK_LIMIT:

@@ -3789,6 +3789,16 @@ async def test_step_refuses_directory_scopes_holding_unlocked_data_and_source(
     assert len(_pursuit_calls(fake_beagle, "open")) == 1
 
 
+def test_scope_dir_walk_skips_cache_directories(tmp_path: Path) -> None:
+    (tmp_path / "pkg" / "src").mkdir(parents=True)
+    (tmp_path / "pkg" / "src" / "x.py").write_text("")
+    cache = tmp_path / "pkg" / ".pytest_cache" / "v" / "cache"
+    cache.mkdir(parents=True)
+    (cache / "lastfailed").write_text("{}")
+
+    assert _module()._scope_dir_files(tmp_path, "pkg") == ["pkg/src/x.py"]
+
+
 @pytest.mark.anyio
 async def test_step_accepts_a_source_directory_alone(
     tmp_path: Path,
