@@ -232,6 +232,17 @@ def main(
             ),
         ),
     ] = None,
+    max_turns: Annotated[
+        int | None,
+        typer.Option(
+            "--max-turns",
+            min=1,
+            help=(
+                "Print mode: turn budget for the run. The model is warned two turns "
+                "before it and then writes a final report with no tools."
+            ),
+        ),
+    ] = None,
     setup_base_url: Annotated[
         str,
         typer.Option("--base-url", help="OpenAI-compatible base URL for `tau setup`."),
@@ -610,9 +621,14 @@ def main(
             custom_system_prompt,
             resolved_append_system_prompt,
         )
+        print_options: dict[str, object] = {}
+        if thinking_level_override is not None:
+            print_options["thinking_level_override"] = thinking_level_override
+        if max_turns is not None:
+            print_options["max_turns"] = max_turns
         print_runner = (
-            partial(run_openai_print_mode, thinking_level_override=thinking_level_override)
-            if thinking_level_override is not None
+            partial(run_openai_print_mode, **print_options)
+            if print_options
             else run_openai_print_mode
         )
         if session is not None:
@@ -1051,6 +1067,7 @@ async def run_openai_print_mode(
     resume_session_id: str | None = None,
     *,
     thinking_level_override: ThinkingLevel | None = None,
+    max_turns: int | None = None,
 ) -> bool:
     """Run a new or resumed print-mode turn using the configured provider."""
     settings = load_provider_settings()
@@ -1173,6 +1190,7 @@ async def run_openai_print_mode(
             startup_model_override=False,
             inference_provider_mode=runtime_inference_mode,
             thinking_level_override=thinking_level_override,
+            max_turns=max_turns,
         )
     finally:
         # This remains the ownership path for the compatibility provider
@@ -1275,6 +1293,7 @@ async def run_print_mode(
     trust_default: TrustDefault = "ask",
     startup_model_override: bool = False,
     thinking_level_override: ThinkingLevel | None = None,
+    max_turns: int | None = None,
 ) -> bool:
     """Run one non-interactive prompt and print streamed events.
 
@@ -1286,6 +1305,7 @@ async def run_print_mode(
             provider=provider,
             model=model,
             thinking_level_override=thinking_level_override,
+            max_turns=max_turns,
             cwd=cwd,
             storage=storage or _MemorySessionStorage(),
             resource_paths=resource_paths,

@@ -27,6 +27,7 @@ from tau_agent.messages import (
     ThinkingContent,
     ToolCall,
     ToolResultMessage,
+    UserMessage,
 )
 from tau_agent.provider import CancellationToken, ModelProvider
 from tau_agent.provider_events import (
@@ -60,6 +61,7 @@ async def run_agent_loop(
     prompts: Sequence[AgentMessage] = (),
     prelude_messages: Sequence[AgentMessage] = (),
     max_turns: int | None = None,
+    report_at_max_turns: bool = False,
     signal: CancellationToken | None = None,
     session_id: str | None = None,
     get_steering_messages: Callable[[], Sequence[AgentMessage]] | None = None,
@@ -73,6 +75,11 @@ async def run_agent_loop(
     With `get_system`, each request reads the system prompt afresh, so a change
     made while the run goes on (an extension's prompt section) reaches the next
     request rather than the next run.
+
+    With `report_at_max_turns`, `max_turns` is a budget the model is told
+    about rather than a wall it hits: a note goes in TURN_CAP_WARN_AHEAD turns
+    before the cap, and past the cap one last request offers no tools, so the
+    run ends with the model's report instead of an error.
     """
     new_messages = list(prompts)
     if prompts:
@@ -116,7 +123,16 @@ async def run_agent_loop(
                 yield MessageEndEvent(message=message)
             pending = ()
 
-            if max_turns is not None and turn > max_turns:
+            if report_at_max_turns and max_turns is not None:
+                cap_note = _turn_cap_note(turn, max_turns)
+                if cap_note is not None:
+                    messages.append(cap_note)
+                    new_messages.append(cap_note)
+                    yield MessageStartEvent(message=cap_note)
+                    yield MessageEndEvent(message=cap_note)
+            final_report = report_at_max_turns and max_turns is not None and turn > max_turns
+
+            if max_turns is not None and turn > max_turns and not final_report:
                 error = _error_message(model, f"Agent stopped after max_turns={max_turns}")
                 messages.append(error)
                 new_messages.append(error)
@@ -135,7 +151,7 @@ async def run_agent_loop(
                 model=model,
                 system=get_system() if get_system is not None else system,
                 messages=_provider_context(messages),
-                tools=tools,
+                tools=[] if final_report else tools,
                 signal=signal,
                 session_id=session_id,
             ):
@@ -152,7 +168,9 @@ async def run_agent_loop(
 
             messages.append(assistant)
             new_messages.append(assistant)
-            if assistant.stop_reason in {"error", "aborted"}:
+            if assistant.stop_reason in {"error", "aborted"} or final_report:
+                # A tool call in the final report turn is not run: the turn
+                # budget is spent, and what the model wrote is its report.
                 yield TurnEndEvent(message=assistant)
                 yield AgentEndEvent(messages=new_messages)
                 return
@@ -187,6 +205,30 @@ async def run_agent_loop(
         break
 
     yield AgentEndEvent(messages=new_messages)
+
+
+TURN_CAP_WARN_AHEAD = 2
+
+
+def _turn_cap_note(turn: int, max_turns: int) -> UserMessage | None:
+    """The steering note for `turn` under a reported turn cap, if one is due."""
+    if turn > max_turns:
+        return UserMessage(
+            content=(
+                f"Turn limit reached ({max_turns} turns used): no more tool calls. "
+                "Write your final report now: what you did, what is saved where, "
+                "what is left, and how it stands against the success criteria."
+            )
+        )
+    left = max_turns - turn + 1
+    if left == TURN_CAP_WARN_AHEAD and max_turns > TURN_CAP_WARN_AHEAD:
+        return UserMessage(
+            content=(
+                f"{left} turns left: stop exploring, make sure your work is saved, "
+                "and write your report."
+            )
+        )
+    return None
 
 
 def _provider_context(messages: list[AgentMessage]) -> list[AgentMessage]:

@@ -3021,3 +3021,94 @@ async def test_unfounded_driver_may_fetch_references(
     )
 
     assert [fetched.text, read.text] == ["ran"] * 2
+
+
+# -- R01: workers stop by turn count, with a bounded timeout and thinking off --
+
+
+@pytest.mark.anyio
+async def test_worker_argv_caps_turns(
+    tmp_path: Path, beagle: Path, fake_tau: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # R01: two 9B workers ran 43 and 51 turns into the kill and handed back nothing.
+    project = tmp_path / "project"
+    project.mkdir()
+    monkeypatch.chdir(project)
+    monkeypatch.delenv("BEAGLE_TAU_WORKER_MAX_TURNS", raising=False)
+    runtime, _ = _bound(tmp_path)
+    dispatch = _tool(runtime, "pursuit_dispatch")
+
+    await dispatch.execute("c1", {"brief": "Write notes"})
+    monkeypatch.setenv("BEAGLE_TAU_WORKER_MAX_TURNS", "12")
+    await dispatch.execute("c2", {"brief": "Write notes"})
+
+    default, pinned = (run["argv"] for run in _runs(fake_tau))
+    assert default[default.index("--max-turns") + 1] == "30"
+    assert pinned[pinned.index("--max-turns") + 1] == "12"
+
+
+@pytest.mark.anyio
+async def test_worker_argv_thinking_off(
+    tmp_path: Path, beagle: Path, fake_tau: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    monkeypatch.chdir(project)
+    monkeypatch.delenv("BEAGLE_TAU_DISPATCH_THINKING", raising=False)
+    runtime, _ = _bound(tmp_path)
+    dispatch = _tool(runtime, "pursuit_dispatch")
+
+    await dispatch.execute("c1", {"brief": "Write notes"})
+    monkeypatch.setenv("BEAGLE_TAU_DISPATCH_THINKING", "low")
+    await dispatch.execute("c2", {"brief": "Write notes"})
+
+    default, pinned = (run["argv"] for run in _runs(fake_tau))
+    assert default[default.index("--thinking") + 1] == "off"
+    assert pinned[pinned.index("--thinking") + 1] == "low"
+
+
+@pytest.mark.anyio
+async def test_step_and_dispatch_timeout_clamped(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # R01: the driver raised a worker's timeout to 1800 s, which bought only a longer spiral.
+    module = _module()
+    timeout, note = module._worker_timeout(1800)
+    assert timeout == module.DEFAULT_DISPATCH_TIMEOUT == 900.0
+    assert "clamped to 900s" in note
+    assert module._worker_timeout(300) == (300.0, "")
+    assert module._worker_timeout(None) == (module.DEFAULT_DISPATCH_TIMEOUT, "")
+    assert module._worker_timeout("soon") == (module.DEFAULT_DISPATCH_TIMEOUT, "")
+
+    monkeypatch.chdir(_pursuit_project(tmp_path))
+    _ready_task(fake_beagle)
+    runtime, _ = _bound(tmp_path)
+    stepped = await _tool(runtime, "pursuit_step").execute(
+        "c1",
+        {
+            "task": "T0002",
+            "criteria": "done.txt exists",
+            "done_when": "test -f done.txt",
+            "scope": ["done.txt"],
+            "timeout": 3600,
+        },
+    )
+    assert stepped.text.startswith("(timeout 3600s was clamped to 900s")
+    assert "closed done" in stepped.text
+
+    bare = tmp_path / "bare"
+    bare.mkdir()
+    dispatch = _tool(runtime, "pursuit_dispatch")
+    dispatched = await dispatch.execute(
+        "c2", {"brief": "Write notes", "cwd": str(bare), "timeout": 1800}
+    )
+    assert dispatched.text.startswith("(timeout 1800s was clamped to 900s")
+    assert "[pursuit_dispatch] step-executor" in dispatched.text
+    unclamped = await dispatch.execute(
+        "c3", {"brief": "Write notes", "cwd": str(bare), "timeout": 600}
+    )
+    assert "clamped" not in unclamped.text

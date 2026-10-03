@@ -198,6 +198,16 @@ DEFAULT_DISPATCH_TIMEOUT = 900.0
 WORKER_MODEL_ENV = "BEAGLE_TAU_DISPATCH_MODEL"
 WORKER_PROVIDER_ENV = "BEAGLE_TAU_DISPATCH_PROVIDER"
 
+#: Turns a worker gets before it is told to stop and report (`tau --max-turns`).
+#: R01's 9B workers ran 43 and 51 turns into the kill and handed back nothing;
+#: a turn cap ends the run with a report instead.
+WORKER_MAX_TURNS_ENV = "BEAGLE_TAU_WORKER_MAX_TURNS"
+DEFAULT_WORKER_MAX_TURNS = 30
+
+#: The worker's thinking level; unset runs it with thinking off, since most of
+#: R01's worker time went to reasoning spirals.
+WORKER_THINKING_ENV = "BEAGLE_TAU_DISPATCH_THINKING"
+
 #: Escape hatch: `BEAGLE_TAU_ALLOW_PURSUIT_EDIT=1` disables the ground-truth guard.
 GUARD_DISABLE_ENV = "BEAGLE_TAU_ALLOW_PURSUIT_EDIT"
 
@@ -1063,6 +1073,42 @@ def _worker_provider(explicit: str | None) -> str:
     return os.environ.get(WORKER_PROVIDER_ENV, "").strip()
 
 
+def _worker_max_turns() -> int:
+    """The worker's turn cap: env, else DEFAULT_WORKER_MAX_TURNS."""
+    raw = os.environ.get(WORKER_MAX_TURNS_ENV, "").strip()
+    try:
+        return max(1, int(raw)) if raw else DEFAULT_WORKER_MAX_TURNS
+    except ValueError:
+        return DEFAULT_WORKER_MAX_TURNS
+
+
+def _worker_timeout(raw: Any) -> tuple[float, str]:
+    """A model-supplied worker timeout, clamped to DEFAULT_DISPATCH_TIMEOUT.
+
+    Returns the timeout and a note for the tool result, empty unless clamped.
+    A longer wall clock bought R01 only a longer spiral; the turn cap is what
+    ends a worker with a report.
+    """
+    try:
+        asked = float(raw or DEFAULT_DISPATCH_TIMEOUT)
+    except (TypeError, ValueError):
+        return DEFAULT_DISPATCH_TIMEOUT, ""
+    if asked <= 0:
+        return DEFAULT_DISPATCH_TIMEOUT, ""
+    if asked > DEFAULT_DISPATCH_TIMEOUT:
+        return DEFAULT_DISPATCH_TIMEOUT, (
+            f"(timeout {asked:.0f}s was clamped to {DEFAULT_DISPATCH_TIMEOUT:.0f}s, the most a "
+            "worker gets; split a task that needs longer.)"
+        )
+    return asked, ""
+
+
+def _with_note(result: AgentToolResult, note: str) -> AgentToolResult:
+    if not note:
+        return result
+    return AgentToolResult(content=[TextContent(text=f"{note}\n\n"), *result.content])
+
+
 def _make_dispatch_result(text: str) -> AgentToolResult:
     return AgentToolResult(content=[TextContent(text=text)])
 
@@ -1266,6 +1312,8 @@ async def _run_worker(
         cmd += ["--provider", provider]
     if model:
         cmd += ["--model", model]
+    cmd += ["--max-turns", str(_worker_max_turns())]
+    cmd += ["--thinking", os.environ.get(WORKER_THINKING_ENV, "").strip() or "off"]
 
     limit = _memory_max()
     try:
@@ -1296,8 +1344,8 @@ async def _run_worker(
         if remaining <= 0:
             problem = (
                 f"the step-executor exceeded its wall-clock budget of {timeout:.0f}s and "
-                "was killed. Budget the worker in wall-clock, not tokens; raise 'timeout' "
-                "or split the task."
+                "was killed. Split the task, or lower its turn cap "
+                f"({WORKER_MAX_TURNS_ENV})."
             )
             break
         await asyncio.wait({talk}, timeout=min(_WORKER_POLL_SECONDS, remaining))
@@ -1377,14 +1425,11 @@ def make_dispatch() -> Any:
 
         model = _worker_model(arguments.get("model"))
         provider = _worker_provider(arguments.get("provider"))
-        try:
-            timeout = float(arguments.get("timeout") or DEFAULT_DISPATCH_TIMEOUT)
-        except (TypeError, ValueError):
-            timeout = DEFAULT_DISPATCH_TIMEOUT
+        timeout, clamped = _worker_timeout(arguments.get("timeout"))
 
         run = await _run_worker(brief, cwd, model, provider, timeout, signal)
         if run.problem is not None:
-            return _make_dispatch_result(f"pursuit_dispatch: {run.problem}")
+            return _with_note(_make_dispatch_result(f"pursuit_dispatch: {run.problem}"), clamped)
         header = (
             f"[pursuit_dispatch] step-executor "
             f"(model={model or 'inherit'} provider={provider or 'inherit'}) "
@@ -1394,7 +1439,7 @@ def make_dispatch() -> Any:
             "\n\n— YOU run the close, not the worker: `beagle pursuit close <task> "
             "--outcome done --spent <n>`, after running its --done-when yourself."
         )
-        return _make_dispatch_result(header + run.shown_report + footer)
+        return _with_note(_make_dispatch_result(header + run.shown_report + footer), clamped)
 
     return execute
 
@@ -1432,7 +1477,7 @@ DISPATCH_PARAMETERS = {
             "type": "number",
             "description": (
                 "Wall-clock seconds before the worker is killed. "
-                f"Default: {DEFAULT_DISPATCH_TIMEOUT:.0f}."
+                f"Default and maximum: {DEFAULT_DISPATCH_TIMEOUT:.0f}."
             ),
         },
     },
@@ -1998,7 +2043,8 @@ STEP_PARAMETERS: dict[str, Any] = {
         "timeout": {
             "type": "number",
             "description": (
-                f"Wall-clock seconds per sub-agent run. Default {DEFAULT_DISPATCH_TIMEOUT:.0f}."
+                "Wall-clock seconds per sub-agent run. Default and maximum "
+                f"{DEFAULT_DISPATCH_TIMEOUT:.0f}."
             ),
         },
     },
@@ -2696,7 +2742,7 @@ def make_step_tool() -> Any:
     carries the worker's measured spend.
     """
 
-    async def execute(
+    async def _execute(
         tool_call_id: str,
         arguments: Mapping[str, Any],
         signal: ToolCancellationToken | None = None,
@@ -2907,9 +2953,9 @@ def make_step_tool() -> Any:
             )
         try:
             attempts = max(1, int(arguments.get("attempts") or DEFAULT_STEP_ATTEMPTS))
-            timeout = float(arguments.get("timeout") or DEFAULT_DISPATCH_TIMEOUT)
         except (TypeError, ValueError):
-            attempts, timeout = DEFAULT_STEP_ATTEMPTS, DEFAULT_DISPATCH_TIMEOUT
+            attempts = DEFAULT_STEP_ATTEMPTS
+        timeout = _worker_timeout(arguments.get("timeout"))[0]
         check_timeout = float(record.get("check_timeout") or DEFAULT_CHECK_TIMEOUT)
 
         spent: int | None = None
@@ -3066,6 +3112,15 @@ def make_step_tool() -> Any:
             f"Sub-agent report:\n{shown}\n\n"
             "Next: call pursuit_step with no arguments for the next task."
         )
+
+    async def execute(
+        tool_call_id: str,
+        arguments: Mapping[str, Any],
+        signal: ToolCancellationToken | None = None,
+        on_update: ToolUpdateCallback | None = None,
+    ) -> AgentToolResult:
+        result = await _execute(tool_call_id, arguments, signal, on_update)
+        return _with_note(result, _worker_timeout(arguments.get("timeout"))[1])
 
     return execute
 
