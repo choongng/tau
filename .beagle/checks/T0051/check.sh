@@ -1,0 +1,5 @@
+#!/bin/sh
+set -e
+git ls-files --error-unmatch .beagle/checks/fix/named_tests.sh .beagle/checks/runs/diagnosed.sh .beagle/checks/runs/scored.sh >/dev/null
+bash .beagle/checks/fix/named_tests.sh tests/test_beagle_example_extension.py 6 test_new_route_resets_the_not_done_count test_plan_of_a_task_resets_its_not_done_count test_abandon_a_superseded_milestones_successor_with_a_reason test_task_worker_brief_carries_the_no_beagle_note test_stop_gate_says_nothing_unfounded_in_an_interactive_session test_stop_gate_founded_session_gets_no_unfounded_followup
+echo OK
