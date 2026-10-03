@@ -54,3 +54,7 @@ in the per-run notes.
   `pursuit tree`?", would save a turn. Low priority.
 - Good: the container-abandon refusal (L143) named the live parts and what
   to do. Keep it.
+
+## R05
+
+- Nothing for beagle: the stall was in tau's `pursuit_found` wrapper, not in beagle's founding.
