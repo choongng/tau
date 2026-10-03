@@ -111,6 +111,7 @@ the extension loads and simply does less.
 
 from __future__ import annotations
 
+import ast
 import asyncio
 import contextlib
 import fnmatch
@@ -2799,6 +2800,58 @@ def _is_test_path(rel: str) -> bool:
     )
 
 
+def _only_data_and_tests(paths: list[str]) -> bool:
+    """Whether `paths` are tests and data files (not .py), at least one a test.
+
+    Without a test it is not known answers: a docs-only task's design.md is
+    neither proved by its absence nor locked.
+    """
+
+    def test(rel: str) -> bool:
+        path = Path(rel.rstrip("/"))
+        return path.name in {"test", "tests"} or _is_test_path(str(path))
+
+    def data(rel: str) -> bool:
+        suffix = Path(rel.rstrip("/")).suffix
+        return bool(suffix) and suffix != ".py"
+
+    return any(test(rel) for rel in paths) and all(test(rel) or data(rel) for rel in paths)
+
+
+def _is_fixture(decorator: ast.expr) -> bool:
+    target = decorator.func if isinstance(decorator, ast.Call) else decorator
+    if isinstance(target, ast.Attribute):
+        return target.attr == "fixture"
+    return isinstance(target, ast.Name) and target.id == "fixture"
+
+
+def _implementation_in_tests(root: Path, changed: list[str]) -> list[str]:
+    """`<file>: <definition>` for each top-level class or non-test function in a changed test.
+
+    Run R04: a cases-first worker wrote an `IntervalTreeClock` class into
+    tests/test_cases.py, and twenty more workers debugged it there.
+    """
+    found: list[str] = []
+    for rel in changed:
+        if not (_is_test_path(rel) and rel.endswith(".py")) or rel.endswith("conftest.py"):
+            continue
+        try:
+            tree = ast.parse((root / rel).read_text(encoding="utf-8"), filename=rel)
+        except (OSError, SyntaxError, ValueError):
+            continue
+        for node in tree.body:
+            if isinstance(node, ast.ClassDef):
+                if not node.name.startswith("Test"):  # pytest's test grouping
+                    found.append(f"{rel}: class {node.name}")
+            elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                if node.name.startswith(("test_", "_", "pytest_")):
+                    continue
+                if any(_is_fixture(d) for d in node.decorator_list):
+                    continue
+                found.append(f"{rel}: def {node.name}")
+    return found
+
+
 def _changed_files(root: Path) -> list[str]:
     """Paths git sees changed or new, beagle's record and caches left out."""
     rc, out = _run(["git", "status", "--porcelain", "--untracked-files=all"], root, timeout=30.0)
@@ -2841,7 +2894,8 @@ async def _prove(
     A check that passes over a defect put back into the work is not about the
     work: run 11d closed two tasks on import-only checks. The worker names the
     defect (`WITNESS_NOTE`); a missing or misshapen one falls back to taking
-    away the source files the task changed. None when neither can be tried —
+    away the source files the task changed, or with none, its data files. None
+    when neither can be tried —
     no witness and no changed file — and the close decides.
     """
     attempts: list[list[str]] = []
@@ -2854,6 +2908,14 @@ async def _prove(
         for rel in _changed_files(root)
         if _in_scope(rel, scope) and not _is_test_path(rel) and (root / rel).is_file()
     ]
+    if not sources:
+        # A known-answers task changes only data and tests: taking its data
+        # file away is the defect (beagle proves it when the task wrote it).
+        sources = [
+            rel
+            for rel in _changed_files(root)
+            if _in_scope(rel, scope) and not rel.endswith(".py") and (root / rel).is_file()
+        ]
     if sources:
         attempts.append([arg for rel in sources for arg in ("--absent", rel)])
     refused: list[str] = []
@@ -3504,15 +3566,23 @@ def make_step_tool() -> Any:
         proof: _Proof | None = None
         scope = scope or _strings(record.get("scope"))
         unproven_key = (str(root), task)
+        tests_only = _only_data_and_tests(scope)
         if _UNPROVEN.get(unproven_key) == (check, tuple(scope)):
             return _step_result(
                 f"pursuit_step: {task} not run: this check already passes and cannot be "
-                f"shown to refuse, since no defect could be put back into a source file "
-                f"in its scope ({', '.join(scope) or 'none'}). Another sub-agent would "
-                f"change nothing. Bind a done_when that imports the code this task tests "
-                f"and runs it (e.g. `python3 -m pytest -q tests/test_<this task>.py`, a "
-                f"test that imports the module), or add that code's source file to scope; "
-                f'call pursuit_step with task="{task}" and the new done_when or scope.'
+                f"shown to refuse, since no defect could be put back into a file in its "
+                f"scope ({', '.join(scope) or 'none'}). Another sub-agent would change "
+                "nothing. "
+                + (
+                    TESTS_ONLY_PROOF_NOTE
+                    + f' Call pursuit_step with task="{task}" and a done_when that runs '
+                    "that file's test, or a scope that names the data file."
+                    if tests_only
+                    else "Bind a done_when that imports the code this task tests and runs "
+                    "it (e.g. `python3 -m pytest -q tests/test_<this task>.py`, a test "
+                    "that imports the module), or add that code's source file to scope; "
+                    f'call pursuit_step with task="{task}" and the new done_when or scope.'
+                )
             )
         brief += "\n\n" + WITNESS_NOTE
         if retrying:
@@ -3614,18 +3684,44 @@ def make_step_tool() -> Any:
                 f"{route}{undid}{task} — {title}: the check passes, but {why}; the task "
                 f"{state}, since a done close needs a check shown to refuse.\n\n"
                 f"`prove` said:\n{proof.text}\n\nLast report:\n{shown}\n\n"
-                f'Next: pursuit_step with task="{task}" and a done_when that runs a test '
-                "of the behaviour itself, e.g. `python3 -m pytest -q tests/test_<this "
-                "task>.py`, with notes saying what that test must check. A bare import or "
-                "file-exists check cannot be shown to refuse."
                 + (
-                    ""
-                    if proof.weak
-                    else " The test must import the code this task tests, and that code's "
-                    "source file must be in scope: the same check and scope again runs "
+                    f'Next: pursuit_step with task="{task}" and notes saying what to '
+                    f"fix. {TESTS_ONLY_PROOF_NOTE} The same check and scope again runs "
                     "no sub-agent."
+                    if tests_only
+                    else f'Next: pursuit_step with task="{task}" and a done_when that runs '
+                    "a test of the behaviour itself, e.g. `python3 -m pytest -q "
+                    "tests/test_<this task>.py`, with notes saying what that test must "
+                    "check. A bare import or file-exists check cannot be shown to refuse."
+                    + (
+                        ""
+                        if proof.weak
+                        else " The test must import the code this task tests, and that "
+                        "code's source file must be in scope: the same check and scope "
+                        "again runs no sub-agent."
+                    )
                 )
             )
+        changed = [
+            rel for rel in _changed_files(root) if _in_scope(rel, scope) and (root / rel).is_file()
+        ]
+        misplaced = _implementation_in_tests(root, changed)
+        if misplaced:
+            state = "stays blocked" if retrying else "stays open"
+            return _step_result(
+                f"{route}{undid}{task} — {title}: the check passes, but the task {state}: "
+                "implementation belongs in the module the test imports, not the test "
+                "file. A test file holds `test_` functions, `_` helpers and pytest "
+                "fixtures; it defines:\n"
+                + "\n".join(f"- {where}" for where in misplaced)
+                + f"\n\nLast report:\n{shown}\n\n"
+                f'Next: pursuit_step with task="{task}" and notes saying to move these '
+                "out of the test file (into the module the test imports, under a task "
+                "whose scope holds it) or delete them."
+            )
+        if not locks and _only_data_and_tests(changed):
+            # Run R04: the driver passed no locks for its known-answers task.
+            locks = changed
         # Committed while the task is still open, as beagle has a worker do:
         # the close's sweep then finds the work in history, not in the tree.
         committed = _commit(task, title, scope, root)
@@ -5413,13 +5509,25 @@ DRIVER_STEERS_NOTE = (
 #: Where a worker's tests come from. A small model that writes the code and its
 #: tests in one sitting makes them agree with each other, not with the reference
 #: (the ITC trial with qwen: wrong fork, join and event, and every test passed).
+#: How a tests-only (known-answers) task is shown to refuse; said instead of
+#: "import the code", which such a task has no code to do.
+TESTS_ONLY_PROOF_NOTE = (
+    "This scope holds only tests and data, so the data file's absence is the proof: "
+    "the check must run a test that reads the data file this task writes (e.g. "
+    "tests/cases.json), so that taking the file away makes it fail. The cases test "
+    "must import the module later tasks will write (e.g. `from <package> import …`); "
+    "it fails with ImportError until that code exists, and the check does not run it."
+)
+
 CASES_FIRST_NOTE = (
     "Cases first. Make the first milestone after the reference the known answers: a "
     "sub-agent reads the reference and writes, without any implementation, (a) a data "
     "file of small inputs and the exact results the reference gives for them, each "
     "citing where in the reference it comes from (e.g. `tests/cases.json`), and (b) "
-    "a test that runs every case against the code (e.g. `tests/test_cases.py`; it "
-    "fails until the code exists). Its done_when checks only the data, with a small "
+    "a test that runs every case against the code (e.g. `tests/test_cases.py`). That "
+    "test imports the module later tasks will write, by name (e.g. `from <package> "
+    "import …`), and defines no class or helper of its own: it fails with ImportError "
+    "until the code exists. Its done_when checks only the data, with a small "
     "test of the file itself (e.g. `python3 -m pytest -q tests/test_case_data.py`: "
     "every case has its inputs, its result and its citation, and there are enough "
     "of them); not `python3 -m json.tool`, which passes once the file parses and is "

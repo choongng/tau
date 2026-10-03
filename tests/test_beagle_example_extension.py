@@ -1369,6 +1369,9 @@ with runs.open("a") as log:
 attempt = len(runs.read_text().splitlines())
 if attempt >= int(os.environ.get("FAKE_TAU_SUCCEEDS_ON", "1")):
     Path("done.txt").write_text("done")
+for rel, text in json.loads(os.environ.get("FAKE_TAU_WRITES") or "{}").items():
+    Path(rel).parent.mkdir(parents=True, exist_ok=True)
+    Path(rel).write_text(text)
 tamper = os.environ.get("FAKE_TAU_TAMPERS")
 if tamper:
     Path(tamper).write_text("tampered")
@@ -2373,6 +2376,136 @@ async def test_pursuit_step_keeps_a_task_open_while_its_check_passes_over_a_defe
     assert _pursuit_calls(fake_beagle, "close") == []
     assert _pursuit_calls(fake_beagle, "commit") == []
     assert "stays open" in result.text and "test of the behaviour itself" in result.text
+
+
+CASES_SCOPE = ["tests/cases.json", "tests/test_case_data.py"]
+CASES_DATA_TEST = (
+    "import json\n\n\ndef test_cases():\n    assert json.load(open('tests/cases.json'))\n"
+)
+
+
+def _cases_task(
+    tmp_path: Path, fake_beagle: Path, monkeypatch: pytest.MonkeyPatch, data_test: str
+) -> Path:
+    """A known-answers task whose worker writes only the data file and its test."""
+    project = _git_project(tmp_path, monkeypatch)
+    monkeypatch.chdir(project)
+    writes = {"tests/cases.json": '[{"in": 1, "out": 2}]', "tests/test_case_data.py": data_test}
+    monkeypatch.setenv("FAKE_TAU_WRITES", json.dumps(writes))
+    _ready_task(fake_beagle, "grep -q out tests/cases.json")
+    (fake_beagle / "prove.out").write_text("T0002: PROVEN — refuses with tests/cases.json gone\n")
+    return project
+
+
+async def _step_cases(tmp_path: Path, **extra: Any) -> Any:
+    runtime, _ = _bound(tmp_path)
+    return await _tool(runtime, "pursuit_step").execute(
+        "c1",
+        {
+            "task": "T0002",
+            "criteria": "the known answers are written",
+            "done_when": "grep -q out tests/cases.json",
+            "scope": CASES_SCOPE,
+            **extra,
+        },
+    )
+
+
+@pytest.mark.anyio
+async def test_cases_task_proves_by_absent_data_file(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Run R04: a data-only task had no source file to take away, and never closed.
+    _cases_task(tmp_path, fake_beagle, monkeypatch, CASES_DATA_TEST)
+
+    result = await _step_cases(tmp_path)
+
+    [prove] = _pursuit_calls(fake_beagle, "prove")
+    assert prove[:3] == ["T0002", "--absent", "tests/cases.json"]
+    assert "--absent" not in prove[3:]
+    assert _pursuit_calls(fake_beagle, "close")[0][:3] == ["T0002", "--outcome", "done"]
+    assert "closed done" in result.text
+
+
+@pytest.mark.anyio
+async def test_cases_task_locks_scope_when_none_given(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project = _cases_task(tmp_path, fake_beagle, monkeypatch, CASES_DATA_TEST)
+
+    result = await _step_cases(tmp_path)
+
+    assert "Locked: tests/cases.json, tests/test_case_data.py" in result.text
+    store = project / ".beagle" / "locked"
+    assert (store / "tests" / "cases.json").read_text() == '[{"in": 1, "out": 2}]'
+    assert (store / "tests" / "test_case_data.py").read_text() == CASES_DATA_TEST
+    assert not (store / "done.txt").exists()
+
+
+@pytest.mark.anyio
+async def test_unproven_text_for_tests_only_scope_does_not_say_import(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _cases_task(tmp_path, fake_beagle, monkeypatch, CASES_DATA_TEST)
+    (fake_beagle / "prove.out").write_text("T0002: NOT PROVEN — the file predates the task\n")
+    (fake_beagle / "prove.rc").write_text("9")
+
+    result = await _step_cases(tmp_path)
+    (fake_beagle / "next.out").write_text(json.dumps({"open": ["T0002"], "ready": []}))
+    runtime, _ = _bound(tmp_path)
+    again = await _tool(runtime, "pursuit_step").execute(
+        "c2", {"task": "T0002", "scope": CASES_SCOPE}
+    )
+
+    assert "stays open" in result.text
+    for text in (result.text, again.text):
+        assert "import the code" not in text
+        assert "the data file's absence is the proof" in text
+        assert "must import the module later tasks will write" in text
+    assert "not run" in again.text
+    assert _pursuit_calls(fake_beagle, "close") == []
+
+
+@pytest.mark.anyio
+async def test_cases_task_with_implementation_in_test_file_stays_open(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Run R04: W1 wrote `class IntervalTreeClock` into the cases test.
+    data_test = (
+        "import pytest\n\n\nclass IntervalTreeClock:\n    pass\n\n\n"
+        "def join(a, b):\n    return a\n\n\n@pytest.fixture\ndef cases():\n    return []\n\n\n"
+        "def _load():\n    return []\n\n\n" + CASES_DATA_TEST.split("\n\n\n", 1)[1]
+    )
+    project = _cases_task(tmp_path, fake_beagle, monkeypatch, data_test)
+
+    result = await _step_cases(tmp_path)
+
+    assert "stays open" in result.text
+    assert "implementation belongs in the module the test imports, not the test file" in (
+        result.text
+    )
+    assert "tests/test_case_data.py: class IntervalTreeClock" in result.text
+    assert "tests/test_case_data.py: def join" in result.text
+    assert "def cases" not in result.text and "def _load" not in result.text
+    assert _pursuit_calls(fake_beagle, "close") == []
+    assert _pursuit_calls(fake_beagle, "commit") == []
+    assert not (project / ".beagle" / "locked").exists()
 
 
 def test_a_witness_block_is_read_from_the_end_of_a_report() -> None:
@@ -3601,7 +3734,9 @@ async def test_unprovable_restep_spawns_no_worker(
     assert "no defect could be put back" in first.text and "stays open" in first.text
     for refused in (again, same):
         assert "not run: this check already passes and cannot be shown to refuse" in refused.text
-        assert "imports the code this task tests" in refused.text
+        # A tests-only scope has no code to import: its data file's absence is the proof.
+        assert "the data file's absence is the proof" in refused.text
+        assert "import the code" not in refused.text
     assert _pursuit_calls(fake_beagle, "close") == []
 
 
