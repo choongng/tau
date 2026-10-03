@@ -10,4 +10,13 @@ python3 -c "import json; c=json.load(open('$H/scorecard.json')); assert 'workers
 test -s "$f"
 grep -q '^## Scorecard' "$f"
 grep -qE '^grader: [0-9]+/[0-9]+' "$f"
+python3 - "$H/scorecard.json" "$f" <<'PY'
+import json, re, sys
+c = json.load(open(sys.argv[1])); md = open(sys.argv[2]).read()
+block = md.split("## Scorecard", 1)[1].split("```")[1]
+for key in ("tasks_total", "tasks_done", "commits", "founded", "uncommitted_files"):
+    m = re.search(rf"^{key}\s+(\S+)", block, re.M)
+    assert m, f"no {key} in the Scorecard block"
+    assert m.group(1) == str(c.get(key)), f"Scorecard {key} {m.group(1)} != scorecard.json {c.get(key)}"
+PY
 echo OK
