@@ -1901,6 +1901,9 @@ async def test_pursuit_step_proves_the_workers_witness_then_closes_and_commits(
     assert _pursuit_calls(fake_beagle, "commit") == [
         ["T0002", "done.txt", "--subject", "T0002: Parser"]
     ]
+    # While still open: a close's workspace-clean sweep excuses only its own writes.
+    verbs = [c["argv"][1] for c in _calls(fake_beagle) if c["argv"][0] == "pursuit"]
+    assert verbs.index("commit") < verbs.index("close")
     assert "closed done" in result.text and "committed abc123" in result.text
 
 

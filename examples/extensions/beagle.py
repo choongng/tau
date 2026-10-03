@@ -2338,7 +2338,7 @@ def _requires_witness(root: Path) -> bool:
 
 
 def _commit(task: str, title: str, scope: list[str], root: Path) -> str:
-    """Commit what a done task changed with `pursuit commit`; a line saying what happened.
+    """Commit what a proven task changed with `pursuit commit`; a line saying what happened.
 
     Run 11d left six of seven tasks' work uncommitted. Claims are the worker's
     to record; with none, the commit says so rather than not landing at all.
@@ -2987,6 +2987,9 @@ def make_step_tool() -> Any:
                 "task>.py`, with notes saying what that test must check. A bare import or "
                 "file-exists check cannot be shown to refuse."
             )
+        # Committed while the task is still open, as beagle has a worker do:
+        # the close's sweep then finds the work in history, not in the tree.
+        committed = _commit(task, title, scope, root)
         if retrying:
             because = (
                 f"a sub-agent reworked it ({attempt} run(s)) and the check now passes"
@@ -3024,10 +3027,8 @@ def make_step_tool() -> Any:
                 )
             if skipped:
                 lock_note += f"Not locked: {'; '.join(skipped)}.\n\n"
-        if rc == 0:
-            lock_note += _commit(task, title, scope, root) + "\n\n"
         return _step_result(
-            f"{route}{task} — {title}: {state}.\n\n{closed}\n\n"
+            f"{route}{task} — {title}: {state}.\n\n{committed}\n\n{closed}\n\n"
             f"{undid}{lock_note}"
             f"Sub-agent report:\n{shown}\n\n"
             "Next: call pursuit_step with no arguments for the next task."
