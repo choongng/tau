@@ -1,0 +1,14 @@
++++
+id = "000325-pursuit"
+ordinal = 325
+kind = "pursuit"
+timestamp = "2026-10-03T20:26:07+00:00"
+summary = "pursuit open T0078: T0057 follow-up: abandoned-target dead wait test on R08's shape"
+metric_command = ""
+drains = []
+hooks = []
++++
+
+criteria: Tests (no code change unless they fail): _dead_waits and the nothing-ready text, on a tree shaped like R08's (root T0001 with containers, T0011 a part under container T0004 which is not the root), (1) for a pending task hard-waiting on an abandoned leaf with no successor, name the wait as dead and suggest a spawn or a new route; (2) for one waiting on an abandoned non-container heir, the same. Tests: test_dead_wait_on_an_abandoned_leaf_in_r08_shape, test_dead_wait_on_an_abandoned_non_container_heir_in_r08_shape.
+decided by: sh -c 'echo "954b68843c64ad3d9d3b1fa8c3514602c661b0479b806bbd255a626bda3995e3  .beagle/checks/T0078/check.sh" | sha256sum -c --quiet && bash .beagle/checks/T0078/check.sh'
+budget: 20000 tokens
