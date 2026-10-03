@@ -3321,6 +3321,84 @@ async def test_found_drops_setup_milestone_and_says_so(
 
 
 @pytest.mark.anyio
+async def test_founding_milestone_with_a_bare_label_takes_its_title_from_the_intent(
+    tmp_path: Path, beagle: Path, fake_beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Run R09 founded with milestones 'M1::…'..'M4::…', titled 'M1'..'M4'.
+    project = tmp_path / "project"
+    project.mkdir()
+    monkeypatch.chdir(project)
+    (fake_beagle / "add.out").write_text("T0001  Implement interval tree clocks\n")
+    runtime, _ = _bound(tmp_path)
+
+    result = await _tool(runtime, "pursuit_found").execute(
+        "c1",
+        {
+            "statement": "Implement interval tree clocks",
+            "criteria": ["`python3 -m pytest -q` exits 0"],
+            "milestones": [
+                "M1::Read the paper and extract the operations",
+                "Parser::reads input",
+            ],
+            "user_confirmed": True,
+        },
+    )
+
+    assert "Founded the pursuit" in result.text
+    split = _pursuit_calls(fake_beagle, "split")
+    assert len(split) == 1
+    title, sep, intent = split[0][1].partition("::")
+    assert title.startswith("Read the paper")
+    assert sep and intent == "Read the paper and extract the operations"
+    assert split[0][2] == "Parser::reads input"
+
+
+@pytest.mark.anyio
+async def test_plan_part_with_a_bare_label_takes_its_title_from_the_intent(
+    tmp_path: Path, beagle: Path, fake_beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Run R09 planned 'P1::…'..'P5::…', and commits read "T0009: P4".
+    monkeypatch.chdir(_pursuit_project(tmp_path))
+    runtime, _ = _bound(tmp_path)
+
+    await _tool(runtime, "pursuit_plan").execute(
+        "c1", {"task": "T0001", "parts": ["P4::Move the code to src/itc"]}
+    )
+
+    assert _pursuit_calls(fake_beagle, "add") == [
+        ["Move the code to src/itc", "--parent", "T0001", "--intent", "Move the code to src/itc"]
+    ]
+
+
+@pytest.mark.anyio
+async def test_founding_drops_a_criterion_about_beagle_setup_with_a_note(
+    tmp_path: Path, beagle: Path, fake_beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Run R09 kept this criterion, and a step then named .beagle/ in scope.
+    project = tmp_path / "project"
+    project.mkdir()
+    monkeypatch.chdir(project)
+    (fake_beagle / "add.out").write_text("T0001  Implement interval tree clocks\n")
+    runtime, _ = _bound(tmp_path)
+    setup = "Packaged as a Beagle Pursuit project (.beagle/ present, tracked)"
+
+    result = await _tool(runtime, "pursuit_found").execute(
+        "c1",
+        {
+            "statement": "Implement interval tree clocks",
+            "criteria": ["`python3 -m pytest -q` exits 0", setup],
+            "milestones": ["impl::itc.py"],
+            "user_confirmed": True,
+        },
+    )
+
+    assert "Founded the pursuit" in result.text
+    assert f"Dropped the setup criterion {setup!r}" in result.text
+    goal = (project / ".beagle" / "pursuit.toml").read_text()
+    assert "exits 0" in goal and "Packaged as" not in goal
+
+
+@pytest.mark.anyio
 async def test_planning_refuses_a_setup_part_and_a_step_its_store_scope(
     tmp_path: Path, beagle: Path, fake_beagle: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

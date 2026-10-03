@@ -1599,6 +1599,23 @@ def _task_title(statement: str) -> str:
     return f"{cut}…"
 
 
+_BARE_LABEL = re.compile(r"[A-Za-z]{0,3}[0-9]+")
+
+
+def _split_part(part: str) -> tuple[str, str]:
+    """A `title::intent` part as (title, intent), both stripped.
+
+    Run R09 titled its milestones 'M1'..'M4' and its parts 'P1'..'P5', which
+    carry no meaning in the tree or a commit: a bare label like that gives way
+    to a title taken from the intent.
+    """
+    title, _, intent = part.partition("::")
+    title, intent = title.strip(), intent.strip()
+    if intent and _BARE_LABEL.fullmatch(title):
+        title = _task_title(intent)
+    return title, intent
+
+
 def _ensure_git_repo(root: Path) -> bool:
     """`git init` a project that is in no repository; True if it ran.
 
@@ -2151,10 +2168,10 @@ def _add_children(task: str, parts: list[str], root: Path) -> tuple[int, str]:
     """
     rc, lines = 0, []
     for part in parts:
-        title, _, intent = part.partition("::")
-        argv = ["add", title.strip(), "--parent", task]
-        if intent.strip():
-            argv += ["--intent", intent.strip()]
+        title, intent = _split_part(part)
+        argv = ["add", title, "--parent", task]
+        if intent:
+            argv += ["--intent", intent]
         rc, added = _pursuit(argv, root)
         lines.append(added)
         if rc != 0:
@@ -2204,7 +2221,7 @@ def _release_waiters(task: str, why: str, root: Path) -> list[str]:
 
 
 def _part_title(part: str) -> str:
-    return part.partition("::")[0].strip()
+    return _split_part(part)[0]
 
 
 def _tree_nodes(root: Path) -> list[dict[str, Any]]:
@@ -2569,6 +2586,7 @@ def make_found_tool(
                 "pursuit_found: name the milestones: the parts of the goal you can "
                 "already see, each '<title>::<what it is for>'."
             )
+        criteria, criteria_notes = _drop_setup_criteria(criteria)
         # Run R03's driver, refused for a setup first milestone, sent the same
         # call fourteen times: what founding can repair itself, it repairs.
         given = milestones
@@ -2579,6 +2597,7 @@ def make_found_tool(
             milestones, repairs = _milestones_from_criteria(given, criteria, repairs)
             if not milestones:
                 return _step_result(f"pursuit_found: nothing written — {repairs[0]}")
+        repairs = [*criteria_notes, *repairs]
         repaired = "".join(f"{note}\n\n" for note in repairs)
         delegated = arguments.get("user_delegated") is True
         if arguments.get("user_confirmed") is not True and not delegated:
@@ -3278,6 +3297,9 @@ def _repair_milestones(milestones: list[str]) -> tuple[list[str], list[str]]:
     for index, part in enumerate(kept, 1):
         title, sep, intent = part.partition("::")
         title = title.strip()
+        if sep and title != (labelled := _split_part(part)[0]):
+            repaired.append(f"{labelled}::{intent.strip()}")
+            continue
         if len(title) <= MAX_TASK_TITLE:
             repaired.append(part)
             continue
@@ -3289,6 +3311,27 @@ def _repair_milestones(milestones: list[str]) -> tuple[list[str], list[str]]:
             f"{MAX_TASK_TITLE}, so it is now {short!r}, with the whole text after '::'."
         )
     return repaired, notes
+
+
+_SETUP_CRITERION = re.compile(r"\.beagle|beagle pursuit", re.IGNORECASE)
+
+
+def _drop_setup_criteria(criteria: list[str]) -> tuple[list[str], list[str]]:
+    """`criteria` without those about beagle's own setup, and a note if any went.
+
+    Run R09 kept 'packaged as a beagle pursuit project (.beagle/ present,
+    tracked)' and a step then named .beagle/ in scope. Founding is that setup,
+    so such a criterion is not the goal's. With every criterion about it, all
+    are kept: a goal needs criteria.
+    """
+    kept = [c for c in criteria if not _SETUP_CRITERION.search(c)]
+    if not kept or len(kept) == len(criteria):
+        return criteria, []
+    named = ", ".join(repr(c) for c in criteria if _SETUP_CRITERION.search(c))
+    return kept, [
+        f"Dropped the setup criterion {named}: founding is the setup, so it is not "
+        "part of the goal's work. The criteria are the rest."
+    ]
 
 
 def _milestones_from_criteria(
