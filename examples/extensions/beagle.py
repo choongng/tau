@@ -2037,15 +2037,19 @@ def _commit_setup(root: Path) -> str | None:
 
     R08: `beagle init`'s files stayed untracked, so the workspace-clean gate
     was red from the first task. A pathspec commit leaves whatever else the
-    user has staged or changed exactly as it was.
+    user has staged or changed exactly as it was; a failed commit unstages
+    only what this call staged.
     """
-    rc, out = _run(["git", "add", "-A", "--", ".beagle", ".gitignore"], root, timeout=30.0)
+    pathspec = ["--", ".beagle", ".gitignore"]
+    rc, out = _run(["git", "diff", "--cached", "--name-only", *pathspec], root, timeout=30.0)
+    if rc != 0:
+        return f"`git diff --cached` failed: {out}"
+    before = set(out.splitlines())
+    rc, out = _run(["git", "add", "-A", *pathspec], root, timeout=30.0)
     if rc != 0:
         return f"`git add` failed: {out}"
     rc, out = _run(
-        ["git", "diff", "--cached", "--name-only", "--", ".beagle", ".gitignore"],
-        root,
-        timeout=30.0,
+        ["git", "diff", "--cached", "--name-only", *pathspec], root, timeout=30.0
     )
     if rc != 0:
         return f"`git diff --cached` failed: {out}"
@@ -2063,7 +2067,9 @@ def _commit_setup(root: Path) -> str | None:
         timeout=60.0,
     )
     if rc != 0:
-        _run(["git", "reset", "-q", "--", *staged], root, timeout=30.0)
+        added = [path for path in staged if path not in before]
+        if added:
+            _run(["git", "reset", "-q", "--", *added], root, timeout=30.0)
         return f"`git commit` failed: {out}"
     return None
 

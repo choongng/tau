@@ -1784,6 +1784,22 @@ async def test_failed_setup_commit_leaves_nothing_staged(
 
 
 @pytest.mark.anyio
+async def test_failed_setup_commit_keeps_the_users_own_staging(
+    tmp_path: Path, beagle: Path, fake_beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project = _setup_project(tmp_path, monkeypatch)
+    _git(project, "add", ".gitignore")
+    hook = project / ".git" / "hooks" / "pre-commit"
+    hook.write_text("#!/bin/sh\nexit 1\n")
+    hook.chmod(0o755)
+
+    result = await _found(tmp_path, fake_beagle)
+
+    assert "setup (.beagle/, .gitignore) is uncommitted" in result.text
+    assert _git(project, "diff", "--cached", "--name-only").split() == [".gitignore"]
+
+
+@pytest.mark.anyio
 async def test_pursuit_plan_adds_to_a_container_it_cannot_split(
     tmp_path: Path, beagle: Path, fake_beagle: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
