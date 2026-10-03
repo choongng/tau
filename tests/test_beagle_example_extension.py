@@ -6368,6 +6368,76 @@ async def test_not_done_step_names_implementation_written_under_tests(
 
 
 @pytest.mark.anyio
+async def test_worker_problem_step_names_implementation_written_under_tests(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A worker that came back with a problem may still have left code under tests/.
+    project = _git_project(tmp_path, monkeypatch)
+    monkeypatch.chdir(project)
+    (project / "tests" / "pkg").mkdir(parents=True)
+    (project / "tests" / "pkg" / "clock.py").write_text("class Clock:\n    pass\n")
+    monkeypatch.setenv("TAU_BIN", str(tmp_path / "no-such-tau"))
+    _ready_task(fake_beagle, "grep -q out tests/cases.json")
+    runtime, _ = _bound(tmp_path)
+
+    result = await _tool(runtime, "pursuit_step").execute(
+        "c1",
+        {
+            "task": "T0002",
+            "criteria": "the known answers are written",
+            "done_when": "grep -q out tests/cases.json",
+            "scope": ["tests/"],
+        },
+    )
+
+    assert "stays open — " in result.text and "not found on PATH" in result.text
+    assert result.text.startswith(
+        "The sub-agent wrote implementation into tests/ (tests/pkg/clock.py: class Clock), "
+        "which is not this task's work."
+    )
+
+
+@pytest.mark.anyio
+async def test_prove_refused_step_names_implementation_written_under_tests(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The check passes but `prove` refuses it; code under tests/ is still named first.
+    monkeypatch.chdir(_git_project(tmp_path, monkeypatch))
+    monkeypatch.setenv("FAKE_TAU_REPORT", WITNESSED_REPORT)
+    writes = {"tests/pkg/clock.py": "class Clock:\n    pass\n"}
+    monkeypatch.setenv("FAKE_TAU_WRITES", json.dumps(writes))
+    _ready_task(fake_beagle)
+    (fake_beagle / "prove.out").write_text("T0002: NOT PROVEN — src/clock.py is not there\n")
+    (fake_beagle / "prove.rc").write_text("9")
+    runtime, _ = _bound(tmp_path)
+
+    result = await _tool(runtime, "pursuit_step").execute(
+        "c1",
+        {
+            "task": "T0002",
+            "criteria": "c",
+            "done_when": "grep -q done done.txt",
+            "scope": ["done.txt", "tests/"],
+        },
+    )
+
+    assert "the check passes, but no defect could be put back" in result.text
+    assert "stays open" in result.text
+    assert result.text.startswith(
+        "The sub-agent wrote implementation into tests/ (tests/pkg/clock.py: class Clock), "
+        "which is not this task's work."
+    )
+
+
+@pytest.mark.anyio
 async def test_worker_scope_refusal_of_source_says_not_under_tests_either(
     tmp_path: Path, beagle: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
