@@ -3899,6 +3899,127 @@ async def test_nothing_ready_with_stalled_root_says_not_done(
         assert settled not in result.text.split("NOT done", 1)[1]
 
 
+#: Run R06's tree after L73, cut down: T0003 waits on T0002, superseded by
+#: T0008, and the driver's bash `depend` made T0008 wait on T0003.
+CYCLE_TREE: list[dict[str, Any]] = [
+    {"id": "T0001", "parent": "", "title": "ITC", "status": "pending", "container": True},
+    {"id": "T0002", "parent": "T0001", "title": "Reference study", "status": "superseded"},
+    {
+        "id": "T0003",
+        "parent": "T0001",
+        "title": "Design",
+        "status": "pending",
+        "container": True,
+        "waiting_on": ["T0002"],
+    },
+    {"id": "T0012", "parent": "T0003", "title": "Plan structure", "status": "pending"},
+    {
+        "id": "T0004",
+        "parent": "T0001",
+        "title": "Impl",
+        "status": "pending",
+        "waiting_on": ["T0003"],
+    },
+    {
+        "id": "T0008",
+        "parent": "T0001",
+        "title": "Reference study",
+        "status": "pending",
+        "container": True,
+        "sibling_of": "T0002",
+        "waiting_on": ["T0003"],
+    },
+    {"id": "T0009", "parent": "T0008", "title": "Read the paper", "status": "pending"},
+]
+
+
+def _nothing_ready(fake: Path, nodes: list[dict[str, Any]]) -> None:
+    (fake / "next.out").write_text(json.dumps({"open": [], "ready": []}))
+    (fake / "next.rc").write_text("3")
+    (fake / "tree.out").write_text(json.dumps({"nodes": nodes}))
+
+
+@pytest.mark.anyio
+async def test_driver_guard_steers_a_hard_depend_to_the_tools(
+    tmp_path: Path, beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # R06 L72: the driver's bash `depend T0008 --hard T0003` closed the cycle.
+    monkeypatch.chdir(_pursuit_project(tmp_path))
+    runtime, _ = _bound(tmp_path)
+    bash = _tool_with_hooks(runtime, "bash")
+    await runtime.emit_session_start("startup")
+
+    hard = await bash.execute("c1", {"command": "beagle pursuit depend T0008 --hard T0003"})
+    soft = await bash.execute(
+        "c2", {"command": "cd /x && beagle pursuit depend T0004 T0003 --reason 'order'"}
+    )
+    drop = await bash.execute(
+        "c3", {"command": 'beagle pursuit depend T0008 T0003 --drop --reason "breaks it"'}
+    )
+
+    for added in (hard.text, soft.text):
+        assert "refusing `beagle pursuit depend`" in added
+        assert "pursuit_step with no arguments" in added and "--drop" in added
+    assert drop.text == "ran"
+
+
+@pytest.mark.anyio
+async def test_step_names_the_drop_for_a_cycle_when_nothing_is_ready(
+    tmp_path: Path, beagle: Path, fake_beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # R06 L77-L169: every step said "Nothing is ready" and offered plan or
+    # new_route; the one call that broke the cycle was never named.
+    monkeypatch.chdir(_pursuit_project(tmp_path))
+    _nothing_ready(fake_beagle, CYCLE_TREE)
+    runtime, _ = _bound(tmp_path)
+    step = _tool(runtime, "pursuit_step")
+
+    bare = await step.execute("c1", {})
+    named = await step.execute("c2", {"task": "T0003"})
+
+    for text in (bare.text, named.text):
+        assert "Nothing is ready" in text and "form a cycle" in text
+        assert "- T0003 waits on T0002 (superseded, handed to T0008: pending)" in text
+        assert "- T0008 waits on T0003 (pending)" in text
+        # The edge the driver added, not the plan's order through the heir.
+        assert 'beagle pursuit depend T0008 T0003 --drop --reason "breaks the cycle' in text
+        assert "beagle pursuit depend T0003 T0002" not in text
+        assert "pursuit_plan" not in text and "new_route" not in text
+        assert "new route" not in text
+    assert _pursuit_calls(fake_beagle, "depend") == []
+
+
+@pytest.mark.anyio
+async def test_nothing_ready_names_each_blocking_edge(
+    tmp_path: Path, beagle: Path, fake_beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # R06 L77: the nothing-ready text listed no task's wait. Each unfinished
+    # task names what holds it, a part through the container that waits.
+    monkeypatch.chdir(_pursuit_project(tmp_path))
+    no_cycle = [{**n, "waiting_on": []} if n["id"] == "T0008" else n for n in CYCLE_TREE]
+    lines = {
+        "T0012": "- T0012 — Plan structure (pending); waits on T0002 (superseded, handed "
+        "to T0008: pending) through T0003",
+        "T0004": "- T0004 — Impl (pending); waits on T0003 (pending)",
+    }
+    for nodes, waits_on_t0003 in ((CYCLE_TREE, True), (no_cycle, False)):
+        _nothing_ready(fake_beagle, nodes)
+        runtime, _ = _bound(tmp_path)
+
+        text = (await _tool(runtime, "pursuit_step").execute("c1", {})).text
+        listed = _module()._unfinished(nodes)
+
+        assert lines["T0012"] in listed and lines["T0004"] in listed
+        t0009 = "- T0009 — Read the paper (pending)"
+        assert (t0009 + "; waits on T0003 (pending) through T0008" in listed) is waits_on_t0003
+        assert t0009 in "\n".join(listed)
+        if waits_on_t0003:
+            assert "form a cycle" in text
+        else:
+            assert "form a cycle" not in text and "The pursuit is NOT done" in text
+            assert all(line in text for line in lines.values())
+
+
 def _say(text: str) -> list[Any]:
     from pi_event_helpers import assistant_done, assistant_start
 

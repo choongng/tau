@@ -2125,6 +2125,120 @@ def _duplicate_of(why: str, task: str, nodes: list[dict[str, Any]]) -> str | Non
     return None
 
 
+#: A hard wait: the task that waits, the task its edge names, and the task it
+#: waits on now, which differs when the named one was superseded.
+_Wait = tuple[str, str, str]
+
+
+def _hard_waits(nodes: list[dict[str, Any]]) -> dict[str, list[_Wait]]:
+    """Each unfinished task's unmet hard waits, by task.
+
+    A superseded task is followed to its heir (`sibling_of`), as beagle's
+    scheduler does, and a task waits on whatever its containers wait on.
+    """
+    by_id = {str(n.get("id")): n for n in nodes}
+    heir = {str(n.get("sibling_of")): str(n.get("id")) for n in nodes if n.get("sibling_of")}
+
+    def resolved(task: str) -> str:
+        seen = {task}
+        while (
+            by_id.get(task, {}).get("status") == "superseded" and heir.get(task, task) not in seen
+        ):
+            task = heir[task]
+            seen.add(task)
+        return task
+
+    own: dict[str, list[_Wait]] = {}
+    for task, node in by_id.items():
+        for named in node.get("waiting_on") or []:
+            now = resolved(str(named))
+            if by_id.get(now, {}).get("status") != "done":
+                own.setdefault(task, []).append((task, str(named), now))
+    waits: dict[str, list[_Wait]] = {}
+    for task, node in by_id.items():
+        if node.get("status") in ("done", "abandoned", "superseded"):
+            continue
+        found: list[_Wait] = []
+        up, seen = task, set()
+        while up and up not in seen:
+            seen.add(up)
+            found += own.get(up, [])
+            up = str(by_id.get(up, {}).get("parent") or "")
+        if found:
+            waits[task] = found
+    return waits
+
+
+def _wait_text(wait: _Wait, nodes: list[dict[str, Any]]) -> str:
+    """One hard wait in words: `waits on T0002 (superseded, handed to T0008: pending)`."""
+    _, named, now = wait
+    status = {str(n.get("id")): n.get("status") for n in nodes}
+    if named != now:
+        return f"waits on {named} (superseded, handed to {now}: {status.get(now)})"
+    return f"waits on {named} ({status.get(named)})"
+
+
+def _wait_cycle(nodes: list[dict[str, Any]]) -> list[_Wait] | None:
+    """The hard waits that form one cycle among unfinished tasks, in order, or None.
+
+    A container waits on its parts and a part on what its container waits
+    on, so a cycle through either is found. Run R06's driver closed
+    T0003 -> T0002 (superseded by T0008) -> T0008 -> T0003 with a bash
+    `depend`, and every step after it said only that nothing was ready.
+    """
+    status = {str(n.get("id")): n.get("status") for n in nodes}
+    edges: dict[str, list[tuple[str, _Wait | None]]] = {}
+    for task, found in _hard_waits(nodes).items():
+        edges[task] = [(wait[2], wait) for wait in found]
+    for node in nodes:
+        parent, task = str(node.get("parent") or ""), str(node.get("id"))
+        if parent and status.get(task) not in ("done", "abandoned", "superseded"):
+            edges.setdefault(parent, []).append((task, None))
+    state: dict[str, int] = {}  # 1 on the path, 2 finished
+
+    def visit(path: list[str], via: list[_Wait | None]) -> list[_Wait] | None:
+        task = path[-1]
+        state[task] = 1
+        for nxt, wait in edges.get(task, []):
+            if state.get(nxt) == 1:
+                cycle = [w for w in [*via[path.index(nxt) :], wait] if w is not None]
+                if cycle:
+                    return cycle
+            elif nxt not in state and (found := visit([*path, nxt], [*via, wait])):
+                return found
+        state[task] = 2
+        return None
+
+    for origin in list(edges):
+        if origin not in state and (found := visit([origin], [])):
+            return found
+    return None
+
+
+def _cycle_break(cycle: list[_Wait], nodes: list[dict[str, Any]]) -> str:
+    """What to tell the driver about a cycle of hard waits: the cycle and the drop.
+
+    The edge dropped is the one most likely added by hand: one a successor
+    holds, then one that names its task directly. An edge that names a
+    superseded task is the plan's order, handed on to the heir.
+    """
+    succeeds = {str(n.get("id")) for n in nodes if n.get("sibling_of")}
+    waiter, named, _ = min(
+        cycle, key=lambda w: (w[1] != w[2], w[0] not in succeeds, cycle.index(w))
+    )
+    ring = " -> ".join([cycle[0][0], *(w[2] for w in cycle)])
+    reason = f"breaks the cycle {ring}"
+    return (
+        f"These hard waits form a cycle, so none of these tasks can ever start "
+        f"({ring}):\n"
+        + "\n".join(f"- {w[0]} {_wait_text(w, nodes)}" for w in cycle)
+        + f"\n\nBreak it by dropping the wait of {waiter} on {named}. Run in bash, "
+        f'exactly:\n\n    beagle pursuit depend {waiter} {named} --drop --reason "{reason}"\n\n'
+        "then call pursuit_step with no arguments. Splitting a task or abandoning one "
+        "does not break the cycle: the parts keep the waits."
+    )
+
+
 def _unfinished(nodes: list[dict[str, Any]]) -> list[str] | None:
     """What keeps the pursuit from done, one line a task; None when it is done.
 
@@ -2141,6 +2255,7 @@ def _unfinished(nodes: list[dict[str, Any]]) -> list[str] | None:
         return None
     by_id = {str(n.get("id")): n for n in nodes}
     heirs = {str(n.get("sibling_of")) for n in nodes if n.get("sibling_of")}
+    waits = _hard_waits(nodes)
     left = []
     for node in nodes:
         task, status = str(node.get("id")), node.get("status")
@@ -2155,6 +2270,10 @@ def _unfinished(nodes: list[dict[str, Any]]) -> list[str] | None:
             f"- {task} — {node.get('title', '')} ({status}"
             + (f": {reason[:120]}" if reason and status != "pending" else "")
             + ")"
+            + "".join(
+                f"; {_wait_text(w, nodes)}" + (f" through {w[0]}" if w[0] != task else "")
+                for w in waits.get(task, [])
+            )
         )
     if not left and roots[0].get("container"):
         return None
@@ -3535,7 +3654,10 @@ def make_step_tool() -> Any:
         blocked = _blocked_tasks(root)
         nodes = _tree_nodes(root)
         left = _unfinished(nodes)
-        if blocked:
+        cycle = _wait_cycle(nodes)
+        if cycle:
+            after = _cycle_break(cycle, nodes)
+        elif blocked:
             after = _blocked_routes(blocked)
         elif left:
             # Run R02's driver was offered "tell the user the pursuit is done"
@@ -3543,8 +3665,9 @@ def make_step_tool() -> Any:
             after = (
                 "The pursuit is NOT done: these tasks are not done, and nothing took "
                 "their work on:\n" + "\n".join(left) + "\n\nDo not tell the user it is "
-                "done. Add the missing work with pursuit_plan, or give a task a new route "
-                'with pursuit_step task="<id>", new_route=true and notes.'
+                "done. A task that waits on another starts once that one is done. Add "
+                "missing work with pursuit_plan, or give a task a new route with "
+                'pursuit_step task="<id>", new_route=true and notes.'
             )
         else:
             after = (
@@ -4498,11 +4621,30 @@ _STEERED_VERBS = {
     "audit": "pursuit_step, which has a sub-agent do a due audit and records it",
     "split": "pursuit_plan",
     "add": "pursuit_plan",
+    "depend": (
+        "pursuit_step with no arguments, which hands out the next ready task, and "
+        "pursuit_plan for work that is missing. A wait added by hand can close a "
+        "cycle that nothing then starts; only withdrawing one, `beagle pursuit depend "
+        "<task> <after> --drop --reason '<why>'`, runs from bash"
+    ),
     "commit": (
         "nothing: pursuit_step commits the files a task changed in its scope before it "
         "closes the task"
     ),
 }
+
+
+def _steered_verb(argv: list[str]) -> str | None:
+    """The steered `beagle pursuit` verb of one argv, or None.
+
+    A `depend` that withdraws an edge passes; one that adds an edge does not.
+    Run R06's driver added `depend T0008 --hard T0003` to "skip" T0008, and
+    the wait closed a cycle through the task T0008 had superseded.
+    """
+    verb = _pursuit_verb(argv)
+    if verb == "depend" and "--drop" in argv:
+        return None
+    return verb if verb in _STEERED_VERBS else None
 
 
 def make_driver_pursuit_guard() -> Any:
@@ -4513,8 +4655,8 @@ def make_driver_pursuit_guard() -> Any:
     close, a spend measured, a blocked task retried or spawned anew. A driver
     that runs `beagle pursuit close` from bash skips all of it — in run 8 it
     closed, spawned, opened and re-split one task over and over by hand. The
-    verbs no tool runs (`retire`, `depend`, `rebudget` …) stay allowed, and so
-    does reading. Only the host-started session, and only in a founded
+    verbs no tool runs (`retire`, `rebudget` …) and a `depend --drop` stay
+    allowed, and so does reading. Only the host-started session, and only in a founded
     pursuit. Fails open.
     """
 
@@ -4526,10 +4668,7 @@ def make_driver_pursuit_guard() -> Any:
                 return None
             if context.session_id != _STARTED_SESSION:
                 return None
-            verb = _bash_find(
-                str((event.arguments or {}).get("command", "")),
-                lambda argv: v if (v := _pursuit_verb(argv)) in _STEERED_VERBS else None,
-            )
+            verb = _bash_find(str((event.arguments or {}).get("command", "")), _steered_verb)
             if verb is None or _find_goal(Path(context.cwd)) is None:
                 return None
         except Exception:  # noqa: BLE001 - fail open, never block on a guard bug
