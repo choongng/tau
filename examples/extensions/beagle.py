@@ -1810,7 +1810,18 @@ def make_found_tool(on_founded: Callable[[Path], None] | None = None) -> Any:
         setup = _setup_milestone(milestones)
         if setup is not None:
             return _step_result(f"pursuit_found: nothing written — {setup}")
-        delegated = arguments.get("user_delegated") is True
+        # Run R01 founded with a 251-character milestone: the goal file and
+        # root task were written, then beagle refused the split.
+        for index, part in enumerate(milestones, 1):
+            length = len(_part_title(part))
+            if length > MAX_TASK_TITLE:
+                return _step_result(
+                    f"pursuit_found: nothing written — milestone {index} has a "
+                    f"{length}-character title; beagle takes at most {MAX_TASK_TITLE}. "
+                    "Shorten that title and put the detail after '::', as "
+                    "'<short title>::<what it is for>'."
+                )
+        delegated =arguments.get("user_delegated") is True
         if arguments.get("user_confirmed") is not True and not delegated:
             listed = "\n".join(f"  - {c}" for c in criteria)
             return _step_result(

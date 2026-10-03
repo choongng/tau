@@ -1651,6 +1651,61 @@ async def test_pursuit_found_adds_a_lone_milestone_beagle_would_not_split(
 
 
 @pytest.mark.anyio
+async def test_found_refuses_long_milestone_before_writing(
+    tmp_path: Path, beagle: Path, fake_beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    monkeypatch.chdir(project)
+    runtime, _ = _bound(tmp_path)
+    limit = _module().MAX_TASK_TITLE
+    long_title = "x" * (limit + 1)
+
+    result = await _tool(runtime, "pursuit_found").execute(
+        "c1",
+        {
+            "statement": "Implement interval tree clocks",
+            "criteria": ["`python3 -m pytest -q` exits 0"],
+            "milestones": ["Parser::reads input", f"{long_title}::the detail"],
+            "user_confirmed": True,
+        },
+    )
+
+    assert "nothing written" in result.text
+    assert "milestone 2" in result.text and f"{limit + 1}-character" in result.text
+    assert "Shorten" in result.text and "'::'" in result.text
+    assert _calls(fake_beagle) == [] and not (project / ".beagle").exists()
+
+
+@pytest.mark.anyio
+async def test_found_accepts_max_length_milestone(
+    tmp_path: Path, beagle: Path, fake_beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    monkeypatch.chdir(project)
+    (fake_beagle / "add.out").write_text("T0001  Greet\n")
+    runtime, _ = _bound(tmp_path)
+    title = "x" * _module().MAX_TASK_TITLE
+    # The intent after '::' does not count toward the title's length.
+    milestones = [f"{title}::{' '.join(['detail'] * 40)}", "CLI::wires it up"]
+
+    result = await _tool(runtime, "pursuit_found").execute(
+        "c1",
+        {
+            "statement": "Greet",
+            "criteria": ["hello.txt says hi"],
+            "milestones": milestones,
+            "user_confirmed": True,
+        },
+    )
+
+    assert "Founded the pursuit" in result.text
+    assert (project / ".beagle" / "pursuit.toml").exists()
+    assert _pursuit_calls(fake_beagle, "split") == [["T0001", *milestones, "--ordered"]]
+
+
+@pytest.mark.anyio
 async def test_pursuit_plan_adds_one_part_to_a_container(
     tmp_path: Path, beagle: Path, fake_beagle: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
