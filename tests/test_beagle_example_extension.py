@@ -1995,8 +1995,16 @@ async def test_pursuit_step_abandons_a_task_without_a_worker(
     _ready_task(fake_beagle)
     (fake_beagle / "close.out").write_text("T0021 abandoned — duplicate of T0006\n  finding N1\n")
     # Run 10: what waited on an abandoned task waited for ever.
-    waits = [{"id": "T0022", "waiting_on": ["T0021"]}, {"id": "T0023", "waiting_on": ["T0022"]}]
-    (fake_beagle / "tree.out").write_text(json.dumps({"nodes": waits}))
+    waits = [
+        {"id": "T0022", "parent": "T0002", "waiting_on": ["T0021"]},
+        {"id": "T0023", "parent": "T0002", "waiting_on": ["T0022"]},
+    ]
+    others = [
+        {"id": "T0001", "parent": "", "status": "pending", "container": True},
+        {"id": "T0006", "parent": "T0002", "status": "done"},
+        {"id": "T0021", "parent": "T0002", "status": "pending"},
+    ]
+    (fake_beagle / "tree.out").write_text(json.dumps({"nodes": others + waits}))
     runtime, _ = _bound(tmp_path)
     step = _tool(runtime, "pursuit_step")
 
@@ -3371,3 +3379,291 @@ async def test_step_and_dispatch_timeout_clamped(
         "c3", {"brief": "Write notes", "cwd": str(bare), "timeout": 600}
     )
     assert "clamped" not in unclamped.text
+
+
+# --------------------------------------------------------------------------- #
+# run R02: an unprovable task re-stepped, milestones abandoned, a stalled stop
+# --------------------------------------------------------------------------- #
+
+
+def _witnessed_pursuit(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    project = _git_project(tmp_path, monkeypatch)
+    with (project / ".beagle" / "pursuit.toml").open("a", encoding="utf-8") as goal:
+        goal.write('\n[close]\nrequire = "witness"\n')
+    return project
+
+
+@pytest.mark.anyio
+async def test_unprovable_restep_spawns_no_worker(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # R02: T0003's scope held tests only, so `prove` had no source file to take
+    # away; six steps sent two workers each at the same passing check.
+    monkeypatch.chdir(_witnessed_pursuit(tmp_path, monkeypatch))
+    _ready_task(fake_beagle)
+    runtime, _ = _bound(tmp_path)
+    step = _tool(runtime, "pursuit_step")
+    args = {"task": "T0002", "criteria": "c", "done_when": "test -f done.txt", "scope": ["tests"]}
+
+    first = await step.execute("c1", args)
+    record = {"id": "T0002", "title": "Parser", "status": "open"}
+    record |= {"done_when": "test -f done.txt", "scope": ["tests"]}
+    (fake_beagle / "show.out").write_text(json.dumps(record))
+    (fake_beagle / "next.out").write_text(json.dumps({"open": [{"id": "T0002"}], "ready": []}))
+    again = await step.execute("c2", {"task": "T0002"})
+    same = await step.execute("c3", {"task": "T0002", "done_when": "test -f done.txt"})
+
+    assert len(_runs(fake_tau)) == 1
+    assert "no defect could be put back" in first.text and "stays open" in first.text
+    for refused in (again, same):
+        assert "not run: this check already passes and cannot be shown to refuse" in refused.text
+        assert "imports the code this task tests" in refused.text
+    assert _pursuit_calls(fake_beagle, "close") == []
+
+
+@pytest.mark.anyio
+async def test_unprovable_first_verdict_stops_attempts(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # R02 ran the second worker of a step after its check already passed.
+    monkeypatch.chdir(_git_project(tmp_path, monkeypatch))
+    monkeypatch.setenv("FAKE_TAU_REPORT", WITNESSED_REPORT)
+    _ready_task(fake_beagle)
+    (fake_beagle / "prove.out").write_text("T0002: NOT PROVEN — src/clock.py is not there\n")
+    (fake_beagle / "prove.rc").write_text("9")
+    runtime, _ = _bound(tmp_path)
+
+    result = await _tool(runtime, "pursuit_step").execute(
+        "c1",
+        {
+            "task": "T0002",
+            "criteria": "c",
+            "done_when": "test -f done.txt",
+            "scope": ["done.txt"],
+            "attempts": 3,
+        },
+    )
+
+    assert len(_runs(fake_tau)) == 1
+    # One verdict: the witness, then the changed source taken away.
+    assert [p[1] for p in _pursuit_calls(fake_beagle, "prove")] == ["--mutate", "--absent"]
+    assert _pursuit_calls(fake_beagle, "close") == []
+    assert "no defect could be put back" in result.text
+    assert "must import the code this task tests" in result.text
+
+
+def _milestones(fake: Path, *nodes: dict[str, Any]) -> None:
+    """A tree: root T0001, milestone T0002 under it, and `nodes` besides."""
+    tree = [
+        {"id": "T0001", "parent": "", "title": "Goal", "status": "pending", "container": True},
+        {"id": "T0002", "parent": "T0001", "title": "Clock", "status": "pending"},
+        *nodes,
+    ]
+    (fake / "tree.out").write_text(json.dumps({"nodes": tree}))
+
+
+@pytest.mark.anyio
+async def test_abandon_already_done_refused(
+    tmp_path: Path, beagle: Path, fake_beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # R02 abandoned four of five milestones as "already exists / passes".
+    monkeypatch.chdir(_pursuit_project(tmp_path))
+    _ready_task(fake_beagle)
+    _milestones(fake_beagle, {"id": "T0003", "parent": "T0002", "status": "pending"})
+    runtime, _ = _bound(tmp_path)
+    step = _tool(runtime, "pursuit_step")
+
+    done = await step.execute("c1", {"task": "T0003", "abandon": "already done"})
+    unknown = await step.execute("c2", {"task": "T0003", "abandon": "duplicate of T0099"})
+
+    assert _pursuit_calls(fake_beagle, "close") == []
+    for refused in (done, unknown):
+        assert "T0003 not abandoned" in refused.text
+        assert "bind the goal criterion's test" in refused.text
+    hint = _module().ABANDON_HINT
+    assert "already done" not in hint and "duplicate of Tnnnn" in hint
+
+
+@pytest.mark.anyio
+async def test_abandon_duplicate_of_done_task_closes(
+    tmp_path: Path, beagle: Path, fake_beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(_pursuit_project(tmp_path))
+    _ready_task(fake_beagle)
+    _milestones(
+        fake_beagle,
+        {"id": "T0003", "parent": "T0002", "status": "done"},
+        {"id": "T0004", "parent": "T0002", "status": "pending"},
+    )
+    (fake_beagle / "close.out").write_text("T0004 abandoned — duplicate of T0003\n")
+    runtime, _ = _bound(tmp_path)
+
+    result = await _tool(runtime, "pursuit_step").execute(
+        "c1", {"task": "T0004", "abandon": "duplicate of T0003"}
+    )
+
+    assert _pursuit_calls(fake_beagle, "close") == [
+        ["T0004", "--outcome", "abandoned", "--reason", "duplicate of T0003"]
+    ]
+    assert "T0004 abandoned" in result.text
+
+
+@pytest.mark.anyio
+async def test_abandon_milestone_refused(
+    tmp_path: Path, beagle: Path, fake_beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(_pursuit_project(tmp_path))
+    _ready_task(fake_beagle)
+    _milestones(fake_beagle, {"id": "T0003", "parent": "T0001", "status": "done"})
+    runtime, _ = _bound(tmp_path)
+
+    result = await _tool(runtime, "pursuit_step").execute(
+        "c1", {"task": "T0002", "abandon": "duplicate of T0003"}
+    )
+
+    assert _pursuit_calls(fake_beagle, "close") == []
+    assert "T0002 not abandoned — it is a milestone" in result.text
+    assert "pursuit_plan" in result.text and "new_route=true" in result.text
+
+
+STALLED_TREE = [
+    {"id": "T0001", "parent": "", "title": "Goal", "status": "pending", "container": True},
+    {"id": "T0002", "parent": "T0001", "title": "Cases", "status": "done"},
+    {
+        "id": "T0003",
+        "parent": "T0001",
+        "title": "Clock",
+        "status": "abandoned",
+        "reason": "already exists",
+    },
+    # Handed on: its successor holds the work.
+    {"id": "T0004", "parent": "T0001", "title": "Old route", "status": "superseded"},
+    {
+        "id": "T0005",
+        "parent": "T0001",
+        "title": "New route",
+        "status": "done",
+        "sibling_of": "T0004",
+    },
+    {
+        "id": "T0006",
+        "parent": "T0001",
+        "title": "Twin",
+        "status": "abandoned",
+        "reason": "duplicate of T0002",
+    },
+]
+
+
+@pytest.mark.anyio
+async def test_nothing_ready_with_stalled_root_says_not_done(
+    tmp_path: Path, beagle: Path, fake_beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # R02 L107: "tell the user the pursuit is done", with the root stalled.
+    monkeypatch.chdir(_pursuit_project(tmp_path))
+    (fake_beagle / "next.out").write_text(json.dumps({"open": [], "ready": []}))
+    (fake_beagle / "next.rc").write_text("3")
+    (fake_beagle / "tree.out").write_text(json.dumps({"nodes": STALLED_TREE}))
+    runtime, _ = _bound(tmp_path)
+
+    result = await _tool(runtime, "pursuit_step").execute("c1", {})
+
+    assert "The pursuit is NOT done" in result.text
+    assert "tell the user the pursuit is done" not in result.text
+    assert "- T0003 — Clock (abandoned: already exists)" in result.text
+    for settled in ("T0004 —", "T0005 —", "T0006 —"):
+        assert settled not in result.text.split("NOT done", 1)[1]
+
+
+def _say(text: str) -> list[Any]:
+    from pi_event_helpers import assistant_done, assistant_start
+
+    return [assistant_start(model="fake"), assistant_done(message=AssistantMessage(content=text))]
+
+
+async def _print_run(tmp_path: Path, project: Path, stops: int) -> tuple[Any, bool]:
+    from tau_ai import FakeProvider
+    from tau_coding.cli import run_print_mode
+
+    provider = FakeProvider([_say(f"complete {n}") for n in range(stops)])
+    ok = await run_print_mode(
+        prompt="Drive the pursuit.",
+        model="fake",
+        cwd=project,
+        provider=provider,
+        resource_paths=TauResourcePaths(root=tmp_path / "home-tau", agents_root=None),
+        extension_paths=(EXTENSION,),
+    )
+    return provider, ok
+
+
+def _sent(provider: Any) -> list[str]:
+    """The user messages of each request after the first, past the prompt."""
+    return [
+        message.text
+        for message in provider.calls[-1][2]
+        if isinstance(message, UserMessage) and message.text.startswith("[beagle]")
+    ]
+
+
+@pytest.mark.anyio
+async def test_print_mode_stop_gate_queues_followup_twice(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    # R02 ended `tau -p` on "complete" with the root stalled: the Stop hooks
+    # skip print mode. Through the real print-mode loop, each queued follow-up
+    # is one more request, and the third stop goes through.
+    project = _pursuit_project(tmp_path)
+    (fake_beagle / "tree.out").write_text(json.dumps({"nodes": STALLED_TREE}))
+
+    provider, ok = await _print_run(tmp_path, project, stops=4)
+
+    assert ok is True
+    assert len(provider.calls) == 3
+    nudges = _sent(provider)
+    assert len(nudges) == 2
+    assert all("The pursuit is not done" in n and "- T0003 — Clock" in n for n in nudges)
+    assert "complete 2" in capsys.readouterr().out
+
+
+@pytest.mark.anyio
+async def test_stop_gate_lets_a_finished_pursuit_and_a_worker_stop(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project = _pursuit_project(tmp_path)
+    done = [{**node, "status": "done"} if node["id"] == "T0001" else node for node in STALLED_TREE]
+    (fake_beagle / "tree.out").write_text(json.dumps({"nodes": done}))
+    finished, _ = await _print_run(tmp_path, project, stops=2)
+    leaves_done = [n for n in STALLED_TREE if n["id"] != "T0003"]
+    (fake_beagle / "tree.out").write_text(json.dumps({"nodes": leaves_done}))
+    all_leaves, _ = await _print_run(tmp_path, project, stops=2)
+    (fake_beagle / "tree.out").write_text(json.dumps({"nodes": STALLED_TREE}))
+    monkeypatch.setenv("BEAGLE_TAU_WORKER", "1")
+    worker, _ = await _print_run(tmp_path, project, stops=2)
+
+    assert len(finished.calls) == len(all_leaves.calls) == len(worker.calls) == 1
+
+
+def test_cases_first_note_recommends_a_check_beagle_accepts() -> None:
+    import re
+
+    module = _module()
+    checks = re.findall(r"`(python3 [^`]+)`", module.CASES_FIRST_NOTE)
+    recommended = [c for c in checks if "json.tool" not in c]
+    assert recommended and all(module._check_problem(c) is None for c in recommended)
+    assert module._check_problem("python3 -m json.tool tests/cases.json") is not None

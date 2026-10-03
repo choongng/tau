@@ -1979,10 +1979,90 @@ def _part_title(part: str) -> str:
     return part.partition("::")[0].strip()
 
 
+def _tree_nodes(root: Path) -> list[dict[str, Any]]:
+    """The pursuit's `tree --json` nodes; empty when beagle cannot say."""
+    rc, out = _pursuit(["tree", "--json"], root)
+    tree = _json_reply(out) if rc == 0 else None
+    nodes = tree.get("nodes") if isinstance(tree, dict) else None
+    return [n for n in nodes if isinstance(n, dict)] if isinstance(nodes, list) else []
+
+
+def _duplicate_of(why: str, task: str, nodes: list[dict[str, Any]]) -> str | None:
+    """The done or open task that `why` names as the one `task` repeats, or None."""
+    status = {str(n.get("id")): n.get("status") for n in nodes}
+    for named in _TASK_ID.findall(why):
+        if named != task and status.get(named) in ("done", "open"):
+            return str(named)
+    return None
+
+
+def _unfinished(nodes: list[dict[str, Any]]) -> list[str] | None:
+    """What keeps the pursuit from done, one line a task; None when it is done.
+
+    None too when the tree has no root, so a tree beagle cannot show is not
+    called unfinished. A leaf that ended undone counts unless another task
+    took its work on (`sibling_of`) or it was dropped as a duplicate of a
+    done task: run R02's driver abandoned four of five milestones as
+    "already done", and the root, stalled, read as finished to it.
+    """
+    roots = [n for n in nodes if not n.get("parent")]
+    if not roots:
+        return None
+    if roots[0].get("status") == "done":
+        return None
+    by_id = {str(n.get("id")): n for n in nodes}
+    heirs = {str(n.get("sibling_of")) for n in nodes if n.get("sibling_of")}
+    left = []
+    for node in nodes:
+        task, status = str(node.get("id")), node.get("status")
+        if node.get("container") or status == "done" or task in heirs:
+            continue
+        if status == "abandoned":
+            named = _TASK_ID.findall(str(node.get("reason") or ""))
+            if any(by_id.get(n, {}).get("status") == "done" for n in named if n != task):
+                continue
+        reason = str(node.get("reason") or "").strip()
+        left.append(
+            f"- {task} — {node.get('title', '')} ({status}"
+            + (f": {reason[:120]}" if reason and status != "pending" else "")
+            + ")"
+        )
+    if not left and roots[0].get("container"):
+        return None
+    return left or [f"- {roots[0].get('id')} — {roots[0].get('title', '')} (not closed)"]
+
+
+def _abandon_problem(task: str, why: str, nodes: list[dict[str, Any]]) -> str | None:
+    """Why the driver may not abandon `task` for `why`, or None.
+
+    Run R02's driver abandoned four of five milestones in 0.3 min, each as
+    "already exists / passes", right after tau's own hint offered abandoning
+    work "already done". A task is dropped only as a duplicate of one that
+    holds its work; a milestone is the goal's and is never dropped here.
+    """
+    parent = {str(n.get("id")): str(n.get("parent") or "") for n in nodes}
+    roots = [t for t, p in parent.items() if not p]
+    if roots and parent.get(task) == roots[0]:
+        return (
+            f"pursuit_step: {task} not abandoned — it is a milestone, and a milestone is "
+            "the goal's. Split it with pursuit_plan, or give it a new route with "
+            f'pursuit_step task="{task}", new_route=true and notes.'
+        )
+    if _duplicate_of(why, task, nodes) is not None:
+        return None
+    return (
+        f"pursuit_step: {task} not abandoned — a task is dropped only as a duplicate of "
+        "a done or open task, named as abandon='duplicate of Tnnnn'. Work that seems "
+        "already done is not a reason: if its check already passes, bind the goal "
+        "criterion's test as done_when (one that imports and runs the code), so the "
+        "check shows the work is there."
+    )
+
+
 #: What the driver is told to do with a task that should not be worked.
 ABANDON_HINT = (
-    "To drop a task that repeats another or whose work is already done, call "
-    "pursuit_step with its task and abandon='<why>', e.g. abandon='duplicate of T0014'."
+    "To drop a task that repeats another, call pursuit_step with its task and "
+    "abandon='duplicate of Tnnnn', naming the done or open task that holds its work."
 )
 
 
@@ -2250,8 +2330,8 @@ STEP_PARAMETERS: dict[str, Any] = {
         "abandon": {
             "type": "string",
             "description": (
-                "Drop this task instead of working it, saying why: 'duplicate of T0014', "
-                "'already done by T0013'. No sub-agent runs."
+                "Drop this task as a duplicate of a done or open task: 'duplicate of "
+                "T0014'. Refused for a milestone and for any other reason. No sub-agent runs."
             ),
         },
         "new_route": {
@@ -2963,6 +3043,12 @@ def _abandon(task: str, why: str, root: Path, goal: Path) -> str:
     )
 
 
+#: Open tasks whose passing check `prove` could not show to refuse, by (project
+#: root, task): the check and scope it was seen with. A step on the same pair
+#: runs no worker, since the next one passes the same check unproven again.
+_UNPROVEN: dict[tuple[str, str], tuple[str, tuple[str, ...]]] = {}
+
+
 def make_step_tool() -> Any:
     """Build `pursuit_step`: one task, opened, done by a sub-agent, checked and closed.
 
@@ -2994,17 +3080,33 @@ def make_step_tool() -> Any:
         open_ids = _ids(ready.get("open"))
         ready_ids = _ids(ready.get("ready"))
         blocked = _blocked_tasks(root)
-        nothing_ready = f"Nothing is ready to work.\n\n{_tree(root)}\n\n" + (
-            _blocked_routes(blocked)
-            if blocked
-            else "If every criterion of the goal now holds, tell the user the pursuit "
-            "is done. If work remains, add it with pursuit_plan."
-        )
+        nodes = _tree_nodes(root)
+        left = _unfinished(nodes)
+        if blocked:
+            after = _blocked_routes(blocked)
+        elif left:
+            # Run R02's driver was offered "tell the user the pursuit is done"
+            # here with the root stalled and four milestones abandoned.
+            after = (
+                "The pursuit is NOT done: these tasks are not done, and nothing took "
+                "their work on:\n" + "\n".join(left) + "\n\nDo not tell the user it is "
+                "done. Add the missing work with pursuit_plan, or give a task a new route "
+                'with pursuit_step task="<id>", new_route=true and notes.'
+            )
+        else:
+            after = (
+                "If every criterion of the goal now holds, tell the user the pursuit "
+                "is done. If work remains, add it with pursuit_plan."
+            )
+        nothing_ready = f"Nothing is ready to work.\n\n{_tree(root)}\n\n{after}"
         task = str(arguments.get("task") or "").strip()
         abandon = str(arguments.get("abandon") or "").strip()
         if abandon:
             if not task:
                 return _step_result("pursuit_step: abandon names the task to drop; pass task too.")
+            refused = _abandon_problem(task, abandon, nodes)
+            if refused is not None:
+                return _step_result(refused)
             return _step_result(_abandon(task, abandon, root, goal))
         if ready.get("audit_due"):
             return _step_result(await _audit(root, signal, on_update))
@@ -3122,7 +3224,9 @@ def make_step_tool() -> Any:
                     "a check that fails now: name a new test file for what this task adds, "
                     "e.g. `python3 -m pytest -q tests/test_<this task>.py`, put it in scope, "
                     "and say in the notes what it should test. It fails until the sub-agent "
-                    "writes it; do not write it yourself. " + ABANDON_HINT
+                    "writes it; do not write it yourself. If the work is there already, "
+                    "bind the goal criterion's test, which imports and runs the code. "
+                    + ABANDON_HINT
                 )
             argv = ["open", task, "--criteria", criteria, "--done-when", done_when]
             if scope:
@@ -3204,6 +3308,17 @@ def make_step_tool() -> Any:
         attempt = 0
         proof: _Proof | None = None
         scope = scope or _strings(record.get("scope"))
+        unproven_key = (str(root), task)
+        if _UNPROVEN.get(unproven_key) == (check, tuple(scope)):
+            return _step_result(
+                f"pursuit_step: {task} not run: this check already passes and cannot be "
+                f"shown to refuse, since no defect could be put back into a source file "
+                f"in its scope ({', '.join(scope) or 'none'}). Another sub-agent would "
+                f"change nothing. Bind a done_when that imports the code this task tests "
+                f"and runs it (e.g. `python3 -m pytest -q tests/test_<this task>.py`, a "
+                f"test that imports the module), or add that code's source file to scope; "
+                f'call pursuit_step with task="{task}" and the new done_when or scope.'
+            )
         brief += "\n\n" + WITNESS_NOTE
         if retrying:
             # The work may have been done since, under another task.
@@ -3234,6 +3349,11 @@ def make_step_tool() -> Any:
             if verdict[0] == 0:
                 proof = await _prove(task, report, scope, root, check_timeout)
                 if proof is None or proof.proven:
+                    break
+                if not proof.weak:
+                    # No defect could be put back: run R02 sent a second worker
+                    # after every such verdict, and six identical steps more.
+                    _UNPROVEN[unproven_key] = (check, tuple(scope))
                     break
                 retry_note = (
                     "\n\nAn earlier attempt reported back and the check passes, but `prove` "
@@ -3301,6 +3421,13 @@ def make_step_tool() -> Any:
                 "of the behaviour itself, e.g. `python3 -m pytest -q tests/test_<this "
                 "task>.py`, with notes saying what that test must check. A bare import or "
                 "file-exists check cannot be shown to refuse."
+                + (
+                    ""
+                    if proof.weak
+                    else " The test must import the code this task tests, and that code's "
+                    "source file must be in scope: the same check and scope again runs "
+                    "no sub-agent."
+                )
             )
         # Committed while the task is still open, as beagle has a worker do:
         # the close's sweep then finds the work in history, not in the tree.
@@ -4297,6 +4424,58 @@ def make_found_first_gate() -> Any:
     return gate
 
 
+#: Follow-ups the stop gate queues in one run before it lets the driver stop.
+MAX_STOP_GATE_FOLLOWUPS = 2
+_STOP_GATE_SENT = 0
+
+
+def _reset_stop_gate(event: Any, context: ExtensionContext) -> None:
+    global _STOP_GATE_SENT
+    del event, context
+    _STOP_GATE_SENT = 0
+
+
+def make_stop_gate(tau: ExtensionAPI) -> Any:
+    """Build the driver's `turn_end` gate: no stop while the pursuit is unfinished.
+
+    Run R02's driver ended a `tau -p` run with "complete" while the root was
+    stalled, and nothing objected: the Stop hooks do not run in print mode. A
+    turn that ends with no tool call is the run's last unless something is
+    queued, so this queues a follow-up naming what is not done, as the
+    session's output-limit nudge does; the loop sends it in print mode too.
+    At most `MAX_STOP_GATE_FOLLOWUPS` a run, then the stop is let through.
+    """
+
+    async def gate(event: Any, context: ExtensionContext) -> None:
+        global _STOP_GATE_SENT
+        message = getattr(event, "message", None)
+        if (
+            getattr(message, "role", None) != "assistant"
+            or getattr(message, "tool_calls", None)
+            or getattr(message, "stop_reason", None) in ("error", "aborted", "length")
+            or _STOP_GATE_SENT >= MAX_STOP_GATE_FOLLOWUPS
+        ):
+            return
+        goal = _find_goal(Path(context.cwd))
+        if goal is None:
+            return
+        nodes = await asyncio.to_thread(_tree_nodes, goal.parent.parent)
+        left = _unfinished(nodes)
+        if not left:
+            return
+        _STOP_GATE_SENT += 1
+        tau.send_user_message(
+            "[beagle] The pursuit is not done, so this is not the place to stop. Not "
+            "done, and nothing took their work on:\n" + "\n".join(left) + "\n\nCall "
+            "pursuit_step with no arguments for the next task; if nothing is ready, add "
+            "the missing work with pursuit_plan, or give a task a new route with "
+            'pursuit_step task="<id>", new_route=true and notes. Stop only when the '
+            "pursuit is done or a step says to stop and tell the user."
+        )
+
+    return gate
+
+
 def make_stop_hooks(tau: ExtensionAPI) -> Any:
     """Build the `agent_settled` bridge for beagle's Stop hooks.
 
@@ -4934,9 +5113,12 @@ CASES_FIRST_NOTE = (
     "file of small inputs and the exact results the reference gives for them, each "
     "citing where in the reference it comes from (e.g. `tests/cases.json`), and (b) "
     "a test that runs every case against the code (e.g. `tests/test_cases.py`; it "
-    "fails until the code exists). Its done_when checks only the data, e.g. `python3 "
-    "-m json.tool tests/cases.json`, and it passes `locks` with both files. Once it "
-    "closes they are locked, and every later task's done_when runs that test."
+    "fails until the code exists). Its done_when checks only the data, with a small "
+    "test of the file itself (e.g. `python3 -m pytest -q tests/test_case_data.py`: "
+    "every case has its inputs, its result and its citation, and there are enough "
+    "of them); not `python3 -m json.tool`, which passes once the file parses and is "
+    "refused as a check. It passes `locks` with the data file and both tests. Once it "
+    "closes they are locked, and every later task's done_when runs the cases test."
 )
 
 #: Commits need an identity; a model that meets "Please tell me who you are"
@@ -5454,6 +5636,8 @@ def setup(tau: ExtensionAPI) -> None:
         tau.on("agent_start", _note_run_start)
         tau.on("agent_end", _note_run_end)
         tau.on("agent_settled", make_stop_hooks(tau))
+        tau.on("agent_start", _reset_stop_gate)
+        tau.on("turn_end", make_stop_gate(tau))
         tau.on("agent_settled", make_wakeup_delivery(tau))
         tau.on("session_shutdown", lambda event, context: _void_wakeup())
         # Workers do not outlive their session, so a run this session drives
