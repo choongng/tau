@@ -4918,6 +4918,110 @@ async def test_nothing_ready_names_the_drop_for_a_wait_on_a_stalled_heir(
     assert _pursuit_calls(fake_beagle, "depend") == []
 
 
+def _r08_shape(*parts: dict[str, Any]) -> list[dict[str, Any]]:
+    """R08's frame: root T0001 holding containers, T0007 a part of non-root T0004."""
+    return [
+        {"id": "T0001", "parent": "", "title": "ITC", "status": "pending", "container": True},
+        {
+            "id": "T0002",
+            "parent": "T0001",
+            "title": "Design",
+            "status": "done",
+            "container": True,
+            "subtree": "done",
+        },
+        {
+            "id": "T0004",
+            "parent": "T0001",
+            "title": "Impl",
+            "status": "pending",
+            "container": True,
+            "subtree": "idle",
+        },
+        *parts,
+    ]
+
+
+async def _assert_dead_wait_named(
+    nodes: list[dict[str, Any]],
+    wait: tuple[str, str, str],
+    line: str,
+    reason: str,
+    tmp_path: Path,
+    fake_beagle: Path,
+) -> None:
+    assert _module()._dead_waits(nodes) == [wait]
+    _nothing_ready(fake_beagle, nodes)
+    runtime, _ = _bound(tmp_path)
+
+    text = (await _tool(runtime, "pursuit_step").execute("c1", {})).text
+
+    assert "Nothing is ready" in text
+    assert "can never be met" in text
+    assert line in text
+    assert f'beagle pursuit depend T0007 {wait[1]} --drop --reason "{reason}"' in text
+    assert "The pursuit is NOT done" not in text
+    assert _pursuit_calls(fake_beagle, "depend") == []
+
+
+@pytest.mark.anyio
+async def test_dead_wait_on_an_abandoned_leaf_in_r08_shape(
+    tmp_path: Path, beagle: Path, fake_beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(_pursuit_project(tmp_path))
+    nodes = _r08_shape(
+        {
+            "id": "T0007",
+            "parent": "T0004",
+            "title": "implement-fill",
+            "status": "pending",
+            "waiting_on": ["T0011"],
+        },
+        {"id": "T0011", "parent": "T0004", "title": "fix-id-usage", "status": "abandoned"},
+    )
+    await _assert_dead_wait_named(
+        nodes,
+        ("T0007", "T0011", "T0011"),
+        "- T0007 waits on T0011 (abandoned)",
+        "T0011 is abandoned and will never be done",
+        tmp_path,
+        fake_beagle,
+    )
+
+
+@pytest.mark.anyio
+async def test_dead_wait_on_an_abandoned_non_container_heir_in_r08_shape(
+    tmp_path: Path, beagle: Path, fake_beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(_pursuit_project(tmp_path))
+    nodes = _r08_shape(
+        {"id": "T0006", "parent": "T0004", "title": "fix-id-usage", "status": "superseded"},
+        {
+            "id": "T0007",
+            "parent": "T0004",
+            "title": "implement-fill",
+            "status": "pending",
+            "waiting_on": ["T0006"],
+            "waiting_heirs": {"T0006": "T0011"},
+        },
+        {
+            "id": "T0011",
+            "parent": "T0004",
+            "title": "fix-id-usage",
+            "status": "abandoned",
+            "sibling_of": "T0006",
+        },
+    )
+    await _assert_dead_wait_named(
+        nodes,
+        ("T0007", "T0006", "T0011"),
+        "- T0007 waits on T0006 (superseded, handed to T0011: abandoned)",
+        "T0006 was handed to T0011, which is abandoned and will never be done",
+        tmp_path,
+        fake_beagle,
+    )
+
+
 def _say(text: str) -> list[Any]:
     from pi_event_helpers import assistant_done, assistant_start
 
