@@ -52,6 +52,8 @@ _DEFINITION = re.compile(
     r"^(?:\s*(?P<number>\d+)(?:\t|[:|\u2502\u2192] ?))?"
     r"(?P<indent>[ \t]*)(?P<kind>async\s+def|def|class)\s+(?P<name>\w+)"
 )
+#: The note the read tool appends when it stops at a limit; not a file line.
+_READ_TOOL_NOTE = re.compile(r"\n\n\[(?:Showing lines |\d+ more lines in file\. )[^\n]*\]\Z")
 
 
 @dataclass(frozen=True, slots=True)
@@ -84,11 +86,14 @@ def buffer_tool_result(
     buffer_dir: Path,
     limits: BufferLimits,
     first_line: int = 1,
+    limit: int | None = None,
 ) -> AgentToolResult:
     """Return `result` unchanged if it fits inline, else a window plus a buffer path.
 
     `first_line` is the file line the text starts at (a read's offset), so the
-    outline of a head-windowed read names the file's own line numbers.
+    marker and outline of a head-windowed read name the file's own line numbers.
+    `limit` is the read's explicit line limit: a read that asked for a number
+    of lines is cut by characters only, not by `window_lines`.
     """
     texts = [block.text for block in result.content if isinstance(block, TextContent)]
     text = "\n".join(texts)
@@ -101,10 +106,15 @@ def buffer_tool_result(
     except OSError as exc:
         failure = f"{type(exc).__name__}: {exc}"
     head = tool_name in HEAD_WINDOW_TOOLS
-    shown, shown_lines = _window(text, head=head, limits=limits)
+    max_lines = None if head and limit is not None else limits.window_lines
+    shown, shown_lines = _window(text, head=head, limits=limits, max_lines=max_lines)
     total_lines = text.count("\n") + 1
     where = "first" if head else "last"
-    if location is not None:
+    if head:
+        marker = _read_marker(
+            text, shown, first_line=first_line, location=location, failure=failure
+        )
+    elif location is not None:
         marker = (
             f"[Output truncated: the {where} {shown_lines:,} of {total_lines:,} lines "
             f"({len(shown):,} of {len(text):,} chars) are shown. Full output: {location} "
@@ -126,12 +136,40 @@ def buffer_tool_result(
     return result.model_copy(update={"content": [TextContent(text=f"{shown}\n{marker}"), *images]})
 
 
+def read_request(arguments: Mapping[str, object]) -> tuple[int, int | None]:
+    """The file line a read with these arguments starts at, and its explicit limit."""
+    limit = arguments.get("limit")
+    explicit = isinstance(limit, int) and not isinstance(limit, bool) and limit > 0
+    return read_first_line(arguments), limit if explicit else None
+
+
 def read_first_line(arguments: Mapping[str, object]) -> int:
     """The file line a read with these arguments starts at (its offset, 1-indexed)."""
     offset = arguments.get("offset")
     if isinstance(offset, int) and not isinstance(offset, bool) and offset > 1:
         return offset
     return 1
+
+
+def _read_marker(
+    text: str, shown: str, *, first_line: int, location: str | None, failure: str
+) -> str:
+    """Which file lines a cut read shows, of those it returned, and where to go on."""
+    body = _READ_TOOL_NOTE.sub("", text).removesuffix("\n")
+    last_asked = first_line + body.count("\n")
+    whole = shown.count("\n") + (1 if text[len(shown) : len(shown) + 1] in ("\n", "") else 0)
+    last_shown = min(first_line + whole - 1, last_asked)
+    if last_shown >= first_line:
+        shown_part = f"lines {first_line}-{last_shown} of the file are shown"
+    else:
+        shown_part = f"line {first_line} is too long to show whole"
+    marker = (
+        f"[Read cut: {shown_part} (of {first_line}-{last_asked} asked); "
+        f"continue with offset={last_shown + 1}."
+    )
+    if location is not None:
+        return f"{marker} Full output: {location} — page it with read (offset/limit) or grep it.]"
+    return f"{marker} The full output could not be saved ({failure}).]"
 
 
 def _outline(text: str, *, first_line: int, max_chars: int) -> str:
@@ -161,10 +199,14 @@ def _outline(text: str, *, first_line: int, max_chars: int) -> str:
     return "\n".join([header, *kept, *tail])
 
 
-def _window(text: str, *, head: bool, limits: BufferLimits) -> tuple[str, int]:
+def _window(
+    text: str, *, head: bool, limits: BufferLimits, max_lines: int | None
+) -> tuple[str, int]:
     """The kept part of `text` and how many of its lines it shows, whole or in part."""
     lines = text.split("\n")
-    kept = lines[: limits.window_lines] if head else lines[-limits.window_lines :]
+    if max_lines is not None:
+        lines = lines[:max_lines] if head else lines[-max_lines:]
+    kept = lines
     shown = "\n".join(kept)
     if len(shown) > limits.window_chars:
         # A few very long lines (minified JSON, an event stream) would defeat a

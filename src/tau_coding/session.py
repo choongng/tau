@@ -188,7 +188,7 @@ from tau_coding.tool_buffers import (
     BufferLimits,
     buffer_tool_result,
     default_buffer_dir,
-    read_first_line,
+    read_request,
 )
 from tau_coding.tools import ImageSupportState, create_bash_tool, create_coding_tools
 
@@ -1469,12 +1469,18 @@ class CodingSession:
         live = {seen for seen, _ in self._recent_calls}
         for stale in [seen for seen in self._recent_heads if seen not in live]:
             del self._recent_heads[stale]
+        first_line, limit = read_request(call.arguments)
         return self._buffer_result(
-            result, tool_name=call.name, first_line=read_first_line(call.arguments)
+            result, tool_name=call.name, first_line=first_line, limit=limit
         ), is_error
 
     def _buffer_result(
-        self, result: AgentToolResult, *, tool_name: str, first_line: int = 1
+        self,
+        result: AgentToolResult,
+        *,
+        tool_name: str,
+        first_line: int = 1,
+        limit: int | None = None,
     ) -> AgentToolResult:
         """Window an oversized result; its full text goes beside the session file."""
         session_path = _storage_path(self._config.storage)
@@ -1487,6 +1493,7 @@ class CodingSession:
             buffer_dir=buffer_dir,
             limits=BufferLimits.for_context_window(self.context_window_tokens),
             first_line=first_line,
+            limit=limit,
         )
 
     @property

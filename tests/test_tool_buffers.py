@@ -4,9 +4,19 @@ from pathlib import Path
 
 import pytest
 
-from tau_agent.messages import ImageContent, TextContent
+from pi_event_helpers import assistant_done, assistant_start
+from tau_agent import AssistantMessage, ToolCall
+from tau_agent.messages import ImageContent, TextContent, assistant_content
+from tau_agent.session import JsonlSessionStorage
 from tau_agent.tools import AgentToolResult
-from tau_coding.tool_buffers import BufferLimits, buffer_tool_result, read_first_line
+from tau_ai import FakeProvider
+from tau_coding import CodingSession, CodingSessionConfig
+from tau_coding.tool_buffers import (
+    BufferLimits,
+    buffer_tool_result,
+    read_first_line,
+    read_request,
+)
 from tau_coding.tools import create_read_tool
 
 LIMITS = BufferLimits(inline_chars=1_000, window_chars=500, window_lines=10)
@@ -46,7 +56,7 @@ def test_read_keeps_the_head_and_long_lines_are_capped(tmp_path: Path) -> None:
         buffer_dir=tmp_path,
         limits=LIMITS,
     )
-    assert _text(head).startswith("row 0\n") and "the first 10 of 500 lines" in _text(head)
+    assert _text(head).startswith("row 0\n") and "lines 1-10 of the file are shown" in _text(head)
 
     one_line = buffer_tool_result(
         AgentToolResult(content=[TextContent(text="x" * 100_000)]),
@@ -156,3 +166,136 @@ def test_cut_read_outline_is_bounded(tmp_path: Path) -> None:
     assert "Definitions (" not in _text(
         buffer_tool_result(plain, tool_name="read", buffer_dir=tmp_path, limits=limits)
     )
+
+
+@pytest.mark.anyio
+async def test_cut_read_marker_names_file_lines_and_next_offset(tmp_path: Path) -> None:
+    source = "".join(f"row {i}\n" for i in range(1, 2_001))
+    arguments: dict[str, object] = {"offset": 100}
+    result = await _read(tmp_path, source, arguments)
+    first_line, limit = read_request(arguments)
+
+    shown = _text(
+        buffer_tool_result(
+            result,
+            tool_name="read",
+            buffer_dir=tmp_path / "buffers",
+            limits=BufferLimits(inline_chars=2_000, window_chars=8_000, window_lines=60),
+            first_line=first_line,
+            limit=limit,
+        )
+    )
+
+    assert shown.startswith("row 100\n") and "row 159\nrow 160\n" not in shown
+    assert "lines 100-159 of the file are shown (of 100-2000 asked)" in shown
+    assert "continue with offset=160" in shown
+    [path] = list((tmp_path / "buffers").iterdir())
+    assert f"Full output: {path}" in shown
+
+
+def test_char_cut_read_marker_names_the_last_whole_line(tmp_path: Path) -> None:
+    text = "\n".join(f"{i:04d}" + "x" * 95 for i in range(1, 101))
+    limits = BufferLimits(inline_chars=1_000, window_chars=450, window_lines=60)
+
+    shown = _text(
+        buffer_tool_result(
+            AgentToolResult(content=[TextContent(text=text)]),
+            tool_name="read",
+            buffer_dir=tmp_path,
+            limits=limits,
+            first_line=11,
+        )
+    )
+
+    # 450 chars are four whole 100-char lines and part of a fifth.
+    assert "lines 11-14 of the file are shown (of 11-110 asked)" in shown
+    assert "continue with offset=15" in shown
+
+
+@pytest.mark.anyio
+async def test_read_with_explicit_limit_fills_the_char_window(tmp_path: Path) -> None:
+    source = "".join(f"r{i}\n" for i in range(1, 1_001))
+    arguments: dict[str, object] = {"offset": 1, "limit": 300}
+    result = await _read(tmp_path, source, arguments)
+    assert "more lines in file" in _text(result)
+    first_line, limit = read_request(arguments)
+    assert limit == 300
+
+    shown = _text(
+        buffer_tool_result(
+            result,
+            tool_name="read",
+            buffer_dir=tmp_path / "buffers",
+            limits=BufferLimits(inline_chars=1_000, window_chars=8_000, window_lines=60),
+            first_line=first_line,
+            limit=limit,
+        )
+    )
+
+    rows = [line for line in shown.split("\n") if line.startswith("r")]
+    assert len(rows) == 300 > 60
+    assert "lines 1-300 of the file are shown (of 1-300 asked)" in shown
+    assert "continue with offset=301" in shown
+    assert read_request({"limit": True}) == (1, None)
+
+
+def test_outline_reads_line_numbers_from_a_prefixed_read(tmp_path: Path) -> None:
+    text = "\n".join(["17\tdef f():", *[f"{n}\t    pass" for n in range(18, 400)]])
+
+    shown = _text(
+        buffer_tool_result(
+            AgentToolResult(content=[TextContent(text=text)]),
+            tool_name="read",
+            buffer_dir=tmp_path,
+            limits=LIMITS,
+        )
+    )
+
+    assert "  L17 def f" in shown.split("Definitions (", 1)[1]
+
+
+@pytest.mark.anyio
+async def test_cut_read_through_session_outline_carries_file_line_numbers(
+    tmp_path: Path,
+) -> None:
+    source, where = _python_source(classes=200)
+    (tmp_path / "module.py").write_text(source)
+    call = ToolCall(id="call-1", name="read", arguments={"path": "module.py", "offset": 101})
+    provider = FakeProvider(
+        [
+            [
+                assistant_start(model="fake"),
+                assistant_done(
+                    message=AssistantMessage(
+                        content=assistant_content("Reading.", [call]), stop_reason="toolUse"
+                    )
+                ),
+            ],
+            [
+                assistant_start(model="fake"),
+                assistant_done(message=AssistantMessage(content="Done")),
+            ],
+        ]
+    )
+    session = await CodingSession.load(
+        CodingSessionConfig(
+            provider=provider,
+            model="fake",
+            system="You are Tau.",
+            storage=JsonlSessionStorage(tmp_path / "session.jsonl"),
+            cwd=tmp_path,
+        )
+    )
+
+    async for _ in session.prompt("Read it."):
+        pass
+
+    [result] = [m for m in provider.calls[1][2] if m.role == "toolResult"]
+    shown = result.text
+    assert shown.startswith(source.split("\n")[100] + "\n")
+    assert "lines 101-160 of the file are shown" in shown
+    assert "continue with offset=161" in shown
+    outline = shown.split("Definitions (", 1)[1]
+    late = next(name for name, line in where.items() if line > 400 and "class" in name)
+    assert f"L{where[late]} {late}" in outline
+    assert "L5 class Thing0" not in outline
