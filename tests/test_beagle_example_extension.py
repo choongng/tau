@@ -2463,19 +2463,26 @@ async def test_unproven_text_for_tests_only_scope_does_not_say_import(
     (fake_beagle / "prove.out").write_text("T0002: NOT PROVEN — the file predates the task\n")
     (fake_beagle / "prove.rc").write_text("9")
 
-    result = await _step_cases(tmp_path)
-    (fake_beagle / "next.out").write_text(json.dumps({"open": ["T0002"], "ready": []}))
-    runtime, _ = _bound(tmp_path)
-    again = await _tool(runtime, "pursuit_step").execute(
-        "c2", {"task": "T0002", "scope": CASES_SCOPE}
+    runtime, _ = _bound(tmp_path)  # one runtime: the unproven memory is the module's
+    step = _tool(runtime, "pursuit_step")
+    result = await step.execute(
+        "c1",
+        {
+            "task": "T0002",
+            "criteria": "the known answers are written",
+            "done_when": "grep -q out tests/cases.json",
+            "scope": CASES_SCOPE,
+        },
     )
+    (fake_beagle / "next.out").write_text(json.dumps({"open": ["T0002"], "ready": []}))
+    again = await step.execute("c2", {"task": "T0002", "scope": CASES_SCOPE})
 
     assert "stays open" in result.text
     for text in (result.text, again.text):
         assert "import the code" not in text
         assert "the data file's absence is the proof" in text
-        assert "must import the module later tasks will write" in text
-    assert "not run" in again.text
+        assert "ImportError" not in text
+    assert again.text.startswith("pursuit_step: T0002 not run"), again.text
     assert _pursuit_calls(fake_beagle, "close") == []
 
 
@@ -2490,7 +2497,10 @@ async def test_cases_task_with_implementation_in_test_file_stays_open(
     # Run R04: W1 wrote `class IntervalTreeClock` into the cases test.
     data_test = (
         "import pytest\n\n\nclass IntervalTreeClock:\n    pass\n\n\n"
-        "def join(a, b):\n    return a\n\n\n@pytest.fixture\ndef cases():\n    return []\n\n\n"
+        "def join(a, b):\n"
+        + "    a = a\n"
+        * 15
+        + "    return a\n\n\n@pytest.fixture\ndef cases():\n    return []\n\n\n"
         "def _load():\n    return []\n\n\n" + CASES_DATA_TEST.split("\n\n\n", 1)[1]
     )
     project = _cases_task(tmp_path, fake_beagle, monkeypatch, data_test)
@@ -4870,3 +4880,121 @@ async def test_abandon_a_superseded_milestones_successor_with_a_reason(
     ]
     assert "T0008 abandoned" in successor.text
     assert "T0003 not abandoned — it is a milestone" in plain.text
+
+
+@pytest.mark.anyio
+async def test_worker_brief_drops_beagle_contain_run(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # R06: W2 L49 and W4 L41 ran the habit line's `beagle contain run` and were refused.
+    log = "/repo/.git/beagle/logs/T0002.log"
+    beagle_brief = (
+        "# T0002: Parser\nDo the parser.\n"
+        "Finished beside this task (context, not a contract; `beagle pursuit show <id>` "
+        "has the whole record):\n"
+        "29 done task(s) keep a standing check over this tree; `beagle pursuit recheck` "
+        "runs them all and files nothing. Once your check passes, run it.\n"
+        "Working habits:\n"
+        "- Run every test, build and check contained, capped and redirected: "
+        "`RUN_CONTAINED_FOREGROUND=1 beagle contain run heavy -- timeout 540 <cmd> > "
+        f'{log} 2>&1; echo "exit $?"`, then read the tail.\n'
+        "- Read files by the range you need.\n"
+    )
+    monkeypatch.chdir(_pursuit_project(tmp_path))
+    _ready_task(fake_beagle)
+    (fake_beagle / "brief.out").write_text(beagle_brief)
+    runtime, _ = _bound(tmp_path)
+
+    await _tool(runtime, "pursuit_step").execute(
+        "c1",
+        {
+            "task": "T0002",
+            "criteria": "done.txt exists",
+            "done_when": "grep -q done done.txt",
+            "scope": ["done.txt"],
+        },
+    )
+
+    sent = _runs(fake_tau)[0]["stdin"]
+    told = sent.replace(_module().NO_BEAGLE_NOTE, "")
+    assert "beagle contain" not in told and "RUN_CONTAINED" not in told
+    assert "beagle pursuit" not in told
+    assert "- Run every test, build and check capped and redirected, as a plain command: " in told
+    assert f"`timeout 540 <cmd> > {log} 2>&1" in told
+    assert "- Read files by the range you need." in told
+    assert "(context, not a contract):" in told
+    assert re.search(r"\bbeagle\s+\w", told) is None
+
+
+@pytest.mark.anyio
+async def test_worker_guard_refuses_touch_and_mkdir_out_of_scope(
+    tmp_path: Path, beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # R06: W4 L47 `touch src/itc/__init__.py` went through; W2 L64 `mkdir -p src/itc`.
+    targets = _module()._bash_write_targets
+    assert targets("touch a/b.py", tmp_path) == [tmp_path / "a" / "b.py"]
+    assert targets("touch -d 2020-01-01 a.py", tmp_path) == [tmp_path / "a.py"]
+    assert targets("mkdir -p -m 755 src/itc", tmp_path) == [tmp_path / "src" / "itc"]
+    runtime = _scoped_worker(tmp_path, monkeypatch, scope="tests/")
+    bash = _tool_with_hooks(runtime, "bash")
+
+    touched = await bash.execute("c1", {"command": "touch src/itc/__init__.py"})
+    made = await bash.execute("c2", {"command": "mkdir -p src/itc"})
+    inside = await bash.execute("c3", {"command": "mkdir -p tests/data && touch tests/x.py"})
+
+    assert "refusing to write src/itc/__init__.py: it is outside T0003's scope" in touched.text
+    assert "refusing to write src/itc: it is outside T0003's scope" in made.text
+    assert inside.text == "ran"
+
+
+@pytest.mark.anyio
+async def test_tests_only_unproven_next_names_no_import(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # R06 L13: the Next text also asked for an import of unwritten code; W3 put it in the check.
+    _cases_task(tmp_path, fake_beagle, monkeypatch, CASES_DATA_TEST)
+    (fake_beagle / "prove.out").write_text("T0002: NOT PROVEN — the file predates the task\n")
+    (fake_beagle / "prove.rc").write_text("9")
+
+    result = await _step_cases(tmp_path)
+
+    assert "stays open" in result.text
+    next_text = result.text[result.text.index("Next:") :]
+    assert "tests/test_case_data.py must fail when tests/cases.json is removed" in next_text
+    for word in ("ImportError", "import the module", "from <package>", "test_cases.py"):
+        assert word not in next_text, word
+
+
+@pytest.mark.anyio
+async def test_implementation_in_tests_lets_small_helpers_through(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # R06 L21: the check passed, but T0002 stayed open over `load_cases` and `get_module_path`.
+    data_test = (
+        "import json\n\n\ndef load_cases():\n    with open('tests/cases.json') as f:\n"
+        "        return json.load(f)\n\n\ndef get_module_path():\n    return 'src/itc'\n\n\n"
+        "def test_cases():\n    assert load_cases()\n"
+    )
+    _cases_task(tmp_path, fake_beagle, monkeypatch, data_test)
+
+    result = await _step_cases(tmp_path)
+
+    assert "implementation belongs in the module" not in result.text
+    assert "stays open" not in result.text
+    assert _pursuit_calls(fake_beagle, "close") != []
+    found = _module()._implementation_in_tests
+    large = "def fork(s):\n" + "    s = s\n" * 15 + "    return s\n"
+    (tmp_path / "test_big.py").write_text(f"class Stamp:\n    pass\n\n\n{large}")
+    assert found(tmp_path, ["test_big.py"]) == ["test_big.py: class Stamp", "test_big.py: def fork"]

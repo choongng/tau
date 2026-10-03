@@ -676,6 +676,10 @@ def _command_targets(argv: list[str], cwd: Path) -> list[str] | None:
         return _sed_in_place_files(args)
     if name in ("cp", "mv", "install", "ln"):
         return _copy_targets(args, cwd, moves=name == "mv")
+    if name == "touch":
+        return _positional(args, frozenset({"-d", "--date", "-r", "--reference", "-t"}))
+    if name == "mkdir":
+        return _positional(args, frozenset({"-m", "--mode", "--context"}))
     if name in ("rm", "truncate", "shred", "unlink"):
         return _positional(args, frozenset({"-s", "--size", "-r", "--reference", "-n"}))
     if name == "dd":
@@ -3043,11 +3047,18 @@ def _is_fixture(decorator: ast.expr) -> bool:
     return isinstance(target, ast.Name) and target.id == "fixture"
 
 
+#: A top-level function in a test file longer than this is implementation, not a helper.
+_HELPER_MAX_LINES = 15
+
+
 def _implementation_in_tests(root: Path, changed: list[str]) -> list[str]:
-    """`<file>: <definition>` for each top-level class or non-test function in a changed test.
+    """`<file>: <definition>` for each top-level class, or non-test function over
+    `_HELPER_MAX_LINES` lines, in a changed test.
 
     Run R04: a cases-first worker wrote an `IntervalTreeClock` class into
-    tests/test_cases.py, and twenty more workers debugged it there.
+    tests/test_cases.py, and twenty more workers debugged it there. Run R06: a
+    passing cases-first task stayed open over a three-line `load_cases()`, so a
+    small function is let through as a helper.
     """
     found: list[str] = []
     for rel in changed:
@@ -3065,6 +3076,8 @@ def _implementation_in_tests(root: Path, changed: list[str]) -> list[str]:
                 if node.name.startswith(("test_", "_", "pytest_")):
                     continue
                 if any(_is_fixture(d) for d in node.decorator_list):
+                    continue
+                if (node.end_lineno or node.lineno) - node.lineno + 1 <= _HELPER_MAX_LINES:
                     continue
                 found.append(f"{rel}: def {node.name}")
     return found
@@ -3414,6 +3427,41 @@ def _without_commit_steps(brief: str) -> str:
     end = brief.find(_COMMIT_STEPS_END, start)
     rest = "" if end == -1 else brief[end + len(_COMMIT_STEPS_END) :]
     return f"{brief[:start]}{NO_COMMIT_NOTE}{rest}"
+
+
+#: The log a worker's test run is redirected to when beagle's habit names none.
+_DEFAULT_TEST_LOG = "/tmp/tau-worker-test.log"
+_HABIT_LOG = re.compile(r">\s*(\S+\.log)\b")
+_SHOW_ASIDE = re.compile(r"[;,]?\s*`beagle pursuit show[^`]*` has the whole record")
+
+
+def _without_beagle_habits(brief: str) -> str:
+    """beagle's brief without the lines that tell a worker to run `beagle`.
+
+    The worker guard refuses every `beagle` command. Run R06: W2 and W4 ran the
+    "Working habits" line's `RUN_CONTAINED_FOREGROUND=1 beagle contain run heavy
+    -- …` and were refused. That line is said again with a plain capped,
+    redirected command; the standing-checks line (`beagle pursuit recheck`) is
+    dropped, and the `beagle pursuit show` aside is cut.
+    """
+    lines: list[str] = []
+    for line in brief.splitlines(keepends=True):
+        if "beagle contain run" in line:
+            match = _HABIT_LOG.search(line)
+            log = match.group(1) if match else _DEFAULT_TEST_LOG
+            bullet = "- " if line.lstrip().startswith("- ") else ""
+            ending = "\n" if line.endswith("\n") else ""
+            lines.append(
+                f"{bullet}Run every test, build and check capped and redirected, as a plain "
+                f'command: `timeout 540 <cmd> > {log} 2>&1; echo "exit $?"` (e.g. '
+                f"`timeout 540 python3 -m pytest -q tests/ > {log} 2>&1; "
+                f'echo "exit $?"`), then read the tail of {log}.{ending}'
+            )
+        elif "beagle pursuit recheck" in line:
+            continue
+        else:
+            lines.append(_SHOW_ASIDE.sub("", line))
+    return "".join(lines)
 
 
 def _blocked_brief(task: str, record: Mapping[str, Any]) -> str:
@@ -3925,7 +3973,7 @@ def make_step_tool() -> Any:
             rc, brief = _pursuit(["brief", task], root)
             if rc != 0:
                 return _step_result(f"pursuit_step: `beagle pursuit brief {task}` failed:\n{brief}")
-            brief = _without_commit_steps(brief)
+            brief = _without_beagle_habits(_without_commit_steps(brief))
         references = _references_brief(root)
         if references:
             brief = f"{brief}\n\n{references}"
@@ -6077,13 +6125,14 @@ DRIVER_STEERS_NOTE = (
 #: tests in one sitting makes them agree with each other, not with the reference
 #: (the ITC trial with qwen: wrong fork, join and event, and every test passed).
 #: How a tests-only (known-answers) task is shown to refuse; said instead of
-#: "import the code", which such a task has no code to do.
+#: "import the code", which such a task has no code to do. It names only the data
+#: test: run R06's text also described the cases test's import of unwritten code,
+#: and a worker put that import into the check's test.
 TESTS_ONLY_PROOF_NOTE = (
     "This scope holds only tests and data, so the data file's absence is the proof: "
-    "the check must run a test that reads the data file this task writes (e.g. "
-    "tests/cases.json), so that taking the file away makes it fail. The cases test "
-    "must import the module later tasks will write (e.g. `from <package> import …`); "
-    "it fails with ImportError until that code exists, and the check does not run it."
+    "the check must run a test that reads the data file this task writes, so that "
+    "taking the file away makes it fail (e.g. tests/test_case_data.py must fail when "
+    "tests/cases.json is removed). That test reads only the data file."
 )
 
 CASES_FIRST_NOTE = (
