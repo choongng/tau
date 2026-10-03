@@ -2375,6 +2375,16 @@ def _abandon_problem(task: str, why: str, nodes: list[dict[str, Any]]) -> str | 
             f'pursuit_step task="{task}", new_route=true and notes.'
         )
     if _duplicate_of(why, task, nodes) is not None:
+        container = parent.get(task, "")
+        if container and container not in roots:
+            # Run R08: beagle keeps an abandoned leaf with no successor as
+            # accountable, so its container can never be all-done and stalls.
+            return (
+                f"pursuit_step: {task} not abandoned — {container} would stall for good "
+                f'with a part abandoned. Work it with pursuit_step task="{task}" and a '
+                "done_when that runs the code; if the work is already there, the check "
+                "passes and it closes done at once."
+            )
         return None
     return (
         f"pursuit_step: {task} not abandoned — a task is dropped only as a duplicate of "

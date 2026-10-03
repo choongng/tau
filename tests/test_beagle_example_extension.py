@@ -2137,7 +2137,9 @@ async def test_pursuit_step_abandons_a_task_without_a_worker(
     others = [
         {"id": "T0001", "parent": "", "status": "pending", "container": True},
         {"id": "T0006", "parent": "T0002", "status": "done"},
-        {"id": "T0021", "parent": "T0002", "status": "pending"},
+        # T0058: only a superseded milestone's successor may go as a duplicate.
+        {"id": "T0020", "parent": "T0001", "status": "superseded"},
+        {"id": "T0021", "parent": "T0001", "status": "pending", "sibling_of": "T0020"},
     ]
     (fake_beagle / "tree.out").write_text(json.dumps({"nodes": others + waits}))
     runtime, _ = _bound(tmp_path)
@@ -3897,7 +3899,9 @@ async def test_abandon_duplicate_of_done_task_closes(
     _milestones(
         fake_beagle,
         {"id": "T0003", "parent": "T0002", "status": "done"},
-        {"id": "T0004", "parent": "T0002", "status": "pending"},
+        # T0058: a container's part is refused; a superseded milestone's successor goes.
+        {"id": "T0005", "parent": "T0001", "status": "superseded"},
+        {"id": "T0004", "parent": "T0001", "status": "pending", "sibling_of": "T0005"},
     )
     (fake_beagle / "close.out").write_text("T0004 abandoned — duplicate of T0003\n")
     runtime, _ = _bound(tmp_path)
@@ -4143,7 +4147,12 @@ async def test_abandon_releases_a_wait_routed_through_its_heir(
     # R08 L306: abandoning T0011 left T0007's wait on T0006, handed to T0011.
     monkeypatch.chdir(_pursuit_project(tmp_path))
     _ready_task(fake_beagle)
-    (fake_beagle / "tree.out").write_text(json.dumps({"nodes": STALLED_HEIR_TREE}))
+    # T0058: abandoning a part of T0004 is refused, so T0006 and its heir
+    # T0011 are lifted to milestones, where the successor may go.
+    lifted = [
+        {**n, "parent": "T0001"} if n["id"] in ("T0006", "T0011") else n for n in STALLED_HEIR_TREE
+    ]
+    (fake_beagle / "tree.out").write_text(json.dumps({"nodes": lifted}))
     (fake_beagle / "close.out").write_text("T0011 abandoned\n")
     runtime, _ = _bound(tmp_path)
     step = _tool(runtime, "pursuit_step")
@@ -4157,6 +4166,33 @@ async def test_abandon_releases_a_wait_routed_through_its_heir(
         ["T0007", "T0006", "--drop", "--reason", "T0011 abandoned: duplicate of T0015"]
     ]
     assert "No longer waiting on it: T0007." in result.text
+
+
+@pytest.mark.anyio
+async def test_duplicate_abandon_of_a_part_is_refused_because_it_stalls_its_container(
+    tmp_path: Path, beagle: Path, fake_beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # R08: T0013 abandoned as a duplicate of done T0015 left T0011 stalled for good.
+    monkeypatch.chdir(_pursuit_project(tmp_path))
+    _ready_task(fake_beagle)
+    tree = [
+        {"id": "T0001", "parent": "", "title": "ITC", "status": "pending", "container": True},
+        {"id": "T0004", "parent": "T0001", "title": "Impl", "status": "pending", "container": True},
+        {"id": "T0011", "parent": "T0004", "title": "fix", "status": "pending", "container": True},
+        {"id": "T0013", "parent": "T0011", "title": "fix-normalization", "status": "pending"},
+        {"id": "T0015", "parent": "T0011", "title": "fix-event", "status": "done"},
+    ]
+    (fake_beagle / "tree.out").write_text(json.dumps({"nodes": tree}))
+    runtime, _ = _bound(tmp_path)
+
+    result = await _tool(runtime, "pursuit_step").execute(
+        "c1", {"task": "T0013", "abandon": "duplicate of T0015"}
+    )
+
+    assert _pursuit_calls(fake_beagle, "close") == []
+    assert "T0013 not abandoned" in result.text
+    assert "T0011" in result.text and "stall" in result.text
+    assert 'pursuit_step task="T0013"' in result.text and "done_when" in result.text
 
 
 @pytest.mark.anyio
