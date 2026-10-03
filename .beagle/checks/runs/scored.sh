@@ -18,5 +18,8 @@ for key in ("tasks_total", "tasks_done", "commits", "founded", "uncommitted_file
     m = re.search(rf"^{key}\s+(\S+)", block, re.M)
     assert m, f"no {key} in the Scorecard block"
     assert m.group(1) == str(c.get(key)), f"Scorecard {key} {m.group(1)} != scorecard.json {c.get(key)}"
+g = json.load(open(sys.argv[1].replace("scorecard.json", "grade.json")))
+m = re.search(r"^grader: (\d+)/(\d+)", md, re.M)
+assert (int(m.group(1)), int(m.group(2))) == (g["passed"], g["total"]), f"grader line {m.group(0)} != grade.json {g['passed']}/{g['total']}"
 PY
 echo OK
