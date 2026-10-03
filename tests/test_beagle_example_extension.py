@@ -4998,3 +4998,75 @@ async def test_implementation_in_tests_lets_small_helpers_through(
     large = "def fork(s):\n" + "    s = s\n" * 15 + "    return s\n"
     (tmp_path / "test_big.py").write_text(f"class Stamp:\n    pass\n\n\n{large}")
     assert found(tmp_path, ["test_big.py"]) == ["test_big.py: class Stamp", "test_big.py: def fork"]
+
+
+@pytest.mark.anyio
+async def test_task_worker_brief_carries_the_no_beagle_note(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.chdir(_pursuit_project(tmp_path))
+    _ready_task(fake_beagle)
+    (fake_beagle / "brief.out").write_text("# T0002: Parser\nDo the parser.\n")
+    runtime, _ = _bound(tmp_path)
+
+    await _tool(runtime, "pursuit_step").execute(
+        "c1",
+        {
+            "task": "T0002",
+            "criteria": "done.txt exists",
+            "done_when": "grep -q done done.txt",
+            "scope": ["done.txt"],
+        },
+    )
+
+    sent = _runs(fake_tau)[0]["stdin"]
+    assert "Do the parser." in sent
+    assert _module().NO_BEAGLE_NOTE in sent
+
+
+def _stop_gate_sends(monkeypatch: pytest.MonkeyPatch, cwd: Path, *, has_ui: bool) -> list[str]:
+    from types import SimpleNamespace
+
+    module = _module()
+    monkeypatch.setattr(module, "_FOUND_AWAITS_USER", True)
+    monkeypatch.setattr(module, "_STOP_GATE_SENT", 0)
+    sent: list[str] = []
+    gate = module.make_stop_gate(SimpleNamespace(send_user_message=sent.append))
+    stop = SimpleNamespace(
+        message=SimpleNamespace(role="assistant", tool_calls=[], stop_reason="stop")
+    )
+    asyncio.run(gate(stop, SimpleNamespace(cwd=str(cwd), has_ui=has_ui)))
+    return sent
+
+
+def test_stop_gate_says_nothing_unfounded_in_an_interactive_session(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # T0044: a user is there to answer, so an unfounded stop awaiting them is left alone.
+    project = tmp_path / "project"
+    project.mkdir()
+
+    assert _stop_gate_sends(monkeypatch, project, has_ui=True) == []
+    assert _module()._FOUND_AWAITS_USER is True
+    printed = _stop_gate_sends(monkeypatch, project, has_ui=False)
+    assert len(printed) == 1 and printed[0].startswith("[beagle] Nothing is founded")
+
+
+def test_stop_gate_founded_session_gets_no_unfounded_followup(
+    tmp_path: Path, beagle: Path, fake_beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # T0044: once founded, a stop hears what is not done, never "Nothing is founded".
+    project = _pursuit_project(tmp_path)
+    root = {"id": "T0001", "parent": "", "status": "pending", "container": True}
+    leaf = {"id": "T0002", "parent": "T0001", "status": "pending"}
+    (fake_beagle / "tree.out").write_text(json.dumps({"nodes": [root, leaf]}))
+
+    sent = _stop_gate_sends(monkeypatch, project, has_ui=False)
+
+    assert len(sent) == 1
+    assert sent[0].startswith("[beagle] The pursuit is not done") and "T0002" in sent[0]
+    assert not any("Nothing is founded" in s for s in sent)
