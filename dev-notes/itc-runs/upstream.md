@@ -148,3 +148,6 @@ Nothing for beagle. The run never reached beagle: tau's founding tool refused a 
 
 Nothing else for beagle: the other R09 failures are in tau's texts,
 guards and buffers, or in the model.
+
+### Between R09 and R10 (driver)
+- `beagle contain run` passes beagle's own venv (`UV_PROJECT_ENVIRONMENT`, `VIRTUAL_ENV`, PATH) into the job, so a project check that runs `uv run --no-sync` inside the container imports from beagle's venv and fails (`ModuleNotFoundError: tau_agent`). The T0078 worker hit it; it unset the variables to run the check. Suggest: the launcher strips beagle's own environment before exec.
