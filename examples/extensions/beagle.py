@@ -2708,6 +2708,31 @@ PLAN_PARAMETERS: dict[str, Any] = {
 }
 
 
+def _uncommitted_in_scope(root: Path, task: str) -> str:
+    """Name the files git holds uncommitted in an open task's scope, as it is split.
+
+    R09: T0007 was split with tests/cases.json uncommitted, and T0009's commit
+    took it beside src/itc/*.py, unlocked.
+    """
+    rc, out = _pursuit(["show", task], root)
+    record = _json_reply(out) if rc == 0 else None
+    if not isinstance(record, dict) or record.get("status") != "open":
+        return ""
+    scope = _strings(record.get("scope"))
+    if not scope:
+        return ""
+    paths = [rel for rel in _changed_files(root) if _in_scope(rel, scope)]
+    if not paths:
+        return ""
+    named = ", ".join(paths[:8])
+    if len(paths) > 8:
+        named += f", {len(paths) - 8} more"
+    return (
+        f"Uncommitted in {task}'s scope: {named}. Give each to the part that writes it, "
+        "with locks when it is data; otherwise it goes out in a later part's commit."
+    )
+
+
 def make_plan_tool() -> Any:
     """Build `pursuit_plan`: split a task into steps, or add steps to a container."""
 
@@ -2745,6 +2770,8 @@ def make_plan_tool() -> Any:
                 f"pursuit_plan: nothing added — {task} already has {', '.join(repeated)}. "
                 "Work them with pursuit_step; call it with no arguments for the next ready one."
             )
+        # Read before the split, which leaves the task a container.
+        uncommitted = _uncommitted_in_scope(root, task)
         if len(parts) == 1:
             # beagle refuses a one-part split as a rename. A container or the
             # root still takes one more child; a leaf with one part is
@@ -2768,6 +2795,8 @@ def make_plan_tool() -> Any:
             return _step_result(f"pursuit_plan: beagle refused (exit {rc}):\n{out}")
         _forget_task(root, task)
         notes = ""
+        if uncommitted:
+            notes += f"{uncommitted}\n\n"
         if repeated:
             notes += f"Not added again, {task} already has: {', '.join(repeated)}.\n\n"
         if "--outcome abandoned" in out:

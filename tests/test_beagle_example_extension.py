@@ -3474,6 +3474,63 @@ async def test_plan_accepts_a_part_that_verifies_by_writing_a_test(
     assert _module()._rerun_only_part(["Check::check the stamp is normalised"]) is None
 
 
+def _split_open_task_with_cases(tmp_path: Path, fake_beagle: Path, *, commit: bool) -> Path:
+    project = _pursuit_project(tmp_path)
+    _git(project, "init", "-q")
+    (project / "tests").mkdir()
+    (project / "tests" / "cases.json").write_text("[]\n")
+    (project / "notes.txt").write_text("outside the scope\n")
+    if commit:
+        _git(project, "add", "tests/cases.json", "notes.txt")
+        _git(project, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "seed")
+    record = {
+        "id": "T0007",
+        "title": "Cases",
+        "status": "open",
+        "scope": ["tests/", "src/itc"],
+        "done_when": "pytest -q",
+    }
+    (fake_beagle / "show.out").write_text(json.dumps(record))
+    (fake_beagle / "split.out").write_text("T0007 split into 2:\n  T0008  Data\n  T0009  Code\n")
+    return project
+
+
+@pytest.mark.anyio
+async def test_plan_names_uncommitted_files_in_the_split_tasks_scope(
+    tmp_path: Path, beagle: Path, fake_beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # R09 class 4b: T0007 was split with tests/cases.json uncommitted, and
+    # T0009's commit took it beside src/itc/*.py, unlocked.
+    monkeypatch.chdir(_split_open_task_with_cases(tmp_path, fake_beagle, commit=False))
+    runtime, _ = _bound(tmp_path)
+
+    plan = await _tool(runtime, "pursuit_plan").execute(
+        "c1", {"task": "T0007", "parts": ["Data::write the cases", "Code::the clock"]}
+    )
+
+    assert "beagle refused" not in plan.text
+    assert "Uncommitted in T0007's scope: tests/cases.json." in plan.text
+    assert "with locks when it is data" in plan.text
+    assert "a later part's commit" in plan.text
+    assert "notes.txt" not in plan.text
+    assert _pursuit_calls(fake_beagle, "split")
+
+
+@pytest.mark.anyio
+async def test_plan_says_nothing_of_a_clean_scope(
+    tmp_path: Path, beagle: Path, fake_beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(_split_open_task_with_cases(tmp_path, fake_beagle, commit=True))
+    runtime, _ = _bound(tmp_path)
+
+    plan = await _tool(runtime, "pursuit_plan").execute(
+        "c1", {"task": "T0007", "parts": ["Data::write the cases", "Code::the clock"]}
+    )
+
+    assert "beagle refused" not in plan.text and _pursuit_calls(fake_beagle, "split")
+    assert "Uncommitted" not in plan.text
+
+
 R08_SCOPE = ["itc/tests/cases.json", "itc/tests/test_cases.py", "itc/interval_tree_clocks.py"]
 
 
