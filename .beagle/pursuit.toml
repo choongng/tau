@@ -1,11 +1,18 @@
-# Pursuit goal — written on the user's behalf from their request:
-# "diagnose the error 'Tau 0.4.4 is available (installed: 0.4.2). Run `tau
-# update` to upgrade.' in the tau checkout, committing the fix to choong-dev."
+# Pursuit goal — written on the user's behalf from their request (2026-10-03):
+# "set up a pursuit to do some more iterations on this problem. i think five
+# attempts each on the two models above" … "fix between runs, yes to grader
+# and archive, run unattended" … "cap each run at one hour ; run completely
+# unattended ; the primary signal will be in analyzing the traces regardless
+# or success or failure, with a strong model this task is solvable in nearly
+# one shot but the 9b model needs more structure and steps (that we are
+# learning to provide)"
 [goal]
-statement = "Diagnose why Tau shows 'Tau 0.4.4 is available (installed: 0.4.2). Run `tau update` to upgrade.' on this machine, and commit the fix to the choong-dev branch of the tau checkout."
+statement = "Make tau+beagle give a 9B model enough structure to take ~/tautest/itc_prompt.txt (interval tree clocks in Python, via a beagle pursuit) toward a correct, committed result, learning from the traces of ten unattended runs and fixing tau between runs."
 criteria = [
-  "The cause is recorded: the installed tau is an editable uv-tool install of this checkout whose stale metadata says 0.4.2, while PyPI has 0.4.4; `tau update` refuses direct-URL installs, so the notice cannot be acted on.",
-  "On a direct-URL/editable install the startup update notice is no longer shown; a regular PyPI install still gets its notice.",
-  "Tests covering both behaviors pass in the checkout.",
-  "The fix is committed on branch choong-dev (not pushed).",
+  "Ten runs of the unchanged itc_prompt.txt have been executed, each from a clean ~/itc under a one-hour wall cap with the model passed explicitly: five on mimo-v2.6-9b-q4 and five on qwen3.5-9b-q4-mtp-thinking-coding, alternating.",
+  "Each run has a trace analysis in dev-notes/itc-runs/RNN.md with a scorecard (founded and on which try; tasks done/abandoned/stalled; witnessed share; commits; breaker, length stops and compactions; finished on its own or capped; hidden-grader result) and the failure classes the trace shows, whether the run succeeded or not.",
+  "Each run's ITC is scored by a hidden acceptance suite (fork, event, join, leq, normalisation, the paper's examples) that the model never sees.",
+  "Every tau-side failure class named in a run analysis either has a fix committed on choong-dev with a regression test, made before the next run started, or a recorded reason it was deferred; beagle-side problems are listed in dev-notes/itc-runs/upstream.md and not patched.",
+  "dev-notes/itc-runs/summary.md holds a table of all ten scorecards and the failure classes that recurred across runs.",
 ]
+default_budget_tokens = 150000
