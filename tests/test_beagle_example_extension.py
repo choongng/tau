@@ -2020,6 +2020,80 @@ def _stub_fetch(monkeypatch: pytest.MonkeyPatch, pages: dict[str, str]) -> list[
     return asked
 
 
+def test_reference_fetch_retries_a_timeout_with_a_longer_timeout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # R09: itc2008.pdf timed out at 30 s and every worker re-downloaded it.
+    import urllib.error
+
+    module = _module()
+    paper = "https://example.org/papers/itc2008.pdf"
+    timeouts: list[float] = []
+
+    def fetch(url: str, timeout: float = module.REFERENCE_FETCH_TIMEOUT) -> str:
+        timeouts.append(timeout)
+        if len(timeouts) == 1:
+            raise urllib.error.URLError(TimeoutError("timed out"))
+        return "Interval tree clocks, the paper."
+
+    monkeypatch.setattr(module, "_fetch_reference", fetch)
+    index = module._fetch_references(tmp_path, f"The paper: {paper}")
+
+    assert timeouts == [30.0, 90.0]
+    assert module.REFERENCE_FETCH_RETRY_TIMEOUT == 90.0
+    assert index["fetched"] == {"itc2008.txt": paper} and index["failed"] == {}
+    written = (tmp_path / "references" / "itc2008.txt").read_text()
+    assert written == "Interval tree clocks, the paper."
+
+    timeouts.clear()
+
+    def always_slow(url: str, timeout: float = module.REFERENCE_FETCH_TIMEOUT) -> str:
+        timeouts.append(timeout)
+        raise TimeoutError(f"timed out after {timeout:g} s")
+
+    monkeypatch.setattr(module, "_fetch_reference", always_slow)
+    index = module._fetch_references(tmp_path, f"The paper: {paper}")
+
+    assert timeouts == [30.0, 90.0]
+    reason = index["failed"][paper]
+    assert "timed out after 30 s" in reason and "timed out after 90 s" in reason
+
+
+def test_reference_fetch_does_not_retry_a_refused_url(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import email.message
+    import urllib.error
+
+    module = _module()
+    paper = "https://example.org/papers/itc2008.pdf"
+    refusals: list[Exception] = [
+        urllib.error.HTTPError(paper, 404, "Not Found", email.message.Message(), None),
+        urllib.error.URLError(ConnectionRefusedError(111, "Connection refused")),
+        ConnectionRefusedError(111, "Connection refused"),
+        ValueError("larger than 5 MB"),
+        ValueError("it held no text"),
+    ]
+    for refusal in refusals:
+        calls: list[float] = []
+
+        def fetch(
+            url: str,
+            timeout: float = module.REFERENCE_FETCH_TIMEOUT,
+            refusal: Exception = refusal,
+            calls: list[float] = calls,
+        ) -> str:
+            calls.append(timeout)
+            raise refusal
+
+        monkeypatch.setattr(module, "_fetch_reference", fetch)
+        index = module._fetch_references(tmp_path, f"The paper: {paper}")
+
+        assert calls == [30.0], refusal
+        assert index["failed"][paper] == str(refusal)
+        assert not (tmp_path / "references" / "itc2008.txt").exists()
+
+
 @pytest.mark.anyio
 async def test_found_first_steer_carries_reference_extracts(
     tmp_path: Path, beagle: Path, monkeypatch: pytest.MonkeyPatch

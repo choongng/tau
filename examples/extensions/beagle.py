@@ -123,9 +123,11 @@ import os
 import re
 import shlex
 import shutil
+import socket
 import subprocess
 import tempfile
 import tomllib
+import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
@@ -1625,6 +1627,9 @@ REFERENCES_DIR = "references"
 #: What founding recorded there: the request, and each URL's file or failure.
 REFERENCES_INDEX = "index.json"
 REFERENCE_FETCH_TIMEOUT = 30.0
+#: A fetch that timed out is tried once more with this: R09's itc2008.pdf
+#: timed out at 30 s and every worker re-downloaded it to /tmp.
+REFERENCE_FETCH_RETRY_TIMEOUT = 90.0
 REFERENCE_MAX_BYTES = 5 * 1024 * 1024
 _PROMPT_URL = re.compile(r"https?://[^\s<>\"'`]+")
 
@@ -1735,13 +1740,20 @@ def _pdf_text(body: bytes) -> str:
     return proc.stdout.decode("utf-8", "replace")
 
 
-def _fetch_reference(url: str) -> str:
+def _is_timeout(exc: BaseException) -> bool:
+    """Whether `exc` is a timeout, bare or wrapped in urllib's URLError."""
+    if isinstance(exc, urllib.error.URLError) and not isinstance(exc, urllib.error.HTTPError):
+        return isinstance(exc.reason, (TimeoutError, socket.timeout))
+    return isinstance(exc, (TimeoutError, socket.timeout))
+
+
+def _fetch_reference(url: str, timeout: float = REFERENCE_FETCH_TIMEOUT) -> str:
     """`url`'s content as text: a PDF through `pdftotext -layout`, HTML stripped.
 
     Raises OSError (urllib's errors are its subclasses) or ValueError on failure.
     """
     request = urllib.request.Request(url, headers={"User-Agent": "tau-beagle/1"})
-    with urllib.request.urlopen(request, timeout=REFERENCE_FETCH_TIMEOUT) as response:
+    with urllib.request.urlopen(request, timeout=timeout) as response:
         body = response.read(REFERENCE_MAX_BYTES + 1)
         kind = response.headers.get_content_type() if response.headers else ""
         charset = (response.headers.get_content_charset() if response.headers else None) or "utf-8"
@@ -1766,6 +1778,10 @@ def _fetch_reference(url: str) -> str:
     return text
 
 
+def _failure_reason(exc: BaseException) -> str:
+    return str(exc).strip() or type(exc).__name__
+
+
 def _fetch_references(root: Path, prompt: str) -> dict[str, Any]:
     """Fetch each URL in the user's `prompt` once into `references/`, as text.
 
@@ -1773,7 +1789,8 @@ def _fetch_references(root: Path, prompt: str) -> dict[str, Any]:
     reference, wrote the domain into its step notes from the name alone.
     The request itself, and each URL's file or why it could not be fetched,
     go in `references/index.json`, which every worker brief is built from.
-    A failed fetch is recorded, never fatal.
+    A failed fetch is recorded, never fatal; one that timed out is tried
+    once more with REFERENCE_FETCH_RETRY_TIMEOUT before it is.
     """
     urls = _prompt_urls(prompt)
     if not prompt.strip():
@@ -1788,9 +1805,22 @@ def _fetch_references(root: Path, prompt: str) -> dict[str, Any]:
     for url in urls:
         name = _reference_name(url, taken)
         try:
-            (folder / name).write_text(_fetch_reference(url), encoding="utf-8")
+            try:
+                text = _fetch_reference(url)
+            except Exception as exc:  # noqa: BLE001 - only a timeout is retried
+                if not _is_timeout(exc):
+                    raise
+                first = _failure_reason(exc)
+                try:
+                    text = _fetch_reference(url, timeout=REFERENCE_FETCH_RETRY_TIMEOUT)
+                except Exception as again:  # noqa: BLE001 - recorded with both reasons
+                    raise OSError(
+                        f"{first}; retried with {REFERENCE_FETCH_RETRY_TIMEOUT:g} s: "
+                        f"{_failure_reason(again)}"
+                    ) from again
+            (folder / name).write_text(text, encoding="utf-8")
         except Exception as exc:  # noqa: BLE001 - one bad URL must not stop founding
-            index["failed"][url] = str(exc).strip() or type(exc).__name__
+            index["failed"][url] = _failure_reason(exc)
             continue
         index["fetched"][name] = url
     with contextlib.suppress(OSError):
