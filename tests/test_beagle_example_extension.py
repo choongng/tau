@@ -2421,6 +2421,63 @@ async def test_pursuit_step_runs_a_worker_until_the_check_passes_then_closes(
     assert "closed done" in result.text and "pursuit_step with no arguments" in result.text
 
 
+SUPERSEDED_NOTE = (
+    "The check passed at close: failures this report names are from before the "
+    "worker's last edit, and are fixed."
+)
+
+
+async def _closed_done_step(
+    tmp_path: Path, fake_beagle: Path, monkeypatch: pytest.MonkeyPatch, report: str
+) -> str:
+    project = _pursuit_project(tmp_path)
+    monkeypatch.chdir(project)
+    monkeypatch.setenv("FAKE_TAU_REPORT", report)
+    _ready_task(fake_beagle)
+    runtime, _ = _bound(tmp_path)
+    result = await _tool(runtime, "pursuit_step").execute(
+        "c1",
+        {
+            "task": "T0002",
+            "criteria": "c",
+            "done_when": "grep -q done done.txt",
+            "scope": ["done.txt"],
+        },
+    )
+    assert "closed done" in result.text
+    return result.text
+
+
+@pytest.mark.anyio
+async def test_closed_done_step_marks_a_failing_report_superseded(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # R09: W14 reported "2 failed", T0009 closed done, and the driver chased the stale failures.
+    report = "wrote done.txt\n2 failed, 10 passed (exit 1)"
+    text = await _closed_done_step(tmp_path, fake_beagle, monkeypatch, report)
+
+    assert f"{SUPERSEDED_NOTE}\nSub-agent report:\n{report}" in text
+
+
+@pytest.mark.anyio
+async def test_closed_done_step_leaves_a_passing_report_alone(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    report = "wrote done.txt; no errors, nothing fails now: 12 passed"
+    text = await _closed_done_step(tmp_path, fake_beagle, monkeypatch, report)
+
+    assert SUPERSEDED_NOTE not in text
+    assert f"Sub-agent report:\n{report}" in text
+
+
 WITNESSED_REPORT = (
     "wrote done.txt\n\nWITNESS: src/clock.py\nNEEDLE:\n    return a + b\n"
     "REPLACEMENT:\n    return a - b\nEND WITNESS"

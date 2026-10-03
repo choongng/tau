@@ -1564,6 +1564,21 @@ def _step_result(text: str) -> AgentToolResult:
     return AgentToolResult(content=[TextContent(text=text)])
 
 
+# Narrow on purpose: bare "error" and "fail" match ordinary prose.
+_REPORTED_FAILURE = re.compile(
+    r"\b\d+ failed\b|\bexit (code )?[1-9]|(?i:\bunfixed\b|remaining failures)|\bFAILED\b"
+)
+_SUPERSEDED_REPORT_NOTE = (
+    "The check passed at close: failures this report names are from before the "
+    "worker's last edit, and are fixed.\n"
+)
+
+
+def _report_claims_failure(text: str) -> bool:
+    """Whether a worker report says something still fails (R09: a stale claim)."""
+    return _REPORTED_FAILURE.search(text) is not None
+
+
 def _project_root() -> tuple[Path, Path | None]:
     """The project root and its goal file (None when nothing is founded)."""
     cwd = _SEEN_CWD or Path.cwd()
@@ -4685,10 +4700,11 @@ def make_step_tool() -> Any:
                 )
             if skipped:
                 lock_note += f"Not locked: {'; '.join(skipped)}.\n\n"
+        superseded = _SUPERSEDED_REPORT_NOTE if rc == 0 and _report_claims_failure(shown) else ""
         return _step_result(
             f"{route}{task} — {title}: {state}.\n\n{committed}\n\n{closed}\n\n"
             f"{undid}{lock_note}"
-            f"Sub-agent report:\n{shown}\n\n"
+            f"{superseded}Sub-agent report:\n{shown}\n\n"
             "Next: call pursuit_step with no arguments for the next task."
         )
 
