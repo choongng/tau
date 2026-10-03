@@ -1587,7 +1587,11 @@ async def test_pursuit_found_takes_a_delegated_goal_and_makes_a_repo(
         },
     )
 
-    assert (project / ".beagle" / "pursuit.toml").exists()
+    goal = (project / ".beagle" / "pursuit.toml").read_text()
+    # pursuit_step closes in the same call it opens: beagle must hold that
+    # close to a witnessed check (run 11d closed on import-only checks).
+    assert tomllib.loads(goal)["close"] == {"require": "witness"}
+    assert "__pycache__/" in (project / ".gitignore").read_text().splitlines()
     assert (project / ".git").is_dir()
     assert "git init" in result.text and "criteria you chose" in result.text
     assert "Do not fetch or read the reference" in result.text
@@ -1839,6 +1843,129 @@ async def test_pursuit_step_runs_a_worker_until_the_check_passes_then_closes(
     assert close[close.index("--spent") + 1] == "2000"
     assert close[close.index("--body") + 1] == "attempt 2: wrote done.txt"
     assert "closed done" in result.text and "pursuit_step with no arguments" in result.text
+
+
+WITNESSED_REPORT = (
+    "wrote done.txt\n\nWITNESS: src/clock.py\nNEEDLE:\n    return a + b\n"
+    "REPLACEMENT:\n    return a - b\nEND WITNESS"
+)
+
+
+def _git_project(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    project = _pursuit_project(tmp_path)
+    subprocess.run(["git", "init", "--quiet"], cwd=project, check=True)
+    for key, value in (("NAME", "t"), ("EMAIL", "t@example.com")):
+        monkeypatch.setenv(f"GIT_AUTHOR_{key}", value)
+        monkeypatch.setenv(f"GIT_COMMITTER_{key}", value)
+    return project
+
+
+@pytest.mark.anyio
+async def test_pursuit_step_proves_the_workers_witness_then_closes_and_commits(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Run 11d: every check was NOT PROVEN, and six of seven tasks' work was
+    # never committed.
+    project = _git_project(tmp_path, monkeypatch)
+    monkeypatch.chdir(project)
+    monkeypatch.setenv("FAKE_TAU_REPORT", WITNESSED_REPORT)
+    (project / "__pycache__").mkdir()
+    (project / "__pycache__" / "x.pyc").write_text("")
+    _ready_task(fake_beagle)
+    (fake_beagle / "prove.out").write_text("T0002: PROVEN — refuses when `a + b` is `a - b`\n")
+    (fake_beagle / "commit.out").write_text("T0002: committed abc123, 1 file(s): T0002: Parser\n")
+    runtime, _ = _bound(tmp_path)
+
+    result = await _tool(runtime, "pursuit_step").execute(
+        "c1",
+        {"task": "T0002", "criteria": "c", "done_when": "test -f done.txt", "scope": ["done.txt"]},
+    )
+
+    [run] = _runs(fake_tau)
+    assert "WITNESS: <path of the source file>" in run["stdin"]
+    [prove] = _pursuit_calls(fake_beagle, "prove")
+    assert prove[:7] == [
+        "T0002",
+        "--mutate",
+        "src/clock.py",
+        "--needle",
+        "    return a + b",
+        "--replacement",
+        "    return a - b",
+    ]
+    assert _pursuit_calls(fake_beagle, "close")[0][:3] == ["T0002", "--outcome", "done"]
+    assert _pursuit_calls(fake_beagle, "commit") == [
+        ["T0002", "done.txt", "--subject", "T0002: Parser"]
+    ]
+    assert "closed done" in result.text and "committed abc123" in result.text
+
+
+@pytest.mark.anyio
+async def test_pursuit_step_takes_the_work_away_when_the_worker_names_no_witness(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project = _git_project(tmp_path, monkeypatch)
+    monkeypatch.chdir(project)
+    _ready_task(fake_beagle)
+    (fake_beagle / "prove.out").write_text("T0002: PROVEN — refuses with done.txt gone\n")
+    runtime, _ = _bound(tmp_path)
+
+    await _tool(runtime, "pursuit_step").execute(
+        "c1",
+        {"task": "T0002", "criteria": "c", "done_when": "test -f done.txt", "scope": ["done.txt"]},
+    )
+
+    [prove] = _pursuit_calls(fake_beagle, "prove")
+    assert prove[:3] == ["T0002", "--absent", "done.txt"]
+    assert len(_pursuit_calls(fake_beagle, "close")) == 1
+
+
+@pytest.mark.anyio
+async def test_pursuit_step_keeps_a_task_open_while_its_check_passes_over_a_defect(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Run 11d closed T0005/T0006 on checks that only imported the module.
+    monkeypatch.chdir(_git_project(tmp_path, monkeypatch))
+    monkeypatch.setenv("FAKE_TAU_REPORT", WITNESSED_REPORT)
+    _ready_task(fake_beagle)
+    (fake_beagle / "prove.out").write_text(
+        "T0002: NOT PROVEN — the check STILL PASSES with the defect put back\n"
+    )
+    (fake_beagle / "prove.rc").write_text("9")
+    runtime, _ = _bound(tmp_path)
+
+    result = await _tool(runtime, "pursuit_step").execute(
+        "c1",
+        {"task": "T0002", "criteria": "c", "done_when": "test -f done.txt", "scope": ["done.txt"]},
+    )
+
+    first, second = _runs(fake_tau)
+    assert "does not test what this task built" in second["stdin"]
+    assert len(_pursuit_calls(fake_beagle, "prove")) == 2
+    assert _pursuit_calls(fake_beagle, "close") == []
+    assert _pursuit_calls(fake_beagle, "commit") == []
+    assert "stays open" in result.text and "test of the behaviour itself" in result.text
+
+
+def test_a_witness_block_is_read_from_the_end_of_a_report() -> None:
+    witness = _module()._witness
+    assert witness(WITNESSED_REPORT) == ("src/clock.py", "    return a + b", "    return a - b")
+    multi = "WITNESS: `a.py`\nNEEDLE:\nif x:\n    y()\nREPLACEMENT:\nEND WITNESS"
+    assert witness(multi) == ("a.py", "if x:\n    y()", "")
+    assert witness("no witness here") is None
+    assert witness("WITNESS: a.py\nNEEDLE:\n\nREPLACEMENT:\nx\nEND WITNESS") is None
 
 
 @pytest.mark.anyio

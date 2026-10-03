@@ -1463,6 +1463,26 @@ def _ensure_git_repo(root: Path) -> bool:
     return rc == 0
 
 
+def _ignore_caches(root: Path) -> None:
+    """Add the tool caches a project has no `.gitignore` line for to its `.gitignore`.
+
+    Run 11d's one commit carried `__pycache__`; a worker's `git add .` and
+    the step's own commit both read the ignore file.
+    """
+    ignore = root / ".gitignore"
+    try:
+        have = ignore.read_text(encoding="utf-8") if ignore.exists() else ""
+    except OSError:
+        return
+    lines = {line.strip().strip("/") for line in have.splitlines()}
+    missing = [name for name in sorted(_CACHE_DIRS) if name not in lines]
+    if not missing:
+        return
+    sep = "" if not have or have.endswith("\n") else "\n"
+    with contextlib.suppress(OSError):
+        ignore.write_text(have + sep + "".join(f"{name}/\n" for name in missing), encoding="utf-8")
+
+
 def _git_identity(root: Path) -> bool:
     """Whether a commit in `root` would know who made it (config, env or host)."""
     return all(
@@ -1730,9 +1750,14 @@ def make_found_tool(on_founded: Callable[[Path], None] | None = None) -> Any:
             "[goal]\n"
             f"statement = {_toml_string(statement)}\n"
             f"criteria = [{', '.join(_toml_string(c) for c in criteria)}]\n"
-            f"default_budget_tokens = {FOUNDING_BUDGET_TOKENS}\n",
+            f"default_budget_tokens = {FOUNDING_BUDGET_TOKENS}\n"
+            # pursuit_step opens, works and closes in one call, so nothing
+            # else stands where `prove` goes; beagle holds every done close
+            # to a witnessed check only when told to.
+            '\n[close]\nrequire = "witness"\n',
             encoding="utf-8",
         )
+        _ignore_caches(root)
         title = _task_title(statement)
         rc, out = _pursuit(["add", title, "--root-task", "--intent", statement], root)
         found = _TASK_ID.search(out) if rc == 0 else None
@@ -2152,6 +2177,192 @@ async def _run_check(command: str, root: Path, timeout: float) -> tuple[int, str
     out = (stdout or b"").decode("utf-8", "replace").strip()
     note = _killed_note(proc.returncode, limit)
     return proc.returncode or 0, f"{out}\n{note}".strip() if note else out
+
+
+#: What a worker is asked to end its report with: one defect `prove` can put back.
+WITNESS_NOTE = (
+    "When the check passes, end your report with the WITNESS block below. It names one "
+    "small defect the check must catch, in the code you wrote — or, if this task only "
+    "adds tests, in the code they test — never in a test file: "
+    "`prove` puts it back, and if the check still passes, the task is not done. The "
+    "NEEDLE is text copied exactly from the file that occurs there only once; the "
+    "REPLACEMENT is the same text made wrong (a flipped condition, a wrong constant, a "
+    "dropped step).\n\n"
+    "WITNESS: <path of the source file>\n"
+    "NEEDLE:\n<exact text from the file>\n"
+    "REPLACEMENT:\n<that text with the defect>\n"
+    "END WITNESS"
+)
+_WITNESS = re.compile(
+    r"^WITNESS:[ \t]*(?P<path>\S+)[ \t]*\n"
+    r"NEEDLE:[ \t]*\n(?P<needle>.*?)\n"
+    r"REPLACEMENT:[ \t]*\n(?P<replacement>.*?)\n?"
+    r"^END WITNESS",
+    re.MULTILINE | re.DOTALL,
+)
+#: How `prove` gives its verdict: exit 0 for PROVEN, 9 for NOT PROVEN.
+_PROVE_VERDICT = re.compile(r"^(T\d+): (PROVEN|NOT PROVEN) —", re.MULTILINE)
+#: Why a witness may sit in code the task did not write.
+PREDATES_BECAUSE = (
+    "this task's check tests code an earlier task wrote; the defect is put back there "
+    "to show the check this task added catches it"
+)
+#: How much of a `prove` reply the driver and the next worker see.
+PROVE_TAIL_CHARS = 1_500
+
+
+def _witness(report: str) -> tuple[str, str, str] | None:
+    """The last WITNESS block in a worker's report: (path, needle, replacement)."""
+    found = list(_WITNESS.finditer(report))
+    if not found:
+        return None
+    last = found[-1]
+    needle = last.group("needle").strip("\n")
+    if not needle.strip():
+        return None
+    path = last.group("path").strip("`'\"")
+    return path, needle, last.group("replacement").strip("\n")
+
+
+def _is_test_path(rel: str) -> bool:
+    parts = Path(rel).parts
+    name = parts[-1] if parts else rel
+    return (
+        bool({"test", "tests"} & set(parts[:-1]))
+        or name.startswith("test_")
+        or name.endswith("_test.py")
+        or name == "conftest.py"
+    )
+
+
+def _changed_files(root: Path) -> list[str]:
+    """Paths git sees changed or new, beagle's record and caches left out."""
+    rc, out = _run(["git", "status", "--porcelain", "--untracked-files=all"], root, timeout=30.0)
+    if rc != 0:
+        return []
+    paths = []
+    for line in out.splitlines():
+        if len(line) < 4:
+            continue
+        rel = line[3:].split(" -> ")[-1].strip().strip('"')
+        parts = Path(rel).parts
+        if not parts or parts[0] == ".beagle" or _CACHE_DIRS & set(parts):
+            continue
+        paths.append(rel)
+    return paths
+
+
+def _in_scope(rel: str, scope: list[str]) -> bool:
+    if not scope:
+        return True
+    return any(rel == s.rstrip("/") or rel.startswith(s.rstrip("/") + "/") for s in scope)
+
+
+@dataclass(frozen=True)
+class _Proof:
+    """What `prove` said of a passing check, or why it could not be asked."""
+
+    proven: bool
+    text: str
+    #: A defect was put back and the check still passed: the check, not the
+    #: work, is what falls short.
+    weak: bool = False
+
+
+async def _prove(
+    task: str, report: str, scope: list[str], root: Path, timeout: float
+) -> _Proof | None:
+    """Ask `beagle pursuit prove` whether the passing check can refuse at all.
+
+    A check that passes over a defect put back into the work is not about the
+    work: run 11d closed two tasks on import-only checks. The worker names the
+    defect (`WITNESS_NOTE`); a missing or misshapen one falls back to taking
+    away the source files the task changed. None when neither can be tried —
+    no witness and no changed file — and the close decides.
+    """
+    attempts: list[list[str]] = []
+    witness = _witness(report)
+    if witness is not None:
+        path, needle, replacement = witness
+        attempts.append(["--mutate", path, "--needle", needle, "--replacement", replacement])
+    sources = [
+        rel
+        for rel in _changed_files(root)
+        if _in_scope(rel, scope) and not _is_test_path(rel) and (root / rel).is_file()
+    ]
+    if sources:
+        attempts.append([arg for rel in sources for arg in ("--absent", rel)])
+    refused: list[str] = []
+    for how in attempts:
+        argv = [BEAGLE_BIN, "pursuit", "prove", task, *how, "--check-timeout", f"{timeout:.0f}"]
+        rc, out = await asyncio.to_thread(
+            _run, _capped(argv, _memory_max()), root, 2 * timeout + 120
+        )
+        if rc != 0 and "--predates-because" in out and "--mutate" in how:
+            # A task that adds tests for code an earlier task wrote: its
+            # witness is a defect in that code, which beagle takes when said.
+            argv += ["--predates-because", PREDATES_BECAUSE]
+            rc, out = await asyncio.to_thread(
+                _run, _capped(argv, _memory_max()), root, 2 * timeout + 120
+            )
+        tail = out[-PROVE_TAIL_CHARS:]
+        verdicts = {m.group(1): m.group(2) for m in _PROVE_VERDICT.finditer(out)}
+        if rc == 0 and verdicts.get(task) == "PROVEN":
+            return _Proof(proven=True, text=tail)
+        if verdicts.get(task) == "NOT PROVEN" and "STILL PASSES" in out:
+            # The check passed over the defect: a real answer, not one a
+            # different witness should be asked to overturn.
+            return _Proof(proven=False, text=tail, weak=True)
+        refused.append(tail)
+    if not attempts:
+        if not _requires_witness(root):
+            return None
+        return _Proof(
+            proven=False,
+            text="The worker gave no WITNESS block, and changed no source file in the "
+            "task's scope that could be taken away instead.",
+        )
+    return _Proof(proven=False, text="\n\n".join(refused))
+
+
+def _requires_witness(root: Path) -> bool:
+    """Whether the pursuit's `[close] require` holds a done close to a witnessed check."""
+    try:
+        goal = tomllib.loads((root / ".beagle" / GOAL_BASENAME).read_text(encoding="utf-8"))
+    except (OSError, tomllib.TOMLDecodeError):
+        return False
+    close = goal.get("close")
+    require = close.get("require") if isinstance(close, dict) else None
+    # beagle reads any value but "none" as "witness".
+    return require is not None and require != "none"
+
+
+def _commit(task: str, title: str, scope: list[str], root: Path) -> str:
+    """Commit what a done task changed with `pursuit commit`; a line saying what happened.
+
+    Run 11d left six of seven tasks' work uncommitted. Claims are the worker's
+    to record; with none, the commit says so rather than not landing at all.
+    """
+    paths = [rel for rel in _changed_files(root) if _in_scope(rel, scope)]
+    if not paths:
+        return "Nothing to commit: the task changed no file in its scope."
+    if not _git_identity(root):
+        return (
+            "Not committed: git has no user.name or user.email here. That is the user's "
+            "to set; tell them, and do not set one yourself."
+        )
+    subject = f"{task}: {title}"
+    if len(subject) > 72:
+        subject = subject[:71].rsplit(" ", 1)[0].rstrip(" ,;:") + "…"
+    argv = ["commit", task, *paths, "--subject", subject]
+    rc, out = _pursuit(argv, root)
+    if rc != 0 and "--no-claims" in out:
+        rc, out = _pursuit([*argv, "--no-claims"], root)
+    if rc != 0:
+        # A refused commit leaves its paths staged; put the index back.
+        _run(["git", "reset", "--quiet", "--", *paths], root, timeout=30.0)
+        return f"Not committed (`pursuit commit` exit {rc}):\n{out[-PROVE_TAIL_CHARS:]}"
+    return out.splitlines()[0] if out else f"Committed {len(paths)} file(s)."
 
 
 def _next_ready(root: Path) -> tuple[int, Any, str]:
@@ -2676,11 +2887,16 @@ def make_step_tool() -> Any:
         retry_note = ""
         restored: set[str] = set()
         attempt = 0
+        proof: _Proof | None = None
+        scope = scope or _strings(record.get("scope"))
+        brief += "\n\n" + WITNESS_NOTE
         if retrying:
             # The work may have been done since, under another task.
             verdict = await _run_check(check, root, check_timeout)
-        for attempt in range(1, attempts + 1):
             if verdict[0] == 0:
+                proof = await _prove(task, "", scope, root, check_timeout)
+        for attempt in range(1, attempts + 1):
+            if verdict[0] == 0 and (proof is None or proof.proven):
                 break
             if on_update is not None:
                 with contextlib.suppress(Exception):
@@ -2701,7 +2917,24 @@ def make_step_tool() -> Any:
                 break
             verdict = await _run_check(check, root, check_timeout)
             if verdict[0] == 0:
-                break
+                proof = await _prove(task, report, scope, root, check_timeout)
+                if proof is None or proof.proven:
+                    break
+                retry_note = (
+                    "\n\nAn earlier attempt reported back and the check passes, but `prove` "
+                    "could not show the check catches a defect in the work:\n"
+                    f"{proof.text}\n"
+                    + (
+                        "The check passed with the defect put back, so it does not test "
+                        "what this task built. Make the task's tests catch such a defect "
+                        "(in the test file, not by changing the check), then give a new "
+                        "WITNESS block."
+                        if proof.weak
+                        else "Give a WITNESS block whose NEEDLE occurs exactly once in a "
+                        "source file you changed (not a test)."
+                    )
+                )
+                continue
             retry_note = (
                 f"\n\nAn earlier attempt reported back, but the check still fails (exit "
                 f"{verdict[0]}). Its output ends:\n{verdict[1][-CHECK_TAIL_CHARS:]}\n"
@@ -2736,6 +2969,23 @@ def make_step_tool() -> Any:
                 "file it treats as an argument) rather than what is missing — "
                 f"{fix_check} If this route is wrong, pursuit_step with "
                 f'task="{task}", new_route=true and notes saying what to do instead.'
+            )
+        if proof is not None and not proof.proven:
+            state = "stays blocked" if retrying else "stays open"
+            why = (
+                "the check passes even with a defect put back into the work, so it does "
+                "not test what this task built"
+                if proof.weak
+                else "no defect could be put back to show the check can fail"
+            )
+            return _step_result(
+                f"{route}{undid}{task} — {title}: the check passes, but {why}; the task "
+                f"{state}, since a done close needs a check shown to refuse.\n\n"
+                f"`prove` said:\n{proof.text}\n\nLast report:\n{shown}\n\n"
+                f'Next: pursuit_step with task="{task}" and a done_when that runs a test '
+                "of the behaviour itself, e.g. `python3 -m pytest -q tests/test_<this "
+                "task>.py`, with notes saying what that test must check. A bare import or "
+                "file-exists check cannot be shown to refuse."
             )
         if retrying:
             because = (
@@ -2774,6 +3024,8 @@ def make_step_tool() -> Any:
                 )
             if skipped:
                 lock_note += f"Not locked: {'; '.join(skipped)}.\n\n"
+        if rc == 0:
+            lock_note += _commit(task, title, scope, root) + "\n\n"
         return _step_result(
             f"{route}{task} — {title}: {state}.\n\n{closed}\n\n"
             f"{undid}{lock_note}"
