@@ -1652,15 +1652,18 @@ async def test_pursuit_found_adds_a_lone_milestone_beagle_would_not_split(
 
 
 @pytest.mark.anyio
-async def test_found_refuses_long_milestone_before_writing(
+async def test_found_shortens_long_milestone_title(
     tmp_path: Path, beagle: Path, fake_beagle: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    # Run R01 founded with a 251-character milestone title, which beagle refuses.
     project = tmp_path / "project"
     project.mkdir()
     monkeypatch.chdir(project)
+    (fake_beagle / "add.out").write_text("T0001  Implement interval tree clocks\n")
     runtime, _ = _bound(tmp_path)
     limit = _module().MAX_TASK_TITLE
-    long_title = "x" * (limit + 1)
+    long_title = " ".join(["Implement fork join and event for interval tree clocks"] * 5)
+    assert 240 <= len(long_title) <= 280
 
     result = await _tool(runtime, "pursuit_found").execute(
         "c1",
@@ -1672,10 +1675,15 @@ async def test_found_refuses_long_milestone_before_writing(
         },
     )
 
-    assert "nothing written" in result.text
-    assert "milestone 2" in result.text and f"{limit + 1}-character" in result.text
-    assert "Shorten" in result.text and "'::'" in result.text
-    assert _calls(fake_beagle) == [] and not (project / ".beagle").exists()
+    assert "Founded the pursuit" in result.text
+    assert "Milestone 2" in result.text and f"{len(long_title)}-character" in result.text
+    split = _pursuit_calls(fake_beagle, "split")
+    assert len(split) == 1 and split[0][1] == "Parser::reads input"
+    title, sep, intent = split[0][2].partition("::")
+    assert sep and len(title) <= limit
+    assert long_title.startswith(title.removesuffix("…"))
+    assert long_title[len(title.removesuffix("…"))] == " "
+    assert long_title in intent and "the detail" in intent
 
 
 @pytest.mark.anyio
@@ -2618,7 +2626,7 @@ def test_a_check_that_cannot_judge_the_work_is_refused(check: str, problem: str 
 
 
 @pytest.mark.anyio
-async def test_founding_refuses_a_milestone_that_sets_the_pursuit_up(
+async def test_founding_refuses_when_every_milestone_sets_the_pursuit_up(
     tmp_path: Path, beagle: Path, fake_beagle: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     project = tmp_path / "project"
@@ -2631,12 +2639,12 @@ async def test_founding_refuses_a_milestone_that_sets_the_pursuit_up(
         "user_confirmed": True,
     }
 
-    # Run 8's first milestone: a task with no work and a check over .beagle/.
+    # With every milestone a setup one, nothing is left to found.
     setup = await _tool(runtime, "pursuit_found").execute(
-        "c1", {**args, "milestones": ["setup", "reference", "impl"]}
+        "c1", {**args, "milestones": ["setup", "init project"]}
     )
     named = await _tool(runtime, "pursuit_found").execute(
-        "c2", {**args, "milestones": ["configure beagle::doctor and skills.toml", "impl"]}
+        "c2", {**args, "milestones": ["configure beagle::doctor and skills.toml"]}
     )
 
     assert "nothing written" in setup.text and "'setup'" in setup.text
@@ -2646,6 +2654,35 @@ async def test_founding_refuses_a_milestone_that_sets_the_pursuit_up(
     # Run 11 wrote `title: purpose`, and the purpose's words hid the title.
     run_11 = "setup beagle pursuit: configure gates, cadences, skills, and dispatch"
     assert _module()._setup_milestone([run_11]) is not None
+
+
+@pytest.mark.anyio
+async def test_found_drops_setup_milestone_and_says_so(
+    tmp_path: Path, beagle: Path, fake_beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Run R03's driver was refused for a `setup::` first milestone and sent
+    # the same call fourteen times; founding drops it instead.
+    project = tmp_path / "project"
+    project.mkdir()
+    monkeypatch.chdir(project)
+    (fake_beagle / "add.out").write_text("T0001  Implement interval tree clocks\n")
+    runtime, _ = _bound(tmp_path)
+
+    result = await _tool(runtime, "pursuit_found").execute(
+        "c1",
+        {
+            "statement": "Implement interval tree clocks",
+            "criteria": ["`python3 -m pytest -q` exits 0"],
+            "milestones": ["setup::project layout for beagle", "reference::", "impl::itc.py"],
+            "user_confirmed": True,
+        },
+    )
+
+    assert "Founded the pursuit" in result.text
+    assert "Dropped the setup milestone 'setup'" in result.text
+    assert _pursuit_calls(fake_beagle, "split") == [
+        ["T0001", "reference::", "impl::itc.py", "--ordered"]
+    ]
 
 
 @pytest.mark.anyio

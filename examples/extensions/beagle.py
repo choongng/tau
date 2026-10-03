@@ -2142,24 +2142,17 @@ def make_found_tool(on_founded: Callable[[Path], None] | None = None) -> Any:
                 "pursuit_found: name the milestones: the parts of the goal you can "
                 "already see, each '<title>::<what it is for>'."
             )
-        setup = _setup_milestone(milestones)
-        if setup is not None:
-            return _step_result(f"pursuit_found: nothing written — {setup}")
-        # Run R01 founded with a 251-character milestone: the goal file and
-        # root task were written, then beagle refused the split.
-        for index, part in enumerate(milestones, 1):
-            length = len(_part_title(part))
-            if length > MAX_TASK_TITLE:
-                return _step_result(
-                    f"pursuit_found: nothing written — milestone {index} has a "
-                    f"{length}-character title; beagle takes at most {MAX_TASK_TITLE}. "
-                    "Shorten that title and put the detail after '::', as "
-                    "'<short title>::<what it is for>'."
-                )
+        # Run R03's driver, refused for a setup first milestone, sent the same
+        # call fourteen times: what founding can repair itself, it repairs.
+        milestones, repairs = _repair_milestones(milestones)
+        if not milestones:
+            return _step_result(f"pursuit_found: nothing written — {repairs[0]}")
+        repaired = "".join(f"{note}\n\n" for note in repairs)
         delegated = arguments.get("user_delegated") is True
         if arguments.get("user_confirmed") is not True and not delegated:
             listed = "\n".join(f"  - {c}" for c in criteria)
             return _step_result(
+                f"{repaired}"
                 "pursuit_found: nothing written. The goal and its criteria are the user's: "
                 "read them back word for word and ask the user to confirm or correct them:\n\n"
                 f"Goal: {statement}\nCriteria:\n{listed}\n\n"
@@ -2233,7 +2226,7 @@ def make_found_tool(on_founded: Callable[[Path], None] | None = None) -> Any:
                 "The user delegated the details: in your reply, tell them the criteria "
                 "you chose, so they can correct them."
             )
-        noted = "".join(f"{note}\n\n" for note in notes)
+        noted = "".join(f"{note}\n\n" for note in [*repairs, *notes])
         return _step_result(
             f"Founded the pursuit in {goal}, root task {root_task}.\n\n{_tree(root)}\n\n"
             f"{noted}{DRIVER_STEERS_NOTE}\n\n{CASES_FIRST_NOTE}\n\n"
@@ -2573,6 +2566,46 @@ def _setup_milestone(parts: list[str]) -> str | None:
                 "pyproject.toml, src/ and tests/ so the later parts have a home'."
             )
     return None
+
+
+def _repair_milestones(milestones: list[str]) -> tuple[list[str], list[str]]:
+    """`milestones` with what founding can fix fixed, and a note for each fix.
+
+    A setup milestone is dropped and an over-long title is cut at a word, its
+    whole text moved after '::'. With every milestone dropped, nothing is
+    left: the list comes back empty and the one note says why.
+    """
+    kept: list[str] = []
+    dropped: list[str] = []
+    for part in milestones:
+        if _setup_milestone([part]) is not None:
+            dropped.append(part)
+        else:
+            kept.append(part)
+    if not kept:
+        return [], [_setup_milestone(dropped) or "every milestone sets the pursuit up."]
+    notes = []
+    if dropped:
+        named = ", ".join(repr(part.split(":", 1)[0].strip()) for part in dropped)
+        notes.append(
+            f"Dropped the setup milestone {named}: founding is the setup, so it is not "
+            "part of the goal's work. The milestones are the rest."
+        )
+    repaired: list[str] = []
+    for index, part in enumerate(kept, 1):
+        title, sep, intent = part.partition("::")
+        title = title.strip()
+        if len(title) <= MAX_TASK_TITLE:
+            repaired.append(part)
+            continue
+        short = _task_title(title)
+        detail = f"{title} — {intent.strip()}" if sep and intent.strip() else title
+        repaired.append(f"{short}::{detail}")
+        notes.append(
+            f"Milestone {index} had a {len(title)}-character title; beagle takes at most "
+            f"{MAX_TASK_TITLE}, so it is now {short!r}, with the whole text after '::'."
+        )
+    return repaired, notes
 
 
 def _check_argv(command: str, root: Path) -> list[str]:

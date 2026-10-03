@@ -200,6 +200,8 @@ REPEATED_CALL_LIMIT = 2
 REPEATED_CALL_WINDOW = 10
 #: Refusals in a row after which the run is stopped.
 REPEATED_CALL_STOP = 8
+#: Characters of a repeated call's earlier result its refusal quotes.
+REPEATED_CALL_QUOTE = 300
 #: Tools that change the workspace: after one, a call's earlier result no
 #: longer predicts what it gives now, so the calls before it are forgotten.
 WORKSPACE_CHANGING_TOOLS = frozenset({"pursuit_step", "write", "edit"})
@@ -529,6 +531,8 @@ class CodingSession:
         self._run_length_continuations = 0
         #: The latest tool calls that ran, each with a digest of its result.
         self._recent_calls: deque[tuple[str, int]] = deque(maxlen=REPEATED_CALL_WINDOW)
+        #: The first line of the latest result of each call in `_recent_calls`.
+        self._recent_heads: dict[str, str] = {}
         self._refused_in_a_row = 0
         self._refused_call_ids: set[str] = set()
         self._message_origins: dict[int, tuple[AgentMessage, MessageDelivery, MessageSource]] = {}
@@ -1398,10 +1402,14 @@ class CodingSession:
         latest = results[-REPEATED_CALL_LIMIT:]
         if len(latest) < REPEATED_CALL_LIMIT or len(set(latest)) > 1:
             return None
+        # Run R03's driver repeated a refused pursuit_found fourteen times; the
+        # refusal said what to change, and "use the result" did not repeat it.
+        head = self._recent_heads.get(key, "")
+        quoted = f" It said: {head}" if head else ""
         return (
             f"this `{call.name}` call ran {len(results)} times in the last "
             f"{len(self._recent_calls)} calls with the same result each time, and would "
-            "give it again. Use the result you already have, or take a different step."
+            f"give it again.{quoted} Do what that result asks, or take a different step."
         )
 
     def _tool_run_as_command(self, call: ToolCall) -> str | None:
@@ -1449,7 +1457,13 @@ class CodingSession:
             ]
             self._recent_calls.clear()
             self._recent_calls.extend(kept)
-        self._recent_calls.append((_call_key(call), digest))
+        key = _call_key(call)
+        self._recent_calls.append((key, digest))
+        first = next((line.strip() for line in text.splitlines() if line.strip()), "")
+        self._recent_heads[key] = first[:REPEATED_CALL_QUOTE]
+        live = {seen for seen, _ in self._recent_calls}
+        for stale in [seen for seen in self._recent_heads if seen not in live]:
+            del self._recent_heads[stale]
         return self._buffer_result(result, tool_name=call.name), is_error
 
     def _buffer_result(self, result: AgentToolResult, *, tool_name: str) -> AgentToolResult:
@@ -1728,6 +1742,7 @@ class CodingSession:
         if isinstance(event, AgentStartEvent):
             self._length_continuations = self._run_length_continuations = 0
             self._recent_calls.clear()
+            self._recent_heads.clear()
             self._refused_in_a_row = 0
             self._refused_call_ids.clear()
         if isinstance(event, TurnEndEvent):

@@ -83,3 +83,45 @@ async def test_repeat_breaker_resets_after_workspace_change(tmp_path: Path) -> N
     assert ran == ["bash", "bash", "pursuit_step", "bash", "bash"]
     results = [m for m in session.messages if m.role == "toolResult"]
     assert results[5].text.startswith("Not run: this `bash` call ran 2 times")
+
+
+@pytest.mark.anyio
+async def test_repeat_refusal_quotes_earlier_result(tmp_path: Path) -> None:
+    # Run R03: pursuit_found refused a setup milestone, and its fourteen repeats
+    # were each told only "use the result you already have".
+    head = "pursuit_found: nothing written — 'setup' is not part of the goal's work. " * 6
+    ran: list[str] = []
+
+    async def execute(
+        tool_call_id: object, arguments: object, signal: object = None, on_update: object = None
+    ) -> AgentToolResult:
+        ran.append("pursuit_found")
+        return AgentToolResult(content=[TextContent(text=f"{head}\nLeave it out.")])
+
+    found = AgentTool(
+        name="pursuit_found",
+        label="pursuit_found",
+        description="Found a pursuit.",
+        parameters={"type": "object"},
+        execute_fn=execute,
+    )
+    args: dict[str, JSONValue] = {"milestones": ["setup", "impl"]}
+    session = await CodingSession.load(
+        CodingSessionConfig(
+            provider=FakeProvider(_turns([("pursuit_found", args)] * 3)),
+            model="fake",
+            system="You are Tau.",
+            storage=JsonlSessionStorage(tmp_path / "session.jsonl"),
+            cwd=tmp_path,
+            tools=[found],
+        )
+    )
+
+    async for _ in session.prompt("Go."):
+        pass
+
+    assert ran == ["pursuit_found", "pursuit_found"]
+    refusal = [m for m in session.messages if m.role == "toolResult"][2].text
+    assert refusal.startswith("Not run: this `pursuit_found` call ran 2 times")
+    assert f"It said: {head.strip()[:300]}" in refusal
+    assert head.strip()[:301] not in refusal and "Leave it out." not in refusal
