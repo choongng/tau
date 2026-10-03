@@ -1,0 +1,4 @@
+#!/bin/sh
+set -e
+bash .beagle/checks/fix/named_tests.sh tests/test_beagle_example_extension.py 3 test_found_refusal_in_print_mode_quotes_the_prompt_and_leads_with_delegation test_print_mode_stop_gate_objects_once_to_an_unfounded_stop_after_a_confirmation_refusal test_pursuit_found_waits_for_the_user_then_roots_and_splits
+echo OK
