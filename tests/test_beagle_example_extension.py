@@ -3050,6 +3050,73 @@ async def test_planning_refuses_a_setup_part_and_a_step_its_store_scope(
     assert _pursuit_calls(fake_beagle, "open") == []
 
 
+R08_SCOPE = ["itc/tests/cases.json", "itc/tests/test_cases.py", "itc/interval_tree_clocks.py"]
+
+
+@pytest.mark.anyio
+async def test_step_refuses_a_scope_mixing_known_answer_data_with_source(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project = _pursuit_project(tmp_path)
+    monkeypatch.chdir(project)
+    _ready_task(fake_beagle)
+    runtime, _ = _bound(tmp_path)
+    arguments = {
+        "task": "T0002",
+        "criteria": "the clocks pass the cases",
+        "done_when": "grep -q done done.txt",
+        "scope": R08_SCOPE,
+    }
+
+    refused = await _tool(runtime, "pursuit_step").execute("c1", arguments)
+
+    assert "not opened" in refused.text
+    assert "itc/tests/cases.json" in refused.text
+    assert "itc/interval_tree_clocks.py" in refused.text
+    assert "locks=[itc/tests/cases.json]" in refused.text and "later task" in refused.text
+    assert _pursuit_calls(fake_beagle, "open") == []
+    assert _runs(fake_tau) == []
+
+    # Locked by an earlier task, the data is restored before every check.
+    store = project / ".beagle" / "locked" / "itc" / "tests"
+    store.mkdir(parents=True)
+    (store / "cases.json").write_text("[]")
+    passed = await _tool(runtime, "pursuit_step").execute("c2", arguments)
+
+    assert "known-answer data" not in passed.text
+    assert len(_pursuit_calls(fake_beagle, "open")) == 1
+
+
+@pytest.mark.anyio
+async def test_step_accepts_known_answer_data_with_its_tests_only(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.chdir(_pursuit_project(tmp_path))
+    _ready_task(fake_beagle)
+    runtime, _ = _bound(tmp_path)
+
+    result = await _tool(runtime, "pursuit_step").execute(
+        "c1",
+        {
+            "task": "T0002",
+            "criteria": "the cases are written",
+            "done_when": "grep -q done done.txt",
+            "scope": ["itc/tests/cases.json", "itc/tests/test_cases.py"],
+        },
+    )
+
+    assert "known-answer data" not in result.text
+    assert len(_pursuit_calls(fake_beagle, "open")) == 1
+
+
 @pytest.mark.anyio
 async def test_pursuit_step_drops_a_setup_task_instead_of_working_it(
     tmp_path: Path,

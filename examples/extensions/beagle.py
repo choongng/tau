@@ -2897,6 +2897,32 @@ def _scope_problem(scope: list[str]) -> str | None:
     )
 
 
+def _oracle_with_code_problem(scope: list[str], goal: Path) -> str | None:
+    """Why a scope writes known answers beside the code they judge, or None.
+
+    Run R08: T0004's scope held itc/tests/cases.json, its test and the module,
+    so the worker wrote wrong expected values to fit its code, and every later
+    task was graded against them. A data file locked by an earlier task is
+    restored before each check, so it is no oracle the worker can bend.
+    """
+    locked = set(_locked(goal))
+    data = [
+        rel
+        for rel in scope
+        if _is_test_path(rel.rstrip("/"))
+        and Path(rel.rstrip("/")).suffix not in {"", ".py"}
+        and rel.rstrip("/") not in locked
+    ]
+    source = [rel for rel in scope if rel.endswith(".py") and not _is_test_path(rel)]
+    if not data or not source:
+        return None
+    return (
+        f"scope holds known-answer data ({', '.join(data)}) and the code it judges "
+        f"({', '.join(source)}). Split it: first a task with only the data and its cases "
+        f"test in scope, passing locks=[{', '.join(data)}]; then the code in a later task."
+    )
+
+
 #: Words a milestone about setting the pursuit up is made of, and nothing else.
 _SETUP_WORDS = frozenset(
     {
@@ -3944,7 +3970,8 @@ def make_step_tool() -> Any:
                 # Checked before the spawn, which supersedes the task for good:
                 # run R06 spawned T0008, then refused to open it on a check that
                 # already passed, and left a successor with no criteria.
-                scoped = _scope_problem(scope or _strings(record.get("scope")))
+                route_scope = scope or _strings(record.get("scope"))
+                scoped = _scope_problem(route_scope) or _oracle_with_code_problem(route_scope, goal)
                 if scoped is not None:
                     return _step_result(f"pursuit_step: no new route for {task} — {scoped}")
                 new_check = done_when or old_check
@@ -4008,7 +4035,7 @@ def make_step_tool() -> Any:
             prose = _check_problem(done_when)
             if prose is not None:
                 return _step_result(f"pursuit_step: {task} not opened — {prose}")
-            scoped = _scope_problem(scope)
+            scoped = _scope_problem(scope) or _oracle_with_code_problem(scope, goal)
             if scoped is not None:
                 return _step_result(f"pursuit_step: {task} not opened — {scoped}")
             # A check bound once it already passes closes the task on no work:
@@ -4102,6 +4129,10 @@ def make_step_tool() -> Any:
         scope = scope or _strings(record.get("scope"))
         unproven_key = (str(root), task)
         tests_only = _only_data_and_tests(scope)
+        mixed = _oracle_with_code_problem(scope, goal)
+        if mixed is not None:
+            # Opened before this guard, or by hand: still no worker on it.
+            return _step_result(f"pursuit_step: {task} not run — {mixed}")
         if unproven_key in _UNPROVEN:
             return _not_done(
                 root,
