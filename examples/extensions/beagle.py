@@ -1915,6 +1915,41 @@ def _git_identity(root: Path) -> bool:
     )
 
 
+def _commit_setup(root: Path) -> str | None:
+    """Commit beagle's setup (.beagle/ and .gitignore) alone; None, or why not.
+
+    R08: `beagle init`'s files stayed untracked, so the workspace-clean gate
+    was red from the first task. A pathspec commit leaves whatever else the
+    user has staged or changed exactly as it was.
+    """
+    rc, out = _run(["git", "add", "-A", "--", ".beagle", ".gitignore"], root, timeout=30.0)
+    if rc != 0:
+        return f"`git add` failed: {out}"
+    rc, out = _run(
+        ["git", "diff", "--cached", "--name-only", "--", ".beagle", ".gitignore"],
+        root,
+        timeout=30.0,
+    )
+    if rc != 0:
+        return f"`git diff --cached` failed: {out}"
+    staged = out.splitlines()
+    specs = [
+        spec
+        for spec in (".beagle", ".gitignore")
+        if any(path == spec or path.startswith(f"{spec}/") for path in staged)
+    ]
+    if not specs:
+        return None
+    rc, out = _run(
+        ["git", "commit", "-q", "-m", "pursuit: found — beagle setup", "--", *specs],
+        root,
+        timeout=60.0,
+    )
+    if rc != 0:
+        return f"`git commit` failed: {out}"
+    return None
+
+
 @functools.cache
 def _scopes_work() -> bool:
     """Whether `systemd-run --user --scope` can start a process here."""
@@ -2546,9 +2581,12 @@ def make_found_tool(
             notes.append(f"{root} was not a git repository; ran `git init` there.")
         if not _git_identity(root):
             notes.append(
-                "git has no user.name or user.email here, so commits will fail. Tell the "
-                "user now; do not set one yourself."
+                "git has no user.name or user.email here, so commits will fail, and beagle's "
+                "setup (.beagle/, .gitignore) is uncommitted. Tell the user now; do not set "
+                "one yourself."
             )
+        elif (why := _commit_setup(root)) is not None:
+            notes.append(f"beagle's setup (.beagle/, .gitignore) is uncommitted: {why}")
         fetched, failed = references.get("fetched") or {}, references.get("failed") or {}
         if fetched or failed:
             got = ", ".join(f"{REFERENCES_DIR}/{name}" for name in fetched) or "none"

@@ -1607,6 +1607,104 @@ async def test_pursuit_found_takes_a_delegated_goal_and_makes_a_repo(
     assert "git has no user.name or user.email" in result.text
 
 
+def _setup_project(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """A git repo with an identity, holding what `beagle init` leaves untracked."""
+    project = tmp_path / "project"
+    project.mkdir()
+    monkeypatch.chdir(project)
+    gitconfig = tmp_path / "gitconfig"
+    gitconfig.write_text("[user]\n\tname = Tester\n\temail = tester@example.com\n")
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(gitconfig))
+    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+    subprocess.run(["git", "init", "-q"], cwd=project, check=True)
+    beagle_dir = project / ".beagle"
+    beagle_dir.mkdir()
+    for name in ("cadences", "dispatch", "gates", "skills", "track"):
+        (beagle_dir / f"{name}.toml").write_text(f"# {name}\n")
+    (beagle_dir / "memory-rubric.md").write_text("# rubric\n")
+    (project / ".gitignore").write_text(".beagle/scratch/\n")
+    (beagle_dir / "scratch").mkdir()
+    (beagle_dir / "scratch" / "junk.log").write_text("ignored\n")
+    return project
+
+
+def _git(project: Path, *args: str) -> str:
+    return subprocess.run(
+        ["git", *args], cwd=project, check=True, capture_output=True, text=True
+    ).stdout
+
+
+async def _found(tmp_path: Path, fake_beagle: Path) -> Any:
+    (fake_beagle / "add.out").write_text("T0001  Build ITC\n")
+    runtime, _ = _bound(tmp_path)
+    return await _tool(runtime, "pursuit_found").execute(
+        "c1",
+        {
+            "statement": "Build ITC",
+            "criteria": ["`uv run pytest` exits 0"],
+            "milestones": ["Read::the reference", "Core::fork, join, event"],
+            "user_confirmed": True,
+        },
+    )
+
+
+@pytest.mark.anyio
+async def test_founding_commits_beagle_setup_files(
+    tmp_path: Path, beagle: Path, fake_beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # R08: beagle init's files stayed untracked, so workspace-clean was red
+    # from the first task.
+    project = _setup_project(tmp_path, monkeypatch)
+
+    result = await _found(tmp_path, fake_beagle)
+
+    assert "uncommitted" not in result.text
+    assert _git(project, "status", "--porcelain", "--untracked-files=all") == ""
+    committed = _git(project, "show", "--name-only", "--format=", "HEAD").split()
+    assert ".gitignore" in committed and ".beagle/pursuit.toml" in committed
+    assert ".beagle/memory-rubric.md" in committed
+    assert ".beagle/scratch/junk.log" not in committed
+
+
+@pytest.mark.anyio
+async def test_founding_setup_commit_leaves_the_users_files_alone(
+    tmp_path: Path, beagle: Path, fake_beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project = _setup_project(tmp_path, monkeypatch)
+    (project / "staged.py").write_text("x = 1\n")
+    _git(project, "add", "staged.py")
+    (project / "notes.txt").write_text("mine\n")
+
+    await _found(tmp_path, fake_beagle)
+
+    committed = _git(project, "show", "--name-only", "--format=", "HEAD").split()
+    assert committed and all(p == ".gitignore" or p.startswith(".beagle/") for p in committed)
+    status = _git(project, "status", "--porcelain", "--untracked-files=all").splitlines()
+    assert sorted(status) == ["?? notes.txt", "A  staged.py"]
+
+
+@pytest.mark.anyio
+async def test_founding_without_identity_says_setup_is_uncommitted(
+    tmp_path: Path, beagle: Path, fake_beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project = _setup_project(tmp_path, monkeypatch)
+    (tmp_path / "gitconfig").write_text("[user]\n\tuseConfigOnly = true\n")
+    for key in (
+        "GIT_AUTHOR_NAME",
+        "GIT_AUTHOR_EMAIL",
+        "GIT_COMMITTER_NAME",
+        "GIT_COMMITTER_EMAIL",
+        "EMAIL",
+    ):
+        monkeypatch.delenv(key, raising=False)
+
+    result = await _found(tmp_path, fake_beagle)
+
+    assert "Founded the pursuit" in result.text
+    assert "setup (.beagle/, .gitignore) is uncommitted" in result.text
+    assert "?? .beagle/pursuit.toml" in _git(project, "status", "--porcelain", "-uall")
+
+
 @pytest.mark.anyio
 async def test_pursuit_plan_adds_to_a_container_it_cannot_split(
     tmp_path: Path, beagle: Path, fake_beagle: Path, monkeypatch: pytest.MonkeyPatch
