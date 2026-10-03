@@ -4193,3 +4193,205 @@ async def test_ruff_fix_refusal_names_flag(
     assert "refusing to run `ruff check src/ tests/ --fix`" in fixing.text
     assert "whose `--fix` flag rewrites files" in fixing.text
     assert reading.text == "ran"
+
+
+# --------------------------------------------------------------------------- #
+# run R04: no escalation after 14 stays-open; the driver debugs worker files
+# --------------------------------------------------------------------------- #
+
+STAYS_OPEN_SCOPE = ["done.txt", "src/clock.py", "tests"]
+
+
+def _failing_open_task(fake_beagle: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """T0002, whose worker never makes its check pass, opened by the first step."""
+    monkeypatch.setenv("FAKE_TAU_SUCCEEDS_ON", "99")
+    _ready_task(fake_beagle)
+
+
+def _now_open(fake_beagle: Path) -> None:
+    record = {"id": "T0002", "title": "Parser", "status": "open"}
+    record |= {"done_when": "grep -q done done.txt", "scope": STAYS_OPEN_SCOPE}
+    (fake_beagle / "show.out").write_text(json.dumps(record))
+    (fake_beagle / "next.out").write_text(json.dumps({"open": ["T0002"], "ready": []}))
+
+
+async def _stays_open(step: Any, fake_beagle: Path, times: int) -> list[Any]:
+    results = []
+    for n in range(times):
+        args: dict[str, Any] = {"task": "T0002", "attempts": 1}
+        if not results:
+            args |= {"criteria": "c", "done_when": "grep -q done done.txt"}
+            args |= {"scope": STAYS_OPEN_SCOPE}
+        results.append(await step.execute(f"s{n}", args))
+        _now_open(fake_beagle)
+    return results
+
+
+@pytest.mark.anyio
+async def test_fourth_step_after_three_not_done_is_refused_with_choices(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # R04: 14 results left T0002 not done, and none offered another way.
+    monkeypatch.chdir(_pursuit_project(tmp_path))
+    _failing_open_task(fake_beagle, monkeypatch)
+    runtime, _ = _bound(tmp_path)
+    step = _tool(runtime, "pursuit_step")
+
+    results = await _stays_open(step, fake_beagle, 3)
+    fourth = await step.execute(
+        "s4", {"task": "T0002", "scope": ["src/other.py"], "notes": "look harder"}
+    )
+    fifth = await step.execute("s5", {})
+
+    assert len(_runs(fake_tau)) == 3
+    assert all("stays open" in r.text for r in results)
+    assert "The next step on it runs no sub-agent" in results[2].text
+    for refused in (fourth, fifth):
+        assert refused.text.startswith("pursuit_step: T0002 not run: 3 steps on it")
+        assert 'pursuit_plan task="T0002"' in refused.text
+        assert 'pursuit_step task="T0002", new_route=true' in refused.text
+        assert "tell the user what blocks it" in refused.text
+    assert _pursuit_calls(fake_beagle, "close") == []
+
+
+@pytest.mark.anyio
+async def test_new_route_resets_the_not_done_count(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.chdir(_pursuit_project(tmp_path))
+    _failing_open_task(fake_beagle, monkeypatch)
+    runtime, _ = _bound(tmp_path)
+    step = _tool(runtime, "pursuit_step")
+    await _stays_open(step, fake_beagle, 3)
+    (fake_beagle / "spawn.out").write_text("T0002 superseded by T0003\n")
+    successor = {"id": "T0003", "title": "Parser", "status": "open"}
+    successor |= {"done_when": "grep -q done done.txt", "scope": STAYS_OPEN_SCOPE}
+    (fake_beagle / "show-T0003.out").write_text(json.dumps(successor))
+
+    rerouted = await step.execute(
+        "r1",
+        {"task": "T0002", "new_route": True, "notes": "write done.txt first", "attempts": 1},
+    )
+
+    assert len(_runs(fake_tau)) == 4
+    assert "T0003" in rerouted.text and "stays open" in rerouted.text
+    assert "not run" not in rerouted.text
+    module = _loaded_module()
+    assert [key[1] for key in module._NOT_DONE] == ["T0003"]
+
+
+@pytest.mark.anyio
+async def test_plan_of_a_task_resets_its_not_done_count(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.chdir(_pursuit_project(tmp_path))
+    _failing_open_task(fake_beagle, monkeypatch)
+    runtime, _ = _bound(tmp_path)
+    step = _tool(runtime, "pursuit_step")
+    await _stays_open(step, fake_beagle, 3)
+
+    planned = await _tool(runtime, "pursuit_plan").execute(
+        "p1", {"task": "T0002", "parts": ["Lexer::tokens", "Grammar::the tree"]}
+    )
+    again = await step.execute("s4", {"task": "T0002", "attempts": 1})
+
+    assert "refused" not in planned.text
+    assert len(_runs(fake_tau)) == 4
+    assert "not run" not in again.text
+
+
+@pytest.mark.anyio
+async def test_unproven_memory_keyed_by_task_survives_scope_change(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # R04 L100: the driver got past a (check, scope) key by changing the scope.
+    monkeypatch.chdir(_witnessed_pursuit(tmp_path, monkeypatch))
+    _ready_task(fake_beagle)
+    runtime, _ = _bound(tmp_path)
+    step = _tool(runtime, "pursuit_step")
+    args = {"task": "T0002", "criteria": "c", "done_when": "grep -q done done.txt"}
+
+    first = await step.execute("c1", {**args, "scope": ["tests"]})
+    record = {"id": "T0002", "title": "Parser", "status": "open"}
+    record |= {"done_when": "grep -q done done.txt", "scope": ["tests"]}
+    (fake_beagle / "show.out").write_text(json.dumps(record))
+    (fake_beagle / "next.out").write_text(json.dumps({"open": ["T0002"], "ready": []}))
+    rescoped = await step.execute("c2", {"task": "T0002", "scope": ["tests", "src/clock.py"]})
+
+    assert len(_runs(fake_tau)) == 1
+    assert "no defect could be put back" in first.text
+    assert "new_route=true" in first.text
+    assert "not run: this check already passes and cannot be shown to refuse" in rescoped.text
+    assert "whatever check or scope" in rescoped.text
+    assert 'pursuit_step task="T0002", new_route=true' in rescoped.text
+
+
+@pytest.mark.anyio
+async def test_driver_read_of_open_task_file_refused_after_two_stays_open(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # R04: ~60 driver bash/read calls on the workers' test files, 4 compactions.
+    project = _pursuit_project(tmp_path)
+    monkeypatch.chdir(project)
+    _failing_open_task(fake_beagle, monkeypatch)
+    runtime, session = _bound(tmp_path)
+    await runtime.emit_session_start("startup")
+    step = _tool(runtime, "pursuit_step")
+    bash, read = _tool_with_hooks(runtime, "bash"), _tool_with_hooks(runtime, "read")
+
+    await _stays_open(step, fake_beagle, 1)
+    after_one = await read.execute("r0", {"path": "src/clock.py"})
+    [second] = await _stays_open(step, fake_beagle, 1)
+    refused = [
+        await read.execute("r1", {"path": "src/clock.py"}),
+        await read.execute("r2", {"path": str(project / "tests" / "test_clock.py")}),
+        await bash.execute("r3", {"command": "cat tests/test_clock.py"}),
+        await bash.execute("r4", {"command": "head -n 40 src/clock.py | tail -5"}),
+        await bash.execute("r5", {"command": "sed -n 1,20p src/clock.py"}),
+        await bash.execute("r6", {"command": "cd . && grep -n join tests/test_clock.py"}),
+    ]
+    allowed = [
+        await read.execute("a1", {"path": "README.md"}),
+        await bash.execute("a2", {"command": "ls src tests"}),
+        await bash.execute("a3", {"command": "grep -rn tests docs/"}),
+    ]
+    session.session_id = "subagent-session"
+    nested = await read.execute("a5", {"path": "src/clock.py"})
+    session.session_id = "session-1"
+    monkeypatch.setenv("BEAGLE_TAU_WORKER", "1")
+    worker = await read.execute("a6", {"path": "src/clock.py"})
+    monkeypatch.delenv("BEAGLE_TAU_WORKER")
+    monkeypatch.setenv("FAKE_TAU_SUCCEEDS_ON", "1")
+    closed = await step.execute("s3", {"task": "T0002", "attempts": 1})
+    after_close = await read.execute("a7", {"path": "src/clock.py"})
+
+    assert after_one.text == "ran"
+    assert "reading them yourself is refused" in second.text
+    for result in refused:
+        assert "from the driving session" in result.text
+        assert "in the scope of T0002" in result.text
+        assert "pursuit_step's notes" in result.text and "new_route=true" in result.text
+    assert [r.text for r in allowed] == ["ran"] * len(allowed)
+    assert [nested.text, worker.text] == ["ran"] * 2
+    assert "closed done" in closed.text
+    assert after_close.text == "ran"

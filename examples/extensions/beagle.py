@@ -2395,6 +2395,7 @@ def make_plan_tool() -> Any:
                 rc, out = _add_children(task, parts, root)
         if rc != 0:
             return _step_result(f"pursuit_plan: beagle refused (exit {rc}):\n{out}")
+        _forget_task(root, task)
         notes = ""
         if repeated:
             notes += f"Not added again, {task} already has: {', '.join(repeated)}.\n\n"
@@ -3291,6 +3292,7 @@ def _abandon(task: str, why: str, root: Path, goal: Path) -> str:
             f"(exit {rc}):\n{out}"
         )
     _drop_pending_locks(goal, task)
+    _forget_task(root, task)
     released = _release_waiters(task, why, root)
     freed = f"\nNo longer waiting on it: {', '.join(released)}." if released else ""
     return (
@@ -3300,9 +3302,114 @@ def _abandon(task: str, why: str, root: Path, goal: Path) -> str:
 
 
 #: Open tasks whose passing check `prove` could not show to refuse, by (project
-#: root, task): the check and scope it was seen with. A step on the same pair
-#: runs no worker, since the next one passes the same check unproven again.
-_UNPROVEN: dict[tuple[str, str], tuple[str, tuple[str, ...]]] = {}
+#: root, task). A further step on the task runs no worker, whatever check or
+#: scope it is sent with: run R04's driver got past a (check, scope) key by
+#: changing the scope. A new route or a plan of the task clears it.
+_UNPROVEN: set[tuple[str, str]] = set()
+
+#: Step results that left a task not done (stays open or blocked, not run,
+#: unproven), by (project root, task), and the scope it was worked in. Run
+#: R04 sent 14 such steps at one task, none of which offered another way.
+_NOT_DONE: dict[tuple[str, str], int] = {}
+_NOT_DONE_SCOPE: dict[tuple[str, str], tuple[str, ...]] = {}
+
+#: Not-done results after which a further step on the task dispatches no worker.
+ESCALATE_AFTER = 3
+
+#: Not-done results after which the driver may not read the task's files.
+DRIVER_READS_UNTIL = 2
+
+
+def _escalation(task: str, count: int) -> str:
+    """The fixed refusal of a step on a task `count` steps have left not done."""
+    return (
+        f"pursuit_step: {task} not run: {count} steps on it have left it not done, and "
+        "another sub-agent on the same task, however its scope or notes are put, is "
+        "how run R04 spent 14 steps on one. Choose one:\n"
+        f'- pursuit_plan task="{task}" with parts, to split it into smaller tasks;\n'
+        f'- pursuit_step task="{task}", new_route=true, with a rewritten done_when and '
+        "notes saying what the new route does differently (the criteria stay);\n"
+        "- stop, and tell the user what blocks it."
+    )
+
+
+def _forget_task(root: Path, task: str) -> None:
+    """Drop what the step tool remembers of `task`: closed, re-routed or planned."""
+    key = (str(root), task)
+    _UNPROVEN.discard(key)
+    _NOT_DONE.pop(key, None)
+    _NOT_DONE_SCOPE.pop(key, None)
+
+
+def _not_done(root: Path, task: str, scope: list[str], text: str) -> AgentToolResult:
+    """Count a result that left `task` not done, and return it."""
+    key = (str(root), task)
+    count = _NOT_DONE[key] = _NOT_DONE.get(key, 0) + 1
+    if scope:
+        _NOT_DONE_SCOPE[key] = tuple(scope)
+    if count >= ESCALATE_AFTER:
+        text += "\n\n" + _escalation(task, count).replace(
+            f"pursuit_step: {task} not run: ", "The next step on it runs no sub-agent: ", 1
+        )
+    elif count >= DRIVER_READS_UNTIL and scope:
+        text += (
+            f"\n\nThe files in {task}'s scope are the sub-agent's while it is open: "
+            "reading them yourself is refused. Say what to fix in the step's notes, "
+            f'or give it a new route (pursuit_step task="{task}", new_route=true).'
+        )
+    return _step_result(text)
+
+
+def _held_scope(target: Path, root: Path) -> tuple[str, str, int] | None:
+    """The open task, its scope entry and not-done count, holding `target` from the driver."""
+    root = _resolved(root)
+    for (where, task), count in _NOT_DONE.items():
+        if count < DRIVER_READS_UNTIL or _resolved(Path(where)) != root:
+            continue
+        for entry in _NOT_DONE_SCOPE.get((where, task), ()):
+            text = entry.strip().rstrip("/")
+            if not text or text == ".":
+                continue
+            if _GLOB_CHARS & set(text):
+                if fnmatch.fnmatch(str(target), str(root / text)):
+                    return task, entry, count
+                continue
+            path = _resolved(root / text)
+            if target == path or path in target.parents:
+                return task, entry, count
+    return None
+
+
+#: Commands that print a file's text, and the options of each that take a value.
+_FILE_READERS: dict[str, frozenset[str]] = {
+    "cat": frozenset(),
+    "head": frozenset({"-n", "-c"}),
+    "tail": frozenset({"-n", "-c"}),
+    "sed": frozenset({"-e", "-f"}),
+    "grep": frozenset({"-e", "-f", "-m", "-A", "-B", "-C", "--include", "--exclude"}),
+}
+
+
+def _bash_read_targets(command: str, cwd: Path) -> list[Path]:
+    """The files a `cat`, `head`, `tail`, `sed -n` or `grep` in `command` reads."""
+    tokens = _shell_tokens(command) or []
+    targets: list[Path] = []
+    argv: list[str] = []
+    for token in [*tokens, ";"]:
+        if not _is_operator(token):
+            argv.append(token)
+            continue
+        while argv and argv[0] in _WRAPPERS:
+            argv = argv[1:]
+        name = Path(argv[0]).name if argv else ""
+        if name in _FILE_READERS and (name != "sed" or "-n" in argv[1:]):
+            args = argv[1:]
+            files = _positional(args, _FILE_READERS[name])
+            if name in ("sed", "grep") and not any(a in ("-e", "-f") for a in args):
+                files = files[1:]  # the script or the pattern
+            targets += [_resolved(cwd / Path(f).expanduser()) for f in files]
+        argv = []
+    return targets
 
 
 def make_step_tool() -> Any:
@@ -3439,6 +3546,7 @@ def make_step_tool() -> Any:
                         "Say more specifically in notes how this route differs."
                     )
                 route = f"{spawned}\n\n"
+                _forget_task(root, task)
                 task = successor
                 criteria = old_criteria or criteria
                 done_when = done_when or old_check
@@ -3447,6 +3555,9 @@ def make_step_tool() -> Any:
                 record = _json_reply(out) if rc == 0 else None
                 if not isinstance(record, dict):
                     return _step_result(f"pursuit_step: cannot read {task} (exit {rc}):\n{out}")
+        tried = _NOT_DONE.get((str(root), task), 0)
+        if not route and tried >= ESCALATE_AFTER:
+            return _step_result(_escalation(task, tried))
         if not retrying and task not in open_ids and record.get("status") != "open":
             if not criteria or not done_when:
                 why = str(record.get("intent") or "").strip()
@@ -3567,22 +3678,27 @@ def make_step_tool() -> Any:
         scope = scope or _strings(record.get("scope"))
         unproven_key = (str(root), task)
         tests_only = _only_data_and_tests(scope)
-        if _UNPROVEN.get(unproven_key) == (check, tuple(scope)):
-            return _step_result(
+        if unproven_key in _UNPROVEN:
+            return _not_done(
+                root,
+                task,
+                scope,
                 f"pursuit_step: {task} not run: this check already passes and cannot be "
                 f"shown to refuse, since no defect could be put back into a file in its "
                 f"scope ({', '.join(scope) or 'none'}). Another sub-agent would change "
-                "nothing. "
+                "nothing, whatever check or scope this task is sent with. "
                 + (
                     TESTS_ONLY_PROOF_NOTE
-                    + f' Call pursuit_step with task="{task}" and a done_when that runs '
-                    "that file's test, or a scope that names the data file."
+                    + " Give it a new route whose done_when runs that file's test and "
+                    "whose scope names the data file"
                     if tests_only
-                    else "Bind a done_when that imports the code this task tests and runs "
-                    "it (e.g. `python3 -m pytest -q tests/test_<this task>.py`, a test "
-                    "that imports the module), or add that code's source file to scope; "
-                    f'call pursuit_step with task="{task}" and the new done_when or scope.'
+                    else "Give it a new route whose done_when imports the code this task "
+                    "tests and runs it (e.g. `python3 -m pytest -q "
+                    "tests/test_<this task>.py`, a test that imports the module), with "
+                    "that code's source file in scope"
                 )
+                + f': pursuit_step task="{task}", new_route=true, the new done_when and '
+                "notes; or split it with pursuit_plan.",
             )
         brief += "\n\n" + WITNESS_NOTE
         if retrying:
@@ -3604,9 +3720,12 @@ def make_step_tool() -> Any:
             if run.spent is not None:
                 spent = (spent or 0) + run.spent
             if run.problem is not None:
-                return _step_result(
+                return _not_done(
+                    root,
+                    task,
+                    scope,
                     f"pursuit_step: {task} stays open — {run.problem}\n\n"
-                    f'Call pursuit_step with task="{task}" to send it again.'
+                    f'Call pursuit_step with task="{task}" to send it again.',
                 )
             report, shown = run.report, run.shown_report
             if not check:
@@ -3620,7 +3739,7 @@ def make_step_tool() -> Any:
                 if not proof.weak:
                     # No defect could be put back: run R02 sent a second worker
                     # after every such verdict, and six identical steps more.
-                    _UNPROVEN[unproven_key] = (check, tuple(scope))
+                    _UNPROVEN.add(unproven_key)
                     break
                 retry_note = (
                     "\n\nAn earlier attempt reported back and the check passes, but `prove` "
@@ -3662,7 +3781,10 @@ def make_step_tool() -> Any:
                 if retrying
                 else "pass a corrected done_when too; it is amended."
             )
-            return _step_result(
+            return _not_done(
+                root,
+                task,
+                scope,
                 f"{route}{undid}{task} — {title}: the check still fails after {attempts} "
                 f"sub-agent run(s), so the task {state}.\n\n`{check}` exit {verdict[0]}:\n"
                 f"{verdict[1][-CHECK_TAIL_CHARS:]}\n\nLast report:\n{shown}\n\n"
@@ -3670,7 +3792,7 @@ def make_step_tool() -> Any:
                 "the check itself is wrong — it says how it was called (a usage error, a "
                 "file it treats as an argument) rather than what is missing — "
                 f"{fix_check} If this route is wrong, pursuit_step with "
-                f'task="{task}", new_route=true and notes saying what to do instead.'
+                f'task="{task}", new_route=true and notes saying what to do instead.',
             )
         if proof is not None and not proof.proven:
             state = "stays blocked" if retrying else "stays open"
@@ -3680,27 +3802,34 @@ def make_step_tool() -> Any:
                 if proof.weak
                 else "no defect could be put back to show the check can fail"
             )
-            return _step_result(
+            return _not_done(
+                root,
+                task,
+                scope,
                 f"{route}{undid}{task} — {title}: the check passes, but {why}; the task "
                 f"{state}, since a done close needs a check shown to refuse.\n\n"
                 f"`prove` said:\n{proof.text}\n\nLast report:\n{shown}\n\n"
                 + (
                     f'Next: pursuit_step with task="{task}" and notes saying what to '
-                    f"fix. {TESTS_ONLY_PROOF_NOTE} The same check and scope again runs "
-                    "no sub-agent."
-                    if tests_only
+                    f"fix. {TESTS_ONLY_PROOF_NOTE}"
+                    if tests_only and proof.weak
                     else f'Next: pursuit_step with task="{task}" and a done_when that runs '
                     "a test of the behaviour itself, e.g. `python3 -m pytest -q "
                     "tests/test_<this task>.py`, with notes saying what that test must "
                     "check. A bare import or file-exists check cannot be shown to refuse."
+                    if proof.weak
+                    else f'Next: a new route, pursuit_step with task="{task}", '
+                    "new_route=true, notes and "
                     + (
-                        ""
-                        if proof.weak
-                        else " The test must import the code this task tests, and that "
-                        "code's source file must be in scope: the same check and scope "
-                        "again runs no sub-agent."
+                        f"a done_when that runs that file's test. {TESTS_ONLY_PROOF_NOTE}"
+                        if tests_only
+                        else "a done_when that runs a test of the behaviour itself, e.g. "
+                        "`python3 -m pytest -q tests/test_<this task>.py`. The test must "
+                        "import the code this task tests, and that code's source file "
+                        "must be in scope."
                     )
-                )
+                    + " Another step on this task without a new route runs no sub-agent."
+                ),
             )
         changed = [
             rel for rel in _changed_files(root) if _in_scope(rel, scope) and (root / rel).is_file()
@@ -3708,7 +3837,10 @@ def make_step_tool() -> Any:
         misplaced = _implementation_in_tests(root, changed)
         if misplaced:
             state = "stays blocked" if retrying else "stays open"
-            return _step_result(
+            return _not_done(
+                root,
+                task,
+                scope,
                 f"{route}{undid}{task} — {title}: the check passes, but the task {state}: "
                 "implementation belongs in the module the test imports, not the test "
                 "file. A test file holds `test_` functions, `_` helpers and pytest "
@@ -3717,7 +3849,7 @@ def make_step_tool() -> Any:
                 + f"\n\nLast report:\n{shown}\n\n"
                 f'Next: pursuit_step with task="{task}" and notes saying to move these '
                 "out of the test file (into the module the test imports, under a task "
-                "whose scope holds it) or delete them."
+                "whose scope holds it) or delete them.",
             )
         if not locks and _only_data_and_tests(changed):
             # Run R04: the driver passed no locks for its known-answers task.
@@ -3751,6 +3883,8 @@ def make_step_tool() -> Any:
             )
         verb = "retry" if retrying else "close"
         state = "closed done" if rc == 0 else f"{verb} exited {rc}"
+        if rc == 0:
+            _forget_task(root, task)
         lock_note = ""
         if rc == 0 and locks:
             now, skipped = _lock(goal, root, locks)
@@ -4288,6 +4422,44 @@ def _driver_readable_dirs() -> list[Path]:
     return [_resolved(d) for d in dirs]
 
 
+def _held_read(tool: str, args: Mapping[str, Any], cwd: Path) -> ToolCallHookResult | None:
+    """Refuse the driver a read of a file in the scope of a task steps left open.
+
+    Run R04: with T0002 open after a run of stays-open results, the driver
+    spent about 60 bash and read calls on the workers' test files itself,
+    and four compactions followed. Debugging the work is the sub-agent's;
+    the driver's lever is the step's notes, or a new route.
+    """
+    if _is_worker() or not _NOT_DONE:
+        return None
+    if tool == "read":
+        target = _goal_path_from_args(args, cwd)
+        targets = [target] if target is not None else []
+    elif tool == "bash":
+        targets = _bash_read_targets(str(args.get("command", "")), cwd)
+    else:
+        return None
+    goal = _find_goal(cwd) if targets else None
+    if goal is None:
+        return None
+    for target in targets:
+        held = _held_scope(target, goal.parent.parent)
+        if held is not None:
+            task, entry, count = held
+            return ToolCallHookResult(
+                block=True,
+                reason=(
+                    f"refusing to read {target} from the driving session: it is in the "
+                    f"scope of {task} ({entry}), which {count} steps have left not done, "
+                    "and debugging its work is the sub-agent's. Say what to fix in "
+                    f'pursuit_step\'s notes (task="{task}"), or give it a new route: '
+                    f'pursuit_step task="{task}", new_route=true, with a rewritten '
+                    "done_when and notes saying what to do differently."
+                ),
+            )
+    return None
+
+
 def make_driver_reference_guard() -> Any:
     """Build the `tool_call` guard that leaves references to the workers.
 
@@ -4309,6 +4481,9 @@ def make_driver_reference_guard() -> Any:
                 return None
             args = event.arguments or {}
             cwd = Path(context.cwd)
+            held = _held_read(tool, args, cwd)
+            if held is not None:
+                return held
             if tool == "bash":
                 found = _bash_url_fetch(str(args.get("command", "")))
                 what = f"fetch a URL with {found}" if found is not None else None
