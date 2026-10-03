@@ -2130,6 +2130,18 @@ def _duplicate_of(why: str, task: str, nodes: list[dict[str, Any]]) -> str | Non
 _Wait = tuple[str, str, str]
 
 
+def _heir(task: str, nodes: list[dict[str, Any]]) -> str:
+    """The task now holding `task`'s work: `task` itself, unless it was superseded,
+    then the last successor (`sibling_of`) in its chain, as beagle's scheduler does."""
+    by_id = {str(n.get("id")): n for n in nodes}
+    heir = {str(n.get("sibling_of")): str(n.get("id")) for n in nodes if n.get("sibling_of")}
+    seen = {task}
+    while by_id.get(task, {}).get("status") == "superseded" and heir.get(task, task) not in seen:
+        task = heir[task]
+        seen.add(task)
+    return task
+
+
 def _hard_waits(nodes: list[dict[str, Any]]) -> dict[str, list[_Wait]]:
     """Each unfinished task's unmet hard waits, by task.
 
@@ -2137,21 +2149,10 @@ def _hard_waits(nodes: list[dict[str, Any]]) -> dict[str, list[_Wait]]:
     scheduler does, and a task waits on whatever its containers wait on.
     """
     by_id = {str(n.get("id")): n for n in nodes}
-    heir = {str(n.get("sibling_of")): str(n.get("id")) for n in nodes if n.get("sibling_of")}
-
-    def resolved(task: str) -> str:
-        seen = {task}
-        while (
-            by_id.get(task, {}).get("status") == "superseded" and heir.get(task, task) not in seen
-        ):
-            task = heir[task]
-            seen.add(task)
-        return task
-
     own: dict[str, list[_Wait]] = {}
     for task, node in by_id.items():
         for named in node.get("waiting_on") or []:
-            now = resolved(str(named))
+            now = _heir(str(named), nodes)
             if by_id.get(now, {}).get("status") != "done":
                 own.setdefault(task, []).append((task, str(named), now))
     waits: dict[str, list[_Wait]] = {}
@@ -2297,6 +2298,17 @@ def _abandon_problem(task: str, why: str, nodes: list[dict[str, Any]]) -> str | 
             "the goal is the user's. Work its open tasks with pursuit_step, or add what "
             "is missing with pursuit_plan."
         )
+    by_id = {str(n.get("id")): n for n in nodes}
+    predecessor = str(by_id.get(task, {}).get("sibling_of") or "")
+    if (
+        roots
+        and parent.get(predecessor) == roots[0]
+        and by_id.get(predecessor, {}).get("status") == "superseded"
+        and why
+    ):
+        # A successor of a superseded milestone: run R06's T0008 was refused
+        # as "a milestone" four times, with no other way to drop it.
+        return None
     if roots and parent.get(task) == roots[0]:
         return (
             f"pursuit_step: {task} not abandoned — it is a milestone, and a milestone is "
@@ -2549,11 +2561,14 @@ def make_plan_tool() -> Any:
             # root still takes one more child; a leaf with one part is
             # already a single step, which is the model's to work, not split.
             rc, out = _add_children(task, parts, root)
-            if rc != 0 and "pending leaf" in out:
+            # beagle says "a pending leaf" or, for one being worked, "a open
+            # leaf": run R06's plan of one part on open T0002 came back raw.
+            if rc != 0 and "leaf with work of its own" in out:
                 return _step_result(
-                    f"pursuit_plan: {task} is already one step, so one part does not "
-                    f"break it down. Work it with pursuit_step task={task}, or give two "
-                    "or more parts."
+                    f"pursuit_plan: nothing added — {task} is already one step, so one "
+                    "part does not break it down: a plan needs two or more parts, which "
+                    f"split {task} into smaller tasks. Give two or more parts, or work it "
+                    f"with pursuit_step task={task}."
                 )
         else:
             ordered = arguments.get("ordered", True) is not False
@@ -3529,13 +3544,33 @@ ESCALATE_AFTER = 3
 DRIVER_READS_UNTIL = 2
 
 
+def _carried_criteria(predecessor: str, root: Path) -> str:
+    """The criteria of the task a successor follows, which its own must keep."""
+    rc, out = _pursuit(["show", predecessor], root)
+    record = _json_reply(out) if rc == 0 else None
+    return str(record.get("criteria") or "").strip() if isinstance(record, dict) else ""
+
+
+def _already_passes(check: str) -> str:
+    """Why a check that passes before any work is not bound."""
+    return (
+        f"`{check}` already passes, before any work, so it cannot tell this task's work "
+        "from none. Bind a check that fails now: name a new test file for what this task "
+        "adds, e.g. `python3 -m pytest -q tests/test_<this task>.py`, put it in scope, and "
+        "say in the notes what it should test. It fails until the sub-agent writes it; do "
+        "not write it yourself. If the work is there already, bind the goal criterion's "
+        "test, which imports and runs the code. " + ABANDON_HINT
+    )
+
+
 def _escalation(task: str, count: int) -> str:
     """The fixed refusal of a step on a task `count` steps have left not done."""
     return (
         f"pursuit_step: {task} not run: {count} steps on it have left it not done, and "
         "another sub-agent on the same task, however its scope or notes are put, is "
         "how run R04 spent 14 steps on one. Choose one:\n"
-        f'- pursuit_plan task="{task}" with parts, to split it into smaller tasks;\n'
+        f'- pursuit_plan task="{task}" with two or more parts, to split it into smaller '
+        "tasks (a plan of one part is refused: the task is already one step);\n"
         f'- pursuit_step task="{task}", new_route=true, with a rewritten done_when and '
         "notes saying what the new route does differently (the criteria stay);\n"
         "- stop, and tell the user what blocks it."
@@ -3694,6 +3729,18 @@ def make_step_tool() -> Any:
             # A container (done when its parts are) or a task still waiting on
             # one: opening it is refused, and offering to is where a model
             # that finished the leaves goes next.
+            heir = _heir(task, nodes)
+            if heir != task:
+                # Run R06 told its driver a superseded T0002 was "a container".
+                if heir in open_ids or heir in ready_ids:
+                    return _step_result(
+                        f"{task} was superseded by {heir}, which took its work on: work "
+                        f'{heir} instead, with pursuit_step task="{heir}".'
+                    )
+                return _step_result(
+                    f"{task} was superseded by {heir}, which took its work on, and {heir} "
+                    f"is not ready either. {nothing_ready}"
+                )
             if open_ids or ready_ids:
                 workable = ", ".join(open_ids + ready_ids)
                 return _step_result(
@@ -3752,6 +3799,18 @@ def make_step_tool() -> Any:
                         "the user's to change: ask them. Call pursuit_step again without "
                         "criteria."
                     )
+                # Checked before the spawn, which supersedes the task for good:
+                # run R06 spawned T0008, then refused to open it on a check that
+                # already passed, and left a successor with no criteria.
+                scoped = _scope_problem(scope or _strings(record.get("scope")))
+                if scoped is not None:
+                    return _step_result(f"pursuit_step: no new route for {task} — {scoped}")
+                new_check = done_when or old_check
+                if (await _run_check(new_check, root, DEFAULT_CHECK_TIMEOUT))[0] == 0:
+                    return _step_result(
+                        f"pursuit_step: no new route for {task}, which stays as it is — "
+                        + _already_passes(new_check)
+                    )
                 successor, spawned = _spawn(task, record, notes, done_when, root)
                 if successor is None:
                     return _step_result(
@@ -3772,6 +3831,17 @@ def make_step_tool() -> Any:
         if not route and tried >= ESCALATE_AFTER:
             return _step_result(_escalation(task, tried))
         if not retrying and task not in open_ids and record.get("status") != "open":
+            predecessor = str(record.get("sibling_of") or "").strip()
+            carried = _carried_criteria(predecessor, root) if predecessor and not route else ""
+            if carried:
+                # beagle refuses a successor whose criteria drift from its
+                # predecessor's: run R06's driver wrote new ones three times.
+                if criteria and criteria != carried:
+                    route += (
+                        f"Criteria kept from {predecessor}, which {task} succeeds; a new "
+                        f"route does not change what the work is for: {carried!r}\n\n"
+                    )
+                criteria = carried
             if not criteria or not done_when:
                 why = str(record.get("intent") or "").strip()
                 return _step_result(
@@ -3779,8 +3849,13 @@ def make_step_tool() -> Any:
                     + (f"Why: {why}\n" if why else "")
                     + "\nCall pursuit_step again with:\n"
                     f'  task: "{task}"\n'
-                    "  criteria: what will be true when it is done\n"
-                    "  done_when: ONE command that exits 0 only then, e.g. `python3 -m "
+                    + (
+                        f"  (no criteria: they are carried over from {predecessor}, the "
+                        f"task it succeeds: {carried!r})\n"
+                        if carried
+                        else "  criteria: what will be true when it is done\n"
+                    )
+                    + "  done_when: ONE command that exits 0 only then, e.g. `python3 -m "
                     "pytest -q tests/test_x.py`. It is split into words and run without a "
                     "shell: no prose, no &&, |, > or $(...). It should fail now.\n"
                     "  scope: the paths it will touch\n"
@@ -3799,14 +3874,7 @@ def make_step_tool() -> Any:
             # made pass.
             if (await _run_check(done_when, root, DEFAULT_CHECK_TIMEOUT))[0] == 0:
                 return _step_result(
-                    f"pursuit_step: {task} not opened — `{done_when}` already passes, "
-                    "before any work, so it cannot tell this task's work from none. Bind "
-                    "a check that fails now: name a new test file for what this task adds, "
-                    "e.g. `python3 -m pytest -q tests/test_<this task>.py`, put it in scope, "
-                    "and say in the notes what it should test. It fails until the sub-agent "
-                    "writes it; do not write it yourself. If the work is there already, "
-                    "bind the goal criterion's test, which imports and runs the code. "
-                    + ABANDON_HINT
+                    f"pursuit_step: {task} not opened — " + _already_passes(done_when)
                 )
             argv = ["open", task, "--criteria", criteria, "--done-when", done_when]
             if scope:

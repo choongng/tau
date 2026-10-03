@@ -4699,3 +4699,174 @@ async def test_abandon_problem_refuses_root(
 
     assert _pursuit_calls(fake_beagle, "close") == []
     assert "T0001 not abandoned — it is the root" in result.text
+
+
+#: Run R06's T0002 and its successor T0008, as `pursuit show` gives them.
+R06_PREDECESSOR = {
+    "id": "T0002",
+    "parent": "T0001",
+    "title": "Reference study",
+    "status": "superseded",
+    "criteria": "tests/cases.json holds cases from the reference, each citing its source",
+    "done_when": "grep -q done done.txt",
+    "scope": ["done.txt"],
+}
+R06_SUCCESSOR = {
+    "id": "T0008",
+    "parent": "T0001",
+    "title": "Reference study",
+    "status": "pending",
+    "criteria": "",
+    "done_when": "",
+    "sibling_of": "T0002",
+}
+
+
+@pytest.mark.anyio
+async def test_new_route_checks_done_when_before_spawning(
+    tmp_path: Path, beagle: Path, fake_beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # R06 L28-29: T0008 was spawned, then not opened on a check that already
+    # passed, and T0002 was superseded by a successor with no criteria.
+    project = _pursuit_project(tmp_path)
+    monkeypatch.chdir(project)
+    (project / "done.txt").write_text("done")
+    (fake_beagle / "next.out").write_text(json.dumps({"open": [{"id": "T0002"}], "ready": []}))
+    opened = {**R06_PREDECESSOR, "status": "open", "done_when": "grep -q nothing done.txt"}
+    (fake_beagle / "show-T0002.out").write_text(json.dumps(opened))
+    (fake_beagle / "spawn.out").write_text("T0002 superseded by T0008\n")
+    runtime, _ = _bound(tmp_path)
+    step = _tool(runtime, "pursuit_step")
+    route = {"task": "T0002", "new_route": True, "notes": "check only the data file"}
+
+    passing = await step.execute("c1", {**route, "done_when": "grep -q done done.txt"})
+    out_of_scope = await step.execute(
+        "c2", {**route, "done_when": "grep -q x done.txt", "scope": [".beagle/tree"]}
+    )
+
+    assert "no new route for T0002" in passing.text and "already passes" in passing.text
+    assert "no new route for T0002" in out_of_scope.text
+    assert _pursuit_calls(fake_beagle, "spawn") == [] == _pursuit_calls(fake_beagle, "open")
+
+
+@pytest.mark.anyio
+async def test_new_route_successor_opens_with_the_predecessors_criteria(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # R06 L33-69: the successor's Next text asked for criteria, and beagle
+    # refused each new set as drift from T0002's.
+    monkeypatch.chdir(_pursuit_project(tmp_path))
+    ready = {"open": [], "ready": [{"id": "T0008", "title": "Reference study"}]}
+    (fake_beagle / "next.out").write_text(json.dumps(ready))
+    (fake_beagle / "show-T0002.out").write_text(json.dumps(R06_PREDECESSOR))
+    (fake_beagle / "show-T0008.out").write_text(json.dumps(R06_SUCCESSOR))
+    (fake_beagle / "brief.out").write_text("# T0008: Reference study\n")
+    runtime, _ = _bound(tmp_path)
+    step = _tool(runtime, "pursuit_step")
+
+    asked = await step.execute("c1", {"task": "T0008"})
+    result = await step.execute(
+        "c2",
+        {
+            "task": "T0008",
+            "criteria": "A test file validates that cases.json exists",
+            "done_when": "grep -q done done.txt",
+            "scope": ["done.txt"],
+        },
+    )
+
+    assert "carried over from T0002" in asked.text
+    assert "criteria: what will be true" not in asked.text
+    [opened] = _pursuit_calls(fake_beagle, "open")
+    assert opened[0] == "T0008"
+    assert opened[opened.index("--criteria") + 1] == R06_PREDECESSOR["criteria"]
+    assert "refused" not in result.text and "Criteria kept from T0002" in result.text
+    assert "T0008 — Reference study: closed done" in result.text
+
+
+@pytest.mark.anyio
+async def test_superseded_task_is_named_superseded_not_a_container(
+    tmp_path: Path, beagle: Path, fake_beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # R06 L31: "T0002 is not a task to work now: it is a container", for a
+    # T0002 that T0008 had superseded.
+    monkeypatch.chdir(_pursuit_project(tmp_path))
+    ready = {"open": [], "ready": [{"id": "T0008", "title": "Reference study"}]}
+    (fake_beagle / "next.out").write_text(json.dumps(ready))
+    root = {"id": "T0001", "parent": "", "status": "pending", "container": True}
+    tree = [root, R06_PREDECESSOR, R06_SUCCESSOR]
+    (fake_beagle / "tree.out").write_text(json.dumps({"nodes": tree}))
+    runtime, _ = _bound(tmp_path)
+    step = _tool(runtime, "pursuit_step")
+
+    workable = await step.execute("c1", {"task": "T0002"})
+    _nothing_ready(fake_beagle, CYCLE_TREE)
+    stuck = await step.execute("c2", {"task": "T0002"})
+
+    assert "T0002 was superseded by T0008" in workable.text
+    assert 'pursuit_step task="T0008"' in workable.text
+    assert "T0002 was superseded by T0008" in stuck.text and "not ready" in stuck.text
+    for text in (workable.text, stuck.text):
+        assert "it is a container" not in text
+    assert _pursuit_calls(fake_beagle, "open") == []
+
+
+@pytest.mark.anyio
+async def test_plan_on_an_open_leaf_splits_into_two_or_more_parts(
+    tmp_path: Path, beagle: Path, fake_beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # R06 L21-27: the escalation offered pursuit_plan, and a one-part plan of
+    # open T0002 came back as beagle's raw refusal.
+    monkeypatch.chdir(_pursuit_project(tmp_path))
+    (fake_beagle / "add.out").write_text(
+        "beagle: T0002 is a open leaf with work of its own. A child makes it a container: "
+        "its own work stops being offered. To decompose T0002, `split` it. To make it a "
+        "container on purpose, --make-container."
+    )
+    (fake_beagle / "add.rc").write_text("4")
+    (fake_beagle / "split.out").write_text("T0002 split into 2:\n  T0009  Data\n  T0010  Test\n")
+    runtime, _ = _bound(tmp_path)
+    plan = _tool(runtime, "pursuit_plan")
+
+    one = await plan.execute("c1", {"task": "T0002", "parts": ["Data::the cases"]})
+    two = await plan.execute(
+        "c2", {"task": "T0002", "parts": ["Data::the cases", "Test::runs them"]}
+    )
+
+    assert "two or more parts" in one.text and "beagle refused" not in one.text
+    assert "beagle refused" not in two.text
+    assert _pursuit_calls(fake_beagle, "split") == [
+        ["T0002", "Data::the cases", "Test::runs them", "--ordered"]
+    ]
+    escalation = _module()._escalation("T0002", 3)
+    assert 'pursuit_plan task="T0002" with two or more parts' in escalation
+
+
+@pytest.mark.anyio
+async def test_abandon_a_superseded_milestones_successor_with_a_reason(
+    tmp_path: Path, beagle: Path, fake_beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # R06 L109-157: abandoning T0008, the successor of milestone T0002, was
+    # refused as "a milestone" four times.
+    monkeypatch.chdir(_pursuit_project(tmp_path))
+    _ready_task(fake_beagle)
+    root = {"id": "T0001", "parent": "", "status": "pending", "container": True}
+    milestone = {"id": "T0003", "parent": "T0001", "status": "pending"}
+    tree = [root, R06_PREDECESSOR, R06_SUCCESSOR, milestone]
+    (fake_beagle / "tree.out").write_text(json.dumps({"nodes": tree}))
+    (fake_beagle / "close.out").write_text("T0008 abandoned\n")
+    runtime, _ = _bound(tmp_path)
+    step = _tool(runtime, "pursuit_step")
+
+    successor = await step.execute("c1", {"task": "T0008", "abandon": "it closes a cycle"})
+    plain = await step.execute("c2", {"task": "T0003", "abandon": "it closes a cycle"})
+
+    assert _pursuit_calls(fake_beagle, "close") == [
+        ["T0008", "--outcome", "abandoned", "--reason", "it closes a cycle"]
+    ]
+    assert "T0008 abandoned" in successor.text
+    assert "T0003 not abandoned — it is a milestone" in plain.text
