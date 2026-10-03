@@ -1,0 +1,4 @@
+# Written by beagle: files it creates here that are machinery rather than
+# content. Add your own lines below; beagle appends and never rewrites.
+.lock
+loop.json
