@@ -1610,7 +1610,8 @@ def _step_result(text: str) -> AgentToolResult:
 
 # Narrow on purpose: bare "error" and "fail" match ordinary prose.
 _REPORTED_FAILURE = re.compile(
-    r"\b\d+ failed\b|\bexit (code )?[1-9]|(?i:\bunfixed\b|remaining failures)|\bFAILED\b"
+    r"\b[1-9]\d* failed\b|\bexit (code )?[1-9]|(?i:\bunfixed\b|remaining failures)|\bFAILED\b"
+    r"|\b\w*Error:"
 )
 _SUPERSEDED_REPORT_NOTE = (
     "The check passed at close: failures this report names are from before the "

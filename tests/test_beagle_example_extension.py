@@ -2556,6 +2556,27 @@ async def test_closed_done_step_leaves_a_passing_report_alone(
     assert f"Sub-agent report:\n{report}" in text
 
 
+def test_report_with_zero_failed_is_not_a_failure_report() -> None:
+    # T0085: "0 failed, 12 passed" reports success; only a non-zero count is a failure.
+    claims_failure = _module()._report_claims_failure
+
+    assert not claims_failure("pytest: 0 failed, 12 passed")
+    assert claims_failure("pytest: 1 failed, 11 passed")
+    assert claims_failure("pytest: 10 failed, 2 passed")
+    assert claims_failure("exit code 2")
+    assert claims_failure("two remaining failures")
+    assert claims_failure("FAILED tests/test_x.py::test_y")
+
+
+def test_report_naming_an_error_is_a_failure_report() -> None:
+    # T0085: a report quoting a Python error line still claims a failure.
+    claims_failure = _module()._report_claims_failure
+
+    assert claims_failure("ran it:\nTypeError: x")
+    assert claims_failure("ValueError: bad stamp")
+    assert not claims_failure("no errors, nothing fails now: 12 passed")
+
+
 WITNESSED_REPORT = (
     "wrote done.txt\n\nWITNESS: src/clock.py\nNEEDLE:\n    return a + b\n"
     "REPLACEMENT:\n    return a - b\nEND WITNESS"
