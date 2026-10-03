@@ -1,0 +1,4 @@
+#!/bin/sh
+set -e
+bash .beagle/checks/fix/named_tests.sh tests/test_beagle_example_extension.py 3 test_driver_guard_steers_a_hard_depend_to_the_tools test_step_names_the_drop_for_a_cycle_when_nothing_is_ready test_nothing_ready_names_each_blocking_edge
+echo OK
