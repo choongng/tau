@@ -3361,6 +3361,7 @@ def test_setup_milestone_titled_with_a_dash_and_naming_beagle_is_dropped() -> No
     )
     assert setup(["Set up the project layout"]) is None
     assert setup(["Implement the beagle exporter - write the output files"]) is None
+    assert setup(["Implement the beagle exporter - configure its output paths"]) is None
 
 
 @pytest.mark.anyio
