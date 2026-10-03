@@ -1,0 +1,4 @@
+#!/bin/sh
+set -e
+bash .beagle/checks/fix/named_tests.sh tests/test_beagle_example_extension.py 4 test_worker_brief_drops_beagle_contain_run test_worker_guard_refuses_touch_and_mkdir_out_of_scope test_tests_only_unproven_next_names_no_import test_implementation_in_tests_lets_small_helpers_through
+echo OK
