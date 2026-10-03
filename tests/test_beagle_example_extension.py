@@ -11,6 +11,7 @@ import functools
 import importlib.util
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -1529,6 +1530,8 @@ async def test_a_request_to_set_beagle_up_is_steered_to_found_first(
     await runtime.emit_event(AgentStartEvent())
 
     assert len(session.steered) == 1 and "pursuit_found" in session.steered[0]
+    # No URL in the request: the note is the plain one, no references part.
+    assert session.steered[0] == _loaded_module().FOUND_FIRST_NOTE
     # Then the steer has teeth: a few calls for setup, and no more.
     setup = [await bash.execute(f"c{i}", {"command": "beagle doctor"}) for i in range(6)]
     assert [r.text for r in setup] == ["ran"] * 6
@@ -1878,6 +1881,125 @@ async def test_found_reference_fetch_failure_is_noted(
     )
     brief = _module()._references_brief(project)
     assert missed in brief and "references/interval-tree-clocks.txt" in brief
+
+
+def _loaded_module() -> Any:
+    """The extension module the last-bound runtime loaded (not a fresh `_module()`)."""
+    loaded = [
+        m
+        for m in list(sys.modules.values())
+        if getattr(m, "__file__", None) == str(EXTENSION) and hasattr(m, "_fetch_reference")
+    ]
+    assert loaded
+    return loaded[-1]
+
+
+ITC_ABSTRACT = (
+    "Interval Tree Clocks: A Logical Clock for Dynamic Systems\n\n"
+    "Paulo Sergio Almeida, Carlos Baquero, Victor Fonte\n\n"
+    "Abstract\n"
+    "Causality tracking mechanisms, such as vector clocks and version vectors, rely on "
+    "mappings from globally unique identifiers to integer counters. "
+    + "An interval tree clock forks, joins and records events on a stamp. "
+    * 40
+)
+
+
+def _stub_fetch(monkeypatch: pytest.MonkeyPatch, pages: dict[str, str]) -> list[str]:
+    asked: list[str] = []
+
+    def fetch(url: str) -> str:
+        asked.append(url)
+        if url not in pages:
+            raise OSError("Name or service not known")
+        return pages[url]
+
+    monkeypatch.setattr(_loaded_module(), "_fetch_reference", fetch)
+    return asked
+
+
+@pytest.mark.anyio
+async def test_found_first_steer_carries_reference_extracts(
+    tmp_path: Path, beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # R02 and R03: criteria about interval trees for a request about interval
+    # tree clocks, because nothing of the reference reached the driver first.
+    runtime, session = _bound(tmp_path)
+    monkeypatch.chdir(tmp_path / "project")
+    session.is_running = True
+    walkthrough = "https://example.org/blog/interval-tree-clocks.html"
+    _stub_fetch(monkeypatch, {walkthrough: ITC_ABSTRACT})
+
+    await runtime.emit_session_start("startup")
+    await runtime.run_input_hooks(ITC_PROMPT)
+    await runtime.emit_event(AgentStartEvent())
+
+    [note] = session.steered
+    module = _loaded_module()
+    assert note.startswith(module.FOUND_FIRST_NOTE)
+    extract = module._reference_extract(ITC_ABSTRACT)
+    assert extract.startswith("Interval Tree Clocks: A Logical Clock for Dynamic Systems")
+    assert f"From {walkthrough}" in note and extract in note
+    assert "Causality tracking mechanisms" in note
+    failed = "Could not fetch https://example.org/papers/itc2008.pdf: Name or service not known"
+    assert failed in note
+    assert "in the reference's own terms, not from the name alone" in note
+
+
+@pytest.mark.anyio
+async def test_found_reuses_references_fetched_before_founding(
+    tmp_path: Path, beagle: Path, fake_beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project = tmp_path / "project"
+    runtime, session = _bound(tmp_path)
+    monkeypatch.chdir(project)
+    session.is_running = True
+    (fake_beagle / "add.out").write_text("T0001  Interval tree clocks\n")
+    pages = {
+        "https://example.org/papers/itc2008.pdf": ITC_ABSTRACT,
+        "https://example.org/blog/interval-tree-clocks.html": "Interval Tree Clocks\nA walk.",
+    }
+    asked = _stub_fetch(monkeypatch, pages)
+
+    await runtime.emit_session_start("startup")
+    await runtime.run_input_hooks(ITC_PROMPT)
+    await runtime.emit_event(AgentStartEvent())
+    result = await _tool(runtime, "pursuit_found").execute(
+        "c1",
+        {
+            "statement": "Interval tree clocks in Python",
+            "criteria": ["`python3 -m pytest -q` exits 0"],
+            "milestones": ["Cases::from the paper", "Clock::passes them"],
+            "user_confirmed": True,
+        },
+    )
+
+    assert "Founded the pursuit" in result.text
+    assert sorted(asked) == sorted(pages)
+    assert "references/interval-tree-clocks.txt" in result.text
+    assert "references/" in (project / ".gitignore").read_text().splitlines()
+    index = json.loads((project / "references" / "index.json").read_text())
+    assert index["request"] == ITC_PROMPT
+
+
+def test_reference_extract_is_title_and_opening() -> None:
+    module = _module()
+    words = " ".join(f"word{i}" for i in range(1000))
+    extract = module._reference_extract(f"\n\n  The Title Line  \nAuthors here\n{words}\n")
+    assert extract.startswith("The Title Line\n\n")
+    assert len(extract) <= 1600
+    assert extract.endswith("\u2026")
+    last = extract[:-1].split()[-1]
+    assert re.fullmatch(r"word\d+", last) and f" {last} " in f" {words} "
+    assert "Authors here" in extract  # no abstract heading: the opening is what follows
+
+    paper = module._reference_extract(ITC_ABSTRACT)
+    assert paper.startswith("Interval Tree Clocks: A Logical Clock for Dynamic Systems\n\n")
+    assert paper.split("\n\n", 1)[1].startswith("Causality tracking mechanisms")
+    assert len(paper) <= 1600
+
+    html_page = "<html><title>ITC paper</title><body><p>Short body.</p></body></html>"
+    assert module._reference_extract(html_page) == "ITC paper\n\nShort body."
 
 
 @pytest.mark.anyio

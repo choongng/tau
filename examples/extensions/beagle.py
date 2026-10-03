@@ -1792,6 +1792,89 @@ def _fetch_references(root: Path, prompt: str) -> dict[str, Any]:
     return index
 
 
+def _references_for(root: Path, prompt: str) -> dict[str, Any]:
+    """`references/index.json` if it already holds `prompt`'s fetch, else a fresh fetch.
+
+    The found-first steer fetches before founding so the driver sees the
+    references while it writes the criteria; founding then reuses that.
+    """
+    folder = root / REFERENCES_DIR
+    try:
+        index = json.loads((folder / REFERENCES_INDEX).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        index = None
+    if (
+        isinstance(index, dict)
+        and prompt.strip()
+        and index.get("request") == prompt
+        and all((folder / name).is_file() for name in index.get("fetched") or {})
+    ):
+        _ignore(root, [REFERENCES_DIR])
+        return index
+    return _fetch_references(root, prompt)
+
+
+#: About how much of each reference the found-first steer shows the driver.
+REFERENCE_EXTRACT_CHARS = 1500
+_ABSTRACT = re.compile(r"(?im)^\s*abstract\b[\s.:\-\u2014]*")
+
+
+def _reference_extract(text: str) -> str:
+    """A reference's title and opening (its abstract when it has one), cut at a word.
+
+    The title is the `<title>` when the text still has one, else its first
+    non-empty line. The whole is about REFERENCE_EXTRACT_CHARS long.
+    """
+    found = re.search(r"(?is)<title[^>]*>(.*?)</title>", text)
+    lines = text.splitlines()
+    if found and found.group(1).strip():
+        title = " ".join(found.group(1).split())
+        body = text[found.end() :]
+    else:
+        first = next((i for i, line in enumerate(lines) if line.strip()), None)
+        if first is None:
+            return ""
+        title = " ".join(lines[first].split())
+        body = "\n".join(lines[first + 1 :])
+    abstract = _ABSTRACT.search(body, 0, 4 * REFERENCE_EXTRACT_CHARS)
+    if abstract:
+        body = body[abstract.end() :]
+    body = " ".join(re.sub(r"<[^>]+>", " ", body).split())
+    if len(title) > REFERENCE_EXTRACT_CHARS // 4:
+        title = title[: REFERENCE_EXTRACT_CHARS // 4].rsplit(" ", 1)[0] + "\u2026"
+    room = REFERENCE_EXTRACT_CHARS - len(title) - 2
+    if len(body) > room:
+        cut = body[: room + 1]
+        body = (cut.rsplit(" ", 1)[0] if " " in cut else cut[:room]).rstrip(" ,;:") + "\u2026"
+    return f"{title}\n\n{body}" if body else title
+
+
+def _references_note(index: Mapping[str, Any], root: Path) -> str:
+    """The found-first steer's part on the request's references: an extract each."""
+    fetched, failed = index.get("fetched") or {}, index.get("failed") or {}
+    if not fetched and not failed:
+        return ""
+    parts = []
+    for name, url in fetched.items():
+        try:
+            text = (root / REFERENCES_DIR / name).read_text(encoding="utf-8")
+        except OSError as exc:
+            parts.append(f"Could not read {REFERENCES_DIR}/{name} (from {url}): {exc}")
+            continue
+        parts.append(
+            f"From {url} ({REFERENCES_DIR}/{name}), its opening:\n<<<\n"
+            f"{_reference_extract(text)}\n>>>"
+        )
+    parts += [f"Could not fetch {url}: {why}" for url, why in failed.items()]
+    return (
+        "The references in the request, fetched for you:\n\n"
+        + "\n\n".join(parts)
+        + "\n\nThe statement and criteria you give pursuit_found must describe this in "
+        "the reference's own terms, not from the name alone: a name can mean more than "
+        "one thing, and the reference says which."
+    )
+
+
 def _references_brief(root: Path) -> str:
     """The worker brief's part from `references/index.json`: request and references."""
     try:
@@ -2187,7 +2270,7 @@ def make_found_tool(on_founded: Callable[[Path], None] | None = None) -> Any:
                 f"failed (exit {rc}):\n{out}"
             )
         root_task = found.group(0)
-        references = await asyncio.to_thread(_fetch_references, root, _LAST_PROMPT)
+        references = await asyncio.to_thread(_references_for, root, _LAST_PROMPT)
         if on_founded is not None:
             on_founded(goal)
         if len(milestones) == 1:
@@ -4513,18 +4596,30 @@ def make_found_first_steer(tau: ExtensionAPI) -> Any:
     The prompt section says to found first, and a 9B model still reads the
     reference and spends whole turns designing the solution in the driver.
     A note right after the user's request, before the first model call, is
-    the part of the context such a model follows.
+    the part of the context such a model follows. It carries an extract of
+    each reference the request links, which founding then reuses.
     """
 
-    def steer(event: Any, context: ExtensionContext) -> None:
+    async def steer(event: Any, context: ExtensionContext) -> None:
         global _FOUND_FIRST_SENT
         del event, context
         if _FOUND_FIRST_SENT or not re.search(r"(?i)\b(beagle|pursuit)", _LAST_PROMPT):
             return
-        if _project_root()[1] is not None:
+        root, goal = _project_root()
+        if goal is not None:
             return
         _FOUND_FIRST_SENT = True
-        tau.send_custom_message(FOUND_FIRST_NOTE, custom_type="beagle", deliver_as="steer")
+        note = FOUND_FIRST_NOTE
+        if _prompt_urls(_LAST_PROMPT):
+            # R02 and R03 wrote criteria for interval trees when the request
+            # was interval tree clocks: nothing of the reference had reached
+            # the driver before it founded.
+            prompt = _LAST_PROMPT
+            index = await asyncio.to_thread(_fetch_references, root, prompt)
+            extracts = _references_note(index, root)
+            if extracts:
+                note = f"{note}\n\n{extracts}"
+        tau.send_custom_message(note, custom_type="beagle", deliver_as="steer")
 
     return steer
 
