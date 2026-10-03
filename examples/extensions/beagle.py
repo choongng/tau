@@ -217,6 +217,10 @@ GUARD_DISABLE_ENV = "BEAGLE_TAU_ALLOW_PURSUIT_EDIT"
 #: Set in a `pursuit_dispatch` worker's environment. A worker acts for its
 #: parent: it keeps the parent's session id and runs no loop of its own.
 WORKER_ENV = "BEAGLE_TAU_WORKER"
+#: The task a worker was sent on and its scope, newline-joined; unset when the
+#: task has none, and then the worker's writes are not held to one.
+WORKER_TASK_ENV = "BEAGLE_TAU_WORKER_TASK"
+WORKER_SCOPE_ENV = "BEAGLE_TAU_WORKER_SCOPE"
 
 #: The memory cap a worker and a pre-close check run under, as a systemd size
 #: (`4G`, `512M`); `off` runs them uncapped. Applied through a systemd user
@@ -1275,6 +1279,29 @@ async def _talk(proc: asyncio.subprocess.Process, brief: str, events: _WorkerEve
     return err
 
 
+#: A tool call written out as text, which a turn-capped worker can end on.
+_TOOL_CALL_MARKUP = re.compile(r"<tool_call>|<function=")
+
+
+def _unreported_changes(cwd: Path, scope: list[str]) -> str:
+    """The report for a worker that ended on a raw tool call: what git sees it change.
+
+    Run R02's turn-capped workers ended on `<tool_call><function=bash>…` text,
+    which the driver was handed as the report.
+    """
+    stub = f"{NO_REPORT}: the sub-agent ended without a report, on a raw tool call.)"
+    rc, stat = _run(["git", "diff", "--stat", "--", *scope], cwd, timeout=30.0)
+    changed = [rel for rel in _changed_files(cwd) if _in_scope(rel, scope)]
+    lines = [stub]
+    if rc == 0 and stat.strip():
+        lines.append(f"git diff --stat:\n{stat.strip()}")
+    if changed:
+        lines.append("Changed or new in its scope: " + ", ".join(changed))
+    elif rc == 0 and not stat.strip():
+        lines.append("git diff --stat: no change.")
+    return "\n".join(lines)
+
+
 async def _run_worker(
     brief: str,
     cwd: Path,
@@ -1282,8 +1309,13 @@ async def _run_worker(
     provider: str,
     timeout: float,
     signal: ToolCancellationToken | None = None,
+    task: str = "",
+    scope: list[str] | None = None,
 ) -> _WorkerRun:
     """Run one step-executor as a nested `tau -p --mode json` and read its report.
+
+    A task's scope rides in the worker's environment, where its scope guard
+    holds the worker's writes to it.
 
     The brief rides on stdin (tau prepends it to the prompt); the persona is
     appended to tau's base system prompt, not swapped for it, so the worker
@@ -1319,11 +1351,18 @@ async def _run_worker(
     cmd += ["--thinking", os.environ.get(WORKER_THINKING_ENV, "").strip() or "off"]
 
     limit = _memory_max()
+    env = {**os.environ, WORKER_ENV: "1"}
+    env.pop(WORKER_TASK_ENV, None)
+    env.pop(WORKER_SCOPE_ENV, None)
+    if scope:
+        env[WORKER_SCOPE_ENV] = "\n".join(scope)
+        if task:
+            env[WORKER_TASK_ENV] = task
     try:
         proc = await asyncio.create_subprocess_exec(
             *_capped(cmd, limit),
             cwd=str(cwd),
-            env={**os.environ, WORKER_ENV: "1"},
+            env=env,
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
@@ -1361,9 +1400,13 @@ async def _run_worker(
 
     stderr = talk.result()
     note = _killed_note(proc.returncode, limit)
+    if _TOOL_CALL_MARKUP.search(events.report):
+        report = _unreported_changes(cwd, scope or [])
+    else:
+        report = events.final_report(f"{stderr}\n{note}".strip() if note else stderr)
     return _WorkerRun(
         returncode=proc.returncode,
-        report=events.final_report(f"{stderr}\n{note}".strip() if note else stderr),
+        report=report,
         spent=events.spent,
         transcript=transcript,
     )
@@ -2374,6 +2417,9 @@ _PROSE_WORDS = frozenset(
 _ALWAYS_PASSES = frozenset({"true", ":", "echo", "printf", "yes"})
 #: Programs that pass once a file is there, whatever is in it.
 _SHOWS_A_FILE = frozenset({"cat", "ls", "head", "tail", "wc", "stat", "file"})
+#: `test` and `[`, and the operators with which they only ask whether a file is there.
+_TESTS = frozenset({"test", "["})
+_FILE_TESTS = frozenset({"-f", "-e", "-s"})
 
 
 def _check_problem(command: str) -> str | None:
@@ -2432,6 +2478,15 @@ def _check_problem(command: str) -> str | None:
         return (
             f"done_when `{command}` exits 0 whatever the work does, so it cannot judge it. "
             f"{one_command}. {ABANDON_HINT}"
+        )
+    if program in _TESTS and _FILE_TESTS & set(words[1:]):
+        # Run R02 closed its reference task on `test -f src/design.md`; the
+        # design's content was never judged.
+        return (
+            f"done_when `{command}` only tests that a file exists, so it passes whatever "
+            f"the file says. {one_command}; for a document, `grep -q '<a term the "
+            "reference uses>' <doc>`, so the check reads what it must hold. Call "
+            "pursuit_step again with that."
         )
     if program in _SHOWS_A_FILE or (program.startswith("python") and "json.tool" in words[1:3]):
         return (
@@ -2935,6 +2990,29 @@ def _spawn(
     return found.group(1), out
 
 
+#: Where beagle's brief starts and ends the steps that commit the work.
+_COMMIT_STEPS_START = "Before you report back, commit"
+_COMMIT_STEPS_END = "name only the files you changed."
+#: What a worker is told in their place.
+NO_COMMIT_NOTE = "Do not commit or claim; pursuit_step commits on close."
+
+
+def _without_commit_steps(brief: str) -> str:
+    """beagle's brief with its commit and claim steps swapped for `NO_COMMIT_NOTE`.
+
+    pursuit_step commits a task's work itself before the close, and the worker
+    guard refuses `beagle pursuit commit` and `claim`: in run R02 the steps
+    drew about 20 refusals, then raw `git add`/`git commit`, and a sub-agent
+    spawned to record claims.
+    """
+    start = brief.find(_COMMIT_STEPS_START)
+    if start == -1:
+        return brief
+    end = brief.find(_COMMIT_STEPS_END, start)
+    rest = "" if end == -1 else brief[end + len(_COMMIT_STEPS_END) :]
+    return f"{brief[:start]}{NO_COMMIT_NOTE}{rest}"
+
+
 def _blocked_brief(task: str, record: Mapping[str, Any]) -> str:
     """A worker's brief for a blocked task, which `beagle pursuit brief` refuses."""
     lines = [f"Task {task}: {record.get('title', '')}"]
@@ -3277,6 +3355,7 @@ def make_step_tool() -> Any:
             rc, brief = _pursuit(["brief", task], root)
             if rc != 0:
                 return _step_result(f"pursuit_step: `beagle pursuit brief {task}` failed:\n{brief}")
+            brief = _without_commit_steps(brief)
         references = _references_brief(root)
         if references:
             brief = f"{brief}\n\n{references}"
@@ -3331,7 +3410,9 @@ def make_step_tool() -> Any:
             if on_update is not None:
                 with contextlib.suppress(Exception):
                     on_update(_step_result(f"{task}: sub-agent attempt {attempt} of {attempts}"))
-            run = await _run_worker(brief + retry_note, root, model, provider, timeout, signal)
+            run = await _run_worker(
+                brief + retry_note, root, model, provider, timeout, signal, task, scope
+            )
             undone = _restore_locked(goal, root)
             restored.update(undone)
             if run.spent is not None:
@@ -3519,7 +3600,11 @@ def _driver_change(argv: list[str]) -> str | None:
     if name == "git":
         args = _git_args(argv)
         return f"git {args[0]}" if args and args[0] in _GIT_CHANGES else None
-    if name in _FORMATTERS or (name == "ruff" and ("format" in argv or "--fix" in argv)):
+    if name == "ruff" and "--fix" in argv and "format" not in argv:
+        # Run R02 quoted `ruff check src --fix` as `ruff check src`, beside
+        # "`ruff check` is fine": the flag that makes it a write must be named.
+        return " ".join(argv)
+    if name in _FORMATTERS or (name == "ruff" and "format" in argv):
         return " ".join(argv[:3])
     if name.startswith(_INTERPRETERS):
         return name
@@ -3545,6 +3630,8 @@ def _driver_bash_change(command: str, cwd: Path, root: Path, store: Path) -> str
         return None
     if found.startswith(_INTERPRETERS):
         return f"run a {found} script that writes files" if _SCRIPT_WRITE.search(command) else None
+    if found.startswith("ruff") and "--fix" in found.split():
+        return f"run `{found}`, whose `--fix` flag rewrites files (without `--fix` it only reads)"
     return f"run `{found}`"
 
 
@@ -3602,8 +3689,8 @@ def make_driver_edit_guard() -> Any:
                 "its commits, are done by sub-agents. Call pursuit_step, with what you "
                 "meant to change in its notes; a sub-agent does it and the task's check "
                 "decides. For work no task covers (a failing gate, a lint fix), add a task "
-                "with pursuit_plan. Reading and running (tests, `ruff check`, `git status`) "
-                f"is fine. (If the user wants this session to edit, they set "
+                "with pursuit_plan. Reading and running (tests, `ruff check` without "
+                "`--fix`, `git status`) is fine. (If the user wants this session to edit, they set "
                 f"{DRIVER_EDITS_ENV}=1.)"
             ),
         )
@@ -3757,6 +3844,78 @@ def make_history_guard() -> Any:
     return guard
 
 
+#: `git` subcommands that stage or commit, which a worker leaves to pursuit_step.
+_WORKER_GIT_REFUSED = frozenset({"add", "commit", "stage"})
+
+
+def _worker_git_commit(argv: list[str]) -> str | None:
+    if not _named(argv, "git"):
+        return None
+    args = _git_args(argv)
+    return args[0] if args and args[0] in _WORKER_GIT_REFUSED else None
+
+
+def _worker_scope() -> tuple[str, tuple[str, ...]] | None:
+    """The task and scope this worker was sent with, or None when it has no scope."""
+    scope = tuple(
+        line.strip() for line in os.environ.get(WORKER_SCOPE_ENV, "").splitlines() if line.strip()
+    )
+    if not scope:
+        return None
+    return os.environ.get(WORKER_TASK_ENV, "").strip() or "this task", scope
+
+
+def make_worker_scope_guard() -> Any:
+    """Build the `tool_call` guard that keeps a worker's writes inside its task's scope.
+
+    The scope was recorded and not enforced: in run R02 a worker wrote
+    `tests/` over .gitignore with two turns left, and the next three steps went
+    to repairing it. A worker sent with a scope (`BEAGLE_TAU_WORKER_SCOPE`) may
+    write in it, outside the project (/tmp), in beagle's store (the record guard
+    has that) and `.git/beagle/` (the task's log). A worker with no scope is
+    not held. Fails open.
+    """
+
+    async def guard(event: Any, context: ExtensionContext) -> ToolCallHookResult | None:
+        try:
+            sent = _worker_scope()
+            if sent is None:
+                return None
+            task, scope = sent
+            cwd = Path(context.cwd)
+            targets = _write_targets(event.tool_name, event.arguments or {}, cwd)
+            goal = _find_goal(cwd) if targets else None
+            if goal is None:
+                return None
+            root = _resolved(goal.parent.parent)
+            allowed = [_resolved(goal.parent), root / ".git" / "beagle"]
+            for target in targets:
+                target = _resolved(target)
+                if target != root and root not in target.parents:
+                    continue  # outside the project: /tmp, /dev/null
+                if any(target == a or a in target.parents for a in allowed):
+                    continue
+                if _CACHE_DIRS & set(target.parts):
+                    continue
+                if _scope_hit(target, root, scope) is None:
+                    break
+            else:
+                return None
+        except Exception:  # noqa: BLE001 - fail open, never block on a guard bug
+            return None
+        rel = target.relative_to(root) if target != root else target
+        return ToolCallHookResult(
+            block=True,
+            reason=(
+                f"refusing to write {rel}: it is outside {task}'s scope "
+                f"({', '.join(scope)}); name it in your report as follow-up. Scratch "
+                "files go in /tmp."
+            ),
+        )
+
+    return guard
+
+
 def make_worker_pursuit_guard() -> Any:
     """Build the `tool_call` guard that keeps a worker out of the pursuit's books.
 
@@ -3764,25 +3923,40 @@ def make_worker_pursuit_guard() -> Any:
     runs its check and closes it. A worker that opens, closes or dispatches
     tasks itself runs a pursuit nobody is driving — in run 7 a worker opened
     the next task and sent a nested worker at it, which ate its whole budget.
-    Reading the pursuit (`brief`, `show`, `status` …) stays allowed. Fails open.
+    Reading the pursuit (`brief`, `show`, `status` …) stays allowed.
+
+    Committing is the parent's too: pursuit_step commits a task's scope before
+    its close. In run R02 workers ran `git add` and `git commit` around the
+    refused `beagle pursuit commit`, and one spawned an `agent` sub-agent to
+    record claims, which ran 39 turns into a provider error. Fails open.
     """
 
     async def guard(event: Any, context: ExtensionContext) -> ToolCallHookResult | None:
         del context
         try:
-            if event.tool_name != "bash":
-                return None
-            verb = _bash_find(str((event.arguments or {}).get("command", "")), _pursuit_write_verb)
-            if verb is None:
+            if event.tool_name == "agent":
+                what = "spawn a sub-agent with the agent tool"
+            elif event.tool_name == "bash":
+                command = str((event.arguments or {}).get("command", ""))
+                verb = _bash_find(command, _pursuit_write_verb)
+                git = _bash_find(command, _worker_git_commit)
+                if verb is not None:
+                    what = f"run `beagle pursuit {verb}`"
+                elif git is not None:
+                    what = f"run `git {git}`"
+                else:
+                    return None
+            else:
                 return None
         except Exception:  # noqa: BLE001 - fail open, never block on a guard bug
             return None
         return ToolCallHookResult(
             block=True,
             reason=(
-                f"refusing `beagle pursuit {verb}` in a sub-agent: the session that sent "
-                "you opens, checks and closes the pursuit's tasks. Do the work in your "
-                "brief, then end with a report of what you changed and what is left."
+                f"refusing to {what} in a sub-agent: the session that sent you opens, "
+                "checks, commits and closes the pursuit's tasks. Do not commit or claim; "
+                "do the work in your brief yourself, then end with a report of what you "
+                "changed and what is left."
             ),
         )
 
@@ -3804,6 +3978,10 @@ _STEERED_VERBS = {
     "audit": "pursuit_step, which has a sub-agent do a due audit and records it",
     "split": "pursuit_plan",
     "add": "pursuit_plan",
+    "commit": (
+        "nothing: pursuit_step commits the files a task changed in its scope before it "
+        "closes the task"
+    ),
 }
 
 
@@ -5586,6 +5764,7 @@ def setup(tau: ExtensionAPI) -> None:
     tau.on("tool_call", make_bash_hooks())
     if _is_worker():
         tau.on("tool_call", make_worker_pursuit_guard())
+        tau.on("tool_call", make_worker_scope_guard())
     else:
         tau.on("tool_call", make_scope_guard())
         tau.on("tool_result", make_stopped_worker_note())

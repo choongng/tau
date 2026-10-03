@@ -200,6 +200,9 @@ REPEATED_CALL_LIMIT = 2
 REPEATED_CALL_WINDOW = 10
 #: Refusals in a row after which the run is stopped.
 REPEATED_CALL_STOP = 8
+#: Tools that change the workspace: after one, a call's earlier result no
+#: longer predicts what it gives now, so the calls before it are forgotten.
+WORKSPACE_CHANGING_TOOLS = frozenset({"pursuit_step", "write", "edit"})
 MAX_OUTPUT_LIMIT_CONTINUATIONS = 2
 MAX_OUTPUT_LIMIT_CONTINUATIONS_PER_RUN = 6
 OUTPUT_LIMIT_NUDGE = (
@@ -1434,6 +1437,18 @@ class CodingSession:
         # output, which is all the model sees, is the same.
         text = "\n".join(b.text for b in result.content if isinstance(b, TextContent))
         digest = hash((is_error, text))
+        if call.name in WORKSPACE_CHANGING_TOOLS:
+            # Run R02 refused a third identical commit as "would give it
+            # again" after two steps had rewritten the file it failed on. The
+            # changing calls themselves are kept, so one repeated with the
+            # same result each time is still caught.
+            kept = [
+                entry
+                for entry in self._recent_calls
+                if entry[0].split("\0", 1)[0] in WORKSPACE_CHANGING_TOOLS
+            ]
+            self._recent_calls.clear()
+            self._recent_calls.extend(kept)
         self._recent_calls.append((_call_key(call), digest))
         return self._buffer_result(result, tool_name=call.name), is_error
 
