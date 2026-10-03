@@ -218,8 +218,10 @@ GUARD_DISABLE_ENV = "BEAGLE_TAU_ALLOW_PURSUIT_EDIT"
 #: Set in a `pursuit_dispatch` worker's environment. A worker acts for its
 #: parent: it keeps the parent's session id and runs no loop of its own.
 WORKER_ENV = "BEAGLE_TAU_WORKER"
-#: The task a worker was sent on and its scope, newline-joined; unset when the
-#: task has none, and then the worker's writes are not held to one.
+#: The task a `pursuit_step` worker was sent on, which keeps it from beagle and
+#: `.beagle/`, and the task's scope, newline-joined: unset when the task has
+#: none, and then the worker's writes are not held to one. A worker sent with
+#: no task (`pursuit_dispatch`, an audit) may read the pursuit.
 WORKER_TASK_ENV = "BEAGLE_TAU_WORKER_TASK"
 WORKER_SCOPE_ENV = "BEAGLE_TAU_WORKER_SCOPE"
 
@@ -1355,10 +1357,10 @@ async def _run_worker(
     env = {**os.environ, WORKER_ENV: "1"}
     env.pop(WORKER_TASK_ENV, None)
     env.pop(WORKER_SCOPE_ENV, None)
+    if task:
+        env[WORKER_TASK_ENV] = task
     if scope:
         env[WORKER_SCOPE_ENV] = "\n".join(scope)
-        if task:
-            env[WORKER_TASK_ENV] = task
     try:
         proc = await asyncio.create_subprocess_exec(
             *_capped(cmd, limit),
@@ -2169,6 +2171,13 @@ def _abandon_problem(task: str, why: str, nodes: list[dict[str, Any]]) -> str | 
     """
     parent = {str(n.get("id")): str(n.get("parent") or "") for n in nodes}
     roots = [t for t, p in parent.items() if not p]
+    if task in roots:
+        # Run R04 abandoned the root as "duplicate of T0002"; beagle refused it.
+        return (
+            f"pursuit_step: {task} not abandoned — it is the root, the goal itself, and "
+            "the goal is the user's. Work its open tasks with pursuit_step, or add what "
+            "is missing with pursuit_plan."
+        )
     if roots and parent.get(task) == roots[0]:
         return (
             f"pursuit_step: {task} not abandoned — it is a milestone, and a milestone is "
@@ -2572,6 +2581,14 @@ def _check_problem(command: str) -> str | None:
             f"{one_command}, testing what the file must hold; for a document, `grep -q "
             "'<a phrase it must contain>' <path>`. Call pursuit_step again with that."
         )
+    if program.startswith("python") and _only_imports(words[1:]):
+        # Run R04 bound `python3 -c "from tests.test_case_data import
+        # validate_fork_seed; print('OK')"`, which passes once the name exists.
+        return (
+            f"done_when `{command}` only imports and prints, so it passes as soon as the "
+            f"file is there, whatever it says. {one_command}, testing what the code must "
+            "do. Call pursuit_step again with that."
+        )
     found = [w for w in words[1:] if w.lower() in _PROSE_WORDS]
     if not found:
         return None
@@ -2582,6 +2599,33 @@ def _check_problem(command: str) -> str | None:
         "tests/test_greet.py`. Put what the test must assert in criteria and notes, "
         "and call pursuit_step again."
     )
+
+
+def _only_imports(args: list[str]) -> bool:
+    """Whether a python argv's `-c` code only imports, prints and passes."""
+    if "-c" not in args or args.index("-c") + 1 >= len(args):
+        return False
+    try:
+        body = ast.parse(args[args.index("-c") + 1]).body
+    except SyntaxError:
+        return False
+
+    def inert(node: ast.stmt) -> bool:
+        if isinstance(node, (ast.Import, ast.ImportFrom, ast.Pass)):
+            return True
+        if not isinstance(node, ast.Expr):
+            return False
+        value = node.value
+        if isinstance(value, ast.Constant):
+            return True
+        return (
+            isinstance(value, ast.Call)
+            and isinstance(value.func, ast.Name)
+            and value.func.id == "print"
+            and all(isinstance(a, ast.Constant) for a in value.args)
+        )
+
+    return bool(body) and all(inert(node) for node in body)
 
 
 def _bare_operators(command: str) -> list[str]:
@@ -2900,8 +2944,16 @@ async def _prove(
     no witness and no changed file — and the close decides.
     """
     attempts: list[list[str]] = []
+    refused: list[str] = []
     witness = _witness(report)
-    if witness is not None:
+    if witness is not None and _is_test_path(witness[0]):
+        # Run R04: W24's witness was in tests/test_case_data.py, and beagle
+        # answered about the needle's count, not the check.
+        refused.append(
+            f"{witness[0]}: the WITNESS is in a test file; name a defect in the code the "
+            "test runs, and leave the test as it is."
+        )
+    elif witness is not None:
         path, needle, replacement = witness
         attempts.append(["--mutate", path, "--needle", needle, "--replacement", replacement])
     sources = [
@@ -2919,7 +2971,6 @@ async def _prove(
         ]
     if sources:
         attempts.append([arg for rel in sources for arg in ("--absent", rel)])
-    refused: list[str] = []
     for how in attempts:
         argv = [BEAGLE_BIN, "pursuit", "prove", task, *how, "--check-timeout", f"{timeout:.0f}"]
         rc, out = await asyncio.to_thread(
@@ -2941,7 +2992,7 @@ async def _prove(
             # different witness should be asked to overturn.
             return _Proof(proven=False, text=tail, weak=True)
         refused.append(tail)
-    if not attempts:
+    if not attempts and not refused:
         if not _requires_witness(root):
             return None
         return _Proof(
@@ -3650,6 +3701,7 @@ def make_step_tool() -> Any:
             brief = f"{brief}\n\n{references}"
         if notes:
             brief = f"{brief}\n\nFrom the driver (who has not read the reference):\n{notes}"
+        brief += "\n\n" + NO_BEAGLE_NOTE
         locks = _pending_locks(goal, task, _strings(arguments.get("locks")))
         locked = _locked(goal)
         if locked:
@@ -4127,8 +4179,8 @@ def _named(argv: list[str], program: str) -> bool:
     return Path(argv[0]).name == program
 
 
-#: The `beagle pursuit` verbs that only read the pursuit. A worker may run
-#: these; every other verb changes the tree or the log.
+#: The `beagle pursuit` verbs that only read the pursuit. A worker sent with no
+#: task may run these; every other verb changes the tree or the log.
 _PURSUIT_READ_VERBS = frozenset(
     {"next", "brief", "show", "status", "view", "tree", "findings", "rules", "review-check"}
 )
@@ -4201,6 +4253,69 @@ def _worker_git_commit(argv: list[str]) -> str | None:
     return args[0] if args and args[0] in _WORKER_GIT_REFUSED else None
 
 
+#: Why a worker is kept from beagle and its store.
+NO_BEAGLE_REASON = (
+    "the brief has everything; do the task. A worker does not inspect .beagle/ or run "
+    "beagle: the session that sent you does that."
+)
+#: What a worker is told in its brief, to the same end.
+NO_BEAGLE_NOTE = "Do not inspect .beagle/ or run beagle."
+#: Programs that only show what a path holds: a worker reading `.beagle/` with one
+#: is orienting, not working. A check script under it (`bash .beagle/checks/...`)
+#: is run, not read, and passes.
+_READERS = frozenset(
+    {"cat", "ls", "head", "tail", "less", "more", "find", "tree", "grep", "rg", "wc", "stat"}
+)
+#: The path an inline script opens or writes, as its source says it.
+_SCRIPT_PATH = re.compile(
+    r"""open\(\s*['"](?P<open>[^'"]+)['"]\s*,\s*['"][wax]"""
+    r"""|Path\(\s*['"](?P<path>[^'"]+)['"]\s*\)\s*\.write_(?:text|bytes)\("""
+    r"""|writeFileSync\(\s*['"](?P<node>[^'"]+)['"]"""
+)
+
+
+def _in_store(word: str) -> bool:
+    return any(part == ".beagle" for part in Path(word).parts)
+
+
+def _worker_orientation(tool: str, args: Mapping[str, Any], cwd: Path) -> str | None:
+    """What a worker's call does to orient itself on beagle, or None.
+
+    Run R04: 20 of 25 workers capped at 30 turns, W1 spending about ten on
+    `.beagle/`, `beagle doctor`, the tree and `pursuit open` before writing a
+    line. Its own test runs, and a check script under `.beagle/checks/`, pass.
+    """
+    if tool == "read":
+        target = _goal_path_from_args(args, cwd)
+        raw = str(args.get("path") or "")
+        if _in_store(raw) or (target is not None and ".beagle" in target.parts):
+            return f"read {raw}"
+        return None
+    if tool != "bash":
+        return None
+    command = str(args.get("command", ""))
+
+    def match(argv: list[str]) -> str | None:
+        if _named(argv, "beagle"):
+            return f"run `{' '.join(argv[:3])}`"
+        if Path(argv[0]).name in _READERS and any(_in_store(a) for a in argv[1:]):
+            return f"run `{' '.join(argv)}`"
+        return None
+
+    return _bash_find(command, match)
+
+
+def _script_write_targets(command: str, cwd: Path) -> list[Path]:
+    """The paths an inline script in `command` writes, as its source names them.
+
+    Run R04: W9, refused a write to src/__init__.py, wrote it with
+    `python3 -c "open('src/__init__.py','w').write(...)"`. A path the script
+    does not spell out is not guessed at: the guard fails open on it.
+    """
+    found = [next(g for g in m.groups() if g is not None) for m in _SCRIPT_PATH.finditer(command)]
+    return [_resolved(Path(p) if Path(p).is_absolute() else cwd / p) for p in found]
+
+
 def _worker_scope() -> tuple[str, tuple[str, ...]] | None:
     """The task and scope this worker was sent with, or None when it has no scope."""
     scope = tuple(
@@ -4224,12 +4339,31 @@ def make_worker_scope_guard() -> Any:
 
     async def guard(event: Any, context: ExtensionContext) -> ToolCallHookResult | None:
         try:
+            cwd = Path(context.cwd)
+            arguments = event.arguments or {}
+            sent_on_task = bool(os.environ.get(WORKER_TASK_ENV, "").strip())
+            orientation = (
+                _worker_orientation(event.tool_name, arguments, cwd) if sent_on_task else None
+            )
+            if orientation is not None:
+                return ToolCallHookResult(
+                    block=True,
+                    reason=f"refusing to {orientation}: {NO_BEAGLE_REASON}",
+                )
             sent = _worker_scope()
             if sent is None:
                 return None
             task, scope = sent
-            cwd = Path(context.cwd)
-            targets = _write_targets(event.tool_name, event.arguments or {}, cwd)
+            command = str(arguments.get("command", "")) if event.tool_name == "bash" else ""
+            script = _bash_find(command, _driver_change) if command else None
+            scripted = (
+                script is not None
+                and script.startswith(_INTERPRETERS)
+                and _SCRIPT_WRITE.search(command) is not None
+            )
+            targets = _write_targets(event.tool_name, arguments, cwd)
+            if scripted:
+                targets += _script_write_targets(command, cwd)
             goal = _find_goal(cwd) if targets else None
             if goal is None:
                 return None
@@ -4269,7 +4403,8 @@ def make_worker_pursuit_guard() -> Any:
     runs its check and closes it. A worker that opens, closes or dispatches
     tasks itself runs a pursuit nobody is driving — in run 7 a worker opened
     the next task and sent a nested worker at it, which ate its whole budget.
-    Reading the pursuit (`brief`, `show`, `status` …) stays allowed.
+    Reading the pursuit (`brief`, `show`, `status` …) passes here; a worker
+    sent on a task is kept from that by `make_worker_scope_guard`.
 
     Committing is the parent's too: pursuit_step commits a task's scope before
     its close. In run R02 workers ran `git add` and `git commit` around the
