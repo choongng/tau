@@ -123,3 +123,28 @@ Nothing for beagle. The run never reached beagle: tau's founding tool refused a 
   and .gitignore", or the gate could ignore beagle's own config until
   the first commit. Priority: low.
 - **`close --outcome abandoned` has no way to name the task that holds the work.** tau now refuses "duplicate of Tnnnn" abandons of a container's part (T0058), because beagle keeps an abandoned leaf with no successor as accountable and the container stalls for good. A `--duplicate-of T` that records T as the heir (as `spawn` does) would let a true duplicate be dropped without stalling its container. Priority: medium.
+
+## R09
+
+- **A part whose work a done sibling already holds cannot be closed.**
+  T0007 was split into T0009 (move the code) and T0010 ("re-run the
+  test and confirm"), and both had the same check. After T0009 closed
+  done, T0010's check already passed before any work, so tau would not
+  open it. Abandoning it as a duplicate would stall T0007 (see R08's
+  `--duplicate-of`). With T0010 the only ready task, the run ended on the
+  breaker. Proposal: `close T0010 --outcome done --covered-by T0009`
+  records the part as done on T0009's witness when the bound checks are
+  identical. Or `split`/`add --parent` refuses a child whose done_when
+  equals a sibling's. Priority: medium. (The `--duplicate-of` proposal
+  from R08 would also cover it.)
+- **Splitting an open task leaves its uncommitted work to whichever
+  child's scope covers it.** T0007 had written tests/cases.json and its
+  test, uncommitted, when it became a container. T0009's `tests/` scope
+  took them into the code commit, unlocked. Proposal: `split`/`add
+  --parent` on an open leaf with changes in its scope lists them, and
+  either commits them as the split task's WIP or names them on the first
+  child. Priority: low. tau can list them too; R09.md has that as a tau
+  Action.
+
+Nothing else for beagle: the other R09 failures are in tau's texts,
+guards and buffers, or in the model.
