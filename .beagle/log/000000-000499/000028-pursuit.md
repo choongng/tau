@@ -1,0 +1,14 @@
++++
+id = "000028-pursuit"
+ordinal = 28
+kind = "pursuit"
+timestamp = "2026-10-03T11:00:44+00:00"
+summary = "pursuit open T0022: R01 fix: founded driver may not use pursuit_dispatch, nor read references"
+metric_command = ""
+drains = []
+hooks = []
++++
+
+criteria: In a founded pursuit the driver (not a worker) calling pursuit_dispatch is refused without spawning anything, and the refusal names the ready task id and pursuit_step; unfounded, dispatch still runs. Once founded, the driver's attempts to fetch URLs (curl/wget/web tools) or read files outside the project root are refused with a note that workers read references; workers are not refused. Existing beagle extension tests still pass.
+decided by: sh -c 'echo "733f2b2c36f0e99f7630d239b332ec5ec7b1676ee7a0f1be5d7fa48d8562a9d1  .beagle/checks/T0022/named_tests.sh" | sha256sum -c --quiet && bash .beagle/checks/T0022/named_tests.sh tests/test_beagle_example_extension.py 4 test_founded_driver_dispatch_refused test_unfounded_dispatch_runs test_founded_driver_reference_read_refused test_worker_reference_read_allowed'
+budget: 150000 tokens
