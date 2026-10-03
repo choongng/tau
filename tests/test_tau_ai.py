@@ -575,6 +575,44 @@ async def test_zai_provider_serializes_thinking_protocol(
 
 
 @pytest.mark.anyio
+async def test_qwen_chat_template_thinking_off_disables_in_payload() -> None:
+    # `--thinking off` maps to reasoning_effort "none" through the catalog's
+    # thinking_level_map; llama.cpp only honours chat_template_kwargs.
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(
+            200,
+            text='data: {"choices":[{"delta":{"content":"ok"},"finish_reason":"stop"}]}\n\n',
+            headers={"content-type": "text/event-stream"},
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        provider = OpenAICompatibleProvider(
+            OpenAICompatibleConfig(
+                api_key="test-key",
+                base_url="http://bane:8080/v1",
+                reasoning_effort="none",
+                thinking_format="qwen-chat-template",
+            ),
+            client=client,
+        )
+        await _collect(
+            provider.stream_response(
+                model="qwen3.5-9b-q4-mtp-thinking-coding",
+                system="You are Tau.",
+                messages=[UserMessage(content="Say ok")],
+                tools=[],
+            )
+        )
+
+    payload = loads(requests[0].content)
+    assert payload["chat_template_kwargs"]["enable_thinking"] is False
+    assert "reasoning_effort" not in payload
+
+
+@pytest.mark.anyio
 async def test_unsupported_reasoning_effort_guard_remains_for_openai_format() -> None:
     requests: list[httpx.Request] = []
 
