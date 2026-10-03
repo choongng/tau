@@ -3091,6 +3091,60 @@ async def test_step_refuses_a_scope_mixing_known_answer_data_with_source(
     assert len(_pursuit_calls(fake_beagle, "open")) == 1
 
 
+R08_IMPORT = 'python3 -c "from itc.interval_tree_clocks import IntervalTreeClock"'
+
+
+@pytest.mark.anyio
+async def test_check_importing_a_module_outside_scope_and_disk_is_refused(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project = _pursuit_project(tmp_path)
+    (project / "itc" / "src").mkdir(parents=True)
+    scope = ["itc/src/interval_tree_clocks.py"]
+    found = _module()._import_scope_problem(R08_IMPORT, scope, project)
+    assert found is not None and "itc/interval_tree_clocks.py" in found
+    assert "in scope" in found and "change the import" in found
+    wrapped = f"bash -c '{R08_IMPORT}'"
+    assert _module()._import_scope_problem(wrapped, scope, project) is not None
+
+    monkeypatch.chdir(project)
+    _ready_task(fake_beagle)
+    runtime, _ = _bound(tmp_path)
+    refused = await _tool(runtime, "pursuit_step").execute(
+        "c1",
+        {
+            "task": "T0002",
+            "criteria": "the clock is importable",
+            "done_when": R08_IMPORT[:-1] + '; assert IntervalTreeClock().fork()"',
+            "scope": scope,
+        },
+    )
+
+    assert "not opened" in refused.text and "itc/interval_tree_clocks.py" in refused.text
+    assert "only imports" not in refused.text
+    assert _pursuit_calls(fake_beagle, "open") == []
+    assert _runs(fake_tau) == []
+
+
+def test_check_importing_stdlib_or_an_existing_module_is_accepted(tmp_path: Path) -> None:
+    (tmp_path / "itc" / "src").mkdir(parents=True)
+    (tmp_path / "itc" / "src" / "clocks.py").write_text("")
+    problem = _module()._import_scope_problem
+    scope = ["itc/interval_tree_clocks.py"]
+
+    assert problem('python3 -c "import json, os.path"', [], tmp_path) is None
+    assert problem(R08_IMPORT, scope, tmp_path) is None
+    assert problem(R08_IMPORT, ["itc/"], tmp_path) is None
+    assert problem('python3 -c "from itc.src.clocks import Clock"', [], tmp_path) is None
+    assert problem('python3 -c "from itc.src import clocks"', [], tmp_path) is None
+    assert problem("python3 -c 'import (('", [], tmp_path) is None
+    assert problem("python3 -m pytest -q", [], tmp_path) is None
+
+
 @pytest.mark.anyio
 async def test_step_accepts_known_answer_data_with_its_tests_only(
     tmp_path: Path,

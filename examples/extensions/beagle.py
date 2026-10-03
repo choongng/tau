@@ -2923,6 +2923,77 @@ def _oracle_with_code_problem(scope: list[str], goal: Path) -> str | None:
     )
 
 
+def _python_c_code(argv: list[str]) -> str | None:
+    """The code of a `python -c '...'` argv, or None for any other command."""
+    if not Path(argv[0]).name.startswith("python") or "-c" not in argv[1:]:
+        return None
+    at = argv.index("-c") + 1
+    return argv[at] if at < len(argv) else None
+
+
+def _import_scope_problem(command: str, scope: list[str], root: Path) -> str | None:
+    """Why a check imports a project module no task can make importable, or None.
+
+    Run R08 scoped itc/src/interval_tree_clocks.py and checked `from
+    itc.interval_tree_clocks import ...`; the worker made a second itc/ package
+    to fit the check. A module is the project's when its top-level name is in
+    the project or the scope (plain or under src/); it must then be in scope or
+    on disk as a/b.py or a/b/__init__.py, plain or under src/.
+    """
+    code = _bash_find(command, _python_c_code)
+    if code is None:
+        return None
+    try:
+        tree = ast.parse(code)
+    except SyntaxError:
+        return None
+    entries = [path.rstrip("/") for path in scope]
+    modules: list[tuple[str, ...]] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            modules += [(alias.name,) for alias in node.names]
+        elif isinstance(node, ast.ImportFrom) and node.module and not node.level:
+            subs = tuple(f"{node.module}.{alias.name}" for alias in node.names)
+            modules.append((node.module, *subs))
+
+    def candidates(name: str) -> list[str]:
+        rel = name.replace(".", "/")
+        return [f"{base}{rel}{tail}" for base in ("", "src/") for tail in (".py", "/__init__.py")]
+
+    def present(name: str) -> bool:
+        rel = name.replace(".", "/")
+        for path in candidates(name):
+            if any(path == e or path.startswith(f"{e}/") for e in entries):
+                return True
+            if (root / path).is_file():
+                return True
+        return any(
+            (root / base / rel).is_dir() or any(e.startswith(f"{base}{rel}/") for e in entries)
+            for base in ("", "src/")
+        )
+
+    def ours(name: str) -> bool:
+        top = name.split(".")[0]
+        for base in ("", "src/"):
+            if (root / base / top).is_dir() or (root / base / f"{top}.py").is_file():
+                return True
+            if any(e == f"{base}{top}.py" or e.startswith(f"{base}{top}/") for e in entries):
+                return True
+        return False
+
+    for names in modules:
+        if not ours(names[0]) or any(present(name) for name in names):
+            continue
+        expected = candidates(names[0])[0]
+        return (
+            f"done_when imports {names[0]}, which would be {expected}, but that is "
+            "neither in scope nor in the project, so no worker can make the check "
+            f"pass. Put {expected} in scope, or change the import to the module the "
+            "scope names. Call pursuit_step again with that."
+        )
+    return None
+
+
 #: Words a milestone about setting the pursuit up is made of, and nothing else.
 _SETUP_WORDS = frozenset(
     {
@@ -3971,7 +4042,11 @@ def make_step_tool() -> Any:
                 # run R06 spawned T0008, then refused to open it on a check that
                 # already passed, and left a successor with no criteria.
                 route_scope = scope or _strings(record.get("scope"))
-                scoped = _scope_problem(route_scope) or _oracle_with_code_problem(route_scope, goal)
+                scoped = (
+                    _scope_problem(route_scope)
+                    or _oracle_with_code_problem(route_scope, goal)
+                    or _import_scope_problem(done_when or old_check, route_scope, root)
+                )
                 if scoped is not None:
                     return _step_result(f"pursuit_step: no new route for {task} — {scoped}")
                 new_check = done_when or old_check
@@ -4035,7 +4110,11 @@ def make_step_tool() -> Any:
             prose = _check_problem(done_when)
             if prose is not None:
                 return _step_result(f"pursuit_step: {task} not opened — {prose}")
-            scoped = _scope_problem(scope) or _oracle_with_code_problem(scope, goal)
+            scoped = (
+                _scope_problem(scope)
+                or _oracle_with_code_problem(scope, goal)
+                or _import_scope_problem(done_when, scope, root)
+            )
             if scoped is not None:
                 return _step_result(f"pursuit_step: {task} not opened — {scoped}")
             # A check bound once it already passes closes the task on no work:
