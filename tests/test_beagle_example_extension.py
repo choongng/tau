@@ -1705,6 +1705,210 @@ async def test_found_accepts_max_length_milestone(
     assert _pursuit_calls(fake_beagle, "split") == [["T0001", *milestones, "--ordered"]]
 
 
+def _tiny_pdf(text: str) -> bytes:
+    """A one-page PDF that shows `text`, built by hand so tests need no PDF library."""
+    stream = f"BT /F1 12 Tf 72 720 Td ({text}) Tj ET".encode()
+    objects = [
+        b"<< /Type /Catalog /Pages 2 0 R >>",
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] "
+        b"/Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >>",
+        b"<< /Length %d >>\nstream\n" % len(stream) + stream + b"\nendstream",
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+    ]
+    out = b"%PDF-1.4\n"
+    offsets = []
+    for number, body in enumerate(objects, 1):
+        offsets.append(len(out))
+        out += b"%d 0 obj\n" % number + body + b"\nendobj\n"
+    xref = len(out)
+    out += b"xref\n0 %d\n0000000000 65535 f \n" % (len(objects) + 1)
+    out += b"".join(b"%010d 00000 n \n" % offset for offset in offsets)
+    out += b"trailer\n<< /Size %d /Root 1 0 R >>\nstartxref\n%d\n%%%%EOF\n" % (
+        len(objects) + 1,
+        xref,
+    )
+    return out
+
+
+class _FakeResponse:
+    def __init__(self, body: bytes, content_type: str) -> None:
+        import email.message
+
+        self._body = body
+        self.headers = email.message.Message()
+        self.headers["Content-Type"] = content_type
+
+    def read(self, limit: int = -1) -> bytes:
+        return self._body if limit < 0 else self._body[:limit]
+
+    def __enter__(self) -> _FakeResponse:
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        return None
+
+
+def _fake_web(monkeypatch: pytest.MonkeyPatch, pages: dict[str, tuple[bytes, str]]) -> list[str]:
+    """Serve `pages` (url -> body, content type) to urllib; any other URL fails."""
+    import urllib.error
+    import urllib.request
+
+    asked: list[str] = []
+
+    def urlopen(request: Any, timeout: float | None = None) -> _FakeResponse:
+        url = request.full_url if hasattr(request, "full_url") else str(request)
+        asked.append(url)
+        if url not in pages:
+            raise urllib.error.URLError("Name or service not known")
+        return _FakeResponse(*pages[url])
+
+    monkeypatch.setattr(urllib.request, "urlopen", urlopen)
+    return asked
+
+
+ITC_PROMPT = (
+    "Implement interval tree clocks in Python, as a beagle pursuit. The paper: "
+    "https://example.org/papers/itc2008.pdf and a walkthrough "
+    "(https://example.org/blog/interval-tree-clocks.html)."
+)
+
+
+@pytest.mark.anyio
+async def test_found_fetches_references(
+    tmp_path: Path, beagle: Path, fake_beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # R02's workers never saw the paper: the driver wrote the domain from its name.
+    project = tmp_path / "project"
+    project.mkdir()
+    monkeypatch.chdir(project)
+    (fake_beagle / "add.out").write_text("T0001  Interval tree clocks\n")
+    page = (
+        b"<html><head><title>t</title><style>p{color:red}</style></head><body>"
+        b"<script>var stamp = 1;</script><h1>Interval Tree Clocks</h1>"
+        b"<p>A stamp is an id and an event tree.</p></body></html>"
+    )
+    asked = _fake_web(
+        monkeypatch,
+        {
+            "https://example.org/papers/itc2008.pdf": (
+                _tiny_pdf("fork event join"),
+                "application/pdf",
+            ),
+            "https://example.org/blog/interval-tree-clocks.html": (page, "text/html"),
+        },
+    )
+    runtime, _ = _bound(tmp_path)
+    await runtime.run_input_hooks(ITC_PROMPT)
+
+    result = await _tool(runtime, "pursuit_found").execute(
+        "c1",
+        {
+            "statement": "Interval tree clocks in Python",
+            "criteria": ["`python3 -m pytest -q` exits 0"],
+            "milestones": ["Cases::from the paper", "Clock::passes them"],
+            "user_confirmed": True,
+        },
+    )
+
+    assert "Founded the pursuit" in result.text
+    assert asked == [
+        "https://example.org/papers/itc2008.pdf",
+        "https://example.org/blog/interval-tree-clocks.html",
+    ]
+    refs = project / "references"
+    walkthrough = (refs / "interval-tree-clocks.txt").read_text()
+    assert "Interval Tree Clocks" in walkthrough and "an id and an event tree" in walkthrough
+    assert "var stamp" not in walkthrough and "color:red" not in walkthrough
+    index = json.loads((refs / "index.json").read_text())
+    assert index["request"] == ITC_PROMPT
+    if shutil.which("pdftotext"):
+        assert "fork event join" in (refs / "itc2008.txt").read_text()
+        assert set(index["fetched"]) == {"itc2008.txt", "interval-tree-clocks.txt"}
+    else:
+        assert (
+            "pdftotext is not installed"
+            in index["failed"]["https://example.org/papers/itc2008.pdf"]
+        )
+    assert "references/" in (project / ".gitignore").read_text().splitlines()
+    assert "references/interval-tree-clocks.txt" in result.text
+
+
+@pytest.mark.anyio
+async def test_found_reference_fetch_failure_is_noted(
+    tmp_path: Path, beagle: Path, fake_beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    monkeypatch.chdir(project)
+    (fake_beagle / "add.out").write_text("T0001  Interval tree clocks\n")
+    page = (b"Interval tree clocks, in plain text.", "text/plain")
+    _fake_web(monkeypatch, {"https://example.org/blog/interval-tree-clocks.html": page})
+    runtime, _ = _bound(tmp_path)
+    await runtime.run_input_hooks(ITC_PROMPT)
+
+    result = await _tool(runtime, "pursuit_found").execute(
+        "c1",
+        {
+            "statement": "Interval tree clocks in Python",
+            "criteria": ["`python3 -m pytest -q` exits 0"],
+            "milestones": ["Cases::from the paper", "Clock::passes them"],
+            "user_confirmed": True,
+        },
+    )
+
+    assert "Founded the pursuit" in result.text
+    assert _pursuit_calls(fake_beagle, "split")  # founding went on past the failure
+    missed = "could not fetch https://example.org/papers/itc2008.pdf: "
+    assert missed in result.text and "Name or service not known" in result.text
+    assert not (project / "references" / "itc2008.txt").exists()
+    assert (
+        (project / "references" / "interval-tree-clocks.txt")
+        .read_text()
+        .startswith("Interval tree clocks, in plain text.")
+    )
+    brief = _module()._references_brief(project)
+    assert missed in brief and "references/interval-tree-clocks.txt" in brief
+
+
+@pytest.mark.anyio
+async def test_step_brief_carries_references_and_prompt(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project = _pursuit_project(tmp_path)
+    monkeypatch.chdir(project)
+    page = (b"<p>Join merges two stamps.</p>", "text/html")
+    _fake_web(monkeypatch, {"https://example.org/blog/interval-tree-clocks.html": page})
+    _module()._fetch_references(project, ITC_PROMPT)
+    _ready_task(fake_beagle)
+    runtime, _ = _bound(tmp_path)
+
+    await _tool(runtime, "pursuit_step").execute(
+        "c1",
+        {
+            "task": "T0002",
+            "criteria": "done.txt exists",
+            "done_when": "test -f done.txt",
+            "scope": ["done.txt"],
+            "notes": "A stamp is a pair of integers.",
+        },
+    )
+
+    brief = _runs(fake_tau)[0]["stdin"]
+    assert "Do the parser." in brief
+    assert "read first; outranks the driver's notes" in brief
+    assert "- references/interval-tree-clocks.txt (from https://example.org/blog/" in brief
+    assert "could not fetch https://example.org/papers/itc2008.pdf" in brief
+    assert f"The user's original request, verbatim:\n<<<\n{ITC_PROMPT}\n>>>" in brief
+    driver = "From the driver (who has not read the reference):\nA stamp is a pair of integers."
+    assert driver in brief
+    assert brief.index("references/interval-tree-clocks.txt") < brief.index(driver)
+
+
 @pytest.mark.anyio
 async def test_pursuit_plan_adds_one_part_to_a_container(
     tmp_path: Path, beagle: Path, fake_beagle: Path, monkeypatch: pytest.MonkeyPatch

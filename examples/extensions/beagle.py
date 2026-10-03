@@ -115,6 +115,7 @@ import asyncio
 import contextlib
 import fnmatch
 import functools
+import html.parser
 import json
 import math
 import os
@@ -124,6 +125,8 @@ import shutil
 import subprocess
 import tempfile
 import tomllib
+import urllib.parse
+import urllib.request
 import uuid
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
@@ -1548,18 +1551,227 @@ def _ignore_caches(root: Path) -> None:
     Run 11d's one commit carried `__pycache__`; a worker's `git add .` and
     the step's own commit both read the ignore file.
     """
+    _ignore(root, sorted(_CACHE_DIRS))
+
+
+def _ignore(root: Path, names: list[str]) -> None:
+    """Add a `<name>/` line to the project's `.gitignore` for each name it lacks."""
     ignore = root / ".gitignore"
     try:
         have = ignore.read_text(encoding="utf-8") if ignore.exists() else ""
     except OSError:
         return
     lines = {line.strip().strip("/") for line in have.splitlines()}
-    missing = [name for name in sorted(_CACHE_DIRS) if name not in lines]
+    missing = [name for name in names if name not in lines]
     if not missing:
         return
     sep = "" if not have or have.endswith("\n") else "\n"
     with contextlib.suppress(OSError):
         ignore.write_text(have + sep + "".join(f"{name}/\n" for name in missing), encoding="utf-8")
+
+
+#: Where founding puts the references the user's prompt links to, as text.
+REFERENCES_DIR = "references"
+#: What founding recorded there: the request, and each URL's file or failure.
+REFERENCES_INDEX = "index.json"
+REFERENCE_FETCH_TIMEOUT = 30.0
+REFERENCE_MAX_BYTES = 5 * 1024 * 1024
+_PROMPT_URL = re.compile(r"https?://[^\s<>\"'`]+")
+
+
+def _prompt_urls(text: str) -> list[str]:
+    """The http(s) URLs in `text`, in order, each once, trailing punctuation off."""
+    urls: list[str] = []
+    for match in _PROMPT_URL.finditer(text):
+        url = match.group(0).rstrip(".,;:!?")
+        while url.endswith((")", "]", "}")) and url.count(url[-1]) > url.count(
+            {")": "(", "]": "[", "}": "{"}[url[-1]]
+        ):
+            url = url[:-1].rstrip(".,;:!?")
+        if url not in urls:
+            urls.append(url)
+    return urls
+
+
+def _reference_name(url: str, taken: set[str]) -> str:
+    """`references/<name>.txt`'s name for `url`: its last path segment, extension off."""
+    parsed = urllib.parse.urlsplit(url)
+    segments = [s for s in urllib.parse.unquote(parsed.path).split("/") if s]
+    stem = segments[-1] if segments else parsed.hostname or "reference"
+    stem = re.sub(r"\.(pdf|html?|php|aspx?|txt|md)$", "", stem, flags=re.IGNORECASE)
+    stem = re.sub(r"[^A-Za-z0-9._-]+", "-", stem).strip("-.") or "reference"
+    name, n = f"{stem}.txt", 1
+    while name in taken or name == REFERENCES_INDEX:
+        n += 1
+        name = f"{stem}-{n}.txt"
+    taken.add(name)
+    return name
+
+
+class _HtmlText(html.parser.HTMLParser):
+    """An HTML page's text, script and style left out, block elements on their own lines."""
+
+    _SKIP = frozenset({"script", "style", "noscript", "template", "svg", "head"})
+    _BLOCK = frozenset(
+        {
+            "p",
+            "div",
+            "br",
+            "li",
+            "tr",
+            "h1",
+            "h2",
+            "h3",
+            "h4",
+            "h5",
+            "h6",
+            "pre",
+            "section",
+            "article",
+            "blockquote",
+            "table",
+            "ul",
+            "ol",
+            "dt",
+            "dd",
+            "hr",
+            "figure",
+        }
+    )
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.parts: list[str] = []
+        self._skipping = 0
+
+    def handle_starttag(self, tag: str, attrs: Any) -> None:
+        if tag in self._SKIP:
+            self._skipping += 1
+        elif tag in self._BLOCK:
+            self.parts.append("\n")
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag in self._SKIP:
+            self._skipping = max(0, self._skipping - 1)
+        elif tag in self._BLOCK:
+            self.parts.append("\n")
+
+    def handle_data(self, data: str) -> None:
+        if not self._skipping:
+            self.parts.append(data)
+
+    def text(self) -> str:
+        lines = (
+            re.sub(r"[ \t\r\f\v]+", " ", line).strip() for line in "".join(self.parts).splitlines()
+        )
+        return re.sub(r"\n{3,}", "\n\n", "\n".join(lines)).strip() + "\n"
+
+
+def _pdf_text(body: bytes) -> str:
+    if shutil.which("pdftotext") is None:
+        raise OSError("it is a PDF and pdftotext is not installed")
+    with tempfile.TemporaryDirectory() as tmp:
+        pdf = Path(tmp) / "reference.pdf"
+        pdf.write_bytes(body)
+        proc = subprocess.run(
+            ["pdftotext", "-layout", str(pdf), "-"],
+            capture_output=True,
+            timeout=120,
+            check=False,
+        )
+    if proc.returncode != 0:
+        why = proc.stderr.decode("utf-8", "replace").strip().splitlines()
+        raise OSError(f"pdftotext failed (exit {proc.returncode}): {why[-1] if why else ''}")
+    return proc.stdout.decode("utf-8", "replace")
+
+
+def _fetch_reference(url: str) -> str:
+    """`url`'s content as text: a PDF through `pdftotext -layout`, HTML stripped.
+
+    Raises OSError (urllib's errors are its subclasses) or ValueError on failure.
+    """
+    request = urllib.request.Request(url, headers={"User-Agent": "tau-beagle/1"})
+    with urllib.request.urlopen(request, timeout=REFERENCE_FETCH_TIMEOUT) as response:
+        body = response.read(REFERENCE_MAX_BYTES + 1)
+        kind = response.headers.get_content_type() if response.headers else ""
+        charset = (response.headers.get_content_charset() if response.headers else None) or "utf-8"
+    if len(body) > REFERENCE_MAX_BYTES:
+        raise ValueError(f"larger than {REFERENCE_MAX_BYTES // (1024 * 1024)} MB")
+    if kind == "application/pdf" or body.startswith(b"%PDF"):
+        text = _pdf_text(body)
+    else:
+        try:
+            text = body.decode(charset, "replace")
+        except LookupError:
+            text = body.decode("utf-8", "replace")
+        if kind in ("text/html", "application/xhtml+xml") or re.match(
+            r"\s*(<!doctype html|<html)", text[:512], re.IGNORECASE
+        ):
+            parser = _HtmlText()
+            parser.feed(text)
+            parser.close()
+            text = parser.text()
+    if not text.strip():
+        raise ValueError("it held no text")
+    return text
+
+
+def _fetch_references(root: Path, prompt: str) -> dict[str, Any]:
+    """Fetch each URL in the user's `prompt` once into `references/`, as text.
+
+    R02's workers never saw the paper: the driver, barred from the
+    reference, wrote the domain into its step notes from the name alone.
+    The request itself, and each URL's file or why it could not be fetched,
+    go in `references/index.json`, which every worker brief is built from.
+    A failed fetch is recorded, never fatal.
+    """
+    urls = _prompt_urls(prompt)
+    if not prompt.strip():
+        return {}
+    folder = root / REFERENCES_DIR
+    index: dict[str, Any] = {"request": prompt, "fetched": {}, "failed": {}}
+    taken: set[str] = set()
+    try:
+        folder.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        return {**index, "failed": {url: f"cannot make {folder}: {exc}" for url in urls}}
+    for url in urls:
+        name = _reference_name(url, taken)
+        try:
+            (folder / name).write_text(_fetch_reference(url), encoding="utf-8")
+        except Exception as exc:  # noqa: BLE001 - one bad URL must not stop founding
+            index["failed"][url] = str(exc).strip() or type(exc).__name__
+            continue
+        index["fetched"][name] = url
+    with contextlib.suppress(OSError):
+        (folder / REFERENCES_INDEX).write_text(json.dumps(index, indent=2) + "\n", encoding="utf-8")
+    _ignore(root, [REFERENCES_DIR])
+    return index
+
+
+def _references_brief(root: Path) -> str:
+    """The worker brief's part from `references/index.json`: request and references."""
+    try:
+        index = json.loads((root / REFERENCES_DIR / REFERENCES_INDEX).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return ""
+    if not isinstance(index, dict):
+        return ""
+    parts = []
+    fetched = index.get("fetched") or {}
+    failed = index.get("failed") or {}
+    if fetched or failed:
+        lines = [f"- {REFERENCES_DIR}/{name} (from {url})" for name, url in fetched.items()]
+        lines += [f"- could not fetch {url}: {why}" for url, why in failed.items()]
+        parts.append(
+            "References: read first; outranks the driver's notes. Where the driver's "
+            "notes or the task disagree with the reference, the reference is right:\n"
+            + "\n".join(lines)
+        )
+    request = str(index.get("request") or "").strip()
+    if request:
+        parts.append(f"The user's original request, verbatim:\n<<<\n{request}\n>>>")
+    return "\n\n".join(parts)
 
 
 def _git_identity(root: Path) -> bool:
@@ -1821,7 +2033,7 @@ def make_found_tool(on_founded: Callable[[Path], None] | None = None) -> Any:
                     "Shorten that title and put the detail after '::', as "
                     "'<short title>::<what it is for>'."
                 )
-        delegated =arguments.get("user_delegated") is True
+        delegated = arguments.get("user_delegated") is True
         if arguments.get("user_confirmed") is not True and not delegated:
             listed = "\n".join(f"  - {c}" for c in criteria)
             return _step_result(
@@ -1859,6 +2071,7 @@ def make_found_tool(on_founded: Callable[[Path], None] | None = None) -> Any:
                 f"failed (exit {rc}):\n{out}"
             )
         root_task = found.group(0)
+        references = await asyncio.to_thread(_fetch_references, root, _LAST_PROMPT)
         if on_founded is not None:
             on_founded(goal)
         if len(milestones) == 1:
@@ -1882,6 +2095,15 @@ def make_found_tool(on_founded: Callable[[Path], None] | None = None) -> Any:
             notes.append(
                 "git has no user.name or user.email here, so commits will fail. Tell the "
                 "user now; do not set one yourself."
+            )
+        fetched, failed = references.get("fetched") or {}, references.get("failed") or {}
+        if fetched or failed:
+            got = ", ".join(f"{REFERENCES_DIR}/{name}" for name in fetched) or "none"
+            missed = "".join(f"; could not fetch {url}: {why}" for url, why in failed.items())
+            notes.append(
+                f"References from the user's request, fetched for the workers: {got}{missed}. "
+                "Every pursuit_step brief carries them and the request; leave reading them "
+                "to the workers."
             )
         if delegated:
             notes.append(
@@ -2951,8 +3173,11 @@ def make_step_tool() -> Any:
             rc, brief = _pursuit(["brief", task], root)
             if rc != 0:
                 return _step_result(f"pursuit_step: `beagle pursuit brief {task}` failed:\n{brief}")
+        references = _references_brief(root)
+        if references:
+            brief = f"{brief}\n\n{references}"
         if notes:
-            brief = f"{brief}\n\nFrom the driver:\n{notes}"
+            brief = f"{brief}\n\nFrom the driver (who has not read the reference):\n{notes}"
         locks = _pending_locks(goal, task, _strings(arguments.get("locks")))
         locked = _locked(goal)
         if locked:
@@ -3554,8 +3779,8 @@ def make_driver_reference_guard() -> Any:
     itself, and what it read fed the spirals that followed. Once founded,
     the host-started session may not fetch a URL (curl, wget, a Python
     urllib or requests script, a web tool) or `read` a file outside the
-    project, Tau's and beagle's own files aside. A worker reads what its
-    task needs. Fails open.
+    project, Tau's and beagle's own files aside, or one founding fetched into
+    `references/`. A worker reads what its task needs. Fails open.
     """
 
     async def guard(event: Any, context: ExtensionContext) -> ToolCallHookResult | None:
@@ -3584,8 +3809,11 @@ def make_driver_reference_guard() -> Any:
                 return None
             if tool == "read":
                 root = _resolved(goal.parent.parent)
+                fetched = root / REFERENCES_DIR
                 allowed = [root, *_driver_readable_dirs()]
-                if any(target == d or d in target.parents for d in allowed):
+                if fetched not in target.parents and any(
+                    target == d or d in target.parents for d in allowed
+                ):
                     return None
         except Exception:  # noqa: BLE001 - fail open, never block on a guard bug
             return None
@@ -3595,7 +3823,7 @@ def make_driver_reference_guard() -> Any:
                 f"refusing to {what} from the driving session: references are read by the "
                 "worker that a pursuit_step dispatches. Call pursuit_step, naming in its "
                 "notes the reference the task needs (its URL or path); the sub-agent reads "
-                "it. Files inside the project are yours to read. "
+                f"it. Files inside the project, {REFERENCES_DIR}/ aside, are yours to read. "
                 f"(If the user wants this session to read it, they set {DRIVER_EDITS_ENV}=1.)"
             ),
         )
