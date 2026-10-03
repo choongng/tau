@@ -151,3 +151,35 @@ guards and buffers, or in the model.
 
 ### Between R09 and R10 (driver)
 - `beagle contain run` passes beagle's own venv (`UV_PROJECT_ENVIRONMENT`, `VIRTUAL_ENV`, PATH) into the job, so a project check that runs `uv run --no-sync` inside the container imports from beagle's venv and fails (`ModuleNotFoundError: tau_agent`). The T0078 worker hit it; it unset the variables to run the check. Suggest: the launcher strips beagle's own environment before exec.
+
+## R10
+
+- **`beagle init` writes another project's rulings as this one's, inside
+  long essays.** The skills.toml it placed in ~/itc already declares
+  ffi-bindings "not-applicable" because it is "pure Python, no native
+  bindings anywhere in the tree". It declines repo-hygiene because "this
+  one is thirty files at five commits", and both are stamped `ruled_at =
+  2026-08-11`. The other templates run to 18.5 KB (gates.toml), 12 KB
+  (cadences.toml) and 11 KB (track.toml), mostly measured-rationale
+  comments. R10's 9B driver took them as config to finish. It spent 53
+  calls and about 54 K chars of a 32K-token window reading and editing
+  them (R10.md, Answer 3), until compaction. Proposal: `init` writes
+  dispositions commented out, or with `status` left for the project to
+  set (doctor already reports "no recorded disposition"), and puts the
+  rationale in the skill docs, with a one-line pointer in each file. Or
+  add an `init --terse` that a host bridge can ask for. Priority: medium.
+- **`beagle pursuit next` names `beagle pursuit open` as the next
+  command, even under a host that refuses that verb.** At E142 its "Next:
+  beagle pursuit open T0002 --criteria '…' --done-when '…'" became the
+  call the driver sent 11 times into tau's guard. Proposal: a
+  `[run] next_hint` (or an env var a host bridge sets) that replaces the
+  CLI line, e.g. "call pursuit_step". Priority: low. tau can also guard
+  `next` (R10.md, fourth tau class).
+- **`doctor`'s one FAIL sits mid-output, and the summary gives only a
+  count.** "[FAIL] gates .beagle/gates.toml does not load" was line 35 of
+  113. A host that keeps the tail (tau keeps the last 60 lines) shows
+  only "41 check(s): … 1 FAILED". Proposal: repeat each FAIL line in the
+  closing summary, as the "Not checked" lists already are. Priority: low.
+
+Nothing else for beagle: the run's main failure is tau's setup-milestone
+detector (R10.md, first tau class).
