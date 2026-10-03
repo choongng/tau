@@ -19,7 +19,9 @@ stale.
 from __future__ import annotations
 
 import os
+import re
 import tempfile
+from collections.abc import Mapping
 from dataclasses import dataclass
 from hashlib import sha256
 from pathlib import Path
@@ -40,6 +42,16 @@ WINDOW_LINES = 60
 #: output, tracebacks and build logs end with the part that matters; a file
 #: read starts with it.
 HEAD_WINDOW_TOOLS = frozenset({"read"})
+#: A head-windowed result is followed by an outline of its def/class lines, so
+#: the model can jump to one with read offset/limit instead of paging. The
+#: outline is capped at this many entries and a quarter of the window's chars.
+OUTLINE_MAX_ENTRIES = 80
+OUTLINE_WINDOW_DIVISOR = 4
+#: An optional line-number prefix (`17\t`, `17: `, `17|`), then a definition.
+_DEFINITION = re.compile(
+    r"^(?:\s*(?P<number>\d+)(?:\t|[:|\u2502\u2192] ?))?"
+    r"(?P<indent>[ \t]*)(?P<kind>async\s+def|def|class)\s+(?P<name>\w+)"
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -71,8 +83,13 @@ def buffer_tool_result(
     tool_name: str,
     buffer_dir: Path,
     limits: BufferLimits,
+    first_line: int = 1,
 ) -> AgentToolResult:
-    """Return `result` unchanged if it fits inline, else a window plus a buffer path."""
+    """Return `result` unchanged if it fits inline, else a window plus a buffer path.
+
+    `first_line` is the file line the text starts at (a read's offset), so the
+    outline of a head-windowed read names the file's own line numbers.
+    """
     texts = [block.text for block in result.content if isinstance(block, TextContent)]
     text = "\n".join(texts)
     if len(text) <= limits.inline_chars:
@@ -99,8 +116,49 @@ def buffer_tool_result(
             f"({len(shown):,} of {len(text):,} chars) are shown. The full output could "
             f"not be saved ({failure}).]"
         )
+    if head:
+        outline = _outline(
+            text, first_line=first_line, max_chars=limits.window_chars // OUTLINE_WINDOW_DIVISOR
+        )
+        if outline:
+            marker = f"{marker}\n{outline}"
     images = [block for block in result.content if isinstance(block, ImageContent)]
     return result.model_copy(update={"content": [TextContent(text=f"{shown}\n{marker}"), *images]})
+
+
+def read_first_line(arguments: Mapping[str, object]) -> int:
+    """The file line a read with these arguments starts at (its offset, 1-indexed)."""
+    offset = arguments.get("offset")
+    if isinstance(offset, int) and not isinstance(offset, bool) and offset > 1:
+        return offset
+    return 1
+
+
+def _outline(text: str, *, first_line: int, max_chars: int) -> str:
+    """The def/class lines of `text` with their file line numbers, bounded."""
+    entries: list[str] = []
+    for index, line in enumerate(text.split("\n")):
+        match = _DEFINITION.match(line)
+        if match is None:
+            continue
+        number = match["number"]
+        line_number = int(number) if number is not None else first_line + index
+        depth = len(match["indent"].expandtabs(4)) // 4
+        kind = " ".join(match["kind"].split())
+        entries.append(f"  L{line_number} {'  ' * depth}{kind} {match['name']}")
+    if not entries:
+        return ""
+    header = "Definitions (jump with read offset=<line>):"
+    kept: list[str] = []
+    used = len(header)
+    for entry in entries[:OUTLINE_MAX_ENTRIES]:
+        if used + 1 + len(entry) > max_chars:
+            break
+        kept.append(entry)
+        used += 1 + len(entry)
+    left_out = len(entries) - len(kept)
+    tail = [f"  ... {left_out:,} more definitions not listed"] if left_out else []
+    return "\n".join([header, *kept, *tail])
 
 
 def _window(text: str, *, head: bool, limits: BufferLimits) -> tuple[str, int]:

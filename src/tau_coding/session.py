@@ -184,7 +184,12 @@ from tau_coding.thinking import (
     next_thinking_level,
     normalize_thinking_level,
 )
-from tau_coding.tool_buffers import BufferLimits, buffer_tool_result, default_buffer_dir
+from tau_coding.tool_buffers import (
+    BufferLimits,
+    buffer_tool_result,
+    default_buffer_dir,
+    read_first_line,
+)
 from tau_coding.tools import ImageSupportState, create_bash_tool, create_coding_tools
 
 StreamingBehavior = Literal["steer", "follow_up"]
@@ -1464,9 +1469,13 @@ class CodingSession:
         live = {seen for seen, _ in self._recent_calls}
         for stale in [seen for seen in self._recent_heads if seen not in live]:
             del self._recent_heads[stale]
-        return self._buffer_result(result, tool_name=call.name), is_error
+        return self._buffer_result(
+            result, tool_name=call.name, first_line=read_first_line(call.arguments)
+        ), is_error
 
-    def _buffer_result(self, result: AgentToolResult, *, tool_name: str) -> AgentToolResult:
+    def _buffer_result(
+        self, result: AgentToolResult, *, tool_name: str, first_line: int = 1
+    ) -> AgentToolResult:
         """Window an oversized result; its full text goes beside the session file."""
         session_path = _storage_path(self._config.storage)
         buffer_dir = (
@@ -1477,6 +1486,7 @@ class CodingSession:
             tool_name=tool_name,
             buffer_dir=buffer_dir,
             limits=BufferLimits.for_context_window(self.context_window_tokens),
+            first_line=first_line,
         )
 
     @property
