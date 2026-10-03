@@ -58,3 +58,35 @@ in the per-run notes.
 ## R05
 
 - Nothing for beagle: the stall was in tau's `pursuit_found` wrapper, not in beagle's founding.
+
+## R06
+
+- **The `depend --hard` cycle check does not follow superseded tasks to
+  their heirs.** In R06 (driver L72–73) `depend T0008 --hard T0003` was
+  accepted. T0003 waited on T0002, which was superseded by T0008, so the
+  edge closed a cycle. `Tree.reaches` (pursuit.py ~L1796) walks only
+  `after`, but the scheduler (`dep_standing`/`_heir`) and `Order` resolve
+  heirs. The very next `tree` printed "order: cycle via T0008", and the
+  run deadlocked. Proposal: resolve `_heir` in `reaches`, the same way the
+  scheduler does. `depend --help` already promises that hard edges "are
+  checked for cycles". Priority: high.
+- **`tree` flags the cycle but not the way out.** "order: cycle via T0008"
+  could print the edges in the cycle and the command that drops one
+  (`depend T0008 T0003 --drop --reason …`). The R06 driver tried
+  retire, unretire, unbind and abandon, and never found `--drop`.
+  Priority: medium.
+- **The `open` refusal for criteria drift on a fresh successor does not
+  say what to pass.** At L35, L53 and L69 a successor that never had
+  criteria was refused three times: "criteria differ from those of T0002".
+  The message could quote T0002's criteria and the exact
+  `--criteria-delta` form, or a successor that has never been open could
+  take the predecessor's criteria by default. Priority: medium.
+- **The brief's "Working habits" line tells workers to run
+  `beagle contain run`.** Hosts that keep workers off beagle (tau since
+  T0041) then refuse it (W2 L49, W4 L41). A dispatch setting that leaves
+  the habit out, or a way to mark it host-optional, would stop the brief
+  contradicting its host. Priority: low.
+- **`retire` on a pending task could point somewhere useful.** "only a
+  done task's check can be retired" (L88, L115) could add "to remove a
+  wait, use `depend … --drop`; to give up the task, close it abandoned".
+  Priority: low.
