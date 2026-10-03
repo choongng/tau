@@ -1,0 +1,4 @@
+#!/bin/sh
+set -e
+bash .beagle/checks/fix/named_tests.sh tests/test_beagle_example_extension.py 4 test_new_route_checks_done_when_before_spawning test_new_route_successor_opens_with_the_predecessors_criteria test_superseded_task_is_named_superseded_not_a_container test_plan_on_an_open_leaf_splits_into_two_or_more_parts
+echo OK
