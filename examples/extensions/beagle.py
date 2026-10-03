@@ -2654,6 +2654,9 @@ def make_plan_tool() -> Any:
         setup = _setup_milestone(parts)
         if setup is not None:
             return _step_result(f"pursuit_plan: nothing added — {setup}")
+        rerun = _rerun_only_part(parts)
+        if rerun is not None:
+            return _step_result(f"pursuit_plan: nothing added — {rerun}")
         # A small model re-sends the plan it already made; beagle adds every
         # part again, and the copies are then worked twice.
         existing = _children(task, root)
@@ -3075,6 +3078,67 @@ def _setup_milestone(parts: list[str]) -> str | None:
                 "sets the pursuit up, and it is done once it is founded. Leave it out. If "
                 "the project itself needs scaffolding, name what, e.g. 'package layout::"
                 "pyproject.toml, src/ and tests/ so the later parts have a home'."
+            )
+    return None
+
+
+#: Verbs a part that only re-runs or confirms a check opens with.
+_RERUN_VERBS = frozenset({"re", "rerun", "run", "confirm", "verify", "check", "ensure", "validate"})
+#: Words naming the check such a part re-runs, one of which it must name.
+#: 'check' is left out: as a verb it opens real work ('check the stamp is
+#: normalised'), and a false refusal costs the driver a turn.
+_CHECK_WORDS = frozenset(
+    {"test", "tests", "checks", "suite", "pass", "passes", "exit", "green", "pytest"}
+)
+#: Verbs that make something: a part with one has work of its own.
+_MAKING_WORDS = frozenset(
+    {
+        "write",
+        "add",
+        "create",
+        "implement",
+        "fix",
+        "move",
+        "change",
+        "update",
+        "refactor",
+        "edit",
+        "build",
+        "port",
+        "derive",
+        "make",
+        "remove",
+        "delete",
+        "rename",
+        "replace",
+        "extend",
+        "record",
+        "generate",
+    }
+)
+
+
+def _rerun_only_part(parts: list[str]) -> str | None:
+    """Why one of `parts` only re-runs or confirms a check, or None.
+
+    Run R09 planned 'P5::Re-run the case-data test and confirm exit 0': a
+    part with nothing to change, whose check every close already runs. Such a
+    part opens with a re-run verb, names a check, and has no making verb.
+    """
+    for part in parts:
+        title, sep, purpose = part.partition("::")
+        if not sep:
+            title, _, purpose = part.partition(":")
+        title_words = re.findall(r"[a-z0-9]+", title.lower())
+        purpose_words = re.findall(r"[a-z0-9]+", purpose.lower())
+        words = title_words + purpose_words
+        # The title may be a label ('P5'); the purpose then opens with the verb.
+        opening = {w[0] for w in (title_words, purpose_words) if w}
+        if opening & _RERUN_VERBS and not set(words) & _MAKING_WORDS and set(words) & _CHECK_WORDS:
+            return (
+                f"{title.strip()!r} only re-runs or confirms a check: a part must change "
+                "something, and the check runs at every close anyway. Fold it into the "
+                "part before it, and plan the parts that do the work."
             )
     return None
 

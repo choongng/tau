@@ -3216,6 +3216,55 @@ async def test_planning_refuses_a_setup_part_and_a_step_its_store_scope(
     assert _pursuit_calls(fake_beagle, "open") == []
 
 
+@pytest.mark.anyio
+async def test_plan_refuses_a_part_that_only_reruns_a_check(
+    tmp_path: Path, beagle: Path, fake_beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # R09 class 2b: P5 had nothing to change; the check runs at every close.
+    monkeypatch.chdir(_pursuit_project(tmp_path))
+    _ready_task(fake_beagle)
+    runtime, _ = _bound(tmp_path)
+
+    plan = await _tool(runtime, "pursuit_plan").execute(
+        "c1",
+        {
+            "task": "T0001",
+            "parts": [
+                "P4::Move the code into src/itc",
+                "P5::Re-run the case-data test and confirm exit 0",
+            ],
+        },
+    )
+
+    assert "nothing added" in plan.text and "'P5'" in plan.text
+    assert "must change something" in plan.text and "every close" in plan.text
+    assert "'P4'" not in plan.text
+    assert _pursuit_calls(fake_beagle, "split") == []
+    assert _pursuit_calls(fake_beagle, "add") == []
+
+
+@pytest.mark.anyio
+async def test_plan_accepts_a_part_that_verifies_by_writing_a_test(
+    tmp_path: Path, beagle: Path, fake_beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(_pursuit_project(tmp_path))
+    _ready_task(fake_beagle)
+    (fake_beagle / "split.out").write_text("T0001 split into 2:\n  T0009  Join\n  T0010  Test\n")
+    runtime, _ = _bound(tmp_path)
+    parts = [
+        "Join::implement join of two stamps",
+        "Test::Add a test that verifies join restores the seed",
+    ]
+
+    plan = await _tool(runtime, "pursuit_plan").execute("c1", {"task": "T0001", "parts": parts})
+
+    assert "nothing added" not in plan.text and "only re-runs" not in plan.text
+    calls = _pursuit_calls(fake_beagle, "split") + _pursuit_calls(fake_beagle, "add")
+    assert calls and calls[0][1:3] == parts
+    assert _module()._rerun_only_part(["Verify::confirm the tests pass"]) is not None
+    assert _module()._rerun_only_part(["Check::check the stamp is normalised"]) is None
+
+
 R08_SCOPE = ["itc/tests/cases.json", "itc/tests/test_cases.py", "itc/interval_tree_clocks.py"]
 
 
