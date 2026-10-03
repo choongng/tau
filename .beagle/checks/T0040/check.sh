@@ -1,0 +1,4 @@
+#!/bin/bash
+set -eu
+bash .beagle/checks/fix/named_tests.sh tests/test_beagle_example_extension.py 3 test_fourth_step_after_three_not_done_is_refused_with_choices test_unproven_memory_keyed_by_task_survives_scope_change test_driver_read_of_open_task_file_refused_after_two_stays_open
+echo OK
