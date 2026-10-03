@@ -1,0 +1,14 @@
++++
+id = "000321-pursuit"
+ordinal = 321
+kind = "pursuit"
+timestamp = "2026-10-03T20:23:57+00:00"
+summary = "pursuit open T0077: T0062 follow-up: a failed setup commit unstages, and the check runs both founding failure tests"
+metric_command = ""
+drains = []
+hooks = []
++++
+
+criteria: When _commit_setup's git commit fails (hook refuses, no identity), founding still succeeds and says the setup is uncommitted, and the index holds nothing tau staged: the paths its git add staged are unstaged again (git reset -q -- <paths>), leaving files on disk. Tested by test_failed_setup_commit_leaves_nothing_staged (a pre-commit hook that exits 1) beside test_founding_without_identity_says_setup_is_uncommitted.
+decided by: sh -c 'echo "f139f11b3050db5a23cf4ba39cce7f7fcc14085ac06cef861c36be4b7917b449  .beagle/checks/T0077/check.sh" | sha256sum -c --quiet && bash .beagle/checks/T0077/check.sh'
+budget: 20000 tokens
