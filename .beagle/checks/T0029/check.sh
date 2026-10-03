@@ -1,0 +1,6 @@
+#!/bin/bash
+set -eu
+c=.beagle/checks/fix/named_tests.sh
+bash $c tests/test_beagle_example_extension.py 7 test_step_brief_has_no_commit_steps test_worker_guard_refuses_git_commit test_worker_write_outside_scope_refused test_worker_write_in_scope_or_tmp_allowed test_check_refuses_test_dash_f test_worker_raw_tool_call_report_falls_back test_ruff_fix_refusal_names_flag
+bash $c tests/test_repeat_breaker_reset.py 1 test_repeat_breaker_resets_after_workspace_change
+echo OK
