@@ -3825,16 +3825,42 @@ def _carried_criteria(predecessor: str, root: Path) -> str:
     return str(record.get("criteria") or "").strip() if isinstance(record, dict) else ""
 
 
-def _already_passes(check: str) -> str:
-    """Why a check that passes before any work is not bound."""
-    return (
+def _already_passes(check: str, task: str = "", nodes: list[dict[str, Any]] | None = None) -> str:
+    """Why a check that passes before any work is not bound.
+
+    A part of a non-root container gets no abandon hint, which
+    `_abandon_problem` would refuse: run R09's driver sent that refused call
+    nine times. A done sibling closed on the same check is named instead.
+    """
+    text = (
         f"`{check}` already passes, before any work, so it cannot tell this task's work "
         "from none. Bind a check that fails now: name a new test file for what this task "
         "adds, e.g. `python3 -m pytest -q tests/test_<this task>.py`, put it in scope, and "
         "say in the notes what it should test. It fails until the sub-agent writes it; do "
         "not write it yourself. If the work is there already, bind the goal criterion's "
-        "test, which imports and runs the code. " + ABANDON_HINT
+        "test, which imports and runs the code."
     )
+    nodes = nodes or []
+    parent = {str(n.get("id")): str(n.get("parent") or "") for n in nodes}
+    roots = [t for t, p in parent.items() if not p]
+    container = parent.get(task, "")
+    if not container or container in roots:
+        return f"{text} {ABANDON_HINT}"
+    same = " ".join(check.split())
+    for node in nodes:
+        sibling = str(node.get("id"))
+        if (
+            sibling != task
+            and parent.get(sibling) == container
+            and node.get("status") == "done"
+            and " ".join(str(node.get("done_when") or "").split()) == same
+        ):
+            return (
+                f"{text} {sibling} closed done on this same check; {task} must add "
+                "something beyond it: bind a test of what is left (e.g. the goal's cases "
+                "test that imports the code), or call pursuit_step {} for other work."
+            )
+    return text
 
 
 def _escalation(task: str, count: int) -> str:
@@ -4091,7 +4117,7 @@ def make_step_tool() -> Any:
                 if (await _run_check(new_check, root, DEFAULT_CHECK_TIMEOUT))[0] == 0:
                     return _step_result(
                         f"pursuit_step: no new route for {task}, which stays as it is — "
-                        + _already_passes(new_check)
+                        + _already_passes(new_check, task, _tree_nodes(root))
                     )
                 successor, spawned = _spawn(task, record, notes, done_when, root)
                 if successor is None:
@@ -4160,7 +4186,8 @@ def make_step_tool() -> Any:
             # made pass.
             if (await _run_check(done_when, root, DEFAULT_CHECK_TIMEOUT))[0] == 0:
                 return _step_result(
-                    f"pursuit_step: {task} not opened — " + _already_passes(done_when)
+                    f"pursuit_step: {task} not opened — "
+                    + _already_passes(done_when, task, _tree_nodes(root))
                 )
             argv = ["open", task, "--criteria", criteria, "--done-when", done_when]
             if scope:

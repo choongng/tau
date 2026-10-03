@@ -2899,6 +2899,74 @@ async def test_pursuit_step_will_not_open_a_task_whose_check_already_passes(
     assert _pursuit_calls(fake_beagle, "open") == [] and _runs(fake_tau) == []
 
 
+def _part_on_a_passing_check(fake: Path, project: Path, container: str) -> None:
+    """T0010 ready under `container`, beside T0009 done on the same check."""
+    (project / "done.txt").write_text("done by T0009")
+    nodes = [
+        {"id": "T0001", "status": "open", "container": True},
+        {"id": "T0007", "parent": "T0001", "status": "open", "container": True},
+        {
+            "id": "T0009",
+            "parent": container,
+            "status": "done",
+            "done_when": "grep -q  done\tdone.txt",
+        },
+        {"id": "T0010", "parent": container, "status": "pending", "done_when": ""},
+    ]
+    (fake / "tree.out").write_text(json.dumps({"goal": "Ship it", "nodes": nodes}))
+    ready = {"open": [], "ready": [{"id": "T0010", "title": "Re-run"}], "ready_total": 1}
+    (fake / "next.out").write_text(json.dumps(ready))
+    record = {"id": "T0010", "title": "Re-run", "intent": "confirm", "status": "pending"}
+    (fake / "show.out").write_text(json.dumps({**record, "done_when": ""}))
+
+
+@pytest.mark.anyio
+async def test_already_passes_on_a_container_part_names_the_done_sibling(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Run R09: T0010 sat beside T0009, done on the same check, and was told to
+    # abandon itself as a duplicate, which T0058 refuses for a container's part.
+    project = _pursuit_project(tmp_path)
+    monkeypatch.chdir(project)
+    _part_on_a_passing_check(fake_beagle, project, "T0007")
+    runtime, _ = _bound(tmp_path)
+
+    result = await _tool(runtime, "pursuit_step").execute(
+        "c1", {"task": "T0010", "criteria": "it runs", "done_when": "grep -q done done.txt"}
+    )
+
+    assert "already passes" in result.text and "abandon=" not in result.text
+    assert "T0009 closed done on this same check" in result.text
+    assert "pursuit_step {} for other work" in result.text
+    assert _pursuit_calls(fake_beagle, "open") == [] and _runs(fake_tau) == []
+
+
+@pytest.mark.anyio
+async def test_already_passes_on_a_root_child_keeps_the_abandon_hint(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project = _pursuit_project(tmp_path)
+    monkeypatch.chdir(project)
+    _part_on_a_passing_check(fake_beagle, project, "T0001")
+    runtime, _ = _bound(tmp_path)
+
+    result = await _tool(runtime, "pursuit_step").execute(
+        "c1", {"task": "T0010", "criteria": "it runs", "done_when": "grep -q done done.txt"}
+    )
+
+    assert "already passes" in result.text and "abandon=" in result.text
+    assert "closed done on this same check" not in result.text
+    assert _pursuit_calls(fake_beagle, "open") == [] and _runs(fake_tau) == []
+
+
 def _audit_due(fake: Path) -> None:
     ready = {"open": [], "ready": [{"id": "T0005", "title": "Impl"}], "ready_total": 1}
     (fake / "next.out").write_text(json.dumps({**ready, "audit_due": {"closes": ["T0002"]}}))
