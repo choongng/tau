@@ -2938,6 +2938,26 @@ def _scope_problem(scope: list[str]) -> str | None:
     )
 
 
+_SCOPE_WALK_SKIP = frozenset({".git", ".beagle", "__pycache__", ".venv", "node_modules"})
+_SCOPE_WALK_LIMIT = 2000
+
+
+def _scope_dir_files(root: Path, rel: str) -> list[str]:
+    """The files under a scope directory, relative to root, bounded and sorted."""
+    found: list[str] = []
+    for dirpath, dirnames, filenames in os.walk(root / rel):
+        dirnames[:] = sorted(d for d in dirnames if d not in _SCOPE_WALK_SKIP)
+        for name in sorted(filenames):
+            found.append(Path(dirpath, name).relative_to(root).as_posix())
+            if len(found) >= _SCOPE_WALK_LIMIT:
+                return found
+    return found
+
+
+def _first_few(paths: list[str], few: int = 5) -> list[str]:
+    return paths if len(paths) <= few else [*paths[:few], f"{len(paths) - few} more"]
+
+
 def _oracle_with_code_problem(scope: list[str], goal: Path) -> str | None:
     """Why a scope writes known answers beside the code they judge, or None.
 
@@ -2947,14 +2967,23 @@ def _oracle_with_code_problem(scope: list[str], goal: Path) -> str | None:
     restored before each check, so it is no oracle the worker can bend.
     """
     locked = set(_locked(goal))
+    root = goal.parent.parent
+    entries: list[str] = []
+    for rel in scope:
+        entries.append(rel)
+        # Run R09: scope src/, tests/ held tests/cases.json beside src/itc/*.py,
+        # and a directory entry has neither suffix, so it is judged by its files.
+        if (root / rel).is_dir():
+            entries.extend(_scope_dir_files(root, rel.rstrip("/")))
     data = [
         rel
-        for rel in scope
+        for rel in entries
         if _is_test_path(rel.rstrip("/"))
         and Path(rel.rstrip("/")).suffix not in {"", ".py"}
         and rel.rstrip("/") not in locked
     ]
-    source = [rel for rel in scope if rel.endswith(".py") and not _is_test_path(rel)]
+    source = [rel for rel in entries if rel.endswith(".py") and not _is_test_path(rel)]
+    data, source = _first_few(list(dict.fromkeys(data))), _first_few(list(dict.fromkeys(source)))
     if not data or not source:
         return None
     return (

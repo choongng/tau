@@ -3306,6 +3306,76 @@ async def test_step_refuses_a_scope_mixing_known_answer_data_with_source(
     assert len(_pursuit_calls(fake_beagle, "open")) == 1
 
 
+def _r09_project(tmp_path: Path) -> Path:
+    project = _pursuit_project(tmp_path)
+    (project / "src" / "itc").mkdir(parents=True)
+    (project / "src" / "itc" / "clock.py").write_text("")
+    (project / "tests").mkdir(exist_ok=True)
+    (project / "tests" / "cases.json").write_text("[]")
+    return project
+
+
+@pytest.mark.anyio
+async def test_step_refuses_directory_scopes_holding_unlocked_data_and_source(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project = _r09_project(tmp_path)
+    monkeypatch.chdir(project)
+    _ready_task(fake_beagle)
+    runtime, _ = _bound(tmp_path)
+    arguments = {
+        "task": "T0002",
+        "criteria": "the clocks pass the cases",
+        "done_when": "grep -q done done.txt",
+        "scope": ["src/", "tests/"],
+    }
+
+    refused = await _tool(runtime, "pursuit_step").execute("c1", arguments)
+
+    assert "not opened" in refused.text
+    assert "tests/cases.json" in refused.text
+    assert "src/itc/clock.py" in refused.text
+    assert _pursuit_calls(fake_beagle, "open") == []
+    assert _runs(fake_tau) == []
+
+    store = project / ".beagle" / "locked" / "tests"
+    store.mkdir(parents=True)
+    (store / "cases.json").write_text("[]")
+    passed = await _tool(runtime, "pursuit_step").execute("c2", arguments)
+
+    assert "known-answer data" not in passed.text
+    assert len(_pursuit_calls(fake_beagle, "open")) == 1
+
+
+@pytest.mark.anyio
+async def test_step_accepts_a_source_directory_alone(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project = _r09_project(tmp_path)
+    monkeypatch.chdir(project)
+    _ready_task(fake_beagle)
+    runtime, _ = _bound(tmp_path)
+    arguments = {
+        "task": "T0002",
+        "criteria": "the clocks tick",
+        "done_when": "grep -q done done.txt",
+        "scope": ["src/"],
+    }
+
+    passed = await _tool(runtime, "pursuit_step").execute("c1", arguments)
+
+    assert "known-answer data" not in passed.text
+    assert len(_pursuit_calls(fake_beagle, "open")) == 1
+
+
 R08_IMPORT = 'python3 -c "from itc.interval_tree_clocks import IntervalTreeClock"'
 
 
