@@ -2485,6 +2485,30 @@ def _unfinished(nodes: list[dict[str, Any]]) -> list[str] | None:
     return left or [f"- {roots[0].get('id')} — {roots[0].get('title', '')} (not closed)"]
 
 
+def _setup_abandonable(task: str, nodes: list[dict[str, Any]]) -> bool:
+    """Whether `task` is a setup milestone (by `_setup_milestone`) never opened.
+
+    Run R10 founded with "Setup beagle pursuit infrastructure - ..." as T0002,
+    ordered every later milestone behind it, and had no way to drop it: each
+    step named `.beagle/` and was refused, and so was abandoning a milestone.
+    Never opened: it is pending and none of its children left pending.
+    """
+    node = next((n for n in nodes if str(n.get("id")) == task), None)
+    if node is None or node.get("status") != "pending":
+        return False
+    if _setup_milestone([str(node.get("title") or "")]) is None:
+        return False
+    return all(n.get("status") == "pending" for n in nodes if str(n.get("parent") or "") == task)
+
+
+def _setup_abandon_route(task: str) -> str:
+    """The abandon call that drops `task`, a never-opened setup milestone."""
+    return (
+        f" If this task only sets beagle up, founding did that: pursuit_step "
+        f'task="{task}", abandon="setup: founding did it".'
+    )
+
+
 def _abandon_problem(task: str, why: str, nodes: list[dict[str, Any]]) -> str | None:
     """Why the driver may not abandon `task` for `why`, or None.
 
@@ -2514,6 +2538,8 @@ def _abandon_problem(task: str, why: str, nodes: list[dict[str, Any]]) -> str | 
         # as "a milestone" four times, with no other way to drop it.
         return None
     if roots and parent.get(task) == roots[0]:
+        if _setup_abandonable(task, nodes):
+            return None
         return (
             f"pursuit_step: {task} not abandoned — it is a milestone, and a milestone is "
             "the goal's. Split it with pursuit_plan, or give it a new route with "
@@ -3067,15 +3093,18 @@ def _bare_operators(command: str) -> list[str]:
         return []
 
 
-def _scope_problem(scope: list[str]) -> str | None:
+def _scope_problem(
+    scope: list[str], task: str = "", nodes: list[dict[str, Any]] | None = None
+) -> str | None:
     """Why a task's scope is wrong, or None: it names beagle's own store."""
     store = [path for path in scope if Path(path).parts[:1] == (".beagle",)]
     if not store:
         return None
+    way_out = _setup_abandon_route(task) if _setup_abandonable(task, nodes or []) else ""
     return (
         f"scope names {store[0]}, beagle's own record of the pursuit. pursuit_found "
         "already set the pursuit up, and the tools keep its record; a task's work and "
-        "scope are in the project. Name the project paths the task will touch."
+        "scope are in the project. Name the project paths the task will touch." + way_out
     )
 
 
@@ -4431,7 +4460,7 @@ def make_step_tool() -> Any:
                 # already passed, and left a successor with no criteria.
                 route_scope = scope or _strings(record.get("scope"))
                 scoped = (
-                    _scope_problem(route_scope)
+                    _scope_problem(route_scope, task, nodes)
                     or _oracle_with_code_problem(route_scope, goal)
                     or _import_scope_problem(done_when or old_check, route_scope, root)
                 )
@@ -4499,7 +4528,7 @@ def make_step_tool() -> Any:
             if prose is not None:
                 return _step_result(f"pursuit_step: {task} not opened — {prose}")
             scoped = (
-                _scope_problem(scope)
+                _scope_problem(scope, task, nodes)
                 or _oracle_with_code_problem(scope, goal)
                 or _import_scope_problem(done_when, scope, root)
             )

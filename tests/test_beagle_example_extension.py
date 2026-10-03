@@ -5760,6 +5760,81 @@ async def test_abandon_problem_refuses_root(
     assert "T0001 not abandoned — it is the root" in result.text
 
 
+#: Run R10's founding: a setup milestone T0002 every later milestone waits on.
+R10_SETUP = "Setup beagle pursuit infrastructure - configure gates and checks"
+
+
+def _r10_nodes(
+    status: str = "pending", title: str = R10_SETUP, *children: str
+) -> list[dict[str, Any]]:
+    return [
+        {"id": "T0001", "parent": "", "title": "ITC", "status": "pending"},
+        {"id": "T0002", "parent": "T0001", "title": title, "status": status},
+        {"id": "T0003", "parent": "T0001", "title": "Implement core clock", "status": "pending"},
+        *(
+            {"id": f"T00{10 + i}", "parent": "T0002", "title": "part", "status": child}
+            for i, child in enumerate(children)
+        ),
+    ]
+
+
+@pytest.mark.anyio
+async def test_never_opened_setup_milestone_can_be_abandoned(
+    tmp_path: Path, beagle: Path, fake_beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # R10: T0002 was refused at every step, and its abandon as "a milestone".
+    problem = _module()._abandon_problem
+    assert problem("T0002", "setup: founding did it", _r10_nodes()) is None
+    assert (
+        problem("T0002", "setup: founding did it", _r10_nodes("pending", R10_SETUP, "pending"))
+        is None
+    )
+
+    monkeypatch.chdir(_pursuit_project(tmp_path))
+    _ready_task(fake_beagle)
+    (fake_beagle / "tree.out").write_text(json.dumps({"nodes": _r10_nodes()}))
+    runtime, _ = _bound(tmp_path)
+
+    result = await _tool(runtime, "pursuit_step").execute(
+        "c1", {"task": "T0002", "abandon": "setup: founding did it"}
+    )
+
+    assert "not abandoned" not in result.text
+    assert [c[0] for c in _pursuit_calls(fake_beagle, "close")] == ["T0002"]
+
+
+def test_worked_or_goal_milestone_abandon_is_still_refused() -> None:
+    problem = _module()._abandon_problem
+    why = "setup: founding did it"
+    refused = {
+        "opened": _r10_nodes("open"),
+        "done": _r10_nodes("done"),
+        "worked child": _r10_nodes("pending", R10_SETUP, "pending", "open"),
+        "done child": _r10_nodes("pending", R10_SETUP, "done"),
+        "goal work": _r10_nodes("pending", "Implement core clock operations"),
+    }
+    for case, nodes in refused.items():
+        text = problem("T0002", why, nodes)
+        assert text is not None and "it is a milestone" in text, case
+    assert "it is the root" in (problem("T0001", why, _r10_nodes()) or "")
+
+
+def test_dot_beagle_scope_refusal_names_the_abandon_route() -> None:
+    scope_problem = _module()._scope_problem
+    route = 'pursuit_step task="T0002", abandon="setup: founding did it"'
+
+    setup = scope_problem([".beagle/gates.toml"], "T0002", _r10_nodes())
+    opened = scope_problem([".beagle/gates.toml"], "T0002", _r10_nodes("open"))
+    goal = scope_problem(
+        [".beagle/gates.toml"], "T0002", _r10_nodes("pending", "Implement core clock operations")
+    )
+
+    assert setup is not None and route in setup and "scope names .beagle/gates.toml" in setup
+    for other in (opened, goal, scope_problem([".beagle/gates.toml"])):
+        assert other is not None and "abandon" not in other
+    assert scope_problem(["src/itc.py"], "T0002", _r10_nodes()) is None
+
+
 #: Run R06's T0002 and its successor T0008, as `pursuit show` gives them.
 R06_PREDECESSOR = {
     "id": "T0002",
