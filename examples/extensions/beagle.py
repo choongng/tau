@@ -1882,8 +1882,12 @@ def _references_note(index: Mapping[str, Any], root: Path) -> str:
     )
 
 
-def _references_brief(root: Path) -> str:
-    """The worker brief's part from `references/index.json`: request and references."""
+def _references_brief(root: Path, context_only: bool = False) -> str:
+    """The worker brief's part from `references/index.json`: request and references.
+
+    `context_only` is for a data task: run R09's T0002 brief ended on the
+    request verbatim, and its worker set out to implement the library.
+    """
     try:
         index = json.loads((root / REFERENCES_DIR / REFERENCES_INDEX).read_text(encoding="utf-8"))
     except (OSError, ValueError):
@@ -1903,7 +1907,13 @@ def _references_brief(root: Path) -> str:
         )
     request = str(index.get("request") or "").strip()
     if request:
-        parts.append(f"The user's original request, verbatim:\n<<<\n{request}\n>>>")
+        lead = (
+            "The user's original request, as context only; your task is the one above, "
+            "not this request"
+            if context_only
+            else "The user's original request, verbatim"
+        )
+        parts.append(f"{lead}:\n<<<\n{request}\n>>>")
     return "\n\n".join(parts)
 
 
@@ -2993,6 +3003,30 @@ def _oracle_with_code_problem(scope: list[str], goal: Path) -> str | None:
     )
 
 
+def _data_task(scope: list[str], goal: Path, check: str, locks: list[str]) -> bool:
+    """Whether a task writes known-answer data and its cases test, not the code.
+
+    Judged as `_oracle_with_code_problem` judges a scope's entries, with a
+    directory judged by its files; a scope holding no data yet counts when its
+    check names a cases or data test.
+    """
+    root = goal.parent.parent
+    entries: list[str] = []
+    for rel in scope:
+        entries.append(rel)
+        if (root / rel).is_dir():
+            entries.extend(_scope_dir_files(root, rel.rstrip("/")))
+    if any(rel.endswith(".py") and not _is_test_path(rel) for rel in entries):
+        return False
+    if locks:
+        return True
+    data = any(
+        _is_test_path(rel.rstrip("/")) and Path(rel.rstrip("/")).suffix not in {"", ".py"}
+        for rel in entries
+    )
+    return data or bool(re.search(r"test_\w*(case|data)", check))
+
+
 def _python_c_code(argv: list[str]) -> str | None:
     """The code of a `python -c '...'` argv, or None for any other command."""
     if not Path(argv[0]).name.startswith("python") or "-c" not in argv[1:]:
@@ -3400,6 +3434,28 @@ def _implementation_in_tests(root: Path, changed: list[str]) -> list[str]:
                     continue
                 found.append(f"{rel}: def {node.name}")
     return found
+
+
+def _implementation_in_tests_lead(root: Path, scope: list[str]) -> str:
+    """The line a not-done result leads with when its worker wrote code into tests/.
+
+    Run R09: W4 wrote the library to tests/itc/ once src/ was refused, and the
+    not-done results only listed tests/itc/clock.py among the changed files.
+    """
+    changed = [
+        rel for rel in _changed_files(root) if _in_scope(rel, scope) and (root / rel).is_file()
+    ]
+    by_file: dict[str, list[str]] = {}
+    for where in _implementation_in_tests(root, changed):
+        rel, _, name = where.partition(": ")
+        by_file.setdefault(rel, []).append(name)
+    if not by_file:
+        return ""
+    found = "; ".join(f"{rel}: {', '.join(names)}" for rel, names in by_file.items())
+    return (
+        f"The sub-agent wrote implementation into tests/ ({found}), which is not this "
+        "task's work.\n\n"
+    )
 
 
 def _changed_files(root: Path) -> list[str]:
@@ -4332,7 +4388,15 @@ def make_step_tool() -> Any:
             if rc != 0:
                 return _step_result(f"pursuit_step: `beagle pursuit brief {task}` failed:\n{brief}")
             brief = _without_beagle_habits(_without_commit_steps(brief))
-        references = _references_brief(root)
+        references = _references_brief(
+            root,
+            _data_task(
+                scope or _strings(record.get("scope")),
+                goal,
+                check,
+                _pending_locks(goal, task) + _strings(arguments.get("locks")),
+            ),
+        )
         if references:
             brief = f"{brief}\n\n{references}"
         if notes:
@@ -4416,7 +4480,8 @@ def make_step_tool() -> Any:
                     root,
                     task,
                     scope,
-                    f"pursuit_step: {task} stays open — {run.problem}\n\n"
+                    _implementation_in_tests_lead(root, scope)
+                    + f"pursuit_step: {task} stays open — {run.problem}\n\n"
                     f'Call pursuit_step with task="{task}" to send it again.',
                 )
             report, shown = run.report, run.shown_report
@@ -4477,7 +4542,8 @@ def make_step_tool() -> Any:
                 root,
                 task,
                 scope,
-                f"{route}{undid}{task} — {title}: the check still fails after {attempts} "
+                _implementation_in_tests_lead(root, scope)
+                + f"{route}{undid}{task} — {title}: the check still fails after {attempts} "
                 f"sub-agent run(s), so the task {state}.\n\n`{check}` exit {verdict[0]}:\n"
                 f"{verdict[1][-CHECK_TAIL_CHARS:]}\n\nLast report:\n{shown}\n\n"
                 f'Next: pursuit_step with task="{task}" and notes saying what to fix. If '
@@ -4498,7 +4564,8 @@ def make_step_tool() -> Any:
                 root,
                 task,
                 scope,
-                f"{route}{undid}{task} — {title}: the check passes, but {why}; the task "
+                _implementation_in_tests_lead(root, scope)
+                + f"{route}{undid}{task} — {title}: the check passes, but {why}; the task "
                 f"{state}, since a done close needs a check shown to refuse.\n\n"
                 f"`prove` said:\n{proof.text}\n\nLast report:\n{shown}\n\n"
                 + (
@@ -5024,12 +5091,19 @@ def make_worker_scope_guard() -> Any:
         except Exception:  # noqa: BLE001 - fail open, never block on a guard bug
             return None
         rel = target.relative_to(root) if target != root else target
+        source = (
+            # Run R09: refused src/, W4 wrote the library to tests/itc/ instead.
+            " The implementation does not go under tests/ either: it is a later "
+            "task's work, so report it instead."
+            if rel.suffix == ".py" and not _is_test_path(rel.as_posix())
+            else ""
+        )
         return ToolCallHookResult(
             block=True,
             reason=(
                 f"refusing to write {rel}: it is outside {task}'s scope "
                 f"({', '.join(scope)}); name it in your report as follow-up. Scratch "
-                "files go in /tmp."
+                f"files go in /tmp.{source}"
             ),
         )
 

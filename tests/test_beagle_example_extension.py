@@ -5605,6 +5605,89 @@ async def test_implementation_in_tests_lets_small_helpers_through(
 
 
 @pytest.mark.anyio
+async def test_not_done_step_names_implementation_written_under_tests(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # R09 W4: refused src/, it wrote the library to tests/itc/; nothing said so.
+    project = _git_project(tmp_path, monkeypatch)
+    monkeypatch.chdir(project)
+    writes = {"tests/pkg/clock.py": "class Clock:\n    pass\n"}
+    monkeypatch.setenv("FAKE_TAU_WRITES", json.dumps(writes))
+    _ready_task(fake_beagle, "grep -q out tests/cases.json")
+    runtime, _ = _bound(tmp_path)
+
+    result = await _tool(runtime, "pursuit_step").execute(
+        "c1",
+        {
+            "task": "T0002",
+            "criteria": "the known answers are written",
+            "done_when": "grep -q out tests/cases.json",
+            "scope": ["tests/"],
+        },
+    )
+
+    assert "stays open" in result.text
+    assert result.text.startswith(
+        "The sub-agent wrote implementation into tests/ (tests/pkg/clock.py: class Clock), "
+        "which is not this task's work."
+    )
+
+
+@pytest.mark.anyio
+async def test_worker_scope_refusal_of_source_says_not_under_tests_either(
+    tmp_path: Path, beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runtime = _scoped_worker(tmp_path, monkeypatch, scope="tests/")
+    write = _tool_with_hooks(runtime, "write")
+
+    source = await write.execute("c1", {"path": "src/x.py", "content": "class X: ...\n"})
+    doc = await write.execute("c2", {"path": "docs/x.md", "content": "x\n"})
+
+    either = "The implementation does not go under tests/ either: it is a later task's work"
+    assert "refusing to write src/x.py: it is outside T0003's scope (tests/)" in source.text
+    assert either in source.text
+    assert "refusing to write docs/x.md" in doc.text and either not in doc.text
+
+
+@pytest.mark.anyio
+async def test_brief_for_a_data_task_gives_the_request_as_context_only(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # R09 T0002: a cases task's brief ended on the request, and its worker implemented it.
+    project = _pursuit_project(tmp_path)
+    monkeypatch.chdir(project)
+    _fake_web(monkeypatch, {})
+    _module()._fetch_references(project, ITC_PROMPT)
+    _ready_task(fake_beagle, "grep -q out tests/cases.json")
+    runtime, _ = _bound(tmp_path)
+
+    await _tool(runtime, "pursuit_step").execute(
+        "c1",
+        {
+            "task": "T0002",
+            "criteria": "the known answers are written",
+            "done_when": "grep -q out tests/cases.json",
+            "scope": CASES_SCOPE,
+        },
+    )
+
+    brief = _runs(fake_tau)[0]["stdin"]
+    assert (
+        "The user's original request, as context only; your task is the one above, not "
+        f"this request:\n<<<\n{ITC_PROMPT}\n>>>"
+    ) in brief
+    assert "The user's original request, verbatim" not in brief
+
+
+@pytest.mark.anyio
 async def test_task_worker_brief_carries_the_no_beagle_note(
     tmp_path: Path,
     beagle: Path,
