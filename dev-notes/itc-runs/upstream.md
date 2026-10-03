@@ -122,3 +122,4 @@ Nothing for beagle. The run never reached beagle: tau's founding tool refused a 
   of the run. `init` could print "commit .beagle/*.toml, memory-rubric.md
   and .gitignore", or the gate could ignore beagle's own config until
   the first commit. Priority: low.
+- **`close --outcome abandoned` has no way to name the task that holds the work.** tau now refuses "duplicate of Tnnnn" abandons of a container's part (T0058), because beagle keeps an abandoned leaf with no successor as accountable and the container stalls for good. A `--duplicate-of T` that records T as the heir (as `spawn` does) would let a true duplicate be dropped without stalling its container. Priority: medium.
