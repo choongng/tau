@@ -2895,3 +2895,129 @@ async def test_a_long_goal_statement_is_cut_to_a_root_task_title(
     title = add[2]
     assert len(title) <= 200 and title.endswith("…")
     assert add[add.index("--intent") + 1] == statement.strip()
+
+
+# -- R01: a founded driver steps, and leaves references to its workers ---------
+
+
+@pytest.mark.anyio
+async def test_founded_driver_dispatch_refused(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # R01: founded, the 9B driver dispatched twice instead of stepping, and
+    # neither dispatch opened or closed a task.
+    monkeypatch.chdir(_pursuit_project(tmp_path))
+    (fake_beagle / "next.out").write_text(json.dumps({"open": [], "ready": ["T0003"]}))
+    runtime, _ = _bound(tmp_path)
+
+    result = await _tool(runtime, "pursuit_dispatch").execute(
+        "c1", {"brief": "Implement the interval tree clock"}
+    )
+
+    assert _runs(fake_tau) == []
+    assert "refused, nothing was spawned" in result.text
+    assert "pursuit_step with task=T0003" in result.text
+
+
+@pytest.mark.anyio
+async def test_unfounded_dispatch_runs(
+    tmp_path: Path, beagle: Path, fake_tau: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    monkeypatch.chdir(project)
+    runtime, _ = _bound(tmp_path)
+
+    result = await _tool(runtime, "pursuit_dispatch").execute("c1", {"brief": "Write notes"})
+
+    assert len(_runs(fake_tau)) == 1
+    assert "[pursuit_dispatch] step-executor" in result.text and "refused" not in result.text
+
+
+@pytest.mark.anyio
+async def test_founded_driver_reference_read_refused(
+    tmp_path: Path, beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project = _pursuit_project(tmp_path)
+    monkeypatch.chdir(project)
+    paper = tmp_path / "refs" / "itc.pdf"
+    runtime, session = _bound(tmp_path)
+    bash, read = _tool_with_hooks(runtime, "bash"), _tool_with_hooks(runtime, "read")
+    fetch = _tool_with_hooks(runtime, "web_fetch")
+    await runtime.emit_session_start("startup")
+
+    refused = [
+        await bash.execute("c1", {"command": "curl -sL https://example.org/itc.pdf -o itc.pdf"}),
+        await bash.execute("c2", {"command": "cd /tmp && wget http://example.org/itc"}),
+        await bash.execute(
+            "c3", {"command": "python3 -c 'import urllib.request as u; u.urlopen(\"https://x\")'"}
+        ),
+        await bash.execute(
+            "c4", {"command": "python3 - <<'EOF'\nimport requests\nrequests.get('https://x')\nEOF"}
+        ),
+        await read.execute("c5", {"path": str(paper)}),
+        await read.execute("c6", {"path": "../refs/itc.pdf"}),
+        await fetch.execute("c7", {"url": "https://example.org/itc"}),
+    ]
+    allowed = [
+        await read.execute("c8", {"path": "src/itc.py"}),
+        await read.execute("c9", {"path": str(project / ".beagle" / "pursuit.toml")}),
+        await read.execute("c10", {"path": str(beagle / "plugins")}),
+        await read.execute("c11", {"path": str(tmp_path / "agents" / "x.md")}),
+        await bash.execute("c12", {"command": "curl --version && echo https://x"}),
+        await bash.execute("c13", {"command": "uv run pytest -q"}),
+    ]
+    session.session_id = "subagent-session"  # an in-process subagent's own runtime
+    nested = await read.execute("c14", {"path": str(paper)})
+    session.session_id = "session-1"
+    monkeypatch.setenv("BEAGLE_TAU_DRIVER_EDITS", "1")
+    opted_out = await read.execute("c15", {"path": str(paper)})
+
+    for result in refused:
+        assert "from the driving session" in result.text
+        assert "references are read by the worker that a pursuit_step dispatches" in result.text
+    assert [r.text for r in allowed] == ["ran"] * len(allowed)
+    assert [nested.text, opted_out.text] == ["ran"] * 2
+
+
+@pytest.mark.anyio
+async def test_worker_reference_read_allowed(
+    tmp_path: Path, beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(_pursuit_project(tmp_path))
+    monkeypatch.setenv("BEAGLE_TAU_WORKER", "1")
+    runtime, _ = _bound(tmp_path)
+    await runtime.emit_session_start("startup")
+
+    fetched = await _tool_with_hooks(runtime, "bash").execute(
+        "c1", {"command": "curl -sL https://example.org/itc.pdf -o itc.pdf"}
+    )
+    read = await _tool_with_hooks(runtime, "read").execute(
+        "c2", {"path": str(tmp_path / "refs" / "itc.pdf")}
+    )
+
+    assert [fetched.text, read.text] == ["ran"] * 2
+
+
+@pytest.mark.anyio
+async def test_unfounded_driver_may_fetch_references(
+    tmp_path: Path, beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    monkeypatch.chdir(project)
+    runtime, _ = _bound(tmp_path)
+    await runtime.emit_session_start("startup")
+
+    fetched = await _tool_with_hooks(runtime, "bash").execute(
+        "c1", {"command": "curl -sL https://example.org/itc.pdf"}
+    )
+    read = await _tool_with_hooks(runtime, "read").execute(
+        "c2", {"path": str(tmp_path / "refs" / "itc.pdf")}
+    )
+
+    assert [fetched.text, read.text] == ["ran"] * 2

@@ -122,6 +122,7 @@ import re
 import shlex
 import shutil
 import subprocess
+import tempfile
 import tomllib
 import uuid
 from collections.abc import Callable, Mapping
@@ -1317,6 +1318,36 @@ async def _run_worker(
     )
 
 
+def _founded_dispatch_refusal(cwd: Path) -> str | None:
+    """Why the driver of a founded pursuit may not dispatch, or None.
+
+    R01's 9B driver founded its pursuit and then called pursuit_dispatch
+    twice, not pursuit_step: a dispatch opens and closes no task, so 45 of
+    58 minutes left nothing in the tree. A worker never has the tool.
+    """
+    if _is_worker():
+        return None
+    goal = _find_goal(cwd)
+    if goal is None:
+        return None
+    task = ""
+    with contextlib.suppress(Exception):  # the refusal stands without a task id
+        rc, ready, _raw = _next_ready(goal.parent.parent)
+        if rc in (0, 3) and isinstance(ready, dict):
+            task = (_ids(ready.get("open")) + _ids(ready.get("ready")) or [""])[0]
+    then = (
+        f"Call pursuit_step with task={task}: it opens {task}, has a sub-agent do it, runs "
+        "its check and closes it."
+        if task
+        else "Call pursuit_step with no arguments: it shows the next ready task."
+    )
+    return (
+        "pursuit_dispatch: refused, nothing was spawned. This pursuit is founded, and its "
+        "work goes through pursuit_step; a dispatch opens and closes no task, so nothing "
+        f"it does is recorded. {then}"
+    )
+
+
 def make_dispatch() -> Any:
     """Build the `pursuit_dispatch` tool executor."""
 
@@ -1340,6 +1371,9 @@ def make_dispatch() -> Any:
             if isinstance(cwd_raw, str) and cwd_raw
             else _SEEN_CWD or Path.cwd()
         )
+        refusal = _founded_dispatch_refusal(cwd)
+        if refusal is not None:
+            return _make_dispatch_result(refusal)
 
         model = _worker_model(arguments.get("model"))
         provider = _worker_provider(arguments.get("provider"))
@@ -3397,6 +3431,112 @@ def make_driver_pursuit_guard() -> Any:
     return guard
 
 
+#: Programs that fetch a URL, and the Python modules a script fetches one with.
+_URL_FETCHERS = frozenset({"curl", "wget", "lynx", "w3m", "links", "elinks", "aria2c", "http"})
+_URL = re.compile(r"https?://")
+_SCRIPT_FETCH = re.compile(r"\b(?:urllib|requests|httpx|aiohttp|urlopen)\b")
+
+
+def _url_fetch(argv: list[str]) -> str | None:
+    """The program in one simple command that fetches an http(s) URL, or None."""
+    name = Path(argv[0]).name
+    if name in _URL_FETCHERS and any(_URL.search(arg) for arg in argv[1:]):
+        return name
+    if name.startswith("python"):
+        script = " ".join(argv[1:])
+        if _SCRIPT_FETCH.search(script) and _URL.search(script):
+            return f"a {name} script"
+    return None
+
+
+def _bash_url_fetch(command: str) -> str | None:
+    """What in a bash command fetches an http(s) URL, or None."""
+    found = _bash_find(command, _url_fetch)
+    if found is not None:
+        return found
+    # A heredoc script's body is not in the shell words `_bash_find` reads.
+    python = _bash_find(command, lambda a: a[0] if Path(a[0]).name.startswith("python") else None)
+    if python is not None and _SCRIPT_FETCH.search(command) and _URL.search(command):
+        return f"a {Path(python).name} script"
+    return None
+
+
+def _web_tool(name: str) -> bool:
+    lowered = name.lower()
+    return "fetch" in lowered or lowered.startswith(("web", "browse"))
+
+
+def _driver_readable_dirs() -> list[Path]:
+    """Outside the project, where the driver still reads: Tau's and beagle's own files."""
+    tau_home = os.environ.get("TAU_HOME")
+    dirs = [
+        Path(tau_home).expanduser() if tau_home else Path.home() / ".tau",
+        Path.home() / ".agents",
+        AGENTS_DIR,
+        Path(tempfile.gettempdir()) / "tau-buffers",
+        BEAGLE,
+    ]
+    dirs += [d for d in (_PLUGIN_ROOT, _DRIVERS_DIR) if d is not None]
+    return [_resolved(d) for d in dirs]
+
+
+def make_driver_reference_guard() -> Any:
+    """Build the `tool_call` guard that leaves references to the workers.
+
+    The found-first gate keeps a driver from reading references before it
+    founds; R01's 9B driver founded and then fetched and read the ITC paper
+    itself, and what it read fed the spirals that followed. Once founded,
+    the host-started session may not fetch a URL (curl, wget, a Python
+    urllib or requests script, a web tool) or `read` a file outside the
+    project, Tau's and beagle's own files aside. A worker reads what its
+    task needs. Fails open.
+    """
+
+    async def guard(event: Any, context: ExtensionContext) -> ToolCallHookResult | None:
+        if os.environ.get(DRIVER_EDITS_ENV):
+            return None
+        try:
+            tool = event.tool_name
+            if _STARTED_SESSION is None or context.session_id != _STARTED_SESSION:
+                return None
+            args = event.arguments or {}
+            cwd = Path(context.cwd)
+            if tool == "bash":
+                found = _bash_url_fetch(str(args.get("command", "")))
+                what = f"fetch a URL with {found}" if found is not None else None
+            elif tool == "read":
+                target = _goal_path_from_args(args, cwd)
+                what = f"read {target}" if target is not None else None
+            elif _web_tool(tool):
+                what = f"use {tool}"
+            else:
+                return None
+            if what is None:
+                return None
+            goal = _find_goal(cwd)
+            if goal is None:
+                return None
+            if tool == "read":
+                root = _resolved(goal.parent.parent)
+                allowed = [root, *_driver_readable_dirs()]
+                if any(target == d or d in target.parents for d in allowed):
+                    return None
+        except Exception:  # noqa: BLE001 - fail open, never block on a guard bug
+            return None
+        return ToolCallHookResult(
+            block=True,
+            reason=(
+                f"refusing to {what} from the driving session: references are read by the "
+                "worker that a pursuit_step dispatches. Call pursuit_step, naming in its "
+                "notes the reference the task needs (its URL or path); the sub-agent reads "
+                "it. Files inside the project are yours to read. "
+                f"(If the user wants this session to read it, they set {DRIVER_EDITS_ENV}=1.)"
+            ),
+        )
+
+    return guard
+
+
 #: What beagle keeps under `.beagle/` as its record of the pursuit, and the
 #: cases this extension locks. Only beagle and this extension write them;
 #: the `*.toml` beside them is configuration, and editable.
@@ -4961,6 +5101,7 @@ def setup(tau: ExtensionAPI) -> None:
         )
         tau.on("tool_call", make_driver_edit_guard())
         tau.on("tool_call", make_driver_pursuit_guard())
+        tau.on("tool_call", make_driver_reference_guard())
 
     # 5. Enforce the pursuit ground truth on every tool call, and bridge
     #    beagle's Bash PreToolUse hooks onto the same seam.
