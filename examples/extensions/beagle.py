@@ -2416,9 +2416,14 @@ def make_found_tool(
             )
         # Run R03's driver, refused for a setup first milestone, sent the same
         # call fourteen times: what founding can repair itself, it repairs.
-        milestones, repairs = _repair_milestones(milestones)
+        given = milestones
+        milestones, repairs = _repair_milestones(given)
         if not milestones:
-            return _step_result(f"pursuit_found: nothing written — {repairs[0]}")
+            # Run R07's driver named only a setup milestone and was refused
+            # twelve times; the criteria it gave are milestones enough.
+            milestones, repairs = _milestones_from_criteria(given, criteria, repairs)
+            if not milestones:
+                return _step_result(f"pursuit_found: nothing written — {repairs[0]}")
         repaired = "".join(f"{note}\n\n" for note in repairs)
         delegated = arguments.get("user_delegated") is True
         if arguments.get("user_confirmed") is not True and not delegated:
@@ -2912,6 +2917,27 @@ def _repair_milestones(milestones: list[str]) -> tuple[list[str], list[str]]:
             f"{MAX_TASK_TITLE}, so it is now {short!r}, with the whole text after '::'."
         )
     return repaired, notes
+
+
+def _milestones_from_criteria(
+    dropped: list[str], criteria: list[str], refusal: list[str]
+) -> tuple[list[str], list[str]]:
+    """One milestone per criterion, for a milestone list that was only setup.
+
+    A criterion that is itself setup is left out. With none left, the list
+    comes back empty with `refusal`, the note `_repair_milestones` gave.
+    """
+    seeded = [f"{_task_title(c)}::{c}" for c in criteria if _setup_milestone([c]) is None]
+    milestones, notes = _repair_milestones(seeded) if seeded else ([], [])
+    if not milestones:
+        return [], refusal
+    named = ", ".join(repr(part.split(":", 1)[0].strip()) for part in dropped)
+    return milestones, [
+        f"Dropped the setup milestone {named}: founding is the setup, so it is not part "
+        "of the goal's work. That left none, so the milestones are now one per "
+        "criterion, each titled from it with the criterion after '::'.",
+        *notes,
+    ]
 
 
 def _check_argv(command: str, root: Path) -> list[str]:

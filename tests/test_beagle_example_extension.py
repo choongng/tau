@@ -2892,34 +2892,104 @@ def test_a_check_that_cannot_judge_the_work_is_refused(check: str, problem: str 
 
 
 @pytest.mark.anyio
-async def test_founding_refuses_when_every_milestone_sets_the_pursuit_up(
+async def test_founding_seeds_milestones_from_criteria_when_every_one_is_setup(
     tmp_path: Path, beagle: Path, fake_beagle: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     project = tmp_path / "project"
     project.mkdir()
     monkeypatch.chdir(project)
+    (fake_beagle / "add.out").write_text("T0001  Implement interval tree clocks\n")
     runtime, _ = _bound(tmp_path)
+    long = "Every public function of the itc package has a docstring and a test " * 2
     args = {
         "statement": "Implement interval tree clocks",
-        "criteria": ["`python3 -m pytest -q` exits 0"],
+        "criteria": ["`python3 -m pytest -q` exits 0", long.strip(), "set up beagle"],
         "user_confirmed": True,
     }
 
-    # With every milestone a setup one, nothing is left to found.
-    setup = await _tool(runtime, "pursuit_found").execute(
-        "c1", {**args, "milestones": ["setup", "init project"]}
-    )
+    # Only with every criterion setup too is nothing written.
     named = await _tool(runtime, "pursuit_found").execute(
-        "c2", {**args, "milestones": ["configure beagle::doctor and skills.toml"]}
+        "c1",
+        {
+            **args,
+            "criteria": ["set up beagle"],
+            "milestones": ["configure beagle::doctor and skills.toml"],
+        },
     )
 
-    assert "nothing written" in setup.text and "'setup'" in setup.text
-    assert "nothing written" in named.text
+    assert "nothing written" in named.text and "'configure beagle'" in named.text
     assert _calls(fake_beagle) == [] and not (project / ".beagle").exists()
+
+    # With every milestone a setup one, the criteria become the milestones.
+    setup = await _tool(runtime, "pursuit_found").execute(
+        "c2", {**args, "milestones": ["setup", "init project"]}
+    )
+
+    assert "Founded the pursuit" in setup.text
+    assert "Dropped the setup milestone 'setup', 'init project'" in setup.text
+    assert "one per criterion" in setup.text
+    module = _module()
+    [split] = _pursuit_calls(fake_beagle, "split")
+    assert split == [
+        "T0001",
+        "`python3 -m pytest -q` exits 0::`python3 -m pytest -q` exits 0",
+        f"{module._task_title(long)}::{long.strip()}",
+        "--ordered",
+    ]
+    assert all(len(p.split("::")[0]) <= module.MAX_TASK_TITLE for p in split[1:-1])
+
     assert _module()._setup_milestone(["package layout::pyproject.toml and src/"]) is None
     # Run 11 wrote `title: purpose`, and the purpose's words hid the title.
     run_11 = "setup beagle pursuit: configure gates, cadences, skills, and dispatch"
     assert _module()._setup_milestone([run_11]) is not None
+
+
+R07_FOUND = {
+    "statement": (
+        "Implement interval tree clocks — a logical clock for dynamic distributed systems "
+        "where cluster membership changes constantly — in modern Python, per the 2008 ACM "
+        "paper by Almeida, Baquero and Fonte and the ferd.ca reference notes."
+    ),
+    "criteria": [
+        "The package imports and exposes the interval tree clock API (create, join, leave, "
+        "tick, send, receive, compare, merge) and the underlying interval tree data structure."
+    ],
+    "milestones": [
+        "setup::Beagle pursuit setup and modern Python toolchain (uv/ruff/pytest) per "
+        "python-coding skill"
+    ],
+}
+
+
+@pytest.mark.anyio
+async def test_r07_setup_only_milestone_founds_from_its_criterion(
+    tmp_path: Path, beagle: Path, fake_beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # R07: mimo's only milestone was setup; founding refused it twelve times
+    # and the breaker ended the run at 44 s.
+    project = tmp_path / "project"
+    project.mkdir()
+    monkeypatch.chdir(project)
+    (fake_beagle / "add.out").write_text("T0001  Implement interval tree clocks\n")
+    runtime, _ = _bound(tmp_path, ui=False)
+    found = _tool(runtime, "pursuit_found")
+
+    asked = await found.execute("c1", {**R07_FOUND, "user_confirmed": False})
+
+    assert "nothing written —" not in asked.text
+    assert "print mode" in asked.text and "user_delegated=true" in asked.text
+    assert "one per criterion" in asked.text
+    assert _calls(fake_beagle) == [] and not (project / ".beagle").exists()
+
+    founded = await found.execute("c2", {**R07_FOUND, "user_delegated": True})
+
+    assert "Founded the pursuit" in founded.text
+    assert "Dropped the setup milestone 'setup'" in founded.text
+    [criterion] = R07_FOUND["criteria"]
+    title = _module()._task_title(criterion)
+    adds = _pursuit_calls(fake_beagle, "add")
+    assert adds[1:] == [[title, "--parent", "T0001", "--intent", criterion]]
+    assert _pursuit_calls(fake_beagle, "split") == []
 
 
 @pytest.mark.anyio
