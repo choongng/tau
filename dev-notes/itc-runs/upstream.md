@@ -90,3 +90,7 @@ in the per-run notes.
   done task's check can be retired" (L88, L115) could add "to remove a
   wait, use `depend … --drop`; to give up the task, close it abandoned".
   Priority: low.
+
+## R07
+
+Nothing for beagle. The run never reached beagle: tau's founding tool refused a milestone list that was only setup (tau T0054).
