@@ -1444,6 +1444,7 @@ async def test_pursuit_found_waits_for_the_user_then_roots_and_splits(
 
     unconfirmed = await found.execute("c1", {**args, "user_confirmed": False})
     assert "nothing written" in unconfirmed.text and "README documents usage" in unconfirmed.text
+    assert "ask the user to confirm" in unconfirmed.text and "print mode" not in unconfirmed.text
     assert not (project / ".beagle").exists() and _calls(fake_beagle) == []
 
     result = await found.execute("c2", {**args, "user_confirmed": True})
@@ -3972,6 +3973,74 @@ async def test_stop_gate_lets_a_finished_pursuit_and_a_worker_stop(
     worker, _ = await _print_run(tmp_path, project, stops=2)
 
     assert len(finished.calls) == len(all_leaves.calls) == len(worker.calls) == 1
+
+
+DELEGATING_PROMPT = (
+    "set this project up for beagle pursuit, and then implement it. use your judgement "
+    "to do the setup without further discussion."
+)
+
+
+def test_found_refusal_in_print_mode_quotes_the_prompt_and_leads_with_delegation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # R05: mimo took "ask the user to confirm" from a refusal whose delegation
+    # branch came last, in `tau -p`, and the run ended after 18 s.
+    module = _module()
+    monkeypatch.setattr(module, "_LAST_PROMPT", DELEGATING_PROMPT + " x" * 400)
+    text = module._unconfirmed_refusal("Build ITC", ["tests pass"], interactive=False)
+
+    assert "print mode" in text and "without further discussion" in text
+    assert text.index("user_delegated=true") < text.index("Goal: Build ITC")
+    assert "Do not ask the user to confirm" in text and "- tests pass" in text
+    assert len(text) < 1200 and "…" in text
+
+
+@pytest.mark.anyio
+async def test_print_mode_stop_gate_objects_once_to_an_unfounded_stop_after_a_confirmation_refusal(
+    tmp_path: Path, beagle: Path, fake_beagle: Path
+) -> None:
+    from pi_event_helpers import assistant_done, assistant_start, tool_call_end
+    from tau_agent.messages import ToolCall
+    from tau_ai import FakeProvider
+    from tau_coding.cli import run_print_mode
+
+    project = tmp_path / "project"
+    project.mkdir()
+    call = ToolCall(
+        id="f1",
+        name="pursuit_found",
+        arguments={
+            "statement": "Build ITC",
+            "criteria": ["`uv run pytest` exits 0"],
+            "milestones": ["Core::fork, join, event"],
+        },
+    )
+    asked = AssistantMessage(content=[call])
+    provider = FakeProvider(
+        [
+            [assistant_start(), tool_call_end(call), assistant_done(asked, "toolUse")],
+            _say("Please confirm or correct the goal."),
+            _say("Please confirm."),
+            _say("Please confirm, again."),
+        ]
+    )
+    ok = await run_print_mode(
+        prompt=DELEGATING_PROMPT,
+        model="fake",
+        cwd=project,
+        provider=provider,
+        resource_paths=TauResourcePaths(root=tmp_path / "home-tau", agents_root=None),
+        extension_paths=(EXTENSION,),
+    )
+
+    assert ok is True
+    assert len(provider.calls) == 3
+    refusal = [m for m in provider.calls[1][2] if getattr(m, "tool_call_id", None) == "f1"]
+    assert refusal and "print mode" in str(refusal[0].content)
+    nudges = _sent(provider)
+    assert len(nudges) == 1 and nudges[0].startswith("[beagle] Nothing is founded")
+    assert "user_delegated=true" in nudges[0]
 
 
 def test_cases_first_note_recommends_a_check_beagle_accepts() -> None:

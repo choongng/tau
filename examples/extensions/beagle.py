@@ -2202,7 +2202,51 @@ ABANDON_HINT = (
 )
 
 
-def make_found_tool(on_founded: Callable[[Path], None] | None = None) -> Any:
+#: Set when founding refused an unconfirmed goal in a session with no user to
+#: ask; the stop gate holds a turn that ends on it, once.
+_FOUND_AWAITS_USER = False
+#: How much of the user's prompt a print-mode refusal quotes back.
+PROMPT_QUOTE = 400
+
+
+def _unconfirmed_refusal(statement: str, criteria: list[str], *, interactive: bool) -> str:
+    """What `pursuit_found` says to a goal nobody confirmed.
+
+    Run R05's mimo, told "ask the user to confirm … If the user already told
+    you to decide, call again with user_delegated=true", asked — in `tau -p`,
+    where no one answers — and the run ended after 18 s. With no UI, the
+    branch that can apply comes first, beside the prompt that decides it.
+    """
+    listed = "\n".join(f"  - {c}" for c in criteria)
+    drafted = f"Goal: {statement}\nCriteria:\n{listed}"
+    if interactive:
+        return (
+            "pursuit_found: nothing written. The goal and its criteria are the user's: "
+            "read them back word for word and ask the user to confirm or correct them:\n\n"
+            f"{drafted}\n\n"
+            "Then call pursuit_found again with what they approved and "
+            "user_confirmed=true. If the user already told you to decide this "
+            "yourself, call it again with user_delegated=true instead."
+        )
+    said = " ".join(_LAST_PROMPT.split())
+    if len(said) > PROMPT_QUOTE:
+        said = said[:PROMPT_QUOTE].rsplit(" ", 1)[0] + " …"
+    return (
+        "pursuit_found: nothing written yet. This session runs in print mode: no user "
+        "can answer a question, and the prompt that started it is all they will say. "
+        f'It said: "{said}"\n\n'
+        "If that tells you to set up, decide or go ahead without discussion, call "
+        "pursuit_found again now, with the goal and criteria below and "
+        "user_delegated=true. Do not ask the user to confirm: nobody will reply. Only "
+        "if the prompt gives you nothing to decide from, stop and say what you need.\n\n"
+        f"{drafted}"
+    )
+
+
+def make_found_tool(
+    on_founded: Callable[[Path], None] | None = None,
+    interactive: Callable[[], bool] = lambda: True,
+) -> Any:
     """Build `pursuit_found`: write the goal, root the tree, split it into milestones.
 
     The driver text spends pages on founding; a small model loses the thread
@@ -2243,16 +2287,11 @@ def make_found_tool(on_founded: Callable[[Path], None] | None = None) -> Any:
         repaired = "".join(f"{note}\n\n" for note in repairs)
         delegated = arguments.get("user_delegated") is True
         if arguments.get("user_confirmed") is not True and not delegated:
-            listed = "\n".join(f"  - {c}" for c in criteria)
-            return _step_result(
-                f"{repaired}"
-                "pursuit_found: nothing written. The goal and its criteria are the user's: "
-                "read them back word for word and ask the user to confirm or correct them:\n\n"
-                f"Goal: {statement}\nCriteria:\n{listed}\n\n"
-                "Then call pursuit_found again with what they approved and "
-                "user_confirmed=true. If the user already told you to decide this "
-                "yourself, call it again with user_delegated=true instead."
-            )
+            global _FOUND_AWAITS_USER
+            alone = not interactive()
+            _FOUND_AWAITS_USER = alone
+            refusal = _unconfirmed_refusal(statement, criteria, interactive=not alone)
+            return _step_result(f"{repaired}{refusal}")
         initialized = _ensure_git_repo(root)
 
         goal = root / ".beagle" / GOAL_BASENAME
@@ -5159,7 +5198,7 @@ def make_stop_gate(tau: ExtensionAPI) -> Any:
     """
 
     async def gate(event: Any, context: ExtensionContext) -> None:
-        global _STOP_GATE_SENT
+        global _STOP_GATE_SENT, _FOUND_AWAITS_USER
         message = getattr(event, "message", None)
         if (
             getattr(message, "role", None) != "assistant"
@@ -5170,6 +5209,17 @@ def make_stop_gate(tau: ExtensionAPI) -> Any:
             return
         goal = _find_goal(Path(context.cwd))
         if goal is None:
+            # Run R05 ended here, asking an absent user to confirm the goal.
+            if _FOUND_AWAITS_USER and not context.has_ui:
+                _FOUND_AWAITS_USER = False
+                _STOP_GATE_SENT += 1
+                tau.send_user_message(
+                    "[beagle] Nothing is founded, and this is print mode: no user will "
+                    "answer, and their prompt is all they said. If it tells you to set up "
+                    "or decide without discussion, call pursuit_found again now with your "
+                    "goal and criteria and user_delegated=true. Stop only if the prompt "
+                    "gives you nothing to decide from."
+                )
             return
         nodes = await asyncio.to_thread(_tree_nodes, goal.parent.parent)
         left = _unfinished(nodes)
@@ -6257,7 +6307,9 @@ def setup(tau: ExtensionAPI) -> None:
                     "for a pursuit or for beagle to run their project."
                 ),
                 parameters=FOUND_PARAMETERS,
-                execute_fn=make_found_tool(on_founded=_pin_founded(tau)),
+                execute_fn=make_found_tool(
+                    on_founded=_pin_founded(tau), interactive=lambda: tau.context.has_ui
+                ),
                 prompt_snippet="Found a pursuit: goal, criteria, milestones.",
                 prompt_guidelines=(
                     "The pursuit's goal and criteria are the user's: use their words, and set "
