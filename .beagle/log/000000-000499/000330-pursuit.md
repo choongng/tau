@@ -1,0 +1,14 @@
++++
+id = "000330-pursuit"
+ordinal = 330
+kind = "pursuit"
+timestamp = "2026-10-03T20:32:26+00:00"
+summary = "pursuit open T0079: R10 run and score"
+metric_command = ""
+drains = []
+hooks = []
++++
+
+criteria: R10 (qwen3.5-9b-q4-mtp-thinking-coding) ran from launch.sh on the unchanged itc_prompt.txt under the 1 h cap at a committed tau, and runs/R10 holds meta, exit, grade and scorecard; dev-notes/itc-runs/R10.md has the header, grader line and Scorecard block.
+decided by: sh -c 'echo "2ae208e92e51bfceeb75d148b2f73a83bb3fdb482270af92411042a04a7c3b8a  .beagle/checks/T0079/scored.sh" | sha256sum -c --quiet && bash .beagle/checks/T0079/scored.sh R10'
+budget: 30000 tokens
