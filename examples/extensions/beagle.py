@@ -291,6 +291,11 @@ _LAST_RUN_CLEAN = True
 _LAST_PROMPT = ""
 _FOUND_FIRST_SENT = False
 _SETUP_CALLS = 0
+#: The tail of the last `pursuit_step` result per task, for the note after a
+#: compaction: run R10's summary paraphrased a refusal and the driver never
+#: called pursuit_step again.
+_LAST_STEP_RESULT: dict[str, str] = {}
+LAST_STEP_RESULT_CHARS = 2000
 #: The driver's non-`pursuit_` tool calls in a row since the goal existed.
 _OFF_PURSUIT_CALLS = 0
 #: The driver records' directory, once the Tau home is known.
@@ -4322,6 +4327,7 @@ def make_step_tool() -> Any:
     close the check refuses would block the task for good), and the close
     carries the worker's measured spend.
     """
+    stepped: list[str] = []
 
     async def _execute(
         tool_call_id: str,
@@ -4369,6 +4375,7 @@ def make_step_tool() -> Any:
             )
         nothing_ready = f"Nothing is ready to work.\n\n{_tree(root)}\n\n{after}"
         task = str(arguments.get("task") or "").strip()
+        stepped[:] = [task]
         abandon = str(arguments.get("abandon") or "").strip()
         if abandon:
             if not task:
@@ -4383,6 +4390,7 @@ def make_step_tool() -> Any:
             task = (open_ids or ready_ids or [""])[0]
             if not task:
                 return _step_result(nothing_ready)
+            stepped[:] = [task]
         elif task not in open_ids and task not in ready_ids and task not in blocked:
             # A container (done when its parts are) or a task still waiting on
             # one: opening it is refused, and offering to is where a model
@@ -4875,8 +4883,13 @@ def make_step_tool() -> Any:
         signal: ToolCancellationToken | None = None,
         on_update: ToolUpdateCallback | None = None,
     ) -> AgentToolResult:
+        stepped.clear()
         result = await _execute(tool_call_id, arguments, signal, on_update)
-        return _with_note(result, _worker_timeout(arguments.get("timeout"))[1])
+        result = _with_note(result, _worker_timeout(arguments.get("timeout"))[1])
+        if stepped and stepped[0]:
+            text = "".join(getattr(c, "text", "") for c in result.content)
+            _LAST_STEP_RESULT[stepped[0]] = text[-LAST_STEP_RESULT_CHARS:]
+        return result
 
     return execute
 
@@ -5385,6 +5398,9 @@ _STEERED_VERBS = {
         "pursuit_plan for work that is missing. A wait added by hand can close a "
         "cycle that nothing then starts; only withdrawing one, `beagle pursuit depend "
         "<task> <after> --drop --reason '<why>'`, runs from bash"
+    ),
+    "next": (
+        "pursuit_step with no arguments, which picks the ready task and says what to send"
     ),
     "commit": (
         "nothing: pursuit_step commits the files a task changed in its scope before it "
@@ -6026,11 +6042,15 @@ def make_state_after_compaction(tau: ExtensionAPI) -> Any:
         else:
             now = "Nothing is ready now."
         tree = _tree(root)
+        last = ""
+        for task in ready_ids + open_ids:
+            if task in _LAST_STEP_RESULT:
+                last += f"\n\nLast pursuit_step on {task} said:\n{_LAST_STEP_RESULT[task]}"
         tau.send_custom_message(
             "The conversation was just compacted. Where the pursuit stands, from beagle "
             f"itself (trust this over the summary):\n\n{tree}\n\n{now} Next: call "
             "pursuit_step with no arguments. Work no task covers goes in with "
-            "pursuit_plan; this session does not do it itself.",
+            f"pursuit_plan; this session does not do it itself.{last}",
             custom_type="beagle",
             deliver_as="steer",
         )

@@ -1518,6 +1518,66 @@ async def test_a_compaction_is_followed_by_the_pursuit_state_from_beagle(
 
 
 @pytest.mark.anyio
+async def test_state_after_compaction_repeats_last_step_result(
+    tmp_path: Path, beagle: Path, fake_beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # R10: after compaction the summary paraphrased T0002's refusal, and the
+    # driver sent `beagle pursuit next`'s open from bash 11 times.
+    monkeypatch.chdir(_pursuit_project(tmp_path))
+    _ready_task(fake_beagle)
+    runtime, session = _bound(tmp_path)
+    session.is_running = True
+    refused = await _tool(runtime, "pursuit_step").execute(
+        "c1",
+        {
+            "task": "T0002",
+            "criteria": "beagle is configured",
+            "done_when": "python3 -m pytest -q",
+            "scope": [".beagle/"],
+        },
+    )
+    assert "not opened" in refused.text
+
+    await runtime.emit_event(CompactionEndEvent(reason="threshold"))
+
+    [note] = session.steered
+    assert f"Last pursuit_step on T0002 said:\n{refused.text}" in note
+    assert "Ready now: T0002." in note
+
+
+@pytest.mark.anyio
+async def test_state_after_compaction_without_a_step_result_is_unchanged(
+    tmp_path: Path, beagle: Path, fake_beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(_pursuit_project(tmp_path))
+    _ready_task(fake_beagle)
+    runtime, session = _bound(tmp_path)
+    session.is_running = True
+
+    await runtime.emit_event(CompactionEndEvent(reason="threshold"))
+
+    [note] = session.steered
+    assert "Last pursuit_step" not in note
+    assert note.endswith("pursuit_plan; this session does not do it itself.")
+
+
+@pytest.mark.anyio
+async def test_bash_pursuit_next_is_steered_to_pursuit_step(
+    tmp_path: Path, beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # R10 E142-164: `beagle pursuit next` ran from bash and its open was sent 11 times.
+    monkeypatch.chdir(_pursuit_project(tmp_path))
+    runtime, _ = _bound(tmp_path)
+    bash = _tool_with_hooks(runtime, "bash")
+    await runtime.emit_session_start("startup")
+
+    result = await bash.execute("c1", {"command": "beagle pursuit next"})
+
+    assert "refusing `beagle pursuit next`" in result.text
+    assert "pursuit_step with no arguments, which picks the ready task" in result.text
+
+
+@pytest.mark.anyio
 async def test_a_request_to_set_beagle_up_is_steered_to_found_first(
     tmp_path: Path, beagle: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
