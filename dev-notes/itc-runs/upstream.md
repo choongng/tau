@@ -31,3 +31,26 @@ in the per-run notes.
   prove, or a documented witness mode for locked known-answer files, would
   give the cases-first pattern a close. Low priority until tau binds that
   task itself.
+
+## R04
+
+- **`prove` has no route for a data-only known-answers task (R02 item,
+  now the whole run).** R04's driver followed tau's cases-first recipe
+  exactly (driver L10: scope tests/cases.json, tests/test_case_data.py,
+  tests/test_cases.py). The check passed by t 6.6, and the task never
+  closed in 59.5 min: no witness may sit in a test file, and there is no
+  source file to take away. Proposal: a witness kind for a declared data
+  file, `prove T --mutate-data tests/cases.json --needle … --replacement …`,
+  where the check must fail when one expected value is changed. Or let
+  `[close]` exempt tasks whose scope is all locked known-answer files.
+  Priority: high, because it blocks the pattern tau recommends.
+- **The needle refusal comes before the test-file refusal.** At L189 a
+  WITNESS in tests/test_case_data.py was refused with "--needle occurs 2
+  time(s)". The worker learned to lengthen the needle, not that a test file
+  can never be a witness. Checking the path rule first would give the more
+  useful message. Low priority, since tau will filter it.
+- **`beagle pursuit list` does not exist** (driver L137). The model reached
+  for it as an alias of `tree`/`status`. An alias, or "did you mean
+  `pursuit tree`?", would save a turn. Low priority.
+- Good: the container-abandon refusal (L143) named the live parts and what
+  to do. Keep it.
