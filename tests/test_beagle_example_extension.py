@@ -3985,7 +3985,118 @@ async def test_driving_session_edits_only_the_pursuit_store(
     opted_out = await write.execute("c4", {"path": "src/app.py", "content": "x"})
 
     assert "from the driving session" in blocked.text and "pursuit_step" in blocked.text
-    assert [before_start.text, store.text, subagent.text, opted_out.text] == ["ran"] * 4
+    assert "the pursuit tools own .beagle/" in store.text
+    assert [before_start.text, subagent.text, opted_out.text] == ["ran"] * 3
+
+
+@pytest.mark.anyio
+async def test_driver_write_or_edit_under_dot_beagle_is_refused(
+    tmp_path: Path, beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Run 10, E45: the driver's own edit of gates.toml left it failing to load.
+    project = _pursuit_project(tmp_path)
+    monkeypatch.chdir(project)
+    runtime, session = _bound(tmp_path)
+    edit = _tool_with_hooks(runtime, "edit")
+    write = _tool_with_hooks(runtime, "write")
+    await runtime.emit_session_start("startup")
+    gate_edit = {
+        "path": ".beagle/gates.toml",
+        "edits": [{"oldText": 'name = "prose-volume"', "newText": 'name = "ruff"'}],
+    }
+
+    edited = await edit.execute("c1", gate_edit)
+    written = await write.execute("c2", {"path": str(project / ".beagle" / "skills.toml")})
+    session.session_id = "subagent-session"
+    worker = await edit.execute("c3", gate_edit)
+
+    for refused in (edited, written):
+        assert "the pursuit tools own .beagle/" in refused.text
+        assert "pursuit_step" in refused.text
+    assert worker.text == "ran"
+
+
+@pytest.mark.anyio
+async def test_driver_bash_writing_dot_beagle_toml_is_refused(
+    tmp_path: Path, beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Run 10, E45 as a shell edit: the ruff gate appended to gates.toml by hand.
+    monkeypatch.chdir(_pursuit_project(tmp_path))
+    runtime, _ = _bound(tmp_path)
+    bash = _tool_with_hooks(runtime, "bash")
+    await runtime.emit_session_start("startup")
+    commands = [
+        "cat >> .beagle/gates.toml <<'EOF'\n[[gate]]\nname = \"ruff\"\n"
+        'command = "ruff check src/ || true"\nEOF',
+        "printf '[[gate]]\\n' > .beagle/gates.toml",
+        "echo '[[gate]]' | tee -a .beagle/gates.toml",
+        "sed -i 's/prose-volume/ruff/' .beagle/gates.toml",
+        "cp /tmp/gates.toml .beagle/gates.toml",
+        "mv /tmp/gates.toml .beagle/",
+        "python3 -c \"open('.beagle/gates.toml', 'a').write('[[gate]]')\"",
+        "python3 - <<'EOF'\nimport tomllib\nopen('.beagle/skills.toml', 'w')\nEOF",
+    ]
+
+    for i, command in enumerate(commands):
+        refused = await bash.execute(f"c{i}", {"command": command})
+        assert "the pursuit tools own .beagle/" in refused.text, command
+        assert "pursuit_step" in refused.text
+
+
+@pytest.mark.anyio
+async def test_driver_reading_dot_beagle_is_allowed(
+    tmp_path: Path, beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(_pursuit_project(tmp_path))
+    runtime, _ = _bound(tmp_path)
+    bash = _tool_with_hooks(runtime, "bash")
+    read = _tool_with_hooks(runtime, "read")
+    await runtime.emit_session_start("startup")
+    commands = [
+        "cat .beagle/gates.toml",
+        "ls .beagle",
+        "beagle pursuit status",
+        'grep -q "ruff" .beagle/gates.toml && echo "OK" || echo "FAIL"',
+        "grep -A5 ruff .beagle/gates.toml 2>&1 | head -5 > /tmp/out",
+        "cp .beagle/gates.toml /tmp/gates.toml",
+    ]
+
+    ran = [(await bash.execute(f"c{i}", {"command": c})).text for i, c in enumerate(commands)]
+    ran.append((await read.execute("r", {"path": ".beagle/gates.toml"})).text)
+
+    assert ran == ["ran"] * (len(commands) + 1)
+
+
+@pytest.mark.anyio
+async def test_driver_non_pursuit_streak_after_founding_is_refused(
+    tmp_path: Path, beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Run 10: 59 calls after founding, 4 of them pursuit_step.
+    monkeypatch.chdir(_pursuit_project(tmp_path))
+    runtime, session = _bound(tmp_path)
+    read = _tool_with_hooks(runtime, "read")
+    step = _tool(runtime, "pursuit_step")
+    await runtime.emit_session_start("startup")
+    limit = _loaded_module().DRIVER_OFF_PURSUIT_CALLS
+    assert limit == 8
+
+    allowed = [(await read.execute(f"a{i}", {"path": "README"})).text for i in range(limit)]
+    ninth = await read.execute("a9", {"path": "README"})
+    tenth = await read.execute("a10", {"path": "README"})
+    stepped = await step.execute("s1", {"task": "T0002"})
+    after_step = await read.execute("b1", {"path": "README"})
+    session.session_id = "subagent-session"
+    worker = [(await read.execute(f"w{i}", {"path": "README"})).text for i in range(limit + 2)]
+    session.session_id = "session-1"
+    await runtime.emit_session_start("startup")
+    restarted = [(await read.execute(f"n{i}", {"path": "README"})).text for i in range(limit)]
+
+    assert allowed == ["ran"] * limit
+    assert "9 tool calls in a row" in ninth.text and "pursuit_step" in ninth.text
+    assert "10 tool calls in a row" in tenth.text
+    assert "Tool call blocked" not in stepped.text and after_step.text == "ran"
+    assert worker == ["ran"] * (limit + 2)
+    assert restarted == ["ran"] * limit
 
 
 @pytest.mark.anyio
@@ -4029,7 +4140,7 @@ async def test_driving_session_spawns_no_sub_agent_of_its_own(
         ("git status --short && git log --oneline", None),
         ("rm -rf __pycache__ tests/__pycache__ .pytest_cache", None),
         ("python3 -m pytest -q > /tmp/out.txt", None),
-        ("beagle pursuit tree > .beagle/notes.txt", None),
+        ("cat .beagle/notes.txt", None),
     ],
 )
 @pytest.mark.anyio
@@ -4368,6 +4479,7 @@ async def test_founded_driver_reference_read_refused(
         await read.execute("c6", {"path": "../refs/itc.pdf"}),
         await fetch.execute("c7", {"url": "https://example.org/itc"}),
     ]
+    _loaded_module()._OFF_PURSUIT_CALLS = 0  # these calls pin other guards, not the streak
     allowed = [
         await read.execute("c8", {"path": "src/itc.py"}),
         await read.execute("c9", {"path": str(project / ".beagle" / "pursuit.toml")}),
@@ -5619,6 +5731,7 @@ async def test_driver_read_of_open_task_file_refused_after_two_stays_open(
         await bash.execute("r5", {"command": "sed -n 1,20p src/clock.py"}),
         await bash.execute("r6", {"command": "cd . && grep -n join tests/test_clock.py"}),
     ]
+    _loaded_module()._OFF_PURSUIT_CALLS = 0  # these calls pin other guards, not the streak
     allowed = [
         await read.execute("a1", {"path": "README.md"}),
         await bash.execute("a2", {"command": "ls src tests"}),

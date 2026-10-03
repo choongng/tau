@@ -291,6 +291,8 @@ _LAST_RUN_CLEAN = True
 _LAST_PROMPT = ""
 _FOUND_FIRST_SENT = False
 _SETUP_CALLS = 0
+#: The driver's non-`pursuit_` tool calls in a row since the goal existed.
+_OFF_PURSUIT_CALLS = 0
 #: The driver records' directory, once the Tau home is known.
 _DRIVERS_DIR: Path | None = None
 #: The session this process last registered as a possible driver.
@@ -5700,10 +5702,11 @@ def _adopt_session(context: ExtensionContext) -> None:
 
 
 def _on_session_start(event: Any, context: ExtensionContext) -> None:
-    global _SEEN_CWD, _STARTED_SESSION
+    global _SEEN_CWD, _STARTED_SESSION, _OFF_PURSUIT_CALLS
     del event
     _SEEN_CWD = context.cwd
     _STARTED_SESSION = context.session_id
+    _OFF_PURSUIT_CALLS = 0
     _adopt_session(context)
 
 
@@ -6065,6 +6068,91 @@ def make_found_first_gate() -> Any:
                 "Call pursuit_found now with the user's goal, criteria and milestones "
                 "(user_delegated=true if they told you to decide). Reading references, "
                 "designing and building are milestones for pursuit_step's sub-agents."
+            ),
+        )
+
+    return gate
+
+
+#: Non-`pursuit_` tool calls in a row the driver may make once the goal exists.
+DRIVER_OFF_PURSUIT_CALLS = 8
+
+_REDIRECT_TARGET = re.compile(r"(?<![<>=-])[0-9&]?>>?\|?\s*['\"]?([^\s;|&<>'\"]+)")
+_SED_IN_PLACE = re.compile(r"\bsed\b(?=[^;|&\n]*\s(?:-[a-zA-Z]*i|--in-place))[^;|&\n]*\.beagle")
+_PYTHON_INLINE = re.compile(r"\bpython[0-9.]*\b[^;|&\n]*(?:\s-c\b|<<)")
+
+
+def _bash_writes_dot_beagle(command: str) -> bool:
+    """Whether a shell command writes a `.beagle/` file, judged conservatively."""
+    if ".beagle" not in command:
+        return False
+    if any(".beagle" in target for target in _REDIRECT_TARGET.findall(command)):
+        return True
+    if re.search(r"\btee\b[^;|&\n]*\.beagle", command) or _SED_IN_PLACE.search(command):
+        return True
+    if _PYTHON_INLINE.search(command) and re.search(r"open\(|write|toml", command):
+        return True
+    for segment in re.split(r"&&|\|\||[;|\n]", command):
+        try:
+            words = shlex.split(segment)
+        except ValueError:
+            words = segment.split()
+        if words and words[0] in ("cp", "mv"):
+            operands = [w for w in words[1:] if not w.startswith("-")]
+            if len(operands) >= 2 and ".beagle" in operands[-1]:
+                return True
+    return False
+
+
+def make_driver_seat_gate() -> Any:
+    """Build the `tool_call` gate that keeps the driver in the directing seat.
+
+    Run R10's driver spent 53 calls after founding hand-editing `.beagle/*.toml`
+    and broke gates.toml. The driver may not write `.beagle/` at all, and once
+    the goal exists it may not go more than `DRIVER_OFF_PURSUIT_CALLS` calls in
+    a row without a pursuit tool.
+    """
+
+    async def gate(event: Any, context: ExtensionContext) -> ToolCallHookResult | None:
+        global _OFF_PURSUIT_CALLS
+        try:
+            if _STARTED_SESSION is None or context.session_id != _STARTED_SESSION:
+                return None
+            tool = event.tool_name
+            if tool.startswith("pursuit_"):
+                _OFF_PURSUIT_CALLS = 0
+                return None
+            cwd = Path(context.cwd)
+            args = event.arguments or {}
+            writes = False
+            if tool in ("write", "edit"):
+                target = _goal_path_from_args(args, cwd)
+                store = _resolved(cwd / ".beagle")
+                writes = target is not None and (target == store or store in target.parents)
+            elif tool == "bash":
+                writes = _bash_writes_dot_beagle(str(args.get("command", "")))
+            if writes:
+                return ToolCallHookResult(
+                    block=True,
+                    reason=(
+                        f"refusing {tool}: the pursuit tools own .beagle/, and the driver "
+                        "does not write it by hand. Work goes through pursuit_step; put what "
+                        "you meant to change in its notes."
+                    ),
+                )
+            if _find_goal(cwd) is None:
+                return None
+        except Exception:  # noqa: BLE001 - fail open, never block on a guard bug
+            return None
+        _OFF_PURSUIT_CALLS += 1
+        if _OFF_PURSUIT_CALLS <= DRIVER_OFF_PURSUIT_CALLS:
+            return None
+        return ToolCallHookResult(
+            block=True,
+            reason=(
+                f"refusing {event.tool_name}: {_OFF_PURSUIT_CALLS} tool calls in a row without "
+                f"a pursuit tool (the limit is {DRIVER_OFF_PURSUIT_CALLS}). The driver directs; "
+                "call pursuit_step for the ready task, and the work runs there."
             ),
         )
 
@@ -7248,6 +7336,7 @@ def setup(tau: ExtensionAPI) -> None:
                 ),
             )
         )
+        tau.on("tool_call", make_driver_seat_gate())
         tau.on("tool_call", make_driver_edit_guard())
         tau.on("tool_call", make_driver_pursuit_guard())
         tau.on("tool_call", make_driver_reference_guard())
