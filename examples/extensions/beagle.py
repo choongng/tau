@@ -3726,6 +3726,30 @@ def _oracle_with_code_problem(scope: list[str], goal: Path) -> str | None:
     )
 
 
+def _no_scope_problem(scope: list[str], root: Path, locks: list[str], check: str) -> str | None:
+    """Why a task may not open with no scope, or None.
+
+    Run R17: T0002, T0008 and T0009 opened with scope [], so no worker on them
+    was held to any path. With references/ fetched the pursuit is past founding,
+    and every task it opens writes something nameable.
+    """
+    if scope or not (root / "references").is_dir():
+        return None
+    if not locks:
+        return (
+            "no scope given, so its sub-agent would write anywhere. Pass scope=[...] "
+            "naming the paths this task writes, and call pursuit_step again."
+        )
+    named = re.findall(r"\S*test_\w*(?:case|data)\w*\.py", check)
+    data_test = named[0] if named else "tests/test_case_data.py"
+    paths = list(dict.fromkeys([*locks, data_test]))
+    return (
+        "no scope given, so its sub-agent would write anywhere, the code its known "
+        f"answers judge included. Pass scope=[{', '.join(paths)}] (the locks and the "
+        "data test), and call pursuit_step again."
+    )
+
+
 def _data_task(scope: list[str], goal: Path, check: str, locks: list[str]) -> bool:
     """Whether a task writes known-answer data and its cases test, not the code.
 
@@ -6514,7 +6538,13 @@ def make_step_tool() -> Any:
             route += _bound_note(done_when, chained)
             done_when = chained
             scoped = (
-                _scope_problem(scope, task, nodes, root)
+                _no_scope_problem(
+                    scope,
+                    root,
+                    _pending_locks(goal, task) + _strings(arguments.get("locks")),
+                    done_when,
+                )
+                or _scope_problem(scope, task, nodes, root)
                 or _oracle_with_code_problem(scope, goal)
                 or _cases_first_problem(scope, task, title, goal, nodes)
                 or _locked_test_problem(done_when, scope, goal)

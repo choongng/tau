@@ -6822,6 +6822,91 @@ async def test_worker_write_in_scope_or_tmp_allowed(
     assert (await _tool_with_hooks(unscoped, "write").execute("c2", outside)).text == "ran"
 
 
+@pytest.mark.anyio
+async def test_opening_a_task_with_no_scope_is_refused(
+    tmp_path: Path, beagle: Path, fake_beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Run R17: T0002, T0008 and T0009 opened with scope [], and all 17 workers ran unguarded.
+    project = _pursuit_project(tmp_path)
+    (project / "references").mkdir()
+    monkeypatch.chdir(project)
+    _ready_task(fake_beagle)
+    runtime, _ = _bound(tmp_path)
+    call = {"task": "T0002", "criteria": "it parses", "done_when": "grep -q done done.txt"}
+
+    result = await _tool(runtime, "pursuit_step").execute("c1", call)
+
+    assert "T0002 not opened — no scope given" in result.text
+    assert "Pass scope=[...]" in result.text
+    assert _pursuit_calls(fake_beagle, "open") == []
+
+    (project / "references").rmdir()
+    before = await _tool(runtime, "pursuit_step").execute("c2", call)
+    assert "no scope given" not in before.text
+
+
+@pytest.mark.anyio
+async def test_known_answers_open_with_locks_and_no_scope_names_the_scope_to_pass(
+    tmp_path: Path, beagle: Path, fake_beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project = _pursuit_project(tmp_path)
+    (project / "references").mkdir()
+    monkeypatch.chdir(project)
+    _ready_task(fake_beagle, "python3 -m pytest -q tests/test_known_data.py")
+    runtime, _ = _bound(tmp_path)
+
+    result = await _tool(runtime, "pursuit_step").execute(
+        "c1",
+        {
+            "task": "T0002",
+            "criteria": "the known answers are written",
+            "done_when": "python3 -m pytest -q tests/test_known_data.py",
+            "locks": ["tests/cases.json", "tests/test_cases.py"],
+        },
+    )
+
+    assert "T0002 not opened — no scope given" in result.text
+    assert (
+        "Pass scope=[tests/cases.json, tests/test_cases.py, tests/test_known_data.py]"
+        in result.text
+    )
+    assert _pursuit_calls(fake_beagle, "open") == []
+
+    unnamed = await _tool(runtime, "pursuit_step").execute(
+        "c2",
+        {
+            "task": "T0002",
+            "criteria": "the known answers are written",
+            "done_when": "grep -q out tests/cases.json",
+            "locks": ["tests/cases.json"],
+        },
+    )
+    assert "Pass scope=[tests/cases.json, tests/test_case_data.py]" in unnamed.text
+
+
+@pytest.mark.anyio
+async def test_worker_of_a_known_answers_task_is_refused_a_write_to_source(
+    tmp_path: Path, beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A known-answers scope holds no source, so the implementation lands outside it.
+    scope = "tests/cases.json\ntests/test_cases.py\ntests/test_case_data.py"
+    runtime = _scoped_worker(tmp_path, monkeypatch, scope)
+    calls = [
+        ("write", {"path": "itc/itc.py", "content": "def seed(): pass\n"}),
+        ("edit", {"path": "itc/itc.py", "old": "a", "new": "b"}),
+        ("bash", {"command": "printf 'x = 1' > itc/itc.py"}),
+    ]
+
+    for tool, arguments in calls:
+        result = await _tool_with_hooks(runtime, tool).execute("c1", arguments)
+
+        assert "refusing to write itc/itc.py: it is outside T0003's scope" in result.text
+        assert "The implementation does not go under tests/ either" in result.text
+
+    data = {"path": "tests/cases.json", "content": "[]"}
+    assert (await _tool_with_hooks(runtime, "write").execute("c2", data)).text == "ran"
+
+
 def test_check_refuses_test_dash_f() -> None:
     # Run R02 closed its reference task on `test -f src/design.md`.
     for check in ("test -f src/design.md", "[ -e docs/itc.md ]", "test -s src/design.md"):
