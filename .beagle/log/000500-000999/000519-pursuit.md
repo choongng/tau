@@ -1,0 +1,14 @@
++++
+id = "000519-pursuit"
+ordinal = 519
+kind = "pursuit"
+timestamp = "2026-10-04T04:32:12+00:00"
+summary = "pursuit open T0126: Refuse construct-and-call checks; parts on the cases module run the cases test"
+metric_command = ""
+drains = []
+hooks = []
++++
+
+criteria: (a) A part whose scope holds a module a locked test imports (_locked_test_imports) is refused a done_when that runs none of those locked tests; the refusal names the module and the pytest command, and a selection of that test file (node ids, -k) counts as running it. (b) A python -c check with no assert, no comparison feeding sys.exit or raise, and no pytest is refused as judging nothing (R14 E33's done_when is refused; one with an assert is allowed). (c) The prove attempts tau makes do not offer --absent for a source file already in the tree at the task's open commit.
+decided by: sh -c 'echo "4165391e416576d1658632a6aa19dbf93bc985d43e403d5bada78b1963e8ed8e  .beagle/checks/T0126/check.sh" | sha256sum -c --quiet && bash .beagle/checks/T0126/check.sh'
+budget: 100000 tokens
