@@ -3756,6 +3756,48 @@ def _in_scope(rel: str, scope: list[str]) -> bool:
     return any(rel == s.rstrip("/") or rel.startswith(s.rstrip("/") + "/") for s in scope)
 
 
+def _scope_has_data(scope: list[str]) -> bool:
+    """Whether `scope` names a data file (a file with a suffix other than .py)."""
+    return any(Path(rel.rstrip("/")).suffix not in {"", ".py"} for rel in scope)
+
+
+def _imported_modules(root: Path, scope: list[str]) -> list[str]:
+    """Project source files (under src/ or the root) that the scoped tests import.
+
+    Run R12: T0008's tests/test_cases.py imported src/interval_tree_clock.py, a
+    defect there was the proof, and nothing offered it.
+    """
+    tests: list[Path] = []
+    for rel in scope:
+        path = root / rel.rstrip("/")
+        found = sorted(path.rglob("*.py")) if path.is_dir() else [path]
+        tests += [p for p in found if p.is_file() and _is_test_path(str(p.relative_to(root)))]
+    modules: list[str] = []
+    for test in tests:
+        try:
+            tree = ast.parse(test.read_text(encoding="utf-8"))
+        except (OSError, SyntaxError, ValueError):
+            continue
+        names = [
+            alias.name
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Import)
+            for alias in node.names
+        ] + [
+            node.module
+            for node in ast.walk(tree)
+            if isinstance(node, ast.ImportFrom) and node.module and not node.level
+        ]
+        for name in names:
+            base = name.replace(".", "/")
+            for rel in (f"src/{base}.py", f"{base}.py", f"src/{base}/__init__.py"):
+                if (root / rel).is_file() and not _is_test_path(rel):
+                    if rel not in modules:
+                        modules.append(rel)
+                    break
+    return modules
+
+
 @dataclass(frozen=True)
 class _Proof:
     """What `prove` said of a passing check, or why it could not be asked."""
@@ -3765,6 +3807,9 @@ class _Proof:
     #: A defect was put back and the check still passed: the check, not the
     #: work, is what falls short.
     weak: bool = False
+    #: A tests-only task had no WITNESS in the module its tests import, named in
+    #: `text`: another worker can give one, so the task is not unproven.
+    ask_module: bool = False
 
 
 async def _prove(
@@ -3782,7 +3827,17 @@ async def _prove(
     attempts: list[list[str]] = []
     refused: list[str] = []
     witness = _witness(report)
-    if witness is not None and _is_test_path(witness[0]):
+    modules = _imported_modules(root, scope) if _only_data_and_tests(scope) else []
+    ask_module = bool(modules) and (witness is None or _is_test_path(witness[0]))
+    if ask_module:
+        # Run R12: a tests-only task's witness in its test was refused, and it
+        # had no source of its own to take away; the module it tests has one.
+        where = f"{witness[0]}: the WITNESS is in a test file. " if witness else ""
+        refused.append(
+            f"{where}Give a WITNESS in {' or '.join(modules)}, the module the test imports: "
+            "a NEEDLE there that the test must catch. Leave the test as it is."
+        )
+    elif witness is not None and _is_test_path(witness[0]):
         # Run R04: W24's witness was in tests/test_case_data.py, and beagle
         # answered about the needle's count, not the check.
         refused.append(
@@ -3828,6 +3883,8 @@ async def _prove(
             # different witness should be asked to overturn.
             return _Proof(proven=False, text=tail, weak=True)
         refused.append(tail)
+    if ask_module:
+        return _Proof(proven=False, text="\n\n".join(refused), ask_module=True)
     if not attempts and not refused:
         if not _requires_witness(root):
             return None
@@ -4287,6 +4344,38 @@ def _already_passes(check: str, task: str = "", nodes: list[dict[str, Any]] | No
     return text
 
 
+async def _passes_without_own_work(check: str, scope: list[str], root: Path) -> bool:
+    """Whether `check` still passes with the uncommitted files in `scope` put back as committed.
+
+    Run R12: T0008's new route was refused as already passing, five times, when
+    only its own uncommitted test made the check pass.
+    """
+    own = [rel for rel in _changed_files(root) if scope and _in_scope(rel, scope)]
+    if not own:
+        return True
+    saved: dict[str, bytes | None] = {}
+    try:
+        for rel in own:
+            path = root / rel
+            saved[rel] = path.read_bytes() if path.is_file() else None
+            head = subprocess.run(
+                ["git", "show", f"HEAD:{rel}"], cwd=root, capture_output=True, check=False
+            )
+            if head.returncode == 0:
+                path.write_bytes(head.stdout)
+            elif path.is_file():
+                path.unlink()
+        return (await _run_check(check, root, DEFAULT_CHECK_TIMEOUT))[0] == 0
+    finally:
+        for rel, data in saved.items():
+            path = root / rel
+            if data is None:
+                path.unlink(missing_ok=True)
+            else:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(data)
+
+
 def _escalation(task: str, count: int) -> str:
     """The fixed refusal of a step on a task `count` steps have left not done."""
     return (
@@ -4541,7 +4630,9 @@ def make_step_tool() -> Any:
                 if scoped is not None:
                     return _step_result(f"pursuit_step: no new route for {task} — {scoped}")
                 new_check = done_when or old_check
-                if (await _run_check(new_check, root, DEFAULT_CHECK_TIMEOUT))[0] == 0:
+                if (await _run_check(new_check, root, DEFAULT_CHECK_TIMEOUT))[0] == 0 and (
+                    await _passes_without_own_work(new_check, route_scope, root)
+                ):
                     return _step_result(
                         f"pursuit_step: no new route for {task}, which stays as it is — "
                         + _already_passes(new_check, task, _tree_nodes(root))
@@ -4708,6 +4799,7 @@ def make_step_tool() -> Any:
         scope = scope or _strings(record.get("scope"))
         unproven_key = (str(root), task)
         tests_only = _only_data_and_tests(scope)
+        proof_note = TESTS_ONLY_PROOF_NOTE if _scope_has_data(scope) else TESTS_ONLY_MUTATE_NOTE
         mixed = _oracle_with_code_problem(scope, goal)
         if mixed is not None:
             # Opened before this guard, or by hand: still no worker on it.
@@ -4725,6 +4817,9 @@ def make_step_tool() -> Any:
                     TESTS_ONLY_PROOF_NOTE
                     + " Give it a new route whose done_when runs that file's test and "
                     "whose scope names the data file"
+                    if tests_only and _scope_has_data(scope)
+                    else TESTS_ONLY_MUTATE_NOTE
+                    + " Give it a new route whose done_when runs the test that imports it"
                     if tests_only
                     else "Give it a new route whose done_when imports the code this task "
                     "tests and runs it (e.g. `python3 -m pytest -q "
@@ -4771,7 +4866,7 @@ def make_step_tool() -> Any:
                 proof = await _prove(task, report, scope, root, check_timeout)
                 if proof is None or proof.proven:
                     break
-                if not proof.weak:
+                if not proof.weak and not proof.ask_module:
                     # No defect could be put back: run R02 sent a second worker
                     # after every such verdict, and six identical steps more.
                     _UNPROVEN.add(unproven_key)
@@ -4786,6 +4881,9 @@ def make_step_tool() -> Any:
                         "(in the test file, not by changing the check), then give a new "
                         "WITNESS block."
                         if proof.weak
+                        else "Give that WITNESS block; its NEEDLE must occur exactly once "
+                        "in that module."
+                        if proof.ask_module
                         else "Give a WITNESS block whose NEEDLE occurs exactly once in a "
                         "source file you changed (not a test)."
                     )
@@ -4836,6 +4934,8 @@ def make_step_tool() -> Any:
                 "the check passes even with a defect put back into the work, so it does "
                 "not test what this task built"
                 if proof.weak
+                else "no WITNESS named a defect in the module the test imports"
+                if proof.ask_module
                 else "no defect could be put back to show the check can fail"
             )
             return _not_done(
@@ -4848,8 +4948,11 @@ def make_step_tool() -> Any:
                 f"`prove` said:\n{proof.text}\n\nLast report:\n{shown}\n\n"
                 + (
                     f'Next: pursuit_step with task="{task}" and notes saying what to '
-                    f"fix. {TESTS_ONLY_PROOF_NOTE}"
+                    f"fix. {proof_note}"
                     if tests_only and proof.weak
+                    else f'Next: pursuit_step with task="{task}" and notes asking for a '
+                    "WITNESS in the module the test imports, named above."
+                    if proof.ask_module
                     else f'Next: pursuit_step with task="{task}" and a done_when that runs '
                     "a test of the behaviour itself, e.g. `python3 -m pytest -q "
                     "tests/test_<this task>.py`, with notes saying what that test must "
@@ -4858,7 +4961,7 @@ def make_step_tool() -> Any:
                     else f'Next: a new route, pursuit_step with task="{task}", '
                     "new_route=true, notes and "
                     + (
-                        f"a done_when that runs that file's test. {TESTS_ONLY_PROOF_NOTE}"
+                        f"a done_when that runs that file's test. {proof_note}"
                         if tests_only
                         else "a done_when that runs a test of the behaviour itself, e.g. "
                         "`python3 -m pytest -q tests/test_<this task>.py`. The test must "
@@ -6947,6 +7050,13 @@ TESTS_ONLY_PROOF_NOTE = (
     "the check must run a test that reads the data file this task writes, so that "
     "taking the file away makes it fail (e.g. tests/test_case_data.py must fail when "
     "tests/cases.json is removed). That test reads only the data file."
+)
+
+#: Said instead of TESTS_ONLY_PROOF_NOTE when the scope holds no data file. Run
+#: R12: that note pointed T0008 at tests/cases.json, another task's locked file.
+TESTS_ONLY_MUTATE_NOTE = (
+    "This scope holds only tests, so mutate the module the test imports: a WITNESS "
+    "in that module, a NEEDLE there that the test must catch."
 )
 
 CASES_FIRST_NOTE = (

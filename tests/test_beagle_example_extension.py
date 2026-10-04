@@ -4815,8 +4815,9 @@ async def test_unprovable_restep_spawns_no_worker(
     assert "no defect could be put back" in first.text and "stays open" in first.text
     for refused in (again, same):
         assert "not run: this check already passes and cannot be shown to refuse" in refused.text
-        # A tests-only scope has no code to import: its data file's absence is the proof.
-        assert "the data file's absence is the proof" in refused.text
+        # R12: a tests-only scope with no data file proves through the module it imports.
+        assert "mutate the module the test imports" in refused.text
+        assert "the data file's absence is the proof" not in refused.text
         assert "import the code" not in refused.text
     assert _pursuit_calls(fake_beagle, "close") == []
 
@@ -6459,6 +6460,128 @@ async def test_tests_only_unproven_next_names_no_import(
     assert "tests/test_case_data.py must fail when tests/cases.json is removed" in next_text
     for word in ("ImportError", "import the module", "from <package>", "test_cases.py"):
         assert word not in next_text, word
+
+
+M_TEST = "from src.m import f\n\n\ndef test_f():\n    assert f() == 1\n"
+
+
+def _imports_m_task(
+    tmp_path: Path, fake_beagle: Path, monkeypatch: pytest.MonkeyPatch, witness: str
+) -> Path:
+    """A tests-only task whose worker writes tests/test_m.py, which imports src/m.py."""
+    project = _git_project(tmp_path, monkeypatch)
+    monkeypatch.chdir(project)
+    (project / "src").mkdir()
+    (project / "src" / "m.py").write_text("def f():\n    return 1\n")
+    monkeypatch.setenv("FAKE_TAU_WRITES", json.dumps({"tests/test_m.py": M_TEST}))
+    monkeypatch.setenv(
+        "FAKE_TAU_REPORT",
+        f"wrote the test\n\nWITNESS: {witness}\nNEEDLE:\n    return 1\n"
+        "REPLACEMENT:\n    return 2\nEND WITNESS",
+    )
+    _ready_task(fake_beagle, "grep -q test_f tests/test_m.py")
+    (fake_beagle / "prove.out").write_text(
+        "T0002: PROVEN — refuses when `return 1` is `return 2`\n"
+    )
+    return project
+
+
+async def _step_m(tmp_path: Path) -> Any:
+    runtime, _ = _bound(tmp_path)
+    return await _tool(runtime, "pursuit_step").execute(
+        "c1",
+        {
+            "task": "T0002",
+            "criteria": "the tests of m are written",
+            "done_when": "grep -q test_f tests/test_m.py",
+            "scope": ["tests/test_m.py"],
+        },
+    )
+
+
+@pytest.mark.anyio
+async def test_tests_only_task_proves_by_mutating_the_imported_module(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # R12 E41-E42: T0008's check passed and its tests imported the module.
+    _imports_m_task(tmp_path, fake_beagle, monkeypatch, "src/m.py")
+
+    result = await _step_m(tmp_path)
+
+    [prove] = _pursuit_calls(fake_beagle, "prove")
+    assert prove[:3] == ["T0002", "--mutate", "src/m.py"]
+    assert _pursuit_calls(fake_beagle, "close")[0][:3] == ["T0002", "--outcome", "done"]
+    assert "closed done" in result.text
+
+
+@pytest.mark.anyio
+async def test_tests_only_witness_in_test_file_names_the_imported_module_and_is_not_unproven(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # R12 E41-E48: the witness in the test was refused, the task went unproven at
+    # once, and the next text pointed at T0007's locked tests/cases.json.
+    project = _imports_m_task(tmp_path, fake_beagle, monkeypatch, "tests/test_m.py")
+
+    result = await _step_m(tmp_path)
+
+    first, second = _runs(fake_tau)
+    assert "Give a WITNESS in src/m.py" in second["stdin"]
+    assert "Give a WITNESS in src/m.py" in result.text
+    assert "stays open" in result.text and "new_route=true" not in result.text
+    assert "the data file's absence is the proof" not in result.text
+    assert (str(project), "T0002") not in _module()._UNPROVEN
+    assert _pursuit_calls(fake_beagle, "prove") == []
+    assert _pursuit_calls(fake_beagle, "close") == []
+    assert _module()._scope_has_data(["tests/cases.json", "tests/test_m.py"])
+    assert not _module()._scope_has_data(["tests/test_m.py", "tests/"])
+
+
+@pytest.mark.anyio
+async def test_new_route_passing_only_on_own_uncommitted_work_is_opened(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # R12 E44-E96: T0008's new route was refused as "already passes" five times,
+    # on a check that passed only on its own uncommitted tests/test_cases.py.
+    project = _git_project(tmp_path, monkeypatch)
+    monkeypatch.chdir(project)
+    (project / "tests").mkdir()
+    (project / "tests" / "test_m.py").write_text(M_TEST)
+    (fake_beagle / "next.out").write_text(json.dumps({"open": [{"id": "T0002"}], "ready": []}))
+    opened = {
+        **R06_PREDECESSOR,
+        "status": "open",
+        "done_when": "grep -q nothing tests/test_m.py",
+        "scope": ["tests/test_m.py"],
+    }
+    (fake_beagle / "show-T0002.out").write_text(json.dumps(opened))
+    (fake_beagle / "spawn.out").write_text("T0002 superseded by T0008\n")
+    runtime, _ = _bound(tmp_path)
+
+    result = await _tool(runtime, "pursuit_step").execute(
+        "c1",
+        {
+            "task": "T0002",
+            "new_route": True,
+            "notes": "run the test that imports src/m.py",
+            "done_when": "grep -q test_f tests/test_m.py",
+        },
+    )
+
+    assert "already passes" not in result.text
+    assert len(_pursuit_calls(fake_beagle, "spawn")) == 1
+    assert (project / "tests" / "test_m.py").read_text() == M_TEST
 
 
 @pytest.mark.anyio
