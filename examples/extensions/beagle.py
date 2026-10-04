@@ -125,6 +125,7 @@ import shlex
 import shutil
 import socket
 import subprocess
+import sys
 import tempfile
 import tomllib
 import urllib.error
@@ -3130,6 +3131,15 @@ def _check_problem(command: str) -> str | None:
             f"file is there, whatever it says. {one_command}, testing what the code must "
             "do. Call pursuit_step again with that."
         )
+    if _key_only_json_check(command):
+        # Run R12 closed T0002 on `assert 'title' in data and ...` over its
+        # summary JSON, which held whatever the worker wrote under those keys.
+        return (
+            f"done_when `{command}` loads JSON and only asserts that keys are there, but a "
+            "key check passes on any content; bind a test that compares values to the "
+            "reference. " + one_command + ", asserting the values the reference gives. "
+            "Call pursuit_step again with that."
+        )
     found = [w for w in words[1:] if w.lower() in _PROSE_WORDS]
     if not found:
         return None
@@ -3140,6 +3150,44 @@ def _check_problem(command: str) -> str | None:
         "tests/test_greet.py`. Put what the test must assert in criteria and notes, "
         "and call pursuit_step again."
     )
+
+
+def _key_only_json_check(command: str) -> bool:
+    """Whether a `python -c` check loads JSON and asserts only that keys are there."""
+    code = _bash_find(command, _python_c_code)
+    if code is None:
+        return False
+    try:
+        tree = ast.parse(code)
+    except SyntaxError:
+        return False
+    loads = any(
+        isinstance(node, ast.Attribute)
+        and node.attr in {"load", "loads"}
+        and isinstance(node.value, ast.Name)
+        and node.value.id == "json"
+        for node in ast.walk(tree)
+    )
+
+    def key_check(test: ast.expr) -> bool:
+        if isinstance(test, ast.Compare):
+            return all(isinstance(op, (ast.In, ast.NotIn)) for op in test.ops)
+        if isinstance(test, ast.BoolOp):
+            return all(key_check(value) for value in test.values)
+        if isinstance(test, ast.UnaryOp) and isinstance(test.op, ast.Not):
+            return key_check(test.operand)
+        if (
+            isinstance(test, ast.Call)
+            and isinstance(test.func, ast.Name)
+            and test.func.id in {"all", "any"}
+            and len(test.args) == 1
+            and isinstance(test.args[0], (ast.GeneratorExp, ast.ListComp))
+        ):
+            return key_check(test.args[0].elt)
+        return False
+
+    asserts = [node.test for node in ast.walk(tree) if isinstance(node, ast.Assert)]
+    return loads and bool(asserts) and all(key_check(test) for test in asserts)
 
 
 def _only_imports(args: list[str]) -> bool:
@@ -3275,6 +3323,159 @@ def _data_task(scope: list[str], goal: Path, check: str, locks: list[str]) -> bo
         for rel in entries
     )
     return data or bool(re.search(r"test_\w*(case|data)", check))
+
+
+#: Root-level directories that hold no package of the project's own.
+_NOT_PACKAGES = frozenset(
+    {"docs", "doc", "references", "tests", "test", "data", "examples", "scripts", "notes"}
+)
+#: Imports in a test that name no module of the project's.
+_TEST_LIBRARIES = frozenset({"pytest", "_pytest", "hypothesis", "tests", "test", "conftest"})
+
+
+def _head_files(root: Path) -> set[str] | None:
+    """The files git holds at HEAD, or None when there is no HEAD to ask."""
+    try:
+        done = subprocess.run(
+            ["git", "ls-tree", "-r", "--name-only", "HEAD"],
+            cwd=root,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except OSError:
+        return None
+    return set(done.stdout.splitlines()) if done.returncode == 0 else None
+
+
+def _module_of(rel: str) -> str:
+    """The dotted module a source path under src/ or the root holds."""
+    path = rel.removeprefix("src/").removesuffix(".py").removesuffix("/__init__")
+    return path.replace("/", ".")
+
+
+def _new_modules(scope: list[str], root: Path) -> list[tuple[str, str]]:
+    """Each new (absent at HEAD) source module a scope names: (entry, dotted name).
+
+    A non-test .py file counts, and so does a package directory under src/ or
+    the root; a bare `src/` names a module not yet known, given as "".
+    """
+    head = _head_files(root)
+
+    def absent(rel: str) -> bool:
+        if head is None:
+            return not (root / rel).exists()
+        return rel not in head and not any(f.startswith(f"{rel}/") for f in head)
+
+    found: list[tuple[str, str]] = []
+    for entry in scope:
+        rel = entry.strip().rstrip("/")
+        parts = Path(rel).parts
+        if not rel or _is_test_path(rel) or Path(rel).name in {"tests", "test"}:
+            continue
+        if rel.endswith(".py"):
+            if absent(rel):
+                found.append((rel, _module_of(rel)))
+            continue
+        if Path(rel).suffix:
+            continue
+        if (root / rel).is_dir():
+            files = [
+                f
+                for f in _scope_dir_files(root, rel)
+                if f.endswith(".py") and not _is_test_path(f) and absent(f)
+            ]
+            found += [(f, _module_of(f)) for f in files]
+            if files:
+                continue
+        package = (
+            parts == ("src",)
+            or (len(parts) == 2 and parts[0] == "src" and parts[1].isidentifier())
+            or (len(parts) == 1 and parts[0].isidentifier() and parts[0] not in _NOT_PACKAGES)
+        )
+        if package and absent(rel):
+            found.append((entry, "" if parts == ("src",) else parts[-1]))
+    return found
+
+
+def _locked_test_imports(goal: Path) -> dict[str, str]:
+    """Each project module a locked test file imports, with the first test importing it."""
+    store = goal.parent / LOCKED_DIR
+    imported: dict[str, str] = {}
+    for rel in _locked(goal):
+        if not rel.endswith(".py") or not _is_test_path(rel):
+            continue
+        try:
+            tree = ast.parse((store / rel).read_text(encoding="utf-8"))
+        except (OSError, SyntaxError, ValueError):
+            continue
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                names = [alias.name for alias in node.names]
+            elif isinstance(node, ast.ImportFrom) and node.module and not node.level:
+                names = [node.module]
+            else:
+                continue
+            for name in names:
+                top = name.split(".")[0]
+                if top in sys.stdlib_module_names or top in _TEST_LIBRARIES:
+                    continue
+                if top.startswith("test_"):
+                    continue
+                imported.setdefault(name, rel)
+    return imported
+
+
+def _cases_first_problem(scope: list[str], task: str, title: str, goal: Path) -> str | None:
+    """Why a task would write new source before known answers judge it, or None.
+
+    Run R12: CASES_FIRST_NOTE was advice, the driver opened the implementation
+    before any cases, and a plain-int event clock was built that nothing from
+    the paper bound. With references/ there, a new source module waits for a
+    locked test that imports it by name.
+    """
+    root = goal.parent.parent
+    if not (root / REFERENCES_DIR).is_dir():
+        return None
+    new = _new_modules(scope, root)
+    if not new:
+        return None
+    imported = _locked_test_imports(goal)
+
+    def judged(module: str) -> bool:
+        if not module:
+            return bool(imported)
+        return any(
+            name == module or name.startswith(f"{module}.") or module.startswith(f"{name}.")
+            for name in imported
+        )
+
+    unjudged = [(entry, module) for entry, module in new if not judged(module)]
+    if not unjudged:
+        return None
+    entry, module = unjudged[0]
+    if imported:
+        name, test = next(iter(imported.items()))
+        path = name.replace(".", "/")
+        base = "src/" if (root / "src").is_dir() else ""
+        return (
+            f"Cases first: scope names new source {entry}, which no locked test imports, "
+            f"so nothing from the reference judges it. The locked cases test {test} imports "
+            f"`{name}`: put that module ({base}{path}.py or {base}{path}/) in this task's "
+            f"scope instead of {entry}, and call pursuit_step again."
+        )
+    named = f"`{module}`" if module else "the module this task writes"
+    label = title.replace("::", ":").replace('"', "'").strip() or task
+    return (
+        "Cases first: open the known-answers milestone before the code; its test imports "
+        f"this module by name. Scope names new source {entry}, and no locked test imports "
+        "it yet, so nothing from the reference would judge the code. Add the milestone "
+        f'before this one in one call: pursuit_plan task="{task}" parts=["Known answers::'
+        f"cases from references/ in tests/cases.json, and tests/test_cases.py importing "
+        f'{named} by name", "{label}::the code, judged by the locked cases"]. Then work the '
+        "known-answers task first, with only tests/ in scope and locks=[tests/cases.json, "
+        "tests/test_cases.py]."
+    )
 
 
 def _python_c_code(argv: list[str]) -> str | None:
@@ -4728,6 +4929,7 @@ def make_step_tool() -> Any:
             scoped = (
                 _scope_problem(scope, task, nodes)
                 or _oracle_with_code_problem(scope, goal)
+                or _cases_first_problem(scope, task, title, goal)
                 or _import_scope_problem(done_when, scope, root)
             )
             if scoped is not None:

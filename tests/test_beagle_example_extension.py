@@ -3891,6 +3891,149 @@ async def test_step_refuses_directory_scopes_holding_unlocked_data_and_source(
     assert len(_pursuit_calls(fake_beagle, "open")) == 1
 
 
+def _r12_project(tmp_path: Path, *, references: bool = True) -> Path:
+    project = _pursuit_project(tmp_path)
+    if references:
+        (project / "references").mkdir()
+        (project / "references" / "itc2008.txt").write_text("Interval Tree Clocks\n")
+    return project
+
+
+def _lock_cases_test(project: Path, imports: str) -> None:
+    store = project / ".beagle" / "locked" / "tests"
+    store.mkdir(parents=True)
+    (store / "cases.json").write_text("[]")
+    (store / "test_cases.py").write_text(f"import json\n\nimport pytest\n\n{imports}\n")
+
+
+def _open_args(scope: list[str]) -> dict[str, Any]:
+    return {
+        "task": "T0002",
+        "criteria": "the clocks pass the cases",
+        "done_when": "grep -q done done.txt",
+        "scope": scope,
+    }
+
+
+@pytest.mark.anyio
+async def test_opening_a_new_source_module_before_a_locked_cases_test_is_refused(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # R12's T0004: scope src/, with no cases locked yet.
+    project = _r12_project(tmp_path)
+    monkeypatch.chdir(project)
+    _ready_task(fake_beagle)
+    runtime, _ = _bound(tmp_path)
+
+    refused = await _tool(runtime, "pursuit_step").execute("c1", _open_args(["src/"]))
+
+    assert "not opened" in refused.text and "Cases first" in refused.text
+    assert "known-answers milestone" in refused.text
+    assert 'pursuit_plan task="T0002" parts=["Known answers::' in refused.text
+    assert '"Parser::the code, judged by the locked cases"' in refused.text
+    assert _pursuit_calls(fake_beagle, "open") == []
+    assert _runs(fake_tau) == []
+
+    # A locked test imports another module: it is named, to scope instead.
+    _lock_cases_test(project, "from itc import Stamp")
+    other = await _tool(runtime, "pursuit_step").execute(
+        "c2", _open_args(["src/interval_tree_clock.py"])
+    )
+
+    assert "Cases first" in other.text and "src/interval_tree_clock.py" in other.text
+    assert "imports `itc`" in other.text and "in this task's scope instead" in other.text
+    assert _pursuit_calls(fake_beagle, "open") == []
+
+    # The known-answers task itself, data and tests only, is never gated.
+    cases = await _tool(runtime, "pursuit_step").execute(
+        "c3", _open_args(["tests/cases.json", "tests/test_cases.py"])
+    )
+
+    assert "Cases first" not in cases.text
+    assert len(_pursuit_calls(fake_beagle, "open")) == 1
+
+
+@pytest.mark.anyio
+async def test_opening_the_module_a_locked_cases_test_imports_is_allowed(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project = _r12_project(tmp_path)
+    _git(project, "init", "-q")
+    (project / "src").mkdir()
+    (project / "src" / "old.py").write_text("")
+    _git(project, "add", "src/old.py")
+    _git(project, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "seed")
+    _lock_cases_test(project, "import interval_tree_clock")
+    monkeypatch.chdir(project)
+    _ready_task(fake_beagle)
+    runtime, _ = _bound(tmp_path)
+
+    opened = await _tool(runtime, "pursuit_step").execute(
+        "c1", _open_args(["src/interval_tree_clock.py"])
+    )
+
+    assert "Cases first" not in opened.text
+    assert len(_pursuit_calls(fake_beagle, "open")) == 1
+
+    # A file already at HEAD is no new module, and docs are no module at all.
+    module = _module()
+    goal = project / ".beagle" / "pursuit.toml"
+    assert module._cases_first_problem(["src/old.py", "docs/"], "T0002", "Parser", goal) is None
+    found = module._cases_first_problem(["src/itc/"], "T0002", "Parser", goal)
+    assert found is not None and "imports `interval_tree_clock`" in found
+
+
+@pytest.mark.anyio
+async def test_cases_first_gate_is_off_without_references(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project = _r12_project(tmp_path, references=False)
+    monkeypatch.chdir(project)
+    _ready_task(fake_beagle)
+    runtime, _ = _bound(tmp_path)
+
+    opened = await _tool(runtime, "pursuit_step").execute("c1", _open_args(["src/"]))
+
+    assert "Cases first" not in opened.text
+    assert len(_pursuit_calls(fake_beagle, "open")) == 1
+
+
+def test_key_only_json_done_when_is_refused() -> None:
+    module = _module()
+    # R12's T0002 done_when (E11), read from its record.
+    r12 = (
+        "python3 -c \"import json; data=json.load(open('reference-summary.json')); "
+        "assert 'title' in data and 'abstract' in data and 'core_concepts' in data "
+        "and 'operations' in data\""
+    )
+    every = (
+        "python3 -c \"import json; cases=json.load(open('tests/cases.json')); "
+        "assert all('expected' in c for c in cases)\""
+    )
+    values = (
+        "python3 -c \"import json; data=json.load(open('tests/cases.json')); "
+        "assert data[0]['expected'] == [1, 0]\""
+    )
+
+    for check in (r12, every):
+        found = module._check_problem(check)
+        assert found is not None and "a key check passes on any content" in found
+        assert "compares values to the reference" in found
+    assert module._check_problem(values) is None
+
+
 def test_scope_dir_walk_skips_cache_directories(tmp_path: Path) -> None:
     (tmp_path / "pkg" / "src").mkdir(parents=True)
     (tmp_path / "pkg" / "src" / "x.py").write_text("")
