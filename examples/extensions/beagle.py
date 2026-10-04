@@ -6046,8 +6046,16 @@ def _move_pending_locks(goal: Path, task: str, first_part: str, root: Path) -> s
 
 
 def _fixes_known_answers(title: str) -> bool:
-    """Whether a task titled `title` re-opens the known answers, and so may hold them."""
-    return _names_known_answers(title) or title.strip().lower().startswith("known answers")
+    """Whether a task titled `title` fixes the known answers, and so may hold them.
+
+    Audit 9 on T0171: matching any title that named the cases let "Implement the
+    clock so it passes the cases" hold, edit and re-lock the locked test.
+    """
+    text = title.strip().lower()
+    if text.startswith(("known answers: fix", "known answers fix")):
+        return True
+    head = text.split("::", 1)[0]
+    return bool(re.search(r"\bfix", head)) and "known answer" in head
 
 
 def _locked_in_scope(scope: list[str], goal: Path) -> list[str]:

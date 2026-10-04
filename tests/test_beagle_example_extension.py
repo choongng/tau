@@ -3734,6 +3734,87 @@ async def test_step_refuses_a_scope_that_names_a_locked_file(
 
 
 @pytest.mark.anyio
+async def test_an_implementation_task_naming_the_cases_cannot_hold_a_locked_file(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Audit 9 on T0171: a title that merely named the cases counted as a fix of
+    # the known answers, so it could hold, edit and re-lock the locked test.
+    project = _pursuit_project(tmp_path)
+    monkeypatch.chdir(project)
+    _locked_cases_test(project)
+    title = "Implement the clock so it passes the cases"
+    _titled_task(fake_beagle, title)
+    runtime, _ = _bound(tmp_path)
+
+    result = await _tool(runtime, "pursuit_step").execute(
+        "c1",
+        {
+            "task": "T0002",
+            "criteria": "the clock passes the cases",
+            "done_when": "grep -q done done.txt",
+            "scope": ["clock.py", "tests/test_cases.py"],
+        },
+    )
+
+    assert "T0002 not opened — tests/test_cases.py is locked as the known answers" in (
+        result.text
+    )
+    assert _pursuit_calls(fake_beagle, "open") == [] and _runs(fake_tau) == []
+
+    module = _module()
+    # Not a fix, so its worker's edits to locked files are put back, not kept.
+    assert module._fixes_known_answers(title) is False
+    assert module._fixes_known_answers("Make the parser pass the known answers") is False
+    assert module._fixes_known_answers("Known answers") is False
+    assert module._fixes_known_answers("Known answers: fix tests/test_cases.py") is True
+    assert module._fixes_known_answers("known answers fix the stamp case") is True
+    assert module._fixes_known_answers("Fix the known answers::case 3 is wrong") is True
+    assert module._fixes_known_answers("Clock::fix it to pass the known answers") is False
+
+
+@pytest.mark.anyio
+async def test_amend_refuses_a_scope_that_names_a_locked_file(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project = _pursuit_project(tmp_path)
+    monkeypatch.chdir(project)
+    _locked_cases_test(project)
+    _open_task(fake_beagle)
+    runtime, _ = _bound(tmp_path)
+    step = _tool(runtime, "pursuit_step")
+    scope = ["parser.py", "tests/test_cases.py"]
+
+    amended = await step.execute(
+        "c1", {"task": "T0002", "done_when": "grep -q x x.txt", "scope": scope}
+    )
+
+    assert "T0002's check not changed — tests/test_cases.py is locked as the known answers" in (
+        amended.text
+    )
+    assert _pursuit_calls(fake_beagle, "amend") == [] and _runs(fake_tau) == []
+
+    (fake_beagle / "next.out").write_text(json.dumps({"open": [{"id": "T0002"}], "ready": []}))
+    record = {**R06_PREDECESSOR, "title": "Parser", "status": "open"}
+    (fake_beagle / "show-T0002.out").write_text(json.dumps(record))
+    route = {"task": "T0002", "new_route": True, "notes": "parse the cases first"}
+
+    rerouted = await step.execute("c2", {**route, "done_when": "grep -q x x.txt", "scope": scope})
+
+    assert "no new route for T0002 — tests/test_cases.py is locked as the known answers" in (
+        rerouted.text
+    )
+    assert _pursuit_calls(fake_beagle, "spawn") == [] == _pursuit_calls(fake_beagle, "open")
+
+
+@pytest.mark.anyio
 async def test_known_answers_fix_task_may_hold_locked_files_and_relocks_them(
     tmp_path: Path,
     beagle: Path,
