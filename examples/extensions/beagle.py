@@ -3606,10 +3606,12 @@ def _is_cases_data(rel: str) -> bool:
 
 
 def _cases_test_reads(test_path: Path, data_basename: str) -> bool:
-    """Whether the test's code, not a docstring or comment, names and opens the data file.
+    """Whether the test's code, not a docstring or comment, opens the data file.
 
     Run R14: test_cases.py held hand-written asserts and never opened
-    cases.json, so the locked known answers judged nothing.
+    cases.json, so the locked known answers judged nothing. The read call
+    (open, Path, read_text, json.load) must take the file: a string naming it,
+    or a name assigned from one. A message string naming it elsewhere does not.
     """
     try:
         tree = ast.parse(test_path.read_text(encoding="utf-8"))
@@ -3627,24 +3629,51 @@ def _cases_test_reads(test_path: Path, data_basename: str) -> bool:
                     and isinstance(stmt.value.value, str)
                 )
             ]
-    named = opens = False
+    names: set[str] = set()
+
+    def mentions(node: ast.AST) -> bool:
+        return any(
+            (
+                isinstance(sub, ast.Constant)
+                and isinstance(sub.value, str)
+                and data_basename in sub.value
+            )
+            or (isinstance(sub, ast.Name) and sub.id in names)
+            for sub in ast.walk(node)
+        )
+
+    assigns = [n for n in ast.walk(tree) if isinstance(n, (ast.Assign, ast.AnnAssign))]
+    grew = True
+    while grew:
+        grew = False
+        for node in assigns:
+            if node.value is None or not mentions(node.value):
+                continue
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            for target in targets:
+                if isinstance(target, ast.Name) and target.id not in names:
+                    names.add(target.id)
+                    grew = True
     for node in ast.walk(tree):
-        if isinstance(node, ast.Constant) and isinstance(node.value, str):
-            named = named or data_basename in node.value
-        elif isinstance(node, ast.Call):
-            func = node.func
-            if isinstance(func, ast.Name):
-                opens = opens or func.id in {"open", "Path"}
-            elif isinstance(func, ast.Attribute):
-                opens = opens or (
-                    func.attr in {"read_text", "Path"}
-                    or (
-                        func.attr in {"load", "loads"}
-                        and isinstance(func.value, ast.Name)
-                        and func.value.id == "json"
-                    )
-                )
-    return named and opens
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        given: list[ast.AST] = [*node.args, *(k.value for k in node.keywords)]
+        if isinstance(func, ast.Name):
+            reads = func.id in {"open", "Path"}
+        elif isinstance(func, ast.Attribute):
+            reads = func.attr in {"read_text", "Path"} or (
+                func.attr in {"load", "loads"}
+                and isinstance(func.value, ast.Name)
+                and func.value.id == "json"
+            )
+            if func.attr == "read_text":
+                given.append(func.value)
+        else:
+            reads = False
+        if reads and any(mentions(arg) for arg in given):
+            return True
+    return False
 
 
 def _test_project_imports(test_path: Path) -> list[str]:

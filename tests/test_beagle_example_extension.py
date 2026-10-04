@@ -2953,6 +2953,62 @@ async def test_cases_test_that_json_loads_the_cases_file_is_locked(
     }
 
 
+def test_locked_test_imports_skips_a_test_that_reads_no_locked_data(tmp_path: Path) -> None:
+    # The store holds a cases file, so a locked test that never reads it is
+    # judged by its own asserts and must not decide which module is tested.
+    goal = tmp_path / ".beagle" / "pursuit.toml"
+    store = tmp_path / ".beagle" / "locked" / "tests"
+    store.mkdir(parents=True)
+    (store / "cases.json").write_text('[{"in": 1, "out": 2}]')
+    (store / "test_case_data.py").write_text(
+        "import json\n\nimport clocks\n\n\n"
+        "def test_cases():\n    assert json.load(open('tests/cases.json'))\n"
+    )
+    (store / "test_stamps.py").write_text(
+        "import stamps\n\n\ndef test_stamps():\n    assert stamps.ok()\n"
+    )
+
+    assert _module()._locked_test_imports(goal) == {"clocks": "tests/test_case_data.py"}
+
+
+def test_cases_test_reads_requires_the_read_to_name_the_file(tmp_path: Path) -> None:
+    shapes = {
+        "message string beside a bare Path(__file__)": (
+            "from pathlib import Path\n\n\ndef test_cases():\n"
+            '    assert Path(__file__).read_text(), "see tests/cases.json"\n',
+            False,
+        ),
+        "named string, another file opened": (
+            'import json\n\nNOTE = "cases.json"\n\n\ndef test_cases():\n'
+            '    assert json.load(open("other.json"))\n',
+            False,
+        ),
+        "open on a literal": (CASES_DATA_TEST, True),
+        "read_text on a path expression": (
+            "import json\nfrom pathlib import Path\n\n"
+            'CASES = json.loads((Path(__file__).parent / "cases.json").read_text())\n',
+            True,
+        ),
+        "read_text on a name assigned the path": (
+            "import json\nfrom pathlib import Path\n\n"
+            'CASES = Path(__file__).parent / "cases.json"\n\n\n'
+            "def test_cases():\n    assert json.loads(CASES.read_text())\n",
+            True,
+        ),
+        "open on an os.path.join name (R14)": (
+            "import json\nimport os\n\n"
+            'TEST_FILE = os.path.join(os.path.dirname(__file__), "cases.json")\n\n\n'
+            'def test_cases():\n    with open(TEST_FILE, "r") as f:\n'
+            "        assert json.load(f)\n",
+            True,
+        ),
+    }
+    for label, (source, expected) in shapes.items():
+        test = tmp_path / "test_cases.py"
+        test.write_text(source)
+        assert _module()._cases_test_reads(test, "cases.json") is expected, label
+
+
 ITC_REFERENCE = (
     "Interval Tree Clocks\n\n4\n\n"
     "fork(i) = (i1, i2), where (i1, i2) = split(i)\n"
@@ -3291,6 +3347,54 @@ async def test_step_refuses_a_check_that_exits_with_a_git_usage_error(
 
     assert "not opened" in result.text and "could not run" in result.text
     assert "(exit 129)" in result.text and "--stat:" in result.text
+    assert _pursuit_calls(fake_beagle, "open") == [] and _runs(fake_tau) == []
+
+
+@pytest.mark.anyio
+async def test_open_refuses_a_check_whose_command_is_missing(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project = _pursuit_project(tmp_path)
+    monkeypatch.chdir(project)
+    subprocess.run(["git", "init", "-q"], cwd=project, check=True)
+    _ready_task(fake_beagle)
+    runtime, _ = _bound(tmp_path)
+
+    result = await _tool(runtime, "pursuit_step").execute(
+        "c1", {"task": "T0002", "criteria": "c", "done_when": "no-such-command-t0127 x.md"}
+    )
+
+    assert "not opened" in result.text and "could not run" in result.text
+    assert "(exit 127)" in result.text
+    assert _pursuit_calls(fake_beagle, "open") == [] and _runs(fake_tau) == []
+
+
+@pytest.mark.anyio
+async def test_open_refuses_a_check_that_prints_usage(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # argparse exits 2 on an unknown option and prints a `usage:` line.
+    project = _pursuit_project(tmp_path)
+    monkeypatch.chdir(project)
+    subprocess.run(["git", "init", "-q"], cwd=project, check=True)
+    _ready_task(fake_beagle)
+    runtime, _ = _bound(tmp_path)
+
+    result = await _tool(runtime, "pursuit_step").execute(
+        "c1",
+        {"task": "T0002", "criteria": "c", "done_when": "python3 -m zipfile --no-such-opt"},
+    )
+
+    assert "not opened" in result.text and "could not run" in result.text
+    assert "(exit 2)" in result.text and "error: one of the arguments" in result.text
     assert _pursuit_calls(fake_beagle, "open") == [] and _runs(fake_tau) == []
 
 
@@ -5689,6 +5793,60 @@ async def test_pending_milestone_abandon_refusal_offers_no_new_route(
     assert "new_route" not in pending.text
     assert "pursuit_plan" in pending.text and 'abandon="done by Tnnnn"' in pending.text
     assert "new_route=true" in opened.text
+
+
+@pytest.mark.anyio
+async def test_part_abandon_refusal_offers_done_by(
+    tmp_path: Path, beagle: Path, fake_beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(_pursuit_project(tmp_path))
+    _ready_task(fake_beagle)
+    _milestones(
+        fake_beagle,
+        {"id": "T0003", "parent": "T0002", "status": "pending"},
+        {"id": "T0004", "parent": "T0002", "status": "done"},
+    )
+    runtime, _ = _bound(tmp_path)
+
+    result = await _tool(runtime, "pursuit_step").execute(
+        "c1", {"task": "T0003", "abandon": "duplicate of T0004"}
+    )
+
+    assert _pursuit_calls(fake_beagle, "close") == []
+    assert "T0003 not abandoned — T0002 would stall for good" in result.text
+    assert 'abandon="done by T' in result.text
+    assert "closes done at once" not in result.text
+
+
+@pytest.mark.anyio
+async def test_done_by_closes_a_pending_milestone(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, sha = _done_by_project(tmp_path, fake_beagle, monkeypatch, "T0003: Cases")
+    nodes = [
+        {"id": "T0001", "parent": "", "title": "Goal", "status": "open", "container": True},
+        {"id": "T0003", "parent": "T0001", "title": "Cases", "status": "done"},
+        {"id": "T0004", "parent": "T0001", "title": "Cases test", "status": "pending"},
+    ]
+    (fake_beagle / "tree.out").write_text(json.dumps({"goal": "Ship it", "nodes": nodes}))
+    runtime, _ = _bound(tmp_path)
+
+    result = await _tool(runtime, "pursuit_step").execute(
+        "c1", {"task": "T0004", "abandon": "done by T0003", "done_when": CASES_CHECK}
+    )
+
+    because = f"satisfied by T0003's commit {sha[:12]}; no sub-agent ran"
+    assert [c[0] for c in _pursuit_calls(fake_beagle, "open")] == ["T0004"]
+    assert _pursuit_calls(fake_beagle, "close") == [
+        ["T0004", "--outcome", "done", "--body", because, "--spent", "0"]
+        + ["--spent-because", because]
+    ]
+    assert _runs(fake_tau) == []
+    assert "T0004 — Cases test: closed done" in result.text
 
 
 @pytest.mark.anyio
