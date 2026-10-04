@@ -673,6 +673,18 @@ def _copy_targets(args: list[str], cwd: Path, moves: bool) -> list[str]:
     return targets + (sources if moves else [])
 
 
+#: `uv init`/`uv add` options that take a value, so it is not read as a directory.
+_UV_VALUE_OPTIONS = frozenset(
+    {
+        *("--name", "--python", "-p", "--build-backend", "--vcs", "--author-from"),
+        *("--description", "--group", "--optional", "--extra", "--index", "--index-url"),
+        *("--default-index", "--extra-index-url", "-r", "--requirements", "--rev", "--tag"),
+        *("--branch", "--package", "--script", "--cache-dir", "--config-file", "--color"),
+        *("--marker", "-m", "--bounds"),
+    }
+)
+
+
 def _command_targets(argv: list[str], cwd: Path) -> list[str] | None:
     """The paths one simple command (argv, redirects removed) writes."""
     while argv and ("=" in argv[0] and not argv[0].startswith("=") or argv[0] in _WRAPPERS):
@@ -696,6 +708,12 @@ def _command_targets(argv: list[str], cwd: Path) -> list[str] | None:
         return _positional(args, frozenset({"-s", "--size", "-r", "--reference", "-n"}))
     if name == "dd":
         return [a[3:] for a in args if a.startswith("of=")]
+    if name == "uv" and args and args[0] in ("init", "add"):
+        # Run R15: W1's `uv init itc_clocks` made itc_clocks/ outside its scope, unseen.
+        rest = _positional(args[1:], _UV_VALUE_OPTIONS)
+        if args[0] == "init" and rest:
+            return [rest[0]]
+        return ["pyproject.toml"]
     if name == "git" and args:
         sub, sub_args = args[0], args[1:]
         if sub == "checkout" and "--" in sub_args:
@@ -712,7 +730,8 @@ def _bash_write_targets(command: str, cwd: Path) -> list[Path] | None:
 
     Deliberately narrow: a redirect target, a `tee` argument, a `sed -i` file,
     a `cp`/`mv`/`install`/`ln` destination (and what `mv` removes), `dd of=`,
-    `rm`/`truncate`, and the `git` verbs that rewrite tracked files (`stash`,
+    `rm`/`truncate`, the directory `uv init <dir>` creates (pyproject.toml for
+    `uv add` or a bare `uv init`), and the `git` verbs that rewrite tracked files (`stash`,
     `clean` and `reset --hard` stand for the whole tree as `.`). A path that is
     only read — `cat pursuit.toml > /tmp/x`, `git check-ignore -v pursuit.toml`
     — is not a target. `cd` is followed along a chain, and `bash -c '...'` is
@@ -1631,6 +1650,8 @@ DEFAULT_STEP_ATTEMPTS = 2
 CLOSE_BODY_CHARS = 3_900
 #: How much of a failing check's output goes back to the next attempt.
 CHECK_TAIL_CHARS = 1_500
+#: How much of the previous attempt's report a retry brief carries.
+RETRY_REPORT_CHARS = 4_000
 #: Fallback for a check with no recorded timeout.
 DEFAULT_CHECK_TIMEOUT = 600.0
 
@@ -6428,6 +6449,17 @@ def make_step_tool() -> Any:
                     f" It also changed locked files ({', '.join(undone)}); they were put "
                     "back. Make the code pass them as they are."
                 )
+            notes = report.strip()
+            if notes and not notes.startswith(NO_REPORT):
+                # Run R15: W5 and W6 re-read both references from line 1, though
+                # the reports before them (W2, W4) already held the semantics.
+                cut = notes[:RETRY_REPORT_CHARS]
+                retry_note += (
+                    "\n\nAn earlier attempt read the references; its notes:\n"
+                    + cut
+                    + ("\n[... cut]" if len(cut) < len(notes) else "")
+                    + "\nStart from these rather than reading the references again."
+                )
         undid = (
             f"The sub-agent changed locked files ({', '.join(sorted(restored))}); they "
             "were put back before the check.\n\n"
@@ -7013,8 +7045,8 @@ def _ruff_over_locked(command: str, cwd: Path, root: Path, locked: list[str]) ->
 
 #: Why a worker is kept from beagle and its store.
 NO_BEAGLE_REASON = (
-    "the brief has everything; do the task. A worker does not inspect .beagle/ or run "
-    "beagle: the session that sent you does that."
+    "the brief already holds what the task needs; do the task. A worker does not "
+    "inspect .beagle/ or run beagle: the session that sent you does that."
 )
 #: What a worker is told in its brief, to the same end.
 NO_BEAGLE_NOTE = "Do not inspect .beagle/ or run beagle."
@@ -7022,8 +7054,10 @@ NO_BEAGLE_NOTE = "Do not inspect .beagle/ or run beagle."
 #: is orienting, not working. A check script under it (`bash .beagle/checks/...`)
 #: is run, not read, and passes.
 _READERS = frozenset(
-    {"cat", "ls", "head", "tail", "less", "more", "find", "tree", "grep", "rg", "wc", "stat"}
+    {"cat", "ls", "head", "tail", "less", "more", "find", "tree", "grep", "rg", "wc", "stat", "sed"}
 )
+#: `git log` options that print each commit's diff.
+_GIT_LOG_PATCH = frozenset({"-p", "-u", "--patch"})
 #: The path an inline script opens or writes, as its source says it.
 _SCRIPT_PATH = re.compile(
     r"""open\(\s*['"](?P<open>[^'"]+)['"]\s*,\s*['"][wax]"""
@@ -7069,9 +7103,25 @@ def _worker_orientation(tool: str, args: Mapping[str, Any], cwd: Path) -> str | 
             return f"run `{' '.join(argv[:3])}`"
         if Path(argv[0]).name in _READERS and any(_in_store(a) for a in argv[1:]):
             return f"run `{' '.join(argv)}`"
+        if _named(argv, "git") and _git_reads_store(argv[1:]):
+            return f"run `{' '.join(argv)}`"
         return None
 
     return _bash_find(command, match)
+
+
+def _git_reads_store(args: list[str]) -> bool:
+    """Whether `git <args>` prints a `.beagle/` file: `show` of one, or `log -p` over one.
+
+    Run R15: W3 and W4, refused `cat .beagle/tree/T0002.md`, spent 11 and 13
+    turns on `git show HEAD:.beagle/tree/T0002.md | grep ...` instead.
+    """
+    if not args or args[0] not in ("show", "log"):
+        return False
+    paths = [a.split(":", 1)[1] if ":" in a else a for a in args[1:] if not a.startswith("-")]
+    if not any(p and _in_store(p) for p in paths):
+        return False
+    return args[0] == "show" or bool(_GIT_LOG_PATCH & set(args[1:]))
 
 
 def _script_write_targets(command: str, cwd: Path) -> list[Path]:

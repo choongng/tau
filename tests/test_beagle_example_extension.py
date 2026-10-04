@@ -7167,7 +7167,8 @@ async def test_worker_guard_refuses_beagle_commands_and_beagle_reads(
     for tool, arguments in calls:
         result = await _tool_with_hooks(runtime, tool).execute("c1", arguments)
 
-        assert "the brief has everything; do the task" in result.text, (tool, arguments)
+        needs = "the brief already holds what the task needs; do the task"
+        assert needs in result.text, (tool, arguments)
     # Its own test runs and its check script still run.
     allowed = [
         ("bash", {"command": "python3 -m pytest -q tests/test_beagle.py"}),
@@ -7182,7 +7183,7 @@ async def test_worker_guard_refuses_beagle_commands_and_beagle_reads(
     monkeypatch.delenv("BEAGLE_TAU_WORKER_SCOPE")
     unscoped, _ = _bound(tmp_path)
     tree = await _tool_with_hooks(unscoped, "bash").execute("c3", {"command": "beagle status"})
-    assert "the brief has everything" in tree.text
+    assert "the brief already holds what the task needs" in tree.text
     # One sent with no task (pursuit_dispatch, an audit) still reads the pursuit.
     monkeypatch.delenv("BEAGLE_TAU_WORKER_TASK")
     taskless, _ = _bound(tmp_path)
@@ -7191,6 +7192,107 @@ async def test_worker_guard_refuses_beagle_commands_and_beagle_reads(
     )
     assert brief.text == "ran"
     assert _module().NO_BEAGLE_NOTE == "Do not inspect .beagle/ or run beagle."
+
+
+# run R15 class 7: workers read .beagle/ through git, uv init wrote unseen, retries re-read
+
+
+@pytest.mark.anyio
+async def test_worker_guard_refuses_reading_dot_beagle(
+    tmp_path: Path, beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # R15: W1 (d3ba87cf…) read the tree file with the read tool; W3 with cat | head.
+    runtime = _scoped_worker(tmp_path, monkeypatch, scope="tests/")
+    refused = [
+        ("read", {"path": ".beagle/tree/T0002.md"}),
+        ("bash", {"command": "cat .beagle/tree/T0002.md 2>/dev/null | head -60 && echo ok"}),
+        ("bash", {"command": "grep -n scope .beagle/tree/T0002.md"}),
+        ("bash", {"command": "sed -n '1,20p' .beagle/tree/T0002.md"}),
+        ("bash", {"command": "tail -20 .beagle/tree/T0002.md"}),
+        ("bash", {"command": "less .beagle/pursuit.toml"}),
+    ]
+    for tool, arguments in refused:
+        result = await _tool_with_hooks(runtime, tool).execute("c1", arguments)
+
+        assert result.text != "ran", (tool, arguments)
+        assert "the brief already holds what the task needs" in result.text, (tool, arguments)
+    # Running its own check is not reading it.
+    check = await _tool_with_hooks(runtime, "bash").execute(
+        "c2", {"command": "bash .beagle/checks/T0003/check.sh"}
+    )
+    assert check.text == "ran"
+
+
+@pytest.mark.anyio
+async def test_worker_guard_refuses_git_show_of_a_dot_beagle_path(
+    tmp_path: Path, beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # R15: W3 and W4 spent 11 and 13 turns on `git show HEAD:.beagle/tree/T0002.md`.
+    runtime = _scoped_worker(tmp_path, monkeypatch, scope="tests/")
+    refused = [
+        'git show HEAD:.beagle/tree/T0002.md | grep -n "check_seconds\\|scope =\\|check_wrote"',
+        "git show 05d8d4e:.beagle/tree/T0002.md 2>&1",
+        "git log -p -- .beagle/tree/T0002.md",
+    ]
+    for command in refused:
+        result = await _tool_with_hooks(runtime, "bash").execute("c1", {"command": command})
+
+        assert "the brief already holds what the task needs" in result.text, command
+    allowed = ["git log --oneline -5", "git show HEAD:tests/test_cases.py", "git show --stat HEAD"]
+    for command in allowed:
+        result = await _tool_with_hooks(runtime, "bash").execute("c2", {"command": command})
+
+        assert result.text == "ran", command
+
+
+@pytest.mark.anyio
+async def test_bash_write_targets_sees_uv_init_dir(
+    tmp_path: Path, beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # R15: W1 (d3ba87cf…) ran this, and itc_clocks/ was made outside T0002's scope.
+    targets = _module()._bash_write_targets
+    itc = Path("/home/choong/itc")
+    command = "cd /home/choong/itc && uv init itc_clocks 2>&1 | tail -5; ls itc_clocks 2>/dev/null"
+    assert targets(command, itc) == [itc / "itc_clocks", Path("/dev/null")]
+    assert targets("uv init --name x --python 3.12 itc_clocks", itc) == [itc / "itc_clocks"]
+    assert targets("uv init", itc) == [itc / "pyproject.toml"]
+    added = "cd /home/choong/itc && uv add --dev pytest pytest-xdist ruff zuban 2>&1 | tail -20"
+    assert targets(added, itc) == [itc / "pyproject.toml"]
+    runtime = _scoped_worker(tmp_path, monkeypatch, scope="tests/")
+    result = await _tool_with_hooks(runtime, "bash").execute(
+        "c1", {"command": "uv init itc_clocks 2>&1 | tail -5"}
+    )
+    assert "refusing to write itc_clocks" in result.text
+
+
+@pytest.mark.anyio
+async def test_retry_brief_carries_the_previous_attempts_report(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # R15: W5 and W6 re-read both references from line 1 after W2 and W4 had reported.
+    monkeypatch.chdir(_pursuit_project(tmp_path))
+    monkeypatch.setenv("FAKE_TAU_SUCCEEDS_ON", "2")
+    _ready_task(fake_beagle)
+    runtime, _ = _bound(tmp_path)
+
+    await _tool(runtime, "pursuit_step").execute(
+        "c1",
+        {
+            "task": "T0002",
+            "criteria": "done.txt exists",
+            "done_when": "grep -q done done.txt",
+            "scope": ["done.txt"],
+        },
+    )
+
+    first, second = _runs(fake_tau)
+    assert "An earlier attempt read the references" not in first["stdin"]
+    notes = second["stdin"].split("An earlier attempt read the references; its notes:\n", 1)
+    assert len(notes) == 2 and notes[1].startswith("attempt 1: wrote done.txt")
 
 
 @pytest.mark.anyio
