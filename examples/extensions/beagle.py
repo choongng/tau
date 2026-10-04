@@ -4455,14 +4455,31 @@ def _implementation_in_tests_lead(root: Path, scope: list[str]) -> str:
 
 def _changed_files(root: Path) -> list[str]:
     """Paths git sees changed or new, beagle's record and caches left out."""
-    rc, out = _run(["git", "status", "--porcelain", "--untracked-files=all"], root, timeout=30.0)
-    if rc != 0:
+    # -z, read unstripped: _run's strip would eat the leading space of " M path".
+    try:
+        proc = subprocess.run(
+            ["git", "status", "--porcelain", "-z", "--untracked-files=all"],
+            cwd=str(root),
+            input="",
+            capture_output=True,
+            text=True,
+            timeout=30.0,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
         return []
+    if proc.returncode != 0:
+        return []
+    fields = proc.stdout.split("\0")
     paths = []
-    for line in out.splitlines():
-        if len(line) < 4:
+    i = 0
+    while i < len(fields):
+        record = fields[i]
+        i += 1
+        if len(record) < 4:
             continue
-        rel = line[3:].split(" -> ")[-1].strip().strip('"')
+        rel = record[3:]
+        if record[0] in "RC" or record[1] in "RC":
+            i += 1  # the rename or copy source follows as its own field
         parts = Path(rel).parts
         if not parts or parts[0] == ".beagle" or _CACHE_DIRS & set(parts):
             continue

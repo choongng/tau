@@ -7981,3 +7981,37 @@ async def test_worker_guard_refuses_ruff_format_over_the_whole_tree(
     for command in allowed:
         result = await bash.execute("c2", {"command": command})
         assert "refusing" not in result.text, command
+
+
+def test_changed_files_keeps_the_first_path_whole(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    gitconfig = tmp_path / "gitconfig"
+    gitconfig.write_text("[user]\n\tname = Tester\n\temail = tester@example.com\n")
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(gitconfig))
+    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+    project = tmp_path / "proj"
+    project.mkdir()
+    _git(project, "init", "-q")
+    (project / "apple.py").write_text("a = 1\n")
+    (project / "old name.py").write_text("b = 1\n")
+    _git(project, "add", "-A")
+    _git(project, "commit", "-q", "-m", "base")
+    mod = _module()
+
+    (project / "apple.py").write_text("a = 2\n")
+    assert _git(project, "status", "--porcelain").startswith(" M apple.py")
+    assert mod._changed_files(project) == ["apple.py"]
+
+    _git(project, "mv", "old name.py", "new name.py")
+    (project / "dir with space").mkdir()
+    (project / "dir with space" / "x y.py").write_text("c = 1\n")
+    (project / ".beagle").mkdir()
+    (project / ".beagle" / "state.json").write_text("{}\n")
+    (project / "__pycache__").mkdir()
+    (project / "__pycache__" / "apple.cpython-312.pyc").write_bytes(b"\0")
+    assert sorted(mod._changed_files(project)) == [
+        "apple.py",
+        "dir with space/x y.py",
+        "new name.py",
+    ]
