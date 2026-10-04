@@ -3735,6 +3735,76 @@ async def test_plan_says_nothing_of_a_clean_scope(
     assert "Uncommitted" not in plan.text
 
 
+FAKE_BEAGLE_GIT_COMMIT = """\
+import os, subprocess, sys
+argv = sys.argv[1:]
+if argv[:2] == ["pursuit", "commit"]:
+    paths = argv[3 : argv.index("--subject")]
+    subject = argv[argv.index("--subject") + 1]
+    subprocess.run(["git", "add", "--", *paths], check=True)
+    subprocess.run(["git", "commit", "-q", "-m", subject, "--", *paths], check=True)
+    with open(os.path.join(os.environ["FAKE_BEAGLE_DIR"], "commit.out"), "w") as out:
+        out.write(f"{argv[2]}: committed {len(paths)} file(s): {subject}\\n")
+"""
+
+
+def _split_with_a_check_that_last_exited(
+    tmp_path: Path, fake_beagle: Path, monkeypatch: pytest.MonkeyPatch, exit_status: int
+) -> tuple[Path, Any]:
+    """T0007 open over tests/ with tests/test_x.py uncommitted; the pending plan's result."""
+    project = _split_open_task_with_cases(tmp_path, fake_beagle, commit=True)
+    (project / "tests" / "test_x.py").write_text("def test_x():\n    assert True\n")
+    script = fake_beagle / "beagle"
+    script.write_text(
+        f"#!{sys.executable}\n{FAKE_BEAGLE_GIT_COMMIT}{FAKE_BEAGLE}", encoding="utf-8"
+    )
+    for var in ("GIT_AUTHOR", "GIT_COMMITTER"):
+        monkeypatch.setenv(f"{var}_NAME", "t")
+        monkeypatch.setenv(f"{var}_EMAIL", "t@t")
+    monkeypatch.chdir(project)
+    runtime, _ = _bound(tmp_path)
+    _loaded_module()._LAST_CHECK_EXIT[(str(project), "T0007")] = exit_status
+    plan = _tool(runtime, "pursuit_plan").execute(
+        "c1", {"task": "T0007", "parts": ["Data::write the cases", "Code::the clock"]}
+    )
+    return project, plan
+
+
+@pytest.mark.anyio
+async def test_split_commits_passing_uncommitted_work_before_the_parts(
+    tmp_path: Path, beagle: Path, fake_beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # R12 class 4: test_comprehensive.py passed under T0007 and was left to the
+    # last part, so the workspace-clean gate stayed red for every part before it.
+    project, pending = _split_with_a_check_that_last_exited(tmp_path, fake_beagle, monkeypatch, 0)
+    plan = await pending
+
+    assert "beagle refused" not in plan.text
+    assert "was committed as 'T0007: work in progress before split'" in plan.text
+    assert "tests/test_x.py" in plan.text
+    assert "Give each to the part" not in plan.text
+    assert _git(project, "status", "--porcelain", "--untracked-files=all", "--", "tests") == ""
+    assert _git(project, "log", "-1", "--format=%s") == "T0007: work in progress before split\n"
+    verbs = [c["argv"][1] for c in _calls(fake_beagle) if c["argv"][0] == "pursuit"]
+    assert verbs.index("commit") < verbs.index("split")
+    [commit] = _pursuit_calls(fake_beagle, "commit")
+    assert commit[:2] == ["T0007", "tests/test_x.py"]
+
+
+@pytest.mark.anyio
+async def test_split_keeps_the_note_for_uncommitted_work_whose_check_failed(
+    tmp_path: Path, beagle: Path, fake_beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project, pending = _split_with_a_check_that_last_exited(tmp_path, fake_beagle, monkeypatch, 1)
+    plan = await pending
+
+    assert "beagle refused" not in plan.text and _pursuit_calls(fake_beagle, "split")
+    assert "Uncommitted in T0007's scope: tests/test_x.py. Give each to the part" in plan.text
+    assert "work in progress before split" not in plan.text
+    assert _pursuit_calls(fake_beagle, "commit") == []
+    assert "?? tests/test_x.py" in _git(project, "status", "--porcelain", "-uall")
+
+
 R08_SCOPE = ["itc/tests/cases.json", "itc/tests/test_cases.py", "itc/interval_tree_clocks.py"]
 
 

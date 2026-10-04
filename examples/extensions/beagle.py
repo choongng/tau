@@ -2831,8 +2831,8 @@ PLAN_PARAMETERS: dict[str, Any] = {
 }
 
 
-def _uncommitted_in_scope(root: Path, task: str) -> str:
-    """Name the files git holds uncommitted in an open task's scope, as it is split.
+def _uncommitted_in_scope(root: Path, task: str) -> tuple[list[str], list[str]]:
+    """An open task's scope and the files git holds uncommitted in it, as it is split.
 
     R09: T0007 was split with tests/cases.json uncommitted, and T0009's commit
     took it beside src/itc/*.py, unlocked.
@@ -2840,19 +2840,40 @@ def _uncommitted_in_scope(root: Path, task: str) -> str:
     rc, out = _pursuit(["show", task], root)
     record = _json_reply(out) if rc == 0 else None
     if not isinstance(record, dict) or record.get("status") != "open":
-        return ""
+        return [], []
     scope = _strings(record.get("scope"))
     if not scope:
-        return ""
-    paths = [rel for rel in _changed_files(root) if _in_scope(rel, scope)]
-    if not paths:
-        return ""
+        return [], []
+    return scope, [rel for rel in _changed_files(root) if _in_scope(rel, scope)]
+
+
+def _uncommitted_note(task: str, paths: list[str]) -> str:
     named = ", ".join(paths[:8])
     if len(paths) > 8:
         named += f", {len(paths) - 8} more"
     return (
         f"Uncommitted in {task}'s scope: {named}. Give each to the part that writes it, "
         "with locks when it is data; otherwise it goes out in a later part's commit."
+    )
+
+
+def _commit_before_split(root: Path, task: str, scope: list[str], paths: list[str]) -> str:
+    """Commit a split task's uncommitted work when its check last passed; the note to give.
+
+    R12: test_comprehensive.py passed under T0007 and was left to the last
+    part, so the workspace-clean gate stayed red for every part before it.
+    Work whose check failed, or was never run, stays a note for the parts.
+    """
+    if _LAST_CHECK_EXIT.get((str(root), task)) != 0:
+        return _uncommitted_note(task, paths)
+    said = _commit(task, SPLIT_WIP_TITLE, scope, root)
+    left = [rel for rel in _changed_files(root) if _in_scope(rel, scope)]
+    if left:
+        return f"{said}\n\n{_uncommitted_note(task, left)}"
+    return (
+        f"{task}'s check passed at its last run, so its uncommitted work "
+        f"({', '.join(paths[:8])}{', …' if len(paths) > 8 else ''}) was committed as "
+        f"'{task}: {SPLIT_WIP_TITLE}' before the split: {said}"
     )
 
 
@@ -2894,7 +2915,8 @@ def make_plan_tool() -> Any:
                 "Work them with pursuit_step; call it with no arguments for the next ready one."
             )
         # Read before the split, which leaves the task a container.
-        uncommitted = _uncommitted_in_scope(root, task)
+        scope, uncommitted = _uncommitted_in_scope(root, task)
+        uncommitted_note = _uncommitted_note(task, uncommitted) if uncommitted else ""
         if len(parts) == 1:
             # beagle refuses a one-part split as a rename. A container or the
             # root still takes one more child; a leaf with one part is
@@ -2911,15 +2933,20 @@ def make_plan_tool() -> Any:
                 )
         else:
             ordered = arguments.get("ordered", True) is not False
+            if uncommitted:
+                uncommitted_note = _commit_before_split(root, task, scope, uncommitted)
             rc, out = _pursuit(["split", task, *parts, *(["--ordered"] if ordered else [])], root)
             if rc != 0 and "already has children" in out:
                 rc, out = _add_children(task, parts, root)
         if rc != 0:
-            return _step_result(f"pursuit_plan: beagle refused (exit {rc}):\n{out}")
+            refused = f"pursuit_plan: beagle refused (exit {rc}):\n{out}"
+            if uncommitted_note:
+                refused += f"\n\n{uncommitted_note}"
+            return _step_result(refused)
         _forget_task(root, task)
         notes = ""
-        if uncommitted:
-            notes += f"{uncommitted}\n\n"
+        if uncommitted_note:
+            notes += f"{uncommitted_note}\n\n"
         if repeated:
             notes += f"Not added again, {task} already has: {', '.join(repeated)}.\n\n"
         if "--outcome abandoned" in out:
@@ -4286,6 +4313,11 @@ def _abandon(task: str, why: str, root: Path, goal: Path) -> str:
 #: changing the scope. A new route or a plan of the task clears it.
 _UNPROVEN: set[tuple[str, str]] = set()
 
+#: The exit status of each open task's check at its last run in a step, by
+#: (project root, task): a split commits the task's work when it was 0.
+_LAST_CHECK_EXIT: dict[tuple[str, str], int] = {}
+SPLIT_WIP_TITLE = "work in progress before split"
+
 #: Step results that left a task not done (stays open or blocked, not run,
 #: unproven), by (project root, task), and the scope it was worked in. Run
 #: R04 sent 14 such steps at one task, none of which offered another way.
@@ -4394,6 +4426,7 @@ def _forget_task(root: Path, task: str) -> None:
     """Drop what the step tool remembers of `task`: closed, re-routed or planned."""
     key = (str(root), task)
     _UNPROVEN.discard(key)
+    _LAST_CHECK_EXIT.pop(key, None)
     _NOT_DONE.pop(key, None)
     _NOT_DONE_SCOPE.pop(key, None)
 
@@ -4833,6 +4866,7 @@ def make_step_tool() -> Any:
         if retrying:
             # The work may have been done since, under another task.
             verdict = await _run_check(check, root, check_timeout)
+            _LAST_CHECK_EXIT[unproven_key] = verdict[0]
             if verdict[0] == 0:
                 proof = await _prove(task, "", scope, root, check_timeout)
         for attempt in range(1, attempts + 1):
@@ -4862,6 +4896,7 @@ def make_step_tool() -> Any:
                 verdict = (0, "")
                 break
             verdict = await _run_check(check, root, check_timeout)
+            _LAST_CHECK_EXIT[unproven_key] = verdict[0]
             if verdict[0] == 0:
                 proof = await _prove(task, report, scope, root, check_timeout)
                 if proof is None or proof.proven:
