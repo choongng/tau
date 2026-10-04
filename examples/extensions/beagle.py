@@ -2592,6 +2592,39 @@ ABANDON_HINT = (
 _FOUND_AWAITS_USER = False
 #: How much of the user's prompt a print-mode refusal quotes back.
 PROMPT_QUOTE = 400
+#: The statement a print-mode `pursuit_found` refused as unconfirmed, folded;
+#: sending it again is the delegation the refusal asked for.
+_FOUND_REFUSED_STATEMENT: str | None = None
+#: Wording in a prompt that hands the founding decisions to the model.
+DELEGATING_WORDS = re.compile(
+    r"(?i)\b(?:use (?:your|ur) (?:own |best )?judge?ment"
+    r"|without (?:any |further |more )?(?:discussion|asking|confirmation)"
+    r"|(?:up to you|your call|at your discretion)"
+    r"|(?:you|yourself) (?:can |should )?decide|decide (?:for )?yourself"
+    r"|go ahead|don'?t ask|no need to (?:ask|confirm))"
+)
+
+
+def _fold(text: str) -> str:
+    return " ".join(text.split()).casefold()
+
+
+def _inferred_delegation(statement: str) -> str | None:
+    """Why a print-mode `pursuit_found` without the flag counts as delegated, or None.
+
+    Run R11's mimo, in `tau -p` with a prompt saying "use your judgement to do
+    the setup without further discussion", sent `pursuit_found` eleven times,
+    identical and without `user_delegated`, and the run ended unfounded.
+    """
+    said = DELEGATING_WORDS.search(_LAST_PROMPT)
+    if said is not None:
+        return f'the prompt that started this print-mode session says "{said.group(0)}"'
+    if _fold(statement) == _FOUND_REFUSED_STATEMENT:
+        return (
+            "you sent the same goal again after this print-mode session's refusal, "
+            "and no user is here to confirm it"
+        )
+    return None
 
 
 def _unconfirmed_refusal(statement: str, criteria: list[str], *, interactive: bool) -> str:
@@ -2678,12 +2711,19 @@ def make_found_tool(
         repairs = [*criteria_notes, *repairs]
         repaired = "".join(f"{note}\n\n" for note in repairs)
         delegated = arguments.get("user_delegated") is True
+        inferred = None
         if arguments.get("user_confirmed") is not True and not delegated:
-            global _FOUND_AWAITS_USER
+            global _FOUND_AWAITS_USER, _FOUND_REFUSED_STATEMENT
             alone = not interactive()
-            _FOUND_AWAITS_USER = alone
-            refusal = _unconfirmed_refusal(statement, criteria, interactive=not alone)
-            return _step_result(f"{repaired}{refusal}")
+            inferred = _inferred_delegation(statement) if alone else None
+            if inferred is None:
+                _FOUND_AWAITS_USER = alone
+                if alone:
+                    _FOUND_REFUSED_STATEMENT = _fold(statement)
+                refusal = _unconfirmed_refusal(statement, criteria, interactive=not alone)
+                return _step_result(f"{repaired}{refusal}")
+            delegated = True
+            _FOUND_AWAITS_USER = False
         initialized = _ensure_git_repo(root)
 
         goal = root / ".beagle" / GOAL_BASENAME
@@ -2748,7 +2788,12 @@ def make_found_tool(
                 "Every pursuit_step brief carries them and the request; leave reading them "
                 "to the workers."
             )
-        if delegated:
+        if inferred is not None:
+            notes.append(
+                f"Delegation was inferred, not given: {inferred}. In your reply, tell "
+                "the user the criteria you chose, so they can correct them."
+            )
+        elif delegated:
             notes.append(
                 "The user delegated the details: in your reply, tell them the criteria "
                 "you chose, so they can correct them."
@@ -5737,11 +5782,12 @@ def _adopt_session(context: ExtensionContext) -> None:
 
 
 def _on_session_start(event: Any, context: ExtensionContext) -> None:
-    global _SEEN_CWD, _STARTED_SESSION, _OFF_PURSUIT_CALLS
+    global _SEEN_CWD, _STARTED_SESSION, _OFF_PURSUIT_CALLS, _FOUND_REFUSED_STATEMENT
     del event
     _SEEN_CWD = context.cwd
     _STARTED_SESSION = context.session_id
     _OFF_PURSUIT_CALLS = 0
+    _FOUND_REFUSED_STATEMENT = None
     _adopt_session(context)
 
 

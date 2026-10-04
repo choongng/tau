@@ -5427,6 +5427,118 @@ def test_found_refusal_in_print_mode_quotes_the_prompt_and_leads_with_delegation
     assert len(text) < 1200 and "…" in text
 
 
+R11_PROMPT = (
+    "set this project up for beagle pursuit, and then implement a modern python (see "
+    "skill) implementation of interval tree clocks. use your judgement to do the setup "
+    "without further discussion, and use beagle's pursuit-run to structure and "
+    "orchestrate the work."
+)
+UNDELEGATING_PROMPT = "set this project up for beagle pursuit and implement interval tree clocks."
+UNFLAGGED_FOUND = {
+    "statement": "Build ITC",
+    "criteria": ["`uv run pytest` exits 0"],
+    "milestones": ["Core::fork, join, event"],
+    "user_confirmed": False,
+}
+
+
+def _found_in(
+    tmp_path: Path,
+    fake_beagle: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    prompt: str,
+    *,
+    interactive: bool,
+) -> tuple[Any, Path]:
+    """A `pursuit_found` for a fresh project, after `prompt` started the session."""
+    project = _setup_project(tmp_path, monkeypatch)
+    (fake_beagle / "add.out").write_text("T0001  Build ITC\n")
+    module = _module()
+    monkeypatch.setattr(module, "_LAST_PROMPT", prompt)
+    monkeypatch.setattr(module, "_FOUND_REFUSED_STATEMENT", None)
+    monkeypatch.setattr(module, "_FOUND_AWAITS_USER", False)
+    return module.make_found_tool(interactive=lambda: interactive), project
+
+
+@pytest.mark.anyio
+async def test_print_mode_found_infers_delegation_from_a_delegating_prompt(
+    tmp_path: Path, beagle: Path, fake_beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # R11: mimo sent this call eleven times without user_delegated, under a
+    # prompt that said "use your judgement ... without further discussion".
+    found, project = _found_in(tmp_path, fake_beagle, monkeypatch, R11_PROMPT, interactive=False)
+
+    result = await found("c1", UNFLAGGED_FOUND)
+
+    assert (project / ".beagle" / "pursuit.toml").is_file()
+    assert "Founded the pursuit" in result.text
+    assert "Delegation was inferred" in result.text and "use your judgement" in result.text
+    assert "criteria you chose" in result.text
+    assert _module()._FOUND_AWAITS_USER is False
+
+
+@pytest.mark.anyio
+async def test_print_mode_found_takes_a_resend_after_its_refusal_as_delegation(
+    tmp_path: Path, beagle: Path, fake_beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Told "call pursuit_found again", a 9B model calls it again unchanged:
+    # with nobody to confirm, that repeat is the delegation.
+    found, project = _found_in(
+        tmp_path, fake_beagle, monkeypatch, UNDELEGATING_PROMPT, interactive=False
+    )
+    goal = project / ".beagle" / "pursuit.toml"
+
+    other = await found("c1", {**UNFLAGGED_FOUND, "statement": "Build something else"})
+    assert "print mode" in other.text and not goal.exists()
+    refused = await found("c2", UNFLAGGED_FOUND)
+    assert "print mode" in refused.text and not goal.exists()
+    again = await found("c3", {**UNFLAGGED_FOUND, "statement": "build  ITC"})
+
+    assert goal.is_file() and "Founded the pursuit" in again.text
+    assert "Delegation was inferred" in again.text and "same goal again" in again.text
+
+    from types import SimpleNamespace
+
+    module = _module()
+    for name in ("_SEEN_CWD", "_STARTED_SESSION", "_OFF_PURSUIT_CALLS"):
+        monkeypatch.setattr(module, name, getattr(module, name))
+    for key in ("CLAUDE_CODE_SESSION_ID", "CLAUDE_PID"):
+        monkeypatch.delenv(key, raising=False)
+    assert module._FOUND_REFUSED_STATEMENT == "build itc"
+    module._on_session_start(None, SimpleNamespace(cwd=str(project), session_id="s2"))
+    assert module._FOUND_REFUSED_STATEMENT is None
+
+
+@pytest.mark.anyio
+async def test_print_mode_found_without_a_delegating_prompt_refuses_first(
+    tmp_path: Path, beagle: Path, fake_beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    found, project = _found_in(
+        tmp_path, fake_beagle, monkeypatch, UNDELEGATING_PROMPT, interactive=False
+    )
+
+    refused = await found("c1", UNFLAGGED_FOUND)
+
+    assert not (project / ".beagle" / "pursuit.toml").exists()
+    assert "print mode" in refused.text and "user_delegated=true" in refused.text
+    assert "Founded" not in refused.text
+    assert _module()._FOUND_AWAITS_USER is True
+
+
+@pytest.mark.anyio
+async def test_interactive_found_never_infers_delegation(
+    tmp_path: Path, beagle: Path, fake_beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A user is there to ask, so neither the prompt nor a repeat stands in for them.
+    found, project = _found_in(tmp_path, fake_beagle, monkeypatch, R11_PROMPT, interactive=True)
+
+    for i in range(3):
+        result = await found(f"c{i}", UNFLAGGED_FOUND)
+        assert "ask the user to confirm" in result.text
+        assert "Delegation was inferred" not in result.text
+    assert not (project / ".beagle" / "pursuit.toml").exists()
+
+
 @pytest.mark.anyio
 async def test_print_mode_stop_gate_objects_once_to_an_unfounded_stop_after_a_confirmation_refusal(
     tmp_path: Path, beagle: Path, fake_beagle: Path
@@ -5457,7 +5569,7 @@ async def test_print_mode_stop_gate_objects_once_to_an_unfounded_stop_after_a_co
         ]
     )
     ok = await run_print_mode(
-        prompt=DELEGATING_PROMPT,
+        prompt=UNDELEGATING_PROMPT,  # a delegating one now founds unasked (R11)
         model="fake",
         cwd=project,
         provider=provider,
