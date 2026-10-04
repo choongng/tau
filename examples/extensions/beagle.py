@@ -3994,10 +3994,15 @@ def _source_strings(case: object) -> list[str]:
 
 
 def _quotes_reference(text: str, reference: str) -> bool:
-    """Whether `text`, whole, quoted within it or split at an ellipsis, occurs in `reference`."""
+    """Whether `text`, whole, quoted in it, or split at an ellipsis or colon, is in `reference`.
+
+    Run R15: a leading label ('send: This operation is ...' against the
+    reference's 'send This operation ...') and a formula after a colon that
+    the reference's PDF extraction spaced differently hid verbatim quotes.
+    """
     candidates = [text]
     candidates += [next(g for g in m.groups() if g) for m in _QUOTE_MARKS.finditer(text)]
-    candidates += [part for c in list(candidates) for part in re.split(r"\.\.\.|…", c)]
+    candidates += [part for c in list(candidates) for part in re.split(r"\.\.\.|…|:\s", c)]
     for candidate in candidates:
         quote = _normalised(candidate).strip(" \"'`“”.,;:")
         if len(quote.split()) >= SOURCE_QUOTE_MIN_WORDS and quote in reference:

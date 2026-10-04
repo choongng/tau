@@ -3107,6 +3107,78 @@ async def test_close_accepts_cases_whose_sources_quote_references(
     assert found(project, ["missing.json"]) is None
 
 
+#: R15's references/itc2008.txt, lines 119-126 and 346-348, verbatim.
+R15_REFERENCE_LINES = (
+    "send This operation is the atomic composition of event followed by peek. E.g. in vector "
+    "clock systems,\n"
+    "     message sending is modeled by incrementing the local counter and then creating a new "
+    "message.\n"
+    "\n"
+    "receive A receive is the atomic composition of join followed by event. E.g. in vector "
+    "clocks taking the\n"
+    "      pointwise maximum is followed by an increment of the local counter.\n"
+    "\n"
+    "sync A sync is the atomic composition of join followed by fork. E.g. In version vector "
+    "systems and in\n"
+    "     bounded version vectors [1] it models the atomic synchronization of two replicas.\n"
+    "\n"
+    "Comparison of ITC can be derived from the pointwise comparison of the corresponding "
+    "functions:\n"
+    "                                                                .\n"
+    "                                        (i1 , e1 ) \u2264 (i2 , e2 ) = Je1 K \u2264 Je2 K.\n"
+)
+#: The sources of R15's tests/cases.json cases 24-31, which went unfound before T0147.
+R15_UNFOUND_SOURCES = {
+    "compare-equals-self": "Comparison of ITC can be derived from the pointwise comparison "
+    "of the corresponding functions: (i1, e1) \u2264 (i2, e2) \u27fa Je1K \u2264 Je2K.",
+    "send-is-event-then-peek": "send: This operation is the atomic composition of event "
+    "followed by peek.",
+    "receive-is-join-then-event": "receive: A receive is the atomic composition of join "
+    "followed by event.",
+    "sync-is-join-then-fork": "sync: A sync is the atomic composition of join followed by fork.",
+}
+R15_UNFOUND_CASES = [
+    {"id": name, "source": R15_UNFOUND_SOURCES[key]}
+    for name, key in [
+        ("compare-equals-self", "compare-equals-self"),
+        ("compare-strictly-lesser", "compare-equals-self"),
+        ("compare-greater", "compare-equals-self"),
+        ("compare-equals-other-id", "compare-equals-self"),
+        ("compare-unknown-id", "compare-equals-self"),
+        ("send-is-event-then-peek", "send-is-event-then-peek"),
+        ("receive-is-join-then-event", "receive-is-join-then-event"),
+        ("sync-is-join-then-fork", "sync-is-join-then-fork"),
+    ]
+]
+
+
+def test_quoted_source_with_a_leading_label_is_found() -> None:
+    module = _module()
+    reference = module._normalised(R15_REFERENCE_LINES)
+    quotes = module._quotes_reference
+    assert quotes(
+        "send: This operation is the atomic composition of event followed by peek.", reference
+    )
+    assert not quotes("send: This operation is the composition of peek.", reference)
+
+
+def test_r15_cases_all_quote_the_reference(tmp_path: Path) -> None:
+    module = _module()
+    reference = module._normalised(R15_REFERENCE_LINES)
+    unfound = [
+        module._case_label(case, i)
+        for i, case in enumerate(R15_UNFOUND_CASES)
+        if not any(module._quotes_reference(s, reference) for s in module._source_strings(case))
+    ]
+    assert unfound == []
+    refs = tmp_path / "references"
+    refs.mkdir()
+    (refs / "itc2008.txt").write_text(R15_REFERENCE_LINES, encoding="utf-8")
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "tests" / "cases.json").write_text(json.dumps(R15_UNFOUND_CASES))
+    assert module._unquoted_cases(tmp_path, ["tests/cases.json"]) is None
+
+
 def test_known_answers_guidance_asks_for_a_quoted_source(tmp_path: Path) -> None:
     module = _module()
     assert "quoting the reference's own words verbatim" in module.CASES_FIRST_NOTE
