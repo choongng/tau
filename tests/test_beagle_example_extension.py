@@ -7544,6 +7544,89 @@ async def test_retry_brief_carries_the_previous_attempts_report(
     assert len(notes) == 2 and notes[1].startswith("attempt 1: wrote done.txt")
 
 
+async def _step_done_txt(tmp_path: Path) -> Any:
+    runtime, _ = _bound(tmp_path)
+    return await _tool(runtime, "pursuit_step").execute(
+        "c1",
+        {
+            "task": "T0002",
+            "criteria": "done.txt exists",
+            "done_when": "grep -q done done.txt",
+            "scope": ["done.txt"],
+        },
+    )
+
+
+@pytest.mark.anyio
+async def test_step_result_flags_report_paths_not_on_disk(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # R17: W4's report claimed four tests/ files it never wrote, and E14 showed it as-is.
+    project = _pursuit_project(tmp_path)
+    monkeypatch.chdir(project)
+    (project / "src").mkdir()
+    (project / "src" / "real.py").write_text("")
+    monkeypatch.setenv(
+        "FAKE_TAU_REPORT",
+        "Wrote tests/cases.json and `src/real.py`; scratch in /tmp/w/x.py, "
+        "task in .beagle/tree/T0002.md, e.g. and/or 3.12 left as prose.",
+    )
+    _ready_task(fake_beagle)
+
+    result = await _step_done_txt(tmp_path)
+
+    assert "The report names tests/cases.json, which is not on disk." in result.text
+    for named in ("src/real.py,", "w/x.py", ".beagle", "T0002.md,", "and/or", "3.12,"):
+        assert f"The report names {named}" not in result.text, named
+
+
+@pytest.mark.anyio
+async def test_retry_note_flags_claimed_files_not_on_disk(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # R17: W9's claimed cases.json reached W10's retry note unchecked.
+    monkeypatch.chdir(_pursuit_project(tmp_path))
+    monkeypatch.setenv("FAKE_TAU_SUCCEEDS_ON", "2")
+    monkeypatch.setenv("FAKE_TAU_REPORT", "Wrote tests/cases.json with the known answers.")
+    _ready_task(fake_beagle)
+
+    await _step_done_txt(tmp_path)
+
+    first, second = _runs(fake_tau)
+    assert "which is not on disk" not in first["stdin"]
+    assert "The report names tests/cases.json, which is not on disk." in second["stdin"]
+
+
+@pytest.mark.anyio
+async def test_retry_note_skips_a_preamble_only_report(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # R17: W3 left only this, and W4's brief carried it as the references' notes.
+    monkeypatch.chdir(_pursuit_project(tmp_path))
+    monkeypatch.setenv("FAKE_TAU_SUCCEEDS_ON", "2")
+    monkeypatch.setenv("FAKE_TAU_REPORT", "I'll start by reading the reference materials.")
+    _ready_task(fake_beagle)
+
+    await _step_done_txt(tmp_path)
+
+    _, second = _runs(fake_tau)
+    assert "check still fails" in second["stdin"]
+    assert "An earlier attempt read the references" not in second["stdin"]
+    assert "I'll start by reading the reference materials." not in second["stdin"]
+
+
 @pytest.mark.anyio
 async def test_worker_guard_refuses_python_one_liner_write_out_of_scope(
     tmp_path: Path, beagle: Path, monkeypatch: pytest.MonkeyPatch

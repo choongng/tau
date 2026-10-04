@@ -1213,6 +1213,43 @@ def _capped_report(run: _WorkerRun) -> str:
     return f"{head}\n[... {len(lines)}-line report cut; {where}]\n{tail}"
 
 
+#: A project-relative file path in prose: at least one directory and a
+#: suffix that starts with a letter, not inside an absolute path or a URL.
+_REPORT_PATH = re.compile(
+    r"(?<![\w./~$*:-])((?:[\w][\w.-]*/)+[\w][\w-]*(?:\.[\w-]+)*\.[A-Za-z][A-Za-z0-9]{0,7})"
+    r"(?![\w/-])"
+)
+#: A file name with or without a directory, for telling a preamble from notes.
+_REPORT_FILE_NAME = re.compile(r"(?<![\w.])[\w][\w./-]*\.[A-Za-z][A-Za-z0-9]{0,7}(?![\w/-])")
+#: A report shorter than this that names no file is a preamble
+#: (R17 W3: "I'll start by reading the reference materials.").
+PREAMBLE_REPORT_CHARS = 300
+
+
+def _report_paths(report: str, root: Path) -> list[str]:
+    """The project-relative file paths a report names, in order, once each."""
+    seen: list[str] = []
+    for match in _REPORT_PATH.finditer(report):
+        rel = match.group(1)
+        if rel in seen or rel.split("/", 1)[0] in (".beagle", ".git", "tmp"):
+            continue
+        if not (root / rel).resolve().is_relative_to(root.resolve()):
+            continue
+        seen.append(rel)
+    return seen
+
+
+def _report_missing_paths(report: str, root: Path) -> str:
+    """One line per project path the report names that is not on disk (R17 W4/W9/W11)."""
+    if report.startswith(NO_REPORT):
+        return ""
+    return "".join(
+        f"The report names {rel}, which is not on disk.\n"
+        for rel in _report_paths(report, root)
+        if not (root / rel).exists()
+    )
+
+
 #: How the stub a worker that wrote no report gets in its place begins.
 NO_REPORT = "(The worker wrote no report"
 #: How often a running worker is checked for the caller's cancellation.
@@ -6868,6 +6905,10 @@ def make_step_tool() -> Any:
                     + f'Call pursuit_step with task="{task}" to send it again.',
                 )
             report, shown = run.report, _capped_report(run)
+            # Run R17: W4, W9 and W11 claimed files they never wrote.
+            missing = _report_missing_paths(report, root)
+            if missing:
+                shown = f"{shown}\n\n{missing.rstrip()}"
             if not check:
                 verdict = (0, "")
                 break
@@ -6916,8 +6957,11 @@ def make_step_tool() -> Any:
                     f" It also changed locked files ({', '.join(undone)}); they were put "
                     "back. Make the code pass them as they are."
                 )
+            if missing:
+                retry_note += "\n\n" + missing.rstrip()
             notes = report.strip()
-            if notes and not notes.startswith(NO_REPORT):
+            preamble = len(notes) < PREAMBLE_REPORT_CHARS and not _REPORT_FILE_NAME.search(notes)
+            if notes and not notes.startswith(NO_REPORT) and not preamble:
                 # Run R15: W5 and W6 re-read both references from line 1, though
                 # the reports before them (W2, W4) already held the semantics.
                 cut = notes[:RETRY_REPORT_CHARS]
