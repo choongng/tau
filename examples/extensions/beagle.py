@@ -2555,6 +2555,15 @@ def _abandon_problem(task: str, why: str, nodes: list[dict[str, Any]]) -> str | 
     if roots and parent.get(task) == roots[0]:
         if _setup_abandonable(task, nodes):
             return None
+        if by_id.get(task, {}).get("status") == "pending":
+            # Run R14: beagle refuses a new route for a task never opened.
+            return (
+                f"pursuit_step: {task} not abandoned — it is a milestone, and a milestone "
+                "is the goal's. Split it with pursuit_plan, or, if a done task's commit "
+                f'already did its work, call pursuit_step task="{task}", abandon="done by '
+                'Tnnnn" and done_when, naming that task; it closes done on that commit '
+                "if the check passes now."
+            )
         return (
             f"pursuit_step: {task} not abandoned — it is a milestone, and a milestone is "
             "the goal's. Split it with pursuit_plan, or give it a new route with "
@@ -2568,16 +2577,19 @@ def _abandon_problem(task: str, why: str, nodes: list[dict[str, Any]]) -> str | 
             return (
                 f"pursuit_step: {task} not abandoned — {container} would stall for good "
                 f'with a part abandoned. Work it with pursuit_step task="{task}" and a '
-                "done_when that runs the code; if the work is already there, the check "
-                "passes and it closes done at once."
+                "done_when that runs the code and fails now. If a done task's commit "
+                f'already did its work, call pursuit_step task="{task}", abandon="done by '
+                'Tnnnn" and done_when, naming that task; it closes done on that commit '
+                "if the check passes now."
             )
         return None
     return (
         f"pursuit_step: {task} not abandoned — a task is dropped only as a duplicate of "
         "a done or open task, named as abandon='duplicate of Tnnnn'. Work that seems "
-        "already done is not a reason: if its check already passes, bind the goal "
-        "criterion's test as done_when (one that imports and runs the code), so the "
-        "check shows the work is there."
+        "already done is not a reason. If a done task's commit did it, call "
+        f'pursuit_step task="{task}", abandon="done by Tnnnn" and done_when, naming '
+        "that task; it closes done on that commit if the check passes now. Otherwise "
+        "work it with a done_when that imports and runs the code and fails now."
     )
 
 
@@ -4770,13 +4782,27 @@ def _carried_criteria(predecessor: str, root: Path) -> str:
     return str(record.get("criteria") or "").strip() if isinstance(record, dict) else ""
 
 
-def _already_passes(check: str, task: str = "", nodes: list[dict[str, Any]] | None = None) -> str:
+def _already_passes(
+    check: str, task: str = "", nodes: list[dict[str, Any]] | None = None, done_by: str = ""
+) -> str:
     """Why a check that passes before any work is not bound.
 
     A part of a non-root container gets no abandon hint, which
     `_abandon_problem` would refuse: run R09's driver sent that refused call
     nine times. A done sibling closed on the same check is named instead.
+    With `done_by`, a done task whose commit is in the scope's history, the
+    done-by abandon is offered: run R14 was told to bind the goal's test,
+    which was the same passing check.
     """
+    if done_by:
+        return (
+            f"`{check}` already passes, before any work, so it cannot tell this task's "
+            f"work from none. If {done_by}'s work already did this, call pursuit_step "
+            f'task="{task}" abandon="done by {done_by}" done_when="{check}": it closes '
+            f"done on {done_by}'s commit, with no sub-agent. If work is left, bind a check "
+            "that fails now: name a new test file for what is left, put it in scope, and "
+            "say in the notes what it should test; do not write it yourself."
+        )
     text = (
         f"`{check}` already passes, before any work, so it cannot tell this task's work "
         "from none. Bind a check that fails now: name a new test file for what this task "
@@ -4838,6 +4864,168 @@ async def _passes_without_own_work(check: str, scope: list[str], root: Path) -> 
             else:
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_bytes(data)
+
+
+#: An abandon naming the done task whose commit did this one's work:
+#: "done by T0008", "Done by T0008's commit".
+_DONE_BY = re.compile(r"(?i)^\s*done\s+by\s+(t\d{4,})\b")
+
+
+def _check_targets(check: str, root: Path) -> list[str]:
+    """The project paths a check's words name, inside one `sh -c` level too."""
+    try:
+        words = shlex.split(check)
+    except ValueError:
+        return []
+    found: list[str] = []
+    for word in words:
+        inner = shlex.split(word) if " " in word and not word.startswith("-") else [word]
+        for part in inner:
+            rel = part.split("::")[0].rstrip("/")
+            if not rel or rel.startswith("-") or Path(rel).is_absolute() or ".." in Path(rel).parts:
+                continue
+            if Path(rel).parts[0] == ".beagle":
+                continue
+            if (root / rel).exists() and rel not in found and rel != ".":
+                found.append(rel)
+    return found
+
+
+def _commit_paths(sha: str, root: Path) -> list[str]:
+    rc, out = _run(["git", "show", "--format=", "--name-only", sha], root, timeout=30.0)
+    return [line.strip() for line in out.splitlines() if line.strip()] if rc == 0 else []
+
+
+def _task_commits(done: str, root: Path) -> list[str]:
+    """The commits `done` landed: the record's, then those whose message starts `Tnnnn:`."""
+    shas: list[str] = []
+    rc, out = _pursuit(["show", done], root)
+    record = _json_reply(out) if rc == 0 else None
+    if isinstance(record, dict):
+        for key in ("commit", "closed_commit", "result_commit"):
+            sha = str(record.get(key) or "").strip()
+            if sha:
+                shas.append(sha)
+    rc, out = _run(["git", "log", "--format=%H", f"--grep=^{done}:"], root, timeout=30.0)
+    if rc == 0:
+        shas += [line.strip() for line in out.splitlines() if line.strip()]
+    return list(dict.fromkeys(shas))
+
+
+def _done_task_in_log(paths: list[str], task: str, nodes: list[dict[str, Any]], root: Path) -> str:
+    """The latest done task, not `task`, whose `Tnnnn:` commit touches `paths`; else ""."""
+    if not paths:
+        return ""
+    done = {str(n.get("id")) for n in nodes if n.get("status") == "done"} - {task}
+    rc, out = _run(["git", "log", "--format=%s", "--", *paths], root, timeout=30.0)
+    if rc != 0:
+        return ""
+    for subject in out.splitlines():
+        named = re.match(rf"({_TASK_ID.pattern}):", subject.strip())
+        if named and named.group(1) in done:
+            return named.group(1)
+    return ""
+
+
+async def _done_by(
+    task: str,
+    done: str,
+    arguments: Mapping[str, Any],
+    nodes: list[dict[str, Any]],
+    root: Path,
+) -> str:
+    """Close pending `task` done on `done`'s commit, or say which condition failed.
+
+    Run R14: T0003's commit made the cases test pass, so T0004 and T0009 could
+    not bind it, could not be abandoned, and had no move left. A task closes
+    done here only on a done task's commit that touches its scope (or its
+    check's targets) and a check that passes now, with no sub-agent.
+    """
+    refused = f"pursuit_step: {task} not closed done by {done} — "
+    status = {str(n.get("id")): n.get("status") for n in nodes}
+    if status.get(task) != "pending":
+        return (
+            f"{refused}only a pending task closes this way, and {task} is "
+            f"{status.get(task) or 'not in the tree'}. Work it with pursuit_step task="
+            f'"{task}"; its check decides.'
+        )
+    if status.get(done) != "done":
+        return (
+            f"{refused}{done} is not a done task in the tree "
+            f"({status.get(done) or 'no such task'}). Name the done task whose commit did "
+            "this task's work."
+        )
+    rc, out = _pursuit(["show", task], root)
+    record = _json_reply(out) if rc == 0 else None
+    if not isinstance(record, dict):
+        return f"pursuit_step: cannot read {task} (exit {rc}):\n{out}"
+    given = str(arguments.get("done_when") or "").strip()
+    check = given or str(record.get("done_when") or "").strip()
+    if not check:
+        return (
+            f"{refused}it has no check: pass done_when, ONE command that exits 0 on "
+            f"{done}'s work, and call again."
+        )
+    chained, prose = _and_chain(check)
+    if prose is not None or chained is None:
+        return f"{refused}{prose}"
+    check = chained
+    scope = _strings(arguments.get("scope")) or _strings(record.get("scope"))
+    paths = scope or _check_targets(check, root)
+    if not paths:
+        return (
+            f"{refused}it has no scope and its check names no project path, so nothing "
+            f"shows {done}'s commit did its work. Pass scope: the paths that work is in."
+        )
+    shas = _task_commits(done, root)
+    if not shas:
+        return (
+            f"{refused}no commit of {done} is found: its record names none and "
+            f'`git log --grep "{done}:"` finds none.'
+        )
+    sha = next(
+        (s for s in shas if any(_in_scope(rel, paths) for rel in _commit_paths(s, root))), ""
+    )
+    if not sha:
+        return (
+            f"{refused}{done}'s commit ({shas[0][:12]}) touches none of "
+            f"{', '.join(paths)}, so it did not do this task's work."
+        )
+    check_rc, check_out = await _run_check(check, root, DEFAULT_CHECK_TIMEOUT)
+    if check_rc != 0:
+        return (
+            f"{refused}its check `{check}` does not pass now (exit {check_rc}), so the "
+            f"work is not there yet: work it with pursuit_step.\n"
+            f"{check_out[-CHECK_TAIL_CHARS:]}"
+        )
+    if not await _passes_without_own_work(check, scope, root):
+        return (
+            f"{refused}its check passes only with uncommitted changes in its scope, not "
+            f"on {done}'s commit: work it with pursuit_step."
+        )
+    title = str(record.get("title") or "")
+    criteria = (
+        str(arguments.get("criteria") or "").strip()
+        or str(record.get("criteria") or "").strip()
+        or f"`{check}` passes on {done}'s work"
+    )
+    argv = ["open", task, "--criteria", criteria, "--done-when", check]
+    if scope:
+        argv += ["--scope", *scope]
+    rc, opened = _pursuit(argv, root)
+    if rc != 0:
+        return f"pursuit_step: `beagle pursuit open` refused (exit {rc}):\n{opened}"
+    because = f"satisfied by {done}'s commit {sha[:12]}; no sub-agent ran"
+    argv = ["close", task, "--outcome", "done", "--body", because]
+    argv += ["--spent", "0", "--spent-because", because]
+    rc, closed = _pursuit(argv, root, timeout=DEFAULT_CHECK_TIMEOUT + 60)
+    if rc != 0:
+        return f"pursuit_step: {task} opened, but `beagle pursuit close` exited {rc}:\n{closed}"
+    _forget_task(root, task)
+    return (
+        f"{task} — {title}: closed done, {because}.\n\n{closed}\n\n{_tree(root)}\n\n"
+        "Next: call pursuit_step with no arguments for the next task."
+    )
 
 
 def _escalation(task: str, count: int) -> str:
@@ -4998,6 +5186,12 @@ def make_step_tool() -> Any:
         if abandon:
             if not task:
                 return _step_result("pursuit_step: abandon names the task to drop; pass task too.")
+            done_by = _DONE_BY.match(abandon)
+            roots = [str(n.get("id")) for n in nodes if not n.get("parent")]
+            if done_by is not None and task not in roots:
+                return _step_result(
+                    await _done_by(task, done_by.group(1).upper(), arguments, nodes, root)
+                )
             refused = _abandon_problem(task, abandon, nodes)
             if refused is not None:
                 return _step_result(refused)
@@ -5133,6 +5327,14 @@ def make_step_tool() -> Any:
                         f"route does not change what the work is for: {carried!r}\n\n"
                     )
                 criteria = carried
+            if done_when and not criteria:
+                # Run R14 sent task and done_when without criteria three times and
+                # got the next-task prompt back with no word of what was missing.
+                return _step_result(
+                    f"pursuit_step: {task} not opened — criteria is missing: say what will "
+                    "be true when it is done, and call pursuit_step again with task, "
+                    "criteria and done_when."
+                )
             if not criteria or not done_when:
                 why = str(record.get("intent") or "").strip()
                 return _step_result(
@@ -5172,9 +5374,14 @@ def make_step_tool() -> Any:
             # made pass.
             pre_rc, pre_out = await _run_check(done_when, root, DEFAULT_CHECK_TIMEOUT)
             if pre_rc == 0:
+                now = _tree_nodes(root)
+                done_by = ""
+                if await _passes_without_own_work(done_when, scope, root):
+                    paths = scope or _check_targets(done_when, root)
+                    done_by = _done_task_in_log(paths, task, now, root)
                 return _step_result(
                     f"pursuit_step: {task} not opened — "
-                    + _already_passes(done_when, task, _tree_nodes(root))
+                    + _already_passes(done_when, task, now, done_by)
                 )
             broke = _check_broke(pre_rc, pre_out)
             if broke is not None:

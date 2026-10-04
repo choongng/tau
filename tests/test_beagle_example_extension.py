@@ -5377,7 +5377,7 @@ async def test_abandon_already_done_refused(
     assert _pursuit_calls(fake_beagle, "close") == []
     for refused in (done, unknown):
         assert "T0003 not abandoned" in refused.text
-        assert "bind the goal criterion's test" in refused.text
+        assert 'abandon="done by Tnnnn"' in refused.text
     hint = _module().ABANDON_HINT
     assert "already done" not in hint and "duplicate of Tnnnn" in hint
 
@@ -5423,7 +5423,177 @@ async def test_abandon_milestone_refused(
 
     assert _pursuit_calls(fake_beagle, "close") == []
     assert "T0002 not abandoned — it is a milestone" in result.text
-    assert "pursuit_plan" in result.text and "new_route=true" in result.text
+    assert "pursuit_plan" in result.text and 'abandon="done by Tnnnn"' in result.text
+
+
+CASES_CHECK = "grep -q def tests/test_cases.py"
+
+
+def _done_by_project(
+    tmp_path: Path, fake: Path, monkeypatch: pytest.MonkeyPatch, subject: str
+) -> tuple[Path, str]:
+    """tests/test_cases.py committed as `subject`; T0003 done and T0004 pending under T0002.
+
+    Returns the project and the commit's sha.
+    """
+    project = _pursuit_project(tmp_path)
+    for var in ("GIT_AUTHOR", "GIT_COMMITTER"):
+        monkeypatch.setenv(f"{var}_NAME", "t")
+        monkeypatch.setenv(f"{var}_EMAIL", "t@t")
+    _git(project, "init", "-q")
+    (project / "tests").mkdir()
+    (project / "tests" / "test_cases.py").write_text("def test_cases():\n    pass\n")
+    _git(project, "add", "tests/test_cases.py")
+    _git(project, "commit", "-q", "-m", subject)
+    sha = _git(project, "rev-parse", "HEAD").strip()
+    nodes = [
+        {"id": "T0001", "parent": "", "title": "Goal", "status": "open", "container": True},
+        {"id": "T0002", "parent": "T0001", "title": "Clock", "status": "open", "container": True},
+        {"id": "T0003", "parent": "T0002", "title": "Cases", "status": "done"},
+        {"id": "T0004", "parent": "T0002", "title": "Cases test", "status": "pending"},
+    ]
+    (fake / "tree.out").write_text(json.dumps({"goal": "Ship it", "nodes": nodes}))
+    ready = {"open": [], "ready": [{"id": "T0004", "title": "Cases test"}], "ready_total": 1}
+    (fake / "next.out").write_text(json.dumps(ready))
+    record = {"id": "T0004", "title": "Cases test", "status": "pending", "done_when": ""}
+    (fake / "show-T0004.out").write_text(json.dumps({**record, "scope": ["tests"]}))
+    (fake / "show-T0003.out").write_text(json.dumps({"id": "T0003", "status": "done"}))
+    (fake / "close.out").write_text("T0004 closed done\n")
+    monkeypatch.chdir(project)
+    return project, sha
+
+
+@pytest.mark.anyio
+async def test_part_whose_check_passes_on_a_done_tasks_commit_closes_done_by_it(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # R14 class 2: T0003's commit made the cases test pass, and T0004 had no move.
+    _, sha = _done_by_project(tmp_path, fake_beagle, monkeypatch, "T0003: Cases")
+    runtime, _ = _bound(tmp_path)
+
+    result = await _tool(runtime, "pursuit_step").execute(
+        "c1",
+        {"task": "T0004", "abandon": "Done by T0003's commit", "done_when": CASES_CHECK},
+    )
+
+    because = f"satisfied by T0003's commit {sha[:12]}; no sub-agent ran"
+    [opened] = _pursuit_calls(fake_beagle, "open")
+    assert opened[0] == "T0004" and opened[opened.index("--done-when") + 1] == CASES_CHECK
+    assert opened[opened.index("--scope") + 1 :] == ["tests"]
+    assert _pursuit_calls(fake_beagle, "close") == [
+        ["T0004", "--outcome", "done", "--body", because, "--spent", "0"]
+        + ["--spent-because", because]
+    ]
+    assert _runs(fake_tau) == []
+    assert "T0004 — Cases test: closed done" in result.text and because in result.text
+
+
+@pytest.mark.anyio
+async def test_done_by_abandon_without_that_tasks_commit_is_refused(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project, _ = _done_by_project(tmp_path, fake_beagle, monkeypatch, "add the cases test")
+    runtime, _ = _bound(tmp_path)
+    step = _tool(runtime, "pursuit_step")
+    args = {"task": "T0004", "abandon": "done by T0003", "done_when": CASES_CHECK}
+
+    no_commit = await step.execute("c1", args)
+    (project / "notes.txt").write_text("elsewhere\n")
+    _git(project, "add", "notes.txt")
+    _git(project, "commit", "-q", "-m", "T0003: Cases")
+    elsewhere = await step.execute("c2", args)
+    not_done = await step.execute("c3", {**args, "abandon": "done by T0002"})
+
+    assert "T0004 not closed done by T0003" in no_commit.text
+    assert "no commit of T0003 is found" in no_commit.text
+    assert "touches none of tests" in elsewhere.text
+    assert "T0002 is not a done task" in not_done.text
+    assert _pursuit_calls(fake_beagle, "open") == []
+    assert _pursuit_calls(fake_beagle, "close") == []
+    assert _runs(fake_tau) == []
+
+
+@pytest.mark.anyio
+async def test_already_passes_on_the_cases_test_offers_done_by_not_the_same_test(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # R14 E24-E46: told to bind the goal criterion's test, the same passing one.
+    _done_by_project(tmp_path, fake_beagle, monkeypatch, "T0003: Cases")
+    runtime, _ = _bound(tmp_path)
+
+    result = await _tool(runtime, "pursuit_step").execute(
+        "c1",
+        {
+            "task": "T0004",
+            "criteria": "the cases run",
+            "done_when": CASES_CHECK,
+            "scope": ["tests"],
+        },
+    )
+
+    assert "T0004 not opened" in result.text and "already passes" in result.text
+    assert f'pursuit_step task="T0004" abandon="done by T0003" done_when="{CASES_CHECK}"' in (
+        result.text
+    )
+    assert "bind the goal criterion's test" not in result.text
+    assert _pursuit_calls(fake_beagle, "open") == [] and _runs(fake_tau) == []
+
+
+@pytest.mark.anyio
+async def test_pending_milestone_abandon_refusal_offers_no_new_route(
+    tmp_path: Path, beagle: Path, fake_beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # R14 E26-E30: offered new_route for T0004, never opened; beagle refused the spawn.
+    monkeypatch.chdir(_pursuit_project(tmp_path))
+    _ready_task(fake_beagle)
+    _milestones(
+        fake_beagle,
+        {"id": "T0003", "parent": "T0001", "status": "done"},
+        {"id": "T0005", "parent": "T0001", "status": "open"},
+    )
+    runtime, _ = _bound(tmp_path)
+    step = _tool(runtime, "pursuit_step")
+
+    pending = await step.execute("c1", {"task": "T0002", "abandon": "duplicate of T0003"})
+    opened = await step.execute("c2", {"task": "T0005", "abandon": "duplicate of T0003"})
+
+    assert _pursuit_calls(fake_beagle, "close") == []
+    assert "T0002 not abandoned — it is a milestone" in pending.text
+    assert "new_route" not in pending.text
+    assert "pursuit_plan" in pending.text and 'abandon="done by Tnnnn"' in pending.text
+    assert "new_route=true" in opened.text
+
+
+@pytest.mark.anyio
+async def test_step_with_done_when_but_no_criteria_says_criteria_is_missing(
+    tmp_path: Path, beagle: Path, fake_beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # R14 E47-E53: task+done_when without criteria re-printed the next-task prompt.
+    monkeypatch.chdir(_pursuit_project(tmp_path))
+    _ready_task(fake_beagle)
+    runtime, _ = _bound(tmp_path)
+
+    result = await _tool(runtime, "pursuit_step").execute(
+        "c1", {"task": "T0002", "done_when": "grep -q done done.txt"}
+    )
+
+    assert "T0002 not opened — criteria is missing: say what will be true when it is done" in (
+        result.text
+    )
+    assert "Next task" not in result.text
+    assert _pursuit_calls(fake_beagle, "open") == []
 
 
 STALLED_TREE = [
