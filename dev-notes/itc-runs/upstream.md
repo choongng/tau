@@ -209,3 +209,17 @@ detector (R10.md, first tau class).
 
 Nothing else for beagle: the event-tree loss is tau's ordering and checks
 (R12.md, second tau class) and the model's invented design.
+
+## R13
+
+- **The open rehearsal does not recognise git's usage error.** R13's
+  T0002 was opened on `git diff --stat: references/NOTES.md`; beagle ran
+  it at open (T0002.md `check_seconds = 1`), and it exited 129 with
+  `error: invalid option: --stat:` and git's `usage:` block. `usage_error`
+  (pursuit.py ~L4664) misses it twice: `_USAGE_EXITS` is (2, 4, 64), not
+  129, and `_USAGE_ERROR` needs `<prog>: error:` or `Error:`, not git's
+  bare lowercase `error:`. So the open printed no warning, and two workers
+  ran on a check no work could pass (R13.md, first tau class). Proposal:
+  add 129 to `_USAGE_EXITS` and accept a line-initial `error: `; for git,
+  whose unknown option is never what the work adds, refuse rather than
+  warn. Priority: low (tau's first class is the fix on the host side).
