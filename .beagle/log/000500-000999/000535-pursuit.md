@@ -1,0 +1,14 @@
++++
+id = "000535-pursuit"
+ordinal = 535
+kind = "pursuit"
+timestamp = "2026-10-04T05:13:25+00:00"
+summary = "pursuit open T0128: scored.sh asserts the expected model"
+metric_command = ""
+drains = []
+hooks = []
++++
+
+criteria: A v3 run check, .beagle/checks/runs/v3/scored.sh RNN mimo|qwen, does everything v2 does and also asserts meta.json's model is the full model name launch.sh maps the short name to (mimo-v2.6-9b-q4, qwen3.5-9b-q4-mtp-thinking-coding); it refuses a missing or unknown model argument. v3/selftest.sh covers a wrong-model run being refused. v2 is left unchanged for the runs already closed on it.
+decided by: sh -c 'echo "c713a4d05b3ad5d5c8f8cfa79a11e161e9dfdd4a2afdacaa5b28429899c16994  .beagle/checks/T0128/check.sh" | sha256sum -c --quiet && bash .beagle/checks/T0128/check.sh'
+budget: 30000 tokens
