@@ -5048,6 +5048,11 @@ def _missing_locked_file(output: str, locks: list[str], root: Path) -> str | Non
     return None
 
 
+def _absent_locks(locks: list[str], root: Path) -> list[str]:
+    """The lock entries that are not a file on disk: the task's work not yet done."""
+    return [lock for lock in locks if not (root / lock.rstrip("/")).is_file()]
+
+
 _COLLECT_ONLY = re.compile(r"(?<![\w-])--(?:collect-only|co)(?![\w-])")
 
 
@@ -5239,7 +5244,12 @@ def _in_commit(sha: str, rel: str, root: Path) -> bool:
 
 
 async def _prove(
-    task: str, report: str, scope: list[str], root: Path, timeout: float
+    task: str,
+    report: str,
+    scope: list[str],
+    root: Path,
+    timeout: float,
+    locks: list[str] | None = None,
 ) -> _Proof | None:
     """Ask `beagle pursuit prove` whether the passing check can refuse at all.
 
@@ -5247,9 +5257,10 @@ async def _prove(
     work: run 11d closed two tasks on import-only checks. The worker names the
     defect (`WITNESS_NOTE`); a missing or misshapen one falls back to taking
     away the source files the task changed that were not in the tree when it
-    opened, or with none, its data files. None
-    when neither can be tried —
-    no witness and no changed file — and the close decides.
+    opened, or with none, its data files; a task with locks it wrote takes those
+    away. None
+    when neither can be tried — no witness and no changed file — and the close
+    decides.
     """
     attempts: list[list[str]] = []
     refused: list[str] = []
@@ -5274,23 +5285,32 @@ async def _prove(
     elif witness is not None:
         path, needle, replacement = witness
         attempts.append(["--mutate", path, "--needle", needle, "--replacement", replacement])
+    # Run R17: T0008's locked cases.json was never written, and the fallback
+    # took away itc.py instead; for a known-answers task the data is the work.
+    opened = _opened_commit(task, root)
+    changed = _changed_files(root)
     sources = [
         rel
-        for rel in _changed_files(root)
-        if _in_scope(rel, scope) and not _is_test_path(rel) and (root / rel).is_file()
+        for rel in (lock.rstrip("/") for lock in locks or [])
+        if rel in changed and (root / rel).is_file() and not _in_commit(opened, rel, root)
     ]
+    if not sources:
+        sources = [
+            rel
+            for rel in changed
+            if _in_scope(rel, scope) and not _is_test_path(rel) and (root / rel).is_file()
+        ]
     if not sources:
         # A known-answers task changes only data and tests: taking its data
         # file away is the defect (beagle proves it when the task wrote it).
         sources = [
             rel
-            for rel in _changed_files(root)
+            for rel in changed
             if _in_scope(rel, scope) and not rel.endswith(".py") and (root / rel).is_file()
         ]
     if sources:
         # Run R14: both witnesses took away interval_tree_clocks.py, which T0003
         # wrote, so removing it showed only that the import was needed.
-        opened = _opened_commit(task, root)
         sources = [rel for rel in sources if not _in_commit(opened, rel, root)]
     if sources:
         attempts.append([arg for rel in sources for arg in ("--absent", rel)])
@@ -6819,9 +6839,13 @@ def make_step_tool() -> Any:
             verdict = await _run_check(check, root, check_timeout)
             _LAST_CHECK_EXIT[unproven_key] = verdict[0]
             if verdict[0] == 0:
-                proof = await _prove(task, "", scope, root, check_timeout)
+                proof = await _prove(task, "", scope, root, check_timeout, locks)
         for attempt in range(1, attempts + 1):
-            if verdict[0] == 0 and (proof is None or proof.proven):
+            if (
+                verdict[0] == 0
+                and (proof is None or proof.proven)
+                and not _absent_locks(locks, root)
+            ):
                 break
             if on_update is not None:
                 with contextlib.suppress(Exception):
@@ -6850,7 +6874,9 @@ def make_step_tool() -> Any:
             verdict = await _run_check(check, root, check_timeout)
             _LAST_CHECK_EXIT[unproven_key] = verdict[0]
             if verdict[0] == 0:
-                proof = await _prove(task, report, scope, root, check_timeout)
+                if _absent_locks(locks, root):
+                    break
+                proof = await _prove(task, report, scope, root, check_timeout, locks)
                 if proof is None or proof.proven:
                     break
                 if not proof.weak and not proof.ask_module:
@@ -6908,6 +6934,22 @@ def make_step_tool() -> Any:
             else ""
         )
 
+        absent = _absent_locks(locks, root)
+        if verdict[0] == 0 and absent:
+            # Run R17: T0008 closed done and its lock became "Not locked:
+            # tests/cases.json: not a file in the project".
+            state = "stays blocked" if retrying else "stays open"
+            named = ", ".join(lock.rstrip("/") for lock in absent)
+            return _not_done(
+                root,
+                task,
+                scope,
+                f"{route}{undid}{task} — {title}: the check passes, but {named}: it is "
+                f"locked for this task and not written, so that is the work; the task "
+                f"{state}, since a done close needs its locked files on disk.\n\n"
+                f"Last report:\n{shown}\n\n"
+                f'Next: pursuit_step with task="{task}" and notes saying to write {named}.',
+            )
         if check and verdict[0] != 0:
             state = "stays blocked" if retrying else "stays open"
             fix_check = (

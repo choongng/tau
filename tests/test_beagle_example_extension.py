@@ -3268,8 +3268,13 @@ async def test_a_step_locks_its_cases_and_later_steps_cannot_change_them(
         },
     )
 
-    assert "Locked: cases.json" in first.text
-    assert "missing.json: not a file in the project" in first.text
+    # R17: a lock entry not on disk is the work left, not a note after the close.
+    assert "missing.json: it is locked for this task and not written" in first.text
+    assert not (project / ".beagle" / "locked").exists()
+    (project / "missing.json").write_text("[]")
+    (fake_beagle / "next.out").write_text(json.dumps({"open": ["T0002"], "ready": []}))
+    first = await step.execute("c1b", {"task": "T0002"})
+    assert "Locked: cases.json, missing.json" in first.text
     assert (project / ".beagle" / "locked" / "cases.json").read_text() == '[{"in": 1, "out": 2}]'
 
     # A later worker that rewrites the cases has them put back before the check.
@@ -10023,6 +10028,70 @@ async def test_not_done_names_a_missing_locked_file_as_the_work(
         "so that is the work" in result.text
     )
     assert "corrected done_when" not in result.text
+
+
+@pytest.mark.anyio
+async def test_close_refused_when_a_lock_is_not_on_disk(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # R17 E56: T0008 closed done, then "Not locked: tests/cases.json: not a file
+    # in the project".
+    project = _pursuit_project(tmp_path)
+    monkeypatch.chdir(project)
+    _ready_task(fake_beagle)
+    runtime, _ = _bound(tmp_path)
+
+    result = await _tool(runtime, "pursuit_step").execute(
+        "c1",
+        {
+            "task": "T0002",
+            "criteria": "c",
+            "done_when": "grep -q done done.txt",
+            "locks": ["tests/cases.json"],
+            "attempts": 1,
+        },
+    )
+
+    assert (project / "done.txt").is_file()
+    assert "stays open" in result.text
+    assert (
+        "tests/cases.json: it is locked for this task and not written, so that is the work"
+        in result.text
+    )
+    assert _pursuit_calls(fake_beagle, "close") == []
+    assert _pursuit_calls(fake_beagle, "prove") == []
+    assert _pursuit_calls(fake_beagle, "commit") == []
+    assert "Not locked" not in result.text
+
+
+@pytest.mark.anyio
+async def test_prove_takes_away_locked_data_for_a_known_answers_task(
+    tmp_path: Path, beagle: Path, fake_beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # R17 E56: "witness: refuses when __init__.py is absent and itc.py is absent".
+    project = _git_project(tmp_path, monkeypatch)
+    (project / "README").write_text("itc\n")
+    _git(project, "add", "README")
+    _git(project, "commit", "-q", "-m", "T0001: the project")
+    opened = _git(project, "rev-parse", "HEAD").strip()
+    record = {"id": "T0008", "status": "open", "opened_commit": opened}
+    (fake_beagle / "show.out").write_text(json.dumps(record))
+    (project / "itc.py").write_text("def fork(i):\n    return i\n")
+    (project / "tests").mkdir(exist_ok=True)
+    (project / "tests" / "cases.json").write_text("[]")
+    scope = ["itc.py", "tests/cases.json", "tests/test_case_data.py"]
+    module = _module()
+    monkeypatch.setattr(module, "BEAGLE_BIN", str(fake_beagle / "beagle"))
+
+    await module._prove("T0008", "done, no witness", scope, project, 60, ["tests/cases.json"])
+
+    prove = _pursuit_calls(fake_beagle, "prove")
+    assert len(prove) == 1 and prove[0][:3] == ["T0008", "--absent", "tests/cases.json"]
+    assert "itc.py" not in prove[0]
 
 
 @pytest.mark.anyio
