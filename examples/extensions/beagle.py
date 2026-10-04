@@ -3189,6 +3189,7 @@ def make_plan_tool() -> Any:
         # Read before the split, which leaves the task a container.
         scope, uncommitted = _uncommitted_in_scope(root, task)
         uncommitted_note = _uncommitted_note(task, uncommitted) if uncommitted else ""
+        moved_note = ""
         if len(parts) == 1:
             rc, out = _add_children(task, parts, root)
             # beagle says "a pending leaf" or, for one being worked, "a open
@@ -3201,6 +3202,8 @@ def make_plan_tool() -> Any:
             rc, out = _pursuit(["split", task, *parts, *(["--ordered"] if ordered else [])], root)
             if rc != 0 and "already has children" in out:
                 rc, out = _add_children(task, parts, root)
+            elif rc == 0:
+                moved_note = _move_pending_locks(goal, task, parts[0], root)
         if rc != 0:
             refused = f"pursuit_plan: beagle refused (exit {rc}):\n{out}"
             if uncommitted_note:
@@ -3210,6 +3213,8 @@ def make_plan_tool() -> Any:
         notes = "".join(f"{note}\n\n" for note in split_notes)
         if uncommitted_note:
             notes += f"{uncommitted_note}\n\n"
+        if moved_note:
+            notes += f"{moved_note}\n\n"
         if repeated:
             notes += f"Not added again, {task} already has: {', '.join(repeated)}.\n\n"
         if "--outcome abandoned" in out:
@@ -4697,6 +4702,11 @@ _DELIVERABLE_WORDS = _MAKING_WORDS | {
     "code",
     "extract",
     "answers",
+    "readme",
+    "doc",
+    "docs",
+    "document",
+    "documenting",
 }
 KNOWN_ANSWERS_TITLE = "Known answers from the reference"
 
@@ -4710,6 +4720,12 @@ def _read_or_design_only(part: str) -> bool:
     """
     words = set(re.findall(r"[a-z0-9]+", part.lower()))
     return bool(words & _READ_DESIGN_WORDS) and not words & _DELIVERABLE_WORDS
+
+
+def _names_known_answers(part: str) -> bool:
+    """Whether milestone `part` already names the known answers or a cases file."""
+    text = part.lower()
+    return "known answer" in text or bool(re.search(r"\bcases\b", text))
 
 
 def _repair_milestones(milestones: list[str]) -> tuple[list[str], list[str]]:
@@ -4746,7 +4762,9 @@ def _repair_milestones(milestones: list[str]) -> tuple[list[str], list[str]]:
     for _part, why in reruns:
         notes.append(f"Dropped a milestone: {why}")
     repaired: list[str] = []
-    retitled = False
+    # Run R17 retitled its docs milestone as a second known-answers task
+    # although milestone 1 already wrote tests/cases.json.
+    retitled = any(_names_known_answers(part) for part in kept)
     for index, part in enumerate(kept, 1):
         title, sep, intent = part.partition("::")
         title = title.strip()
@@ -5675,6 +5693,23 @@ def _drop_pending_locks(goal: Path, task: str) -> None:
         pending = json.loads(path.read_text(encoding="utf-8"))
         if pending.pop(task, None) is not None:
             path.write_text(json.dumps(pending, indent=1), encoding="utf-8")
+
+
+def _move_pending_locks(goal: Path, task: str, first_part: str, root: Path) -> str:
+    """Move `task`'s pending locks to the task split from `first_part`; a note, or "".
+
+    Run R17 split T0002 and its three pending locks stayed behind: only a
+    done close drops them, and a container is never closed that way.
+    """
+    locks = _pending_locks(goal, task)
+    if not locks:
+        return ""
+    heir = _children(task, root).get(_part_title(first_part).lower())
+    if heir is None:
+        return ""
+    _pending_locks(goal, heir, locks)
+    _drop_pending_locks(goal, task)
+    return f"{task}'s pending locks ({', '.join(locks)}) moved to its first part, {heir}."
 
 
 #: Retries beagle allows a task its own check blocked.

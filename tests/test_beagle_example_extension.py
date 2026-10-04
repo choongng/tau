@@ -4107,6 +4107,69 @@ async def test_founding_read_and_design_milestone_is_retitled_known_answers(
     assert not only_reads("Implement the clock operations")
 
 
+#: Run R17's first and sixth founding milestones.
+R17_KNOWN_ANSWERS_MILESTONE = (
+    "Known answers: read the ITC 2008 paper and the ferd.ca notes, write "
+    "tests/cases.json and a test that runs every case"
+)
+R17_DOCS_MILESTONE = (
+    "Toolchain and docs: uv/ruff per the python-coding skill, README documenting "
+    "the paper, API, complexity and design decisions"
+)
+
+
+async def _found_with(tmp_path: Path, fake_beagle: Path, milestones: list[str]) -> Any:
+    (fake_beagle / "add.out").write_text("T0001  Implement interval tree clocks\n")
+    runtime, _ = _bound(tmp_path)
+    return await _tool(runtime, "pursuit_found").execute(
+        "c1",
+        {
+            "statement": "Implement interval tree clocks",
+            "criteria": ["`python3 -m pytest -q` exits 0"],
+            "milestones": milestones,
+            "user_confirmed": True,
+        },
+    )
+
+
+@pytest.mark.anyio
+async def test_founding_does_not_retitle_a_docs_milestone_mentioning_design(
+    tmp_path: Path, beagle: Path, fake_beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (tmp_path / "project").mkdir()
+    monkeypatch.chdir(tmp_path / "project")
+
+    result = await _found_with(
+        tmp_path, fake_beagle, ["Implement the clock operations", R17_DOCS_MILESTONE]
+    )
+
+    assert "Founded the pursuit" in result.text
+    assert _module().KNOWN_ANSWERS_TITLE not in result.text
+    [split] = _pursuit_calls(fake_beagle, "split")
+    assert not any(part.startswith(_module().KNOWN_ANSWERS_TITLE) for part in split)
+    assert not _module()._read_or_design_only(R17_DOCS_MILESTONE)
+    assert _module()._read_or_design_only(R15_FOUNDING_MILESTONE)
+
+
+@pytest.mark.anyio
+async def test_founding_does_not_retitle_when_a_known_answers_milestone_exists(
+    tmp_path: Path, beagle: Path, fake_beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (tmp_path / "project").mkdir()
+    monkeypatch.chdir(tmp_path / "project")
+    later = "Review the paper and choose a design"
+
+    result = await _found_with(
+        tmp_path, fake_beagle, [R17_KNOWN_ANSWERS_MILESTONE, "Implement the clock", later]
+    )
+
+    assert "Founded the pursuit" in result.text
+    assert _module().KNOWN_ANSWERS_TITLE not in result.text
+    [split] = _pursuit_calls(fake_beagle, "split")
+    assert not any(part.startswith(_module().KNOWN_ANSWERS_TITLE) for part in split)
+    assert _module()._read_or_design_only(later)
+
+
 @pytest.mark.anyio
 async def test_founding_milestone_with_a_bare_label_takes_its_title_from_the_intent(
     tmp_path: Path, beagle: Path, fake_beagle: Path, monkeypatch: pytest.MonkeyPatch
@@ -9272,6 +9335,44 @@ async def test_plan_splits_a_multi_line_part_among_others(
         ["T0002", "Docs", "Write A", "Write B", "Ship", "--ordered"]
     ]
     assert "beagle refused" not in plan.text and "each line became a part" in plan.text
+
+
+@pytest.mark.anyio
+async def test_plan_split_moves_parent_pending_locks_to_first_part(
+    tmp_path: Path, beagle: Path, fake_beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Run R17 split T0002 and its three pending locks stayed behind.
+    project = _pursuit_project(tmp_path)
+    monkeypatch.chdir(project)
+    pending = project / ".beagle" / "locks-pending.json"
+    locks = ["tests/cases.json", "tests/test_cases.py", "itc/__init__.py"]
+    pending.write_text(json.dumps({"T0002": locks, "T0003": ["docs/x.md"]}))
+    nodes = [
+        {"id": "T0001", "title": "Ship it", "status": "pending", "container": True},
+        {"id": "T0002", "parent": "T0001", "title": "Known answers", "status": "open"},
+    ]
+    (fake_beagle / "tree.out").write_text(json.dumps({"goal": "Ship it", "nodes": nodes}))
+    nodes += [
+        {"id": "T0008", "parent": "T0002", "title": "Write the cases", "status": "pending"},
+        {"id": "T0009", "parent": "T0002", "title": "Write the runner", "status": "pending"},
+    ]
+    (fake_beagle / "tree-split.out").write_text(json.dumps({"goal": "Ship it", "nodes": nodes}))
+    # As beagle does: the tree has the parts once the split is made.
+    split_tree = (
+        'if sys.argv[2:3] == ["split"]:\n'
+        '    (here / "tree.out").write_text((here / "tree-split.out").read_text())\n'
+    )
+    script = FAKE_BEAGLE.replace("reply = here", split_tree + "reply = here", 1)
+    (fake_beagle / "beagle").write_text(f"#!{sys.executable}\n{script}", encoding="utf-8")
+    runtime, _ = _bound(tmp_path)
+
+    plan = await _tool(runtime, "pursuit_plan").execute(
+        "c1", {"task": "T0002", "parts": ["Write the cases", "Write the runner"]}
+    )
+
+    assert _pursuit_calls(fake_beagle, "split")
+    assert json.loads(pending.read_text()) == {"T0003": ["docs/x.md"], "T0008": locks}
+    assert "moved to its first part, T0008" in plan.text
 
 
 @pytest.mark.anyio
