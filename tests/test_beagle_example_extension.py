@@ -2866,6 +2866,92 @@ async def test_cases_task_with_implementation_in_test_file_stays_open(
     assert not (project / ".beagle" / "locked").exists()
 
 
+@pytest.mark.anyio
+async def test_known_answers_task_whose_test_never_opens_the_cases_file_stays_open(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Run R14: test_case_data.py loaded cases.json to check its shape, and
+    # test_cases.py imported the code with its own asserts, never reading it.
+    cases_test = (
+        "from interval_tree_clocks import create_seed\n\n\n"
+        'def test_create_seed():\n    assert create_seed() == "(1, 0)"\n'
+    )
+    project = _cases_task(tmp_path, fake_beagle, monkeypatch, CASES_DATA_TEST)
+    writes = json.loads(os.environ["FAKE_TAU_WRITES"])
+    writes["tests/test_cases.py"] = cases_test
+    monkeypatch.setenv("FAKE_TAU_WRITES", json.dumps(writes))
+    scope = [*CASES_SCOPE, "tests/test_cases.py"]
+
+    result = await _step_cases(tmp_path, scope=scope, locks=scope)
+
+    assert "stays open" in result.text and "nothing is locked" in result.text
+    assert (
+        "tests/test_cases.py does not read tests/cases.json, so the known answers "
+        "judge nothing: the sub-agent must make tests/test_cases.py load "
+        "tests/cases.json and run every case"
+    ) in result.text
+    assert _pursuit_calls(fake_beagle, "close") == []
+    assert _pursuit_calls(fake_beagle, "commit") == []
+    assert not (project / ".beagle" / "locked").exists()
+
+
+@pytest.mark.anyio
+async def test_cases_test_naming_the_file_only_in_a_docstring_stays_open(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    data_test = (
+        '"""Runs every case in tests/cases.json."""\n'
+        "from pathlib import Path\n\n\n"
+        "def test_cases():\n"
+        '    """Loads tests/cases.json."""\n'
+        "    # json.load(open('tests/cases.json'))\n"
+        "    assert Path(__file__).read_text()\n"
+    )
+    project = _cases_task(tmp_path, fake_beagle, monkeypatch, data_test)
+
+    result = await _step_cases(tmp_path)
+
+    assert "stays open" in result.text
+    assert "tests/test_case_data.py does not read tests/cases.json" in result.text
+    assert _pursuit_calls(fake_beagle, "close") == []
+    assert not (project / ".beagle" / "locked").exists()
+    assert not _module()._locked_test_imports(project / ".beagle" / "pursuit.toml")
+
+
+@pytest.mark.anyio
+async def test_cases_test_that_json_loads_the_cases_file_is_locked(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    data_test = (
+        "import json\nfrom pathlib import Path\n\nimport interval_tree_clocks\n\n"
+        'CASES = json.loads((Path(__file__).parent / "cases.json").read_text())\n\n\n'
+        "def test_cases():\n    for case in CASES:\n"
+        '        assert interval_tree_clocks.run(case["in"]) == case["out"]\n'
+    )
+    project = _cases_task(tmp_path, fake_beagle, monkeypatch, data_test)
+
+    result = await _step_cases(tmp_path)
+
+    assert "Locked: tests/cases.json, tests/test_case_data.py" in result.text
+    assert "does not read" not in result.text
+    goal = project / ".beagle" / "pursuit.toml"
+    assert _module()._locked_test_imports(goal) == {
+        "interval_tree_clocks": "tests/test_case_data.py"
+    }
+
+
 def test_a_witness_block_is_read_from_the_end_of_a_report() -> None:
     witness = _module()._witness
     assert witness(WITNESSED_REPORT) == ("src/clock.py", "    return a + b", "    return a - b")
@@ -4094,7 +4180,10 @@ def _lock_cases_test(project: Path, imports: str) -> None:
     store = project / ".beagle" / "locked" / "tests"
     store.mkdir(parents=True)
     (store / "cases.json").write_text("[]")
-    (store / "test_cases.py").write_text(f"import json\n\nimport pytest\n\n{imports}\n")
+    (store / "test_cases.py").write_text(
+        f"import json\n\nimport pytest\n\n{imports}\n\n"
+        "CASES = json.load(open('tests/cases.json'))\n"
+    )
 
 
 def _open_args(scope: list[str]) -> dict[str, Any]:

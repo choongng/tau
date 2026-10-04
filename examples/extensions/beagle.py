@@ -3516,31 +3516,120 @@ def _new_modules(scope: list[str], root: Path) -> list[tuple[str, str]]:
     return found
 
 
+#: Suffixes of a known-answers data file a cases test must read.
+CASES_DATA_SUFFIXES = frozenset({".json", ".toml", ".yaml", ".yml", ".csv"})
+
+
+def _is_cases_data(rel: str) -> bool:
+    return Path(rel).suffix in CASES_DATA_SUFFIXES and _is_test_path(rel)
+
+
+def _cases_test_reads(test_path: Path, data_basename: str) -> bool:
+    """Whether the test's code, not a docstring or comment, names and opens the data file.
+
+    Run R14: test_cases.py held hand-written asserts and never opened
+    cases.json, so the locked known answers judged nothing.
+    """
+    try:
+        tree = ast.parse(test_path.read_text(encoding="utf-8"))
+    except (OSError, SyntaxError, ValueError):
+        return False
+    for node in ast.walk(tree):
+        body = getattr(node, "body", None)
+        if isinstance(body, list):
+            node.body = [  # type: ignore[attr-defined]
+                stmt
+                for stmt in body
+                if not (
+                    isinstance(stmt, ast.Expr)
+                    and isinstance(stmt.value, ast.Constant)
+                    and isinstance(stmt.value.value, str)
+                )
+            ]
+    named = opens = False
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            named = named or data_basename in node.value
+        elif isinstance(node, ast.Call):
+            func = node.func
+            if isinstance(func, ast.Name):
+                opens = opens or func.id in {"open", "Path"}
+            elif isinstance(func, ast.Attribute):
+                opens = opens or (
+                    func.attr in {"read_text", "Path"}
+                    or (
+                        func.attr in {"load", "loads"}
+                        and isinstance(func.value, ast.Name)
+                        and func.value.id == "json"
+                    )
+                )
+    return named and opens
+
+
+def _test_project_imports(test_path: Path) -> list[str]:
+    """The project modules a test file imports: not stdlib, test libraries or tests."""
+    try:
+        tree = ast.parse(test_path.read_text(encoding="utf-8"))
+    except (OSError, SyntaxError, ValueError):
+        return []
+    found: list[str] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            names = [alias.name for alias in node.names]
+        elif isinstance(node, ast.ImportFrom) and node.module and not node.level:
+            names = [node.module]
+        else:
+            continue
+        for name in names:
+            top = name.split(".")[0]
+            if top in sys.stdlib_module_names or top in _TEST_LIBRARIES:
+                continue
+            if top.startswith("test_") or name in found:
+                continue
+            found.append(name)
+    return found
+
+
+def _unread_cases(root: Path, entries: list[str]) -> tuple[str, str] | None:
+    """(test, data file) when the locks hold a cases data file the code's tests never read.
+
+    Run R14 locked a data-shape test that loaded cases.json beside a test that
+    imported the code and never read it. When a locked test imports the code,
+    one such test must read each data file; a test importing nothing of the
+    project does not count.
+    """
+    files = []
+    for entry in entries:
+        target = _project_file(root, entry)
+        if target is not None and target.is_file():
+            files.append(str(target.relative_to(root.resolve())))
+    tests = [rel for rel in files if rel.endswith(".py") and _is_test_path(rel)]
+    judges = [rel for rel in tests if _test_project_imports(root / rel)]
+    readers = judges or tests
+    for data in (rel for rel in files if _is_cases_data(rel)):
+        name = Path(data).name
+        if readers and not any(_cases_test_reads(root / test, name) for test in readers):
+            return readers[0], data
+    return None
+
+
 def _locked_test_imports(goal: Path) -> dict[str, str]:
-    """Each project module a locked test file imports, with the first test importing it."""
+    """Each project module a locked test file imports, with the first test importing it.
+
+    With a cases data file locked, a test that reads none of them is skipped:
+    its own asserts, not the known answers, would judge the code.
+    """
     store = goal.parent / LOCKED_DIR
     imported: dict[str, str] = {}
-    for rel in _locked(goal):
+    locked = _locked(goal)
+    data = [Path(rel).name for rel in locked if _is_cases_data(rel)]
+    for rel in locked:
         if not rel.endswith(".py") or not _is_test_path(rel):
             continue
-        try:
-            tree = ast.parse((store / rel).read_text(encoding="utf-8"))
-        except (OSError, SyntaxError, ValueError):
+        if data and not any(_cases_test_reads(store / rel, name) for name in data):
             continue
-        for node in ast.walk(tree):
-            if isinstance(node, ast.Import):
-                names = [alias.name for alias in node.names]
-            elif isinstance(node, ast.ImportFrom) and node.module and not node.level:
-                names = [node.module]
-            else:
-                continue
-            for name in names:
-                top = name.split(".")[0]
-                if top in sys.stdlib_module_names or top in _TEST_LIBRARIES:
-                    continue
-                if top.startswith("test_"):
-                    continue
-                imported.setdefault(name, rel)
+        for name in _test_project_imports(store / rel):
+            imported.setdefault(name, rel)
     return imported
 
 
@@ -5391,6 +5480,22 @@ def make_step_tool() -> Any:
         if not locks and _only_data_and_tests(changed):
             # Run R04: the driver passed no locks for its known-answers task.
             locks = changed
+        unread = _unread_cases(root, locks) if locks else None
+        if unread:
+            state = "stays blocked" if retrying else "stays open"
+            test, data = unread
+            return _not_done(
+                root,
+                task,
+                scope,
+                f"{route}{undid}{task} — {title}: the check passes, but the task {state} "
+                f"and nothing is locked: {test} does not read {data}, so the known answers "
+                f"judge nothing: the sub-agent must make {test} load {data} and run every "
+                "case in it against the code, with no hand-written asserts of its own."
+                f"\n\nLast report:\n{shown}\n\n"
+                f'Next: pursuit_step with task="{task}" and notes saying {test} must load '
+                f"{data} and run every case against the code.",
+            )
         # Committed while the task is still open, as beagle has a worker do:
         # the close's sweep then finds the work in history, not in the tree.
         committed = _commit(task, title, scope, root)
