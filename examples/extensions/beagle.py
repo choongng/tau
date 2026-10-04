@@ -3324,10 +3324,31 @@ def _bare_operators(command: str) -> list[str]:
         return []
 
 
+def _under_references(path: str, root: Path | None) -> bool:
+    """Whether a scope path, absolute or relative, is REFERENCES_DIR or inside it."""
+    if root is None:
+        return Path(path).parts[:1] == (REFERENCES_DIR,)
+    folder = (root / REFERENCES_DIR).resolve()
+    target = Path(path) if Path(path).is_absolute() else root / path
+    return target.resolve().is_relative_to(folder)
+
+
 def _scope_problem(
-    scope: list[str], task: str = "", nodes: list[dict[str, Any]] | None = None
+    scope: list[str],
+    task: str = "",
+    nodes: list[dict[str, Any]] | None = None,
+    root: Path | None = None,
 ) -> str | None:
-    """Why a task's scope is wrong, or None: it names beagle's own store."""
+    """Why a task's scope is wrong, or None: it names beagle's own store or references/."""
+    # Run R13: T0002 scoped references/NOTES.md, which founding git-ignores, so
+    # the worker could write it but never commit it.
+    refs = [path for path in scope if _under_references(path, root)]
+    if refs:
+        return (
+            f"scope names {refs[0]}, but {REFERENCES_DIR}/ holds the fetched sources and "
+            "is ignored by git, so nothing written there is committed; put the notes in "
+            "docs/ (e.g. docs/NOTES.md)."
+        )
     store = [path for path in scope if Path(path).parts[:1] == (".beagle",)]
     if not store:
         return None
@@ -4978,7 +4999,7 @@ def make_step_tool() -> Any:
                 # already passed, and left a successor with no criteria.
                 route_scope = scope or _strings(record.get("scope"))
                 scoped = (
-                    _scope_problem(route_scope, task, nodes)
+                    _scope_problem(route_scope, task, nodes, root)
                     or _oracle_with_code_problem(route_scope, goal)
                     or _import_scope_problem(done_when or old_check, route_scope, root)
                 )
@@ -5050,7 +5071,7 @@ def make_step_tool() -> Any:
             route += _bound_note(done_when, chained)
             done_when = chained
             scoped = (
-                _scope_problem(scope, task, nodes)
+                _scope_problem(scope, task, nodes, root)
                 or _oracle_with_code_problem(scope, goal)
                 or _cases_first_problem(scope, task, title, goal)
                 or _import_scope_problem(done_when, scope, root)

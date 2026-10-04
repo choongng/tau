@@ -3983,6 +3983,60 @@ async def test_step_refuses_a_scope_mixing_known_answer_data_with_source(
     assert len(_pursuit_calls(fake_beagle, "open")) == 1
 
 
+def _r13_arguments(project: Path, deliverable: str) -> dict[str, Any]:
+    return {
+        "task": "T0002",
+        "criteria": "the design notes are written",
+        "done_when": "grep -q done done.txt",
+        "scope": [str(project), str(project / "DESIGN.md"), str(project / deliverable)],
+    }
+
+
+@pytest.mark.anyio
+async def test_step_refuses_a_scope_under_references(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project = _pursuit_project(tmp_path)
+    monkeypatch.chdir(project)
+    _ready_task(fake_beagle)
+    runtime, _ = _bound(tmp_path)
+
+    refused = await _tool(runtime, "pursuit_step").execute(
+        "c1", _r13_arguments(project, "references/NOTES.md")
+    )
+
+    assert "not opened" in refused.text
+    assert "references/NOTES.md" in refused.text
+    assert "ignored by git" in refused.text and "docs/NOTES.md" in refused.text
+    assert _pursuit_calls(fake_beagle, "open") == []
+    assert _runs(fake_tau) == []
+
+
+@pytest.mark.anyio
+async def test_step_opens_a_scope_under_docs(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project = _pursuit_project(tmp_path)
+    monkeypatch.chdir(project)
+    _ready_task(fake_beagle)
+    runtime, _ = _bound(tmp_path)
+
+    opened = await _tool(runtime, "pursuit_step").execute(
+        "c1", _r13_arguments(project, "docs/NOTES.md")
+    )
+
+    assert "not opened" not in opened.text
+    assert len(_pursuit_calls(fake_beagle, "open")) == 1
+
+
 def _r09_project(tmp_path: Path) -> Path:
     project = _pursuit_project(tmp_path)
     (project / "src" / "itc").mkdir(parents=True)
