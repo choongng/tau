@@ -12,6 +12,7 @@ import importlib.util
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -3372,6 +3373,73 @@ def test_a_check_that_cannot_judge_the_work_is_refused(check: str, problem: str 
     found = _module()._check_problem(check)
 
     assert found is None if problem is None else problem in found
+
+
+def test_and_chain_refusal_quotes_the_one_segment_left() -> None:
+    # R13 E15: the git diff part passes whatever the work did.
+    check = (
+        'python3 -c "import itc; assert itc.join(1, 2) == 3" '
+        "&& git diff --stat -- . ':!references/'"
+    )
+
+    bound, problem = _module()._and_chain(check)
+
+    assert bound is None
+    one = shlex.join(["python3", "-c", "import itc; assert itc.join(1, 2) == 3"])
+    assert f"send this as done_when: `{one}`" in problem
+    assert "git diff" not in problem.split("done_when: ")[-1]
+
+
+def test_and_chain_of_file_existence_tests_gets_the_file_objection() -> None:
+    # R13 E13.
+    bound, problem = _module()._and_chain("test -s src/itc.py && test -s tests/test_itc.py")
+
+    assert bound is None and "only tests that a file exists" in problem
+    assert "test -s src/itc.py" in problem
+
+
+def test_bash_c_script_is_checked_segment_by_segment() -> None:
+    check_problem = _module()._check_problem
+
+    found = check_problem("bash -c 'test -s A && test -s B'")
+    assert found is not None and "only tests that a file exists" in found
+    assert "exits 0 whatever" in check_problem("sh -c 'true && git diff --stat'")
+    assert "runs beagle itself" in check_problem("bash -c 'beagle doctor && test -d tests'")
+    assert check_problem("bash -c 'test -s A && python3 -m pytest -q'") is None
+    # The form beagle itself runs a check file in.
+    script = 'echo "6ca9e5  checks/c.sh" | sha256sum -c --quiet && bash checks/c.sh'
+    sealed = f"sh -c {shlex.quote(script)}"
+    assert check_problem(sealed) is None
+
+
+@pytest.mark.anyio
+async def test_and_chain_of_real_checks_binds_as_bash_c(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project = _pursuit_project(tmp_path)
+    monkeypatch.chdir(project)
+    _ready_task(fake_beagle)
+    runtime, _ = _bound(tmp_path)
+    check = "uv run pytest -q tests/a.py && uv run pytest -q tests/b.py"
+
+    result = await _tool(runtime, "pursuit_step").execute(
+        "c1", {"task": "T0002", "criteria": "it holds", "done_when": check}
+    )
+
+    [opened] = _pursuit_calls(fake_beagle, "open")
+    assert opened[opened.index("--done-when") + 1] == f"bash -c {shlex.quote(check)}"
+    assert "bound through bash -c because of its bare '&&'" in result.text
+
+
+def test_operator_refusal_says_the_worker_writes_the_test() -> None:
+    found = _module()._check_problem("python3 -m pytest -q tests/ | tail -1")
+
+    assert "bare '|'" in found and "the sub-agent writes it" in found
+    assert "tests/test_<name>.py" in found
 
 
 @pytest.mark.anyio

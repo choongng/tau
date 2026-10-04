@@ -3067,7 +3067,8 @@ def _check_problem(command: str) -> str | None:
     - a bare `&&`, `|` or `>`, which reaches the program as an argument;
     - a check that cannot fail: `true`, which run 9 bound to "abandon" a
       duplicate, or one that only shows a file is there (`cat docs/x.md`,
-      `python3 -m json.tool cases.json`) and passes whatever it says.
+      `python3 -m json.tool cases.json`) and passes whatever it says;
+    - a `bash -c '...'` script whose every `&&` part is one of the above.
     """
     try:
         words = shlex.split(command)
@@ -3075,10 +3076,7 @@ def _check_problem(command: str) -> str | None:
         return None  # beagle says why it will not split
     if not words:
         return None
-    one_command = (
-        "It must be ONE command over the project that exits 0 exactly when the task is "
-        "done, such as `python3 -m pytest -q tests/test_greet.py`"
-    )
+    one_command = _ONE_COMMAND
     if _bash_find(command, lambda argv: "beagle" if _named(argv, "beagle") else None):
         # The close runs the check, so a check that runs beagle can only ever
         # answer how it was called, never whether the work is done.
@@ -3099,15 +3097,22 @@ def _check_problem(command: str) -> str | None:
         return (
             f"done_when has a bare {operators[0]!r}, but it runs without a shell, so "
             f"{operators[0]!r} reaches {words[0]!r} as an argument. {one_command}; for "
-            "more than one thing, write a test that checks them all and run that. Call "
-            "pursuit_step again with it."
+            "more than one thing, name a new test file (e.g. tests/test_<name>.py) in "
+            "scope and say in notes what it must check; the sub-agent writes it, not you. "
+            "Call pursuit_step again with it."
         )
     program = Path(words[0]).name
+    if program in _SHELLS and "-c" in words[1:-1]:
+        # R13: `bash -c 'test -s A && test -s B'` passed this guard whole.
+        segments = _and_segments(words[words.index("-c") + 1])
+        if segments is None:
+            return None
+        left, objections = _judge_segments(segments)
+        if not left:
+            return _always_passes(command)
+        return objections[0] if all(objections) else None
     if program in _ALWAYS_PASSES:
-        return (
-            f"done_when `{command}` exits 0 whatever the work does, so it cannot judge it. "
-            f"{one_command}. {ABANDON_HINT}"
-        )
+        return _always_passes(command)
     if program in _TESTS and _FILE_TESTS & set(words[1:]):
         # Run R02 closed its reference task on `test -f src/design.md`; the
         # design's content was never judged.
@@ -3150,6 +3155,98 @@ def _check_problem(command: str) -> str | None:
         "tests/test_greet.py`. Put what the test must assert in criteria and notes, "
         "and call pursuit_step again."
     )
+
+
+_ONE_COMMAND = (
+    "It must be ONE command over the project that exits 0 exactly when the task is "
+    "done, such as `python3 -m pytest -q tests/test_greet.py`"
+)
+
+
+def _always_passes(command: str) -> str:
+    return (
+        f"done_when `{command}` exits 0 whatever the work does, so it cannot judge it. "
+        f"{_ONE_COMMAND}. {ABANDON_HINT}"
+    )
+
+
+def _and_segments(command: str) -> list[list[str]] | None:
+    """The shell words of `command` split on `&&`; None if it will not parse."""
+    tokens = _shell_tokens(command)
+    if tokens is None:
+        return None
+    segments: list[list[str]] = [[]]
+    for token in tokens:
+        if token == "&&":
+            segments.append([])
+        else:
+            segments[-1].append(token)
+    return segments
+
+
+def _passes_anyway(argv: list[str]) -> bool:
+    """Whether one `&&` part exits 0 whatever the work did: `true`, a plain `git diff`."""
+    if not argv:
+        return True
+    program = Path(argv[0]).name
+    if program in _ALWAYS_PASSES:
+        return True
+    if program != "git":
+        return False
+    sub = next((arg for arg in argv[1:] if not arg.startswith("-")), "")
+    return sub == "diff" and not {"--exit-code", "--quiet"} & set(argv)
+
+
+def _judge_segments(segments: list[list[str]]) -> tuple[list[list[str]], list[str | None]]:
+    """The `&&` parts that can fail, and `_check_problem`'s objection to each.
+
+    A part with its own shell operators (`echo ... | sha256sum -c`) runs under
+    the shell it is in and is not judged here.
+    """
+    left = [segment for segment in segments if not _passes_anyway(segment)]
+    objections = [
+        None if any(_is_operator(t) for t in segment) else _check_problem(shlex.join(segment))
+        for segment in left
+    ]
+    return left, objections
+
+
+def _and_chain(command: str) -> tuple[str | None, str | None]:
+    """The check to bind for `command` and why it cannot be bound; one is None.
+
+    R13's driver resent a bare-`&&` check ten times against a refusal that gave
+    it no move. A check whose only shell operator is `&&` is judged part by
+    part: parts that pass anyway are dropped, one part left is quoted back as
+    the check to send, and two or more that can judge the work are bound as
+    `bash -c '<command>'`.
+    """
+    operators = _bare_operators(command)
+    segments = _and_segments(command) if operators else None
+    if segments is None or any(op != "&&" for op in operators):
+        problem = _check_problem(command)
+        return (None, problem) if problem is not None else (command, None)
+    left, objections = _judge_segments(segments)
+    if not left:
+        return None, _always_passes(command)
+    if all(objections):
+        return None, objections[0]
+    if len(left) == 1:
+        return None, (
+            "done_when joins commands with a bare '&&', which reaches the first as an "
+            "argument, and only one of them can fail with the work; the rest pass "
+            "whatever it does. Drop the rest and send this as done_when: "
+            f"`{shlex.join(left[0])}`. Call pursuit_step again with it."
+        )
+    bound = f"bash -c {shlex.quote(command)}"
+    problem = _check_problem(bound)
+    return (None, problem) if problem is not None else (bound, None)
+
+
+def _bound_note(done_when: str, bound: str) -> str:
+    """What the result says when `_and_chain` rewrote the check, or ''."""
+    if bound == done_when:
+        return ""
+    return f"done_when was bound through bash -c because of its bare '&&': `{bound}`.\n\n"
 
 
 def _key_only_json_check(command: str) -> bool:
@@ -4947,9 +5044,11 @@ def make_step_tool() -> Any:
                     "A sub-agent does the work and the check decides. If you cannot write "
                     "the criteria yet, the task is too big: split it with pursuit_plan."
                 )
-            prose = _check_problem(done_when)
-            if prose is not None:
+            chained, prose = _and_chain(done_when)
+            if prose is not None or chained is None:
                 return _step_result(f"pursuit_step: {task} not opened — {prose}")
+            route += _bound_note(done_when, chained)
+            done_when = chained
             scoped = (
                 _scope_problem(scope, task, nodes)
                 or _oracle_with_code_problem(scope, goal)
@@ -4990,9 +5089,11 @@ def make_step_tool() -> Any:
             # Open already, with a check the model now writes differently: the
             # bound one could not judge the work (prose, a usage error), and
             # repeating the old one forever is the loop this breaks.
-            prose = _check_problem(done_when)
-            if prose is not None:
+            chained, prose = _and_chain(done_when)
+            if prose is not None or chained is None:
                 return _step_result(f"pursuit_step: {task}'s check not changed — {prose}")
+            route += _bound_note(done_when, chained)
+            done_when = chained
             pre_rc, pre_out = await _run_check(done_when, root, DEFAULT_CHECK_TIMEOUT)
             broke = _check_broke(pre_rc, pre_out)
             if broke is not None:
