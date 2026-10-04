@@ -8296,6 +8296,84 @@ def test_dot_beagle_scope_refusal_names_the_abandon_route() -> None:
     assert scope_problem(["src/itc.py"], "T0002", _r10_nodes()) is None
 
 
+#: Run R19's T0002, as founding left it, and the milestone that waited on it.
+R19_SETUP = "Found the pursuit: implement interval tree clocks in Python"
+
+
+def _r19_setup_task(fake_beagle: Path) -> None:
+    """T0002, the R19 setup milestone, opened; T0003 waits on it."""
+    _open_task(fake_beagle)
+    record = {"id": "T0002", "title": R19_SETUP, "status": "open", "done_when": "true"}
+    (fake_beagle / "show.out").write_text(json.dumps(record))
+    nodes = [
+        {"id": "T0001", "parent": "", "title": "ITC", "status": "pending"},
+        {"id": "T0002", "parent": "T0001", "title": R19_SETUP, "status": "open"},
+        {
+            "id": "T0003",
+            "parent": "T0001",
+            "title": "Implement the clock",
+            "status": "pending",
+            "waiting_on": ["T0002"],
+        },
+    ]
+    (fake_beagle / "tree.out").write_text(json.dumps({"nodes": nodes}))
+
+
+@pytest.mark.anyio
+async def test_beagle_dir_refusal_on_a_setup_task_says_abandon_it(
+    tmp_path: Path, beagle: Path, fake_beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # R19: "done_when reads .beagle/ ..." came five times for T0002 without the exit.
+    monkeypatch.chdir(_pursuit_project(tmp_path))
+    _r19_setup_task(fake_beagle)
+    runtime, _ = _bound(tmp_path)
+
+    result = await _tool(runtime, "pursuit_step").execute(
+        "c1",
+        {
+            "task": "T0002",
+            "criteria": "the pursuit is founded",
+            "done_when": "grep -q founded .beagle/notes.md",
+        },
+    )
+
+    assert result.text.startswith(
+        "T0002 is the setup, and pursuit_found already did it: it has no work in the "
+        "project. Abandon it: pursuit_step task T0002 abandon 'done by founding'. The "
+        "tasks waiting on it then become ready."
+    )
+    assert "done_when reads .beagle/" in result.text
+    assert _pursuit_calls(fake_beagle, "close") == []
+
+
+@pytest.mark.anyio
+async def test_setup_task_can_be_abandoned_as_done_by_founding(
+    tmp_path: Path, beagle: Path, fake_beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(_pursuit_project(tmp_path))
+    _r19_setup_task(fake_beagle)
+    (fake_beagle / "close.out").write_text("T0002 abandoned\n")
+    runtime, _ = _bound(tmp_path)
+
+    result = await _tool(runtime, "pursuit_step").execute(
+        "c1", {"task": "T0002", "abandon": "done by founding"}
+    )
+
+    assert "not abandoned" not in result.text and "not closed" not in result.text
+    assert _pursuit_calls(fake_beagle, "close") == [
+        ["T0002", "--outcome", "abandoned", "--reason", "done by founding"]
+    ]
+    assert _pursuit_calls(fake_beagle, "depend") == [
+        ["T0003", "T0002", "--drop", "--reason", "T0002 abandoned: done by founding"]
+    ]
+    assert "No longer waiting on it: T0003." in result.text
+    assert "Next: call pursuit_step with no arguments for the next task." in result.text
+    # A goal milestone is still not dropped this way.
+    problem = _module()._abandon_problem
+    goal = _r10_nodes("open", "Implement core clock operations")
+    assert "it is a milestone" in (problem("T0002", "done by founding", goal) or "")
+
+
 #: Run R06's T0002 and its successor T0008, as `pursuit show` gives them.
 R06_PREDECESSOR = {
     "id": "T0002",

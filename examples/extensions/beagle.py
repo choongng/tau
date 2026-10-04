@@ -2682,6 +2682,35 @@ def _setup_abandon_route(task: str) -> str:
     )
 
 
+#: An abandon reason that says founding did a setup task's work.
+_DONE_BY_FOUNDING = re.compile(r"(?i)\bdone\s+by\s+found")
+
+
+def _founding_did(task: str, why: str, nodes: list[dict[str, Any]]) -> bool:
+    """Whether `why` abandons `task`, a setup milestone not done, as done by founding.
+
+    Run R19's T0002, "Found the pursuit: ...", was refused five times for a
+    done_when over .beagle/; the refusal now says to abandon it so, which holds
+    for an opened one too: founding did its work, so no done task holds it.
+    """
+    node = next((n for n in nodes if str(n.get("id")) == task), None)
+    return (
+        node is not None
+        and node.get("status") in ("pending", "open")
+        and _setup_milestone([str(node.get("title") or "")]) is not None
+        and _DONE_BY_FOUNDING.search(why) is not None
+    )
+
+
+def _setup_lead(task: str) -> str:
+    """What leads a refusal of a step on `task`, a setup milestone."""
+    return (
+        f"{task} is the setup, and pursuit_found already did it: it has no work in the "
+        f"project. Abandon it: pursuit_step task {task} abandon 'done by founding'. The "
+        "tasks waiting on it then become ready.\n\n"
+    )
+
+
 def _stale_known_answers_duplicate(
     task: str, why: str, by_id: dict[str, dict[str, Any]]
 ) -> str | None:
@@ -2744,7 +2773,7 @@ def _abandon_problem(task: str, why: str, nodes: list[dict[str, Any]]) -> str | 
         # as "a milestone" four times, with no other way to drop it.
         return None
     if roots and parent.get(task) == roots[0]:
-        if _setup_abandonable(task, nodes):
+        if _setup_abandonable(task, nodes) or _founding_did(task, why, nodes):
             return None
         if by_id.get(task, {}).get("status") == "pending":
             # Run R14: beagle refuses a new route for a task never opened.
@@ -6732,6 +6761,9 @@ def make_step_tool() -> Any:
     #: This call's new-route spawn: (predecessor, successor, what beagle said).
     spawns: list[tuple[str, str, str]] = []
 
+    #: The lead for this call's refusals, set once the task is a setup milestone.
+    lead: list[str] = []
+
     async def _execute(
         tool_call_id: str,
         arguments: Mapping[str, Any],
@@ -6825,6 +6857,8 @@ def make_step_tool() -> Any:
         if not isinstance(record, dict):
             return _step_result(f"pursuit_step: cannot read {task} (exit {rc}):\n{out}")
         title = str(record.get("title") or "")
+        if _setup_milestone([title]) is not None:
+            lead[:] = [_setup_lead(task)]
         if record.get("status") != "open" and _setup_milestone([title]) is not None:
             # Founding set the pursuit up, so a set-up task has no work in the
             # project and no check that can pass: run 11's driver spent its
@@ -7589,7 +7623,13 @@ def make_step_tool() -> Any:
     ) -> AgentToolResult:
         stepped.clear()
         spawns.clear()
+        lead.clear()
         result = await _execute(tool_call_id, arguments, signal, on_update)
+        refusal = "".join(getattr(c, "text", "") for c in result.content)
+        if lead and refusal.startswith("pursuit_step:"):
+            # Run R19: the .beagle/ refusal came five times for setup T0002
+            # and never said that founding was its work.
+            result = _step_result(lead[0] + refusal)
         if spawns:
             result = _with_spawn_notice(result, *spawns[0])
         result = _with_note(result, _worker_timeout(arguments.get("timeout"))[1])
