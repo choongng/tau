@@ -8173,3 +8173,187 @@ def test_changed_files_keeps_the_first_path_whole(
         "dir with space/x y.py",
         "new name.py",
     ]
+
+
+def _cases_first_tree(project: Path) -> None:
+    """R15's ~/itc: the locked cases test imports itc_clocks.itc, which no file holds."""
+    tests = project / "tests"
+    tests.mkdir(parents=True, exist_ok=True)
+    (tests / "cases.json").write_text('[{"name": "seed", "result": 1}]\n')
+    (tests / "test_cases.py").write_text(
+        "import json\nfrom pathlib import Path\n\nfrom itc_clocks.itc import Stamp\n\n"
+        "CASES = json.loads(Path(__file__).with_name('cases.json').read_text())\n\n\n"
+        "def test_cases():\n    assert Stamp and CASES\n"
+    )
+
+
+@pytest.mark.anyio
+async def test_amending_a_known_answers_check_to_run_the_cases_test_is_refused(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # R15 E9 amended T0002's check to run tests/test_cases.py, which fails until a
+    # later task writes itc_clocks.itc; no worker on tests/ could pass it.
+    project = _pursuit_project(tmp_path)
+    monkeypatch.chdir(project)
+    _cases_first_tree(project)
+    _ready_task(fake_beagle, check="python3 -m pytest -q tests/test_case_data.py")
+    record = json.loads((fake_beagle / "show.out").read_text())
+    scope = ["tests/cases.json", "tests/test_cases.py", "tests/test_case_data.py"]
+    (fake_beagle / "show.out").write_text(json.dumps({**record, "scope": scope}))
+    open_task = {"open": ["T0002"], "ready": [], "ready_total": 0}
+    (fake_beagle / "next.out").write_text(json.dumps(open_task))
+    runtime, _ = _bound(tmp_path)
+
+    result = await _tool(runtime, "pursuit_step").execute(
+        "c1",
+        {"task": "T0002", "done_when": "pytest -q tests/test_cases.py tests/test_case_data.py"},
+    )
+
+    assert "check not changed" in result.text
+    assert (
+        "tests/test_cases.py fails with ImportError until a later task writes itc_clocks.itc"
+        in result.text
+    )
+    assert "`python3 -m pytest -q tests/test_case_data.py`" in result.text
+    assert _pursuit_calls(fake_beagle, "amend") == [] and _runs(fake_tau) == []
+
+
+@pytest.mark.anyio
+async def test_opening_with_a_check_that_imports_an_unwritten_module_outside_scope_is_refused(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project = _pursuit_project(tmp_path)
+    monkeypatch.chdir(project)
+    _cases_first_tree(project)
+    _ready_task(fake_beagle)
+    runtime, _ = _bound(tmp_path)
+    check = "python3 -m pytest -q tests/test_cases.py"
+
+    refused = await _tool(runtime, "pursuit_step").execute(
+        "c1", {"task": "T0002", "criteria": "cases", "done_when": check, "scope": ["tests/"]}
+    )
+
+    assert "not opened" in refused.text
+    assert (
+        "tests/test_cases.py fails with ImportError until a later task writes itc_clocks.itc"
+        in refused.text
+    )
+    assert "`python3 -m pytest -q tests/test_case_data.py`" in refused.text
+    assert _pursuit_calls(fake_beagle, "open") == [] and _runs(fake_tau) == []
+
+    # Cases first: the later part whose scope writes the module binds the cases test.
+    allowed = await _tool(runtime, "pursuit_step").execute(
+        "c2",
+        {
+            "task": "T0002",
+            "criteria": "the code passes the cases",
+            "done_when": check,
+            "scope": ["itc_clocks/itc.py", "itc_clocks/__init__.py"],
+        },
+    )
+
+    assert "ImportError until a later task" not in allowed.text
+    [opened] = _pursuit_calls(fake_beagle, "open")
+    assert opened[opened.index("--done-when") + 1] == check
+
+
+def test_imports_unwritten_counts_stdlib_installed_and_project_modules(tmp_path: Path) -> None:
+    module = _module()
+    tests = tmp_path / "tests"
+    tests.mkdir()
+    (tmp_path / "pkg").mkdir()
+    (tmp_path / "pkg" / "__init__.py").write_text("")
+    (tmp_path / "single.py").write_text("")
+    (tests / "helpers.py").write_text("")
+    (tests / "test_ok.py").write_text(
+        "import json, pytest\nimport pkg\nfrom single import x\nfrom helpers import h\n"
+    )
+    (tests / "test_missing.py").write_text("from pkg.absent import thing\n")
+
+    assert module._imports_unwritten("pytest -q tests/test_ok.py", ["tests/"], tmp_path) is None
+    assert module._imports_unwritten("pytest -q tests/test_missing.py", ["tests/"], tmp_path) == (
+        "tests/test_missing.py",
+        "pkg.absent",
+    )
+    assert module._imports_unwritten("pytest -q tests/", ["tests/"], tmp_path) == (
+        "tests/test_missing.py",
+        "pkg.absent",
+    )
+    assert module._imports_unwritten("pytest -q tests/", ["pkg/absent.py"], tmp_path) is None
+
+
+@pytest.mark.anyio
+async def test_not_done_on_a_missing_scoped_test_file_does_not_offer_a_new_done_when(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # R15 E8: pytest exit 4 for tests/test_case_data.py, which the task was there
+    # to write, invited "pass a corrected done_when too".
+    project = _git_project(tmp_path, monkeypatch)
+    monkeypatch.chdir(project)
+    (project / "tests").mkdir()
+    check = "python3 -m pytest -q tests/test_case_data.py"
+    _ready_task(fake_beagle, check)
+    runtime, _ = _bound(tmp_path)
+
+    result = await _tool(runtime, "pursuit_step").execute(
+        "c1",
+        {"task": "T0002", "criteria": "data", "done_when": check, "scope": ["tests/"]},
+    )
+
+    assert "stays open" in result.text and "exit 4" in result.text
+    assert "tests/test_case_data.py: it is in the scope and not written" in result.text
+    assert "that is the work" in result.text
+    assert "corrected done_when" not in result.text
+
+
+def test_cases_first_note_says_to_open_the_data_beside_the_test() -> None:
+    module = _module()
+    assert "Path(__file__).with_name('cases.json')" in module.CASES_FIRST_NOTE
+    assert "Path(__file__).with_name('cases.json')" in module.TESTS_ONLY_PROOF_NOTE
+
+
+@pytest.mark.anyio
+async def test_not_done_with_a_cwd_relative_data_open_names_the_fix(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # R15 ~/itc tests/test_case_data.py:12: `json.load(open("cases.json"))`, run
+    # from the project root, failed collection with FileNotFoundError.
+    project = _git_project(tmp_path, monkeypatch)
+    monkeypatch.chdir(project)
+    tests = project / "tests"
+    tests.mkdir()
+    (tests / "cases.json").write_text('[{"name": "seed"}]\n')
+    (tests / "test_case_data.py").write_text(
+        'import json\n\nCASES = json.load(open("cases.json"))\n\n\n'
+        "def test_cases():\n    assert CASES\n"
+    )
+    check = "python3 -m pytest -q tests/test_case_data.py"
+    _ready_task(fake_beagle, check)
+    runtime, _ = _bound(tmp_path)
+
+    result = await _tool(runtime, "pursuit_step").execute(
+        "c1",
+        {"task": "T0002", "criteria": "data", "done_when": check, "scope": ["tests/"]},
+    )
+
+    assert "stays open" in result.text and "FileNotFoundError" in result.text
+    assert result.text.startswith(
+        "tests/test_case_data.py opens 'cases.json' relative to the working directory"
+    )
+    assert "`Path(__file__).with_name('cases.json')` (tests/cases.json)" in result.text

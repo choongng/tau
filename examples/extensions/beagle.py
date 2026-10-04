@@ -118,6 +118,7 @@ import fnmatch
 import functools
 import hashlib
 import html.parser
+import importlib.util
 import json
 import math
 import os
@@ -4046,6 +4047,119 @@ def _import_scope_problem(command: str, scope: list[str], root: Path) -> str | N
     return None
 
 
+def _test_imports(test_path: Path) -> list[tuple[str, ...]]:
+    """Each absolute import of a test file: (module,) or (module, module.name, ...)."""
+    try:
+        tree = ast.parse(test_path.read_text(encoding="utf-8"))
+    except (OSError, SyntaxError, ValueError):
+        return []
+    found: list[tuple[str, ...]] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            found += [(alias.name,) for alias in node.names]
+        elif isinstance(node, ast.ImportFrom) and node.module and not node.level:
+            found.append((node.module, *(f"{node.module}.{a.name}" for a in node.names)))
+    return found
+
+
+def _module_written(name: str, root: Path, beside: Path, scope: list[str]) -> bool:
+    """Whether `name` resolves under the project root or beside the test, as a.py or
+    a/__init__.py, would be written by a path in `scope`, or is stdlib or installed.
+
+    A scope path beside the test does not count: code written into tests/ to satisfy
+    an import is run R09's implementation in tests, not the module.
+    """
+    rel = name.replace(".", "/")
+    top = name.split(".")[0]
+    if top in sys.stdlib_module_names or top in _TEST_LIBRARIES:
+        return True
+    entries = [e.rstrip("/") for e in scope]
+    bases = ["", "src/"]
+    with contextlib.suppress(ValueError):
+        bases.append(f"{beside.relative_to(root).as_posix()}/")
+    ours = False
+    for base in bases:
+        for path in (f"{base}{rel}.py", f"{base}{rel}/__init__.py"):
+            if (root / path).is_file():
+                return True
+            if base in {"", "src/"} and any(
+                e in {"", "."} or path == e or path.startswith(f"{e}/") for e in entries
+            ):
+                return True
+        ours = ours or (root / f"{base}{top}").exists() or (root / f"{base}{top}.py").exists()
+    if ours:
+        return False
+    try:
+        return importlib.util.find_spec(top) is not None
+    except (ImportError, ValueError):
+        return False
+
+
+def _check_test_files(command: str, root: Path) -> list[str]:
+    """The test .py files a check runs under pytest, named directly or as a directory
+    holding them; a file the check only reads (grep, cat) is not run."""
+    found: list[str] = []
+    for rel in _check_targets(command, root):
+        target = root / rel
+        if target.is_file():
+            paths = [rel] if rel.endswith(".py") and _is_test_path(rel) else []
+        else:
+            paths = sorted(
+                p.relative_to(root).as_posix()
+                for p in target.rglob("*.py")
+                if not _CACHE_DIRS & set(p.relative_to(root).parts)
+                and (p.name.startswith("test_") or p.name.endswith("_test.py"))
+            )
+        found += [p for p in paths if p not in found and _runs_test_file(command, p)]
+    return found
+
+
+def _imports_unwritten(command: str, scope: list[str], root: Path) -> tuple[str, str] | None:
+    """(test, module) when the check runs a test importing a module that does not
+    exist and that no path in `scope` would create, or None.
+
+    Run R15 E9 amended the known-answers task's check to run tests/test_cases.py,
+    which imports itc_clocks.itc that only a later task writes; no worker on the
+    tests/ scope could pass it. A later part whose scope holds the module may bind
+    the same test.
+    """
+    if not scope:
+        return None
+    for rel in _check_test_files(command, root):
+        test = root / rel
+        for names in _test_imports(test):
+            if names[0].split(".")[0].startswith("test_"):
+                continue
+            if not any(_module_written(n, root, test.parent, scope) for n in names):
+                return rel, names[0]
+    return None
+
+
+def _imports_unwritten_problem(command: str, scope: list[str], root: Path) -> str | None:
+    """Why a check cannot pass on this scope because a test it runs imports unwritten
+    code, naming the data-only test to bind instead; or None."""
+    found = _imports_unwritten(command, scope, root)
+    if found is None:
+        return None
+    test, module = found
+    data_tests = [
+        rel
+        for entry in scope
+        for rel in ([entry.rstrip("/")] if entry.endswith(".py") else [])
+        + _check_test_files(f"pytest {shlex.quote(entry)}", root)
+        if rel != test
+        and _is_test_path(rel)
+        and _imports_unwritten(f"pytest {shlex.quote(rel)}", scope, root) is None
+    ]
+    data_test = data_tests[0] if data_tests else "tests/test_case_data.py"
+    return (
+        f"{test} fails with ImportError until a later task writes {module}, and no path "
+        "in this scope creates it, so no sub-agent on this scope can pass it. This task's "
+        f"check runs the data test only (`python3 -m pytest -q {data_test}`): a test of the "
+        "data file itself, importing none of the code. Call pursuit_step again with that."
+    )
+
+
 #: Words a milestone about setting the pursuit up is made of, and nothing else.
 _SETUP_WORDS = frozenset(
     {
@@ -4480,6 +4594,49 @@ def _implementation_in_tests_lead(root: Path, scope: list[str]) -> str:
         f"The sub-agent wrote implementation into tests/ ({found}), which is not this "
         "task's work.\n\n"
     )
+
+
+def _missing_scoped_test(rc: int, output: str, scope: list[str], root: Path) -> str | None:
+    """The path of a pytest exit 4 "file or directory not found" that is in `scope`
+    and not on disk: the work not yet done, not a wrong check. Run R15 E8 offered a
+    new done_when for tests/test_case_data.py, which the task was there to write."""
+    if rc != 4 or not scope:
+        return None
+    for match in re.finditer(r"file or directory not found:\s*(\S+)", output):
+        rel = match.group(1).split("::")[0].rstrip("/")
+        if _in_scope(rel, scope) and not (root / rel).exists():
+            return rel
+    return None
+
+
+def _cwd_relative_data_lead(output: str, scope: list[str], root: Path) -> str:
+    """The line a not-done result leads with when a test opened scoped data by a bare name.
+
+    Run R15: tests/test_case_data.py ran `open("cases.json")`; the check runs from
+    the project root, so collection failed with FileNotFoundError.
+    """
+    for match in re.finditer(
+        r"FileNotFoundError: \[Errno 2\] No such file or directory: '([^'/\\]+)'", output
+    ):
+        name = match.group(1)
+        data = [entry.rstrip("/") for entry in scope if Path(entry.rstrip("/")).name == name]
+        data += [
+            p.relative_to(root).as_posix()
+            for entry in scope
+            if (root / entry).is_dir()
+            for p in (root / entry).rglob(name)
+        ]
+        if not data:
+            continue
+        tests = re.findall(r"([\w./-]*\.py)", output[: match.start()])
+        tests = [t for t in tests if _is_test_path(t) and (root / t).is_file()]
+        test = tests[-1] if tests else "the test"
+        return (
+            f"{test} opens '{name}' relative to the working directory, and the check runs "
+            f"from the project root, so it is not found. Open it beside the test: "
+            f"`Path(__file__).with_name('{name}')` ({data[0]}).\n\n"
+        )
+    return ""
 
 
 def _changed_files(root: Path) -> list[str]:
@@ -5711,6 +5868,7 @@ def make_step_tool() -> Any:
                     or _oracle_with_code_problem(route_scope, goal)
                     or _locked_test_problem(done_when or old_check, route_scope, goal)
                     or _import_scope_problem(done_when or old_check, route_scope, root)
+                    or _imports_unwritten_problem(done_when or old_check, route_scope, root)
                 )
                 if scoped is not None:
                     return _step_result(f"pursuit_step: no new route for {task} — {scoped}")
@@ -5793,6 +5951,7 @@ def make_step_tool() -> Any:
                 or _cases_first_problem(scope, task, title, goal)
                 or _locked_test_problem(done_when, scope, goal)
                 or _import_scope_problem(done_when, scope, root)
+                or _imports_unwritten_problem(done_when, scope, root)
             )
             if scoped is not None:
                 return _step_result(f"pursuit_step: {task} not opened — {scoped}")
@@ -5838,6 +5997,11 @@ def make_step_tool() -> Any:
                 return _step_result(f"pursuit_step: {task}'s check not changed — {prose}")
             route += _bound_note(done_when, chained)
             done_when = chained
+            unwritten = _imports_unwritten_problem(
+                done_when, scope or _strings(record.get("scope")), root
+            )
+            if unwritten is not None:
+                return _step_result(f"pursuit_step: {task}'s check not changed — {unwritten}")
             pre_rc, pre_out = await _run_check(done_when, root, DEFAULT_CHECK_TIMEOUT)
             broke = _check_broke(pre_rc, pre_out)
             if broke is not None:
@@ -6012,7 +6176,13 @@ def make_step_tool() -> Any:
             retry_note = (
                 f"\n\nAn earlier attempt reported back, but the check still fails (exit "
                 f"{verdict[0]}). Its output ends:\n{verdict[1][-CHECK_TAIL_CHARS:]}\n"
-                "Fix the work, not the check."
+            )
+            unwritten = _imports_unwritten(check, scope, root)
+            retry_note += (
+                f"{unwritten[0]} imports {unwritten[1]}, which no path in this scope "
+                "creates; do not write it. Say so in your report."
+                if unwritten is not None
+                else "Fix the work, not the check."
             )
             if undone:
                 retry_note += (
@@ -6034,18 +6204,28 @@ def make_step_tool() -> Any:
                 if retrying
                 else "pass a corrected done_when too; it is amended."
             )
+            if_wrong = (
+                "the check itself is wrong — it says how it was called (a usage error, a "
+                "file it treats as an argument) rather than what is missing — "
+                f"{fix_check}"
+            )
+            missing = _missing_scoped_test(verdict[0], verdict[1], scope, root)
+            if missing is not None:
+                if_wrong = (
+                    f"the check names {missing}: it is in the scope and not written, so "
+                    "that is the work, not a wrong check."
+                )
             return _not_done(
                 root,
                 task,
                 scope,
                 _implementation_in_tests_lead(root, scope)
+                + _cwd_relative_data_lead(verdict[1], scope, root)
                 + f"{route}{undid}{task} — {title}: the check still fails after {attempts} "
                 f"sub-agent run(s), so the task {state}.\n\n`{check}` exit {verdict[0]}:\n"
                 f"{verdict[1][-CHECK_TAIL_CHARS:]}\n\nLast report:\n{shown}\n\n"
                 f'Next: pursuit_step with task="{task}" and notes saying what to fix. If '
-                "the check itself is wrong — it says how it was called (a usage error, a "
-                "file it treats as an argument) rather than what is missing — "
-                f"{fix_check} If this route is wrong, pursuit_step with "
+                f"{if_wrong} If this route is wrong, pursuit_step with "
                 f'task="{task}", new_route=true and notes saying what to do instead.',
             )
         if proof is not None and not proof.proven:
@@ -8353,7 +8533,9 @@ TESTS_ONLY_PROOF_NOTE = (
     "This scope holds only tests and data, so the data file's absence is the proof: "
     "the check must run a test that reads the data file this task writes, so that "
     "taking the file away makes it fail (e.g. tests/test_case_data.py must fail when "
-    "tests/cases.json is removed). That test reads only the data file."
+    "tests/cases.json is removed). That test reads only the data file, opened beside "
+    "it: `Path(__file__).with_name('cases.json')`, not `open('cases.json')`, which "
+    "looks in the working directory."
 )
 
 #: Said instead of TESTS_ONLY_PROOF_NOTE when the scope holds no data file. Run
@@ -8373,7 +8555,9 @@ CASES_FIRST_NOTE = (
     "a test that runs every case against the code (e.g. `tests/test_cases.py`). That "
     "test imports the module later tasks will write, by name (e.g. `from <package> "
     "import …`), and defines no class or helper of its own: it fails with ImportError "
-    "until the code exists. Its done_when checks only the data, with a small "
+    "until the code exists. Both tests load the data file beside them: load it as "
+    "`Path(__file__).with_name('cases.json')`, since the check runs from the project "
+    "root. Its done_when checks only the data, with a small "
     "test of the file itself (e.g. `python3 -m pytest -q tests/test_case_data.py`: "
     "every case has its inputs, its result and its citation, and there are enough "
     "of them); not `python3 -m json.tool`, which passes once the file parses and is "
