@@ -726,6 +726,44 @@ def _command_targets(argv: list[str], cwd: Path) -> list[str] | None:
     return []
 
 
+def _cd_into(segment: list[str], here: Path) -> Path:
+    """The directory a simple `cd` command, as tokens, moves to from `here`."""
+    dest = next((a for a in segment[1:] if not a.startswith("-")), "~")
+    return Path(os.path.normpath(here / Path(dest).expanduser()))
+
+
+def _cwd_after_cd(command: str, cwd: Path) -> Path:
+    """The directory the leading chain of `cd` commands in `command` leaves.
+
+    Run R21: W2's `cd /tmp/itc && python3 - <<PY open('explore.py','w')` was
+    refused as if explore.py were a project file.
+    """
+    tokens = _shell_tokens(command)
+    if tokens is None:
+        return cwd
+    here = cwd
+    segment: list[str] = []
+    redirect = False
+    for token in [*tokens, ";"]:
+        if redirect and not _is_operator(token):
+            redirect = False  # a redirect's target, not an argument
+            continue
+        redirect = False
+        if not _is_operator(token):
+            segment.append(token)
+            continue
+        if "<" in token or ">" in token:
+            if segment and segment[-1].isdigit():
+                segment.pop()
+            redirect = True
+            continue
+        if not segment or segment[0] != "cd":
+            break
+        here = _cd_into(segment, here)
+        segment = []
+    return here
+
+
 def _bash_write_targets(command: str, cwd: Path) -> list[Path] | None:
     """Every path a bash command would write, resolved; None if unparseable.
 
@@ -769,8 +807,7 @@ def _bash_write_targets(command: str, cwd: Path) -> list[Path] | None:
             continue
         # A separator: the simple command before it is complete.
         if segment and segment[0] == "cd":
-            dest = next((a for a in segment[1:] if not a.startswith("-")), "~")
-            here = Path(os.path.normpath(here / Path(dest).expanduser()))
+            here = _cd_into(segment, here)
         elif segment and Path(segment[0]).name in _SHELLS and "-c" in segment[1:]:
             script_at = segment.index("-c") + 1
             if script_at < len(segment):
@@ -8839,9 +8876,22 @@ def _worker_scope() -> tuple[str, tuple[str, ...]] | None:
 _SCRATCH_DIRS = frozenset({"tmp", "temp", "log", "logs", "scratch"})
 
 
+#: Words in a file's name that mark a probe kept for the worker's own use.
+_SCRATCH_WORDS = frozenset({"scratch", "explore", "exploration", "probe", "tmp", "temp"})
+
+
 def _scratch_like(rel: Path) -> bool:
-    """Whether a refused project path looks like scratch: a log or temp file."""
-    return rel.suffix in {".log", ".tmp"} or bool(_SCRATCH_DIRS & {p.lower() for p in rel.parts})
+    """Whether a refused project path looks like scratch: a log or temp file, a
+    hidden script, or a script whose name says it is a probe.
+
+    Run R21: explore.py, scratch_ref.py and .verify_citations.py were told the
+    implementation does not go under tests/, and W6 kept no derivation at all.
+    """
+    if rel.suffix in {".log", ".tmp"} or _SCRATCH_DIRS & {p.lower() for p in rel.parts}:
+        return True
+    if rel.name.startswith(".") and rel.suffix == ".py":
+        return True
+    return bool(_SCRATCH_WORDS & set(re.split(r"[^a-z0-9]+", rel.stem.lower())))
 
 
 def _task_check(goal: Path, task: str) -> str:
@@ -8896,6 +8946,29 @@ def _link_out(links: list[tuple[Path, Path]], root: Path) -> ToolCallHookResult 
     return None
 
 
+def _truncated_call(arguments: Mapping[str, Any]) -> str | None:
+    """Why a call whose arguments are only unparsed text is refused, or None.
+
+    Run R21: W3's `write` calls were cut off mid-JSON and reached the tool as
+    `{"_raw_arguments": ...}`; told "path must be a string", W3 rewrote the
+    same 30k-character file four times.
+    """
+    if set(arguments) != {"_raw_arguments"}:
+        return None
+    text = str(arguments["_raw_arguments"])
+    try:
+        json.loads(text)
+    except ValueError as exc:
+        error = str(exc)
+    else:
+        error = "not an object of named arguments"
+    return (
+        f"This call's arguments were cut off after {len(text)} characters and are not "
+        f"valid JSON ({error}), so nothing was written. Write the file in parts of a few "
+        "hundred lines: `write` the first part, then add the rest with `edit`."
+    )
+
+
 def make_worker_scope_guard() -> Any:
     """Build the `tool_call` guard that keeps a worker's writes inside its task's scope.
 
@@ -8913,6 +8986,9 @@ def make_worker_scope_guard() -> Any:
         try:
             cwd = Path(context.cwd)
             arguments = event.arguments or {}
+            cut_off = _truncated_call(arguments)
+            if cut_off is not None:
+                return ToolCallHookResult(block=True, reason=cut_off)
             sent_on_task = bool(os.environ.get(WORKER_TASK_ENV, "").strip())
             orientation = (
                 _worker_orientation(event.tool_name, arguments, cwd) if sent_on_task else None
@@ -8959,7 +9035,7 @@ def make_worker_scope_guard() -> Any:
             targets = _write_targets(event.tool_name, arguments, cwd, resolve=False)
             links = _script_links(command, cwd) if scripted else []
             if scripted:
-                targets += _script_write_targets(command, cwd)
+                targets += _script_write_targets(command, _cwd_after_cd(command, cwd))
             goal = _find_goal(cwd) if targets else None
             if goal is None:
                 return None
@@ -8993,7 +9069,7 @@ def make_worker_scope_guard() -> Any:
                 reason=(
                     f"refusing to write {rel}: it is outside {task}'s scope "
                     f"({', '.join(scope)}); name it in your report as follow-up. Scratch "
-                    f"files go in /tmp.{source}"
+                    "files go in /tmp."
                 ),
             )
         # Run R20: W1 and W2, refused the module, built it in /tmp, where it was lost.

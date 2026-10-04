@@ -9341,6 +9341,64 @@ async def test_scope_refusal_of_project_code_does_not_point_to_tmp(
 
 
 @pytest.mark.anyio
+async def test_worker_guard_explains_a_truncated_tool_call_instead_of_a_missing_path(
+    tmp_path: Path, beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # R21: W3's cut-off `write` reached the tool as _raw_arguments, four times.
+    runtime = _scoped_worker(tmp_path, monkeypatch, scope="tests/")
+    raw = '{"path":"tests/itc_clocks.py","content":"class Stamp:\\n    pass'
+
+    result = await _tool_with_hooks(runtime, "write").execute("c1", {"_raw_arguments": raw})
+
+    assert result.text != "ran"
+    assert f"cut off after {len(raw)} characters" in result.text
+    assert "not valid JSON (Unterminated string" in result.text
+    assert "nothing was written" in result.text
+    assert "`write` the first part, then add the rest with `edit`" in result.text
+    whole = {"path": "tests/itc_clocks.py", "content": "x = 1\n"}
+    assert (await _tool_with_hooks(runtime, "write").execute("c2", whole)).text == "ran"
+
+
+@pytest.mark.anyio
+async def test_inline_script_write_after_cd_resolves_against_that_directory(
+    tmp_path: Path, beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # R21: W2's `cd /tmp/itc && python3 - <<PY open('explore.py','w')` was refused.
+    runtime = _scoped_worker(tmp_path, monkeypatch, scope="tests/")
+    bash = _tool_with_hooks(runtime, "bash")
+    outside = tmp_path / "scratch-dir"
+    script = "python3 - <<'PY'\nopen('explore.py','w').write('x')\nPY"
+
+    away = await bash.execute("c1", {"command": f"cd {outside} 2>/dev/null && {script}"})
+    into = await bash.execute("c2", {"command": f"cd tests && cd .. && cd itc && {script}"})
+    here = await bash.execute("c3", {"command": f"cd tests && {script}"})
+
+    assert away.text == "ran"
+    assert "refusing to write itc/explore.py" in into.text
+    assert here.text == "ran"
+
+
+@pytest.mark.anyio
+async def test_scratch_script_refusal_does_not_mention_the_implementation(
+    tmp_path: Path, beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # R21: explore.py, scratch_ref.py and .verify_citations.py were told the
+    # implementation does not go under tests/.
+    runtime = _scoped_worker(tmp_path, monkeypatch, scope="tests/cases.json")
+    write = _tool_with_hooks(runtime, "write")
+
+    for name in ("explore.py", "scratch_ref.py", ".verify_citations.py"):
+        result = await write.execute("c1", {"path": name, "content": "print(1)\n"})
+
+        assert f"refusing to write {name}: it is outside T0003's scope" in result.text
+        assert "Scratch files go in /tmp." in result.text
+        assert "implementation" not in result.text and "tests/ either" not in result.text
+
+    code = await write.execute("c2", {"path": "itc/core.py", "content": "class Stamp: ...\n"})
+    assert "The implementation does not go under tests/ either" in code.text
+
+
+@pytest.mark.anyio
 async def test_scope_refusal_of_the_checks_import_says_the_check_cannot_pass(
     tmp_path: Path, beagle: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
