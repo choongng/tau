@@ -1,5 +1,7 @@
 # ITC runs R01–R10: summary
 
+The next ten runs, R11–R20, are summarised in `summary-R11-R20.md`.
+
 Ten unattended runs on 2026-10-03, alternating mimo-v2.6-9b-q4 (odd runs) and
 qwen3.5-9b-q4-mtp-thinking-coding (even runs). Each one used tau + beagle on
 `~/tautest/itc_prompt.txt` (interval tree clocks in Python). After each run,
