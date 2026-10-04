@@ -1,0 +1,14 @@
++++
+id = "000422-pursuit"
+ordinal = 422
+kind = "pursuit"
+timestamp = "2026-10-04T01:31:10+00:00"
+summary = "pursuit open T0109: R12 diagnose"
+metric_command = ""
+drains = []
+hooks = []
++++
+
+criteria: R12.md diagnosed: each failure class has Evidence and an Action naming a file or a Disposition; upstream recorded or 'upstream: none'
+decided by: sh -c 'echo "778901d5d72febe5a614e6fa8cae1cf58759dbe744e52adca7ddc5ebec07f302  .beagle/checks/T0109/check.sh" | sha256sum -c --quiet && bash .beagle/checks/T0109/check.sh'
+budget: 80000 tokens
