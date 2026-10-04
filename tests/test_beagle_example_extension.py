@@ -8819,6 +8819,45 @@ async def test_plan_drops_a_rerun_only_line_with_a_note(
     assert "Dropped a line of the part: 'Run the check' only re-runs" in plan.text
 
 
+#: Audit 7 defect 1: a multi-line part beside another part.
+MULTI_PART_PLAN = ["Write A\nWrite B\nRun the check: pytest", "Docs"]
+
+
+@pytest.mark.anyio
+async def test_plan_splits_a_multi_line_part_among_others(
+    tmp_path: Path, beagle: Path, fake_beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(_pursuit_project(tmp_path))
+    runtime, _ = _bound(tmp_path)
+
+    plan = await _tool(runtime, "pursuit_plan").execute(
+        "c1", {"task": "T0002", "parts": ["Docs", "Write A\nWrite B", "Ship"]}
+    )
+
+    assert _pursuit_calls(fake_beagle, "split") == [
+        ["T0002", "Docs", "Write A", "Write B", "Ship", "--ordered"]
+    ]
+    assert "beagle refused" not in plan.text and "each line became a part" in plan.text
+
+
+@pytest.mark.anyio
+async def test_plan_drops_rerun_only_line_in_a_multi_part_plan(
+    tmp_path: Path, beagle: Path, fake_beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(_pursuit_project(tmp_path))
+    runtime, _ = _bound(tmp_path)
+
+    plan = await _tool(runtime, "pursuit_plan").execute(
+        "c1", {"task": "T0002", "parts": MULTI_PART_PLAN}
+    )
+
+    assert _pursuit_calls(fake_beagle, "split") == [
+        ["T0002", "Write A", "Write B", "Docs", "--ordered"]
+    ]
+    assert "nothing added" not in plan.text
+    assert "Dropped a line of the part: 'Run the check' only re-runs" in plan.text
+
+
 @pytest.mark.anyio
 async def test_plan_of_one_part_on_a_leaf_is_refused_before_beagle(
     tmp_path: Path, beagle: Path, fake_beagle: Path, monkeypatch: pytest.MonkeyPatch

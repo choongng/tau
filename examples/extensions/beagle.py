@@ -3013,25 +3013,32 @@ def _commit_before_split(root: Path, task: str, scope: list[str], paths: list[st
 
 
 def _split_part_lines(parts: list[str]) -> tuple[list[str], list[str]]:
-    """`parts` with a part of several lines split into one part per line.
+    """`parts` with each part of several lines split, in place, into one part per line.
 
     Run R15 sent one part of three lines, the last 'Run the check: …'. A line
     that only re-runs a check is dropped with a note; a plain part that does is
     left for the plan's own refusal.
     """
-    lines = [line.strip() for line in parts[0].splitlines() if line.strip()] if parts else []
-    if len(parts) != 1 or len(lines) < 2:
-        return parts, []
-    kept, notes = [], []
-    for line in lines:
-        why = _rerun_only_part([line])
-        if why is None:
-            kept.append(line)
-        else:
-            notes.append(f"Dropped a line of the part: {why}")
-    if kept:
-        notes.insert(0, f"The one part held {len(lines)} lines, so each line became a part.")
-    return kept, notes
+    kept: list[str] = []
+    split_notes: list[str] = []
+    dropped: list[str] = []
+    for part in parts:
+        lines = [line.strip() for line in part.splitlines() if line.strip()]
+        if len(lines) < 2:
+            kept.append(part)
+            continue
+        split = []
+        for line in lines:
+            why = _rerun_only_part([line])
+            if why is None:
+                split.append(line)
+            else:
+                dropped.append(f"Dropped a line of the part: {why}")
+        if split:
+            which = "The one part" if len(parts) == 1 else f"Part {_part_title(lines[0])!r}"
+            split_notes.append(f"{which} held {len(lines)} lines, so each line became a part.")
+        kept.extend(split)
+    return kept, split_notes + dropped
 
 
 def _is_leaf(task: str, nodes: list[dict[str, Any]]) -> bool:
