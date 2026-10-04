@@ -1179,6 +1179,29 @@ class _WorkerRun:
         return f"{self.report}\n\n(Worker transcript: {self.transcript})"
 
 
+def _capped_report(run: _WorkerRun) -> str:
+    """`run.shown_report` cut to its first and last lines, for a step result.
+
+    The cut names the worker transcript, which holds the whole report. The
+    stub of a worker that wrote no report is short already, and kept whole.
+    """
+    if run.report.startswith(NO_REPORT):
+        return run.shown_report
+    lines = run.report.strip("\n").splitlines()
+    head_lines = lines[:STEP_REPORT_HEAD_LINES]
+    tail_lines = lines[STEP_REPORT_HEAD_LINES:][-STEP_REPORT_TAIL_LINES:]
+    head = "\n".join(head_lines)[:STEP_REPORT_END_CHARS]
+    tail = "\n".join(tail_lines)[-STEP_REPORT_END_CHARS:]
+    if len(head) + len(tail) + (1 if tail_lines else 0) >= len("\n".join(lines)):
+        return run.shown_report
+    where = (
+        f"the whole report is in the worker transcript, {run.transcript}"
+        if run.transcript is not None
+        else "the worker left no transcript"
+    )
+    return f"{head}\n[... {len(lines)}-line report cut; {where}]\n{tail}"
+
+
 #: How the stub a worker that wrote no report gets in its place begins.
 NO_REPORT = "(The worker wrote no report"
 #: How often a running worker is checked for the caller's cancellation.
@@ -1652,6 +1675,13 @@ CLOSE_BODY_CHARS = 3_900
 CHECK_TAIL_CHARS = 1_500
 #: How much of the previous attempt's report a retry brief carries.
 RETRY_REPORT_CHARS = 4_000
+#: Lines of the last worker report a step result keeps from its start and its end.
+#: Run R16 E16: a 350-line report pushed the lead and the check output out of the
+#: 60 lines tau shows of a tool result.
+STEP_REPORT_HEAD_LINES = 8
+STEP_REPORT_TAIL_LINES = 8
+#: Characters of the last worker report a step result keeps from each end.
+STEP_REPORT_END_CHARS = 750
 #: Fallback for a check with no recorded timeout.
 DEFAULT_CHECK_TIMEOUT = 600.0
 
@@ -4888,11 +4918,31 @@ def _implementation_in_tests_lead(root: Path, scope: list[str]) -> str:
         by_file.setdefault(rel, []).append(name)
     if not by_file:
         return ""
-    found = "; ".join(f"{rel}: {', '.join(names)}" for rel, names in by_file.items())
-    return (
-        f"The sub-agent wrote implementation into tests/ ({found}), which is not this "
-        "task's work.\n\n"
-    )
+
+    def listed(kind: str) -> str:
+        return "; ".join(
+            f"{rel}: {', '.join(n for n in names if n.startswith(kind))}"
+            for rel, names in by_file.items()
+            if any(n.startswith(kind) for n in names)
+        )
+
+    lead = ""
+    classes, runners = listed("class "), listed("def ")
+    if classes:
+        lead += (
+            f"The sub-agent wrote implementation into tests/ ({classes}), which is not this "
+            "task's work.\n\n"
+        )
+    if runners:
+        # Run R16: run_case only dispatched cases.json's ops to the module, and
+        # calling it implementation sent the driver after the module itself.
+        lead += (
+            f"The sub-agent wrote a case runner into the test ({runners}), which cases "
+            "first forbids: each case should call the module directly. Logic shared by "
+            "the cases belongs in the code (or in a helper the module exports), not in "
+            "the test file.\n\n"
+        )
+    return lead
 
 
 def _missing_scoped_test(rc: int, output: str, scope: list[str], root: Path) -> str | None:
@@ -6624,7 +6674,7 @@ def make_step_tool() -> Any:
                     + _killed_attempt_context(run, shown, verdict, check, root, scope)
                     + f'Call pursuit_step with task="{task}" to send it again.',
                 )
-            report, shown = run.report, run.shown_report
+            report, shown = run.report, _capped_report(run)
             if not check:
                 verdict = (0, "")
                 break
@@ -6722,11 +6772,12 @@ def make_step_tool() -> Any:
                 task,
                 scope,
                 unpassable
-                + _implementation_in_tests_lead(root, scope)
                 + _cwd_relative_data_lead(verdict[1], scope, root)
                 + f"{route}{undid}{task} — {title}: the check still fails after {attempt} "
                 f"sub-agent run(s), so the task {state}.\n\n`{check}` exit {verdict[0]}:\n"
-                f"{verdict[1][-CHECK_TAIL_CHARS:]}\n\nLast report:\n{shown}\n\n"
+                f"{verdict[1][-CHECK_TAIL_CHARS:]}\n\n"
+                + _implementation_in_tests_lead(root, scope)
+                + f"Last report:\n{shown}\n\n"
                 f'Next: pursuit_step with task="{task}" and notes saying what to fix. If '
                 f"{if_wrong} If this route is wrong, pursuit_step with "
                 f'task="{task}", new_route=true and notes saying what to do instead.',
@@ -6745,10 +6796,11 @@ def make_step_tool() -> Any:
                 root,
                 task,
                 scope,
-                _implementation_in_tests_lead(root, scope)
-                + f"{route}{undid}{task} — {title}: the check passes, but {why}; the task "
+                f"{route}{undid}{task} — {title}: the check passes, but {why}; the task "
                 f"{state}, since a done close needs a check shown to refuse.\n\n"
-                f"`prove` said:\n{proof.text}\n\nLast report:\n{shown}\n\n"
+                f"`prove` said:\n{proof.text}\n\n"
+                + _implementation_in_tests_lead(root, scope)
+                + f"Last report:\n{shown}\n\n"
                 + (
                     f'Next: pursuit_step with task="{task}" and notes saying what to '
                     f"fix. {proof_note}"

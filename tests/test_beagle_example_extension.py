@@ -8084,10 +8084,12 @@ async def test_not_done_step_names_implementation_written_under_tests(
     )
 
     assert "stays open" in result.text
-    assert result.text.startswith(
+    lead = (
         "The sub-agent wrote implementation into tests/ (tests/pkg/clock.py: class Clock), "
         "which is not this task's work."
     )
+    assert result.text.index("` exit ") < result.text.index(lead)
+    assert result.text.index(lead) < result.text.index("Last report:")
 
 
 @pytest.mark.anyio
@@ -8154,10 +8156,12 @@ async def test_prove_refused_step_names_implementation_written_under_tests(
 
     assert "the check passes, but no defect could be put back" in result.text
     assert "stays open" in result.text
-    assert result.text.startswith(
+    lead = (
         "The sub-agent wrote implementation into tests/ (tests/pkg/clock.py: class Clock), "
         "which is not this task's work."
     )
+    assert result.text.index("`prove` said:") < result.text.index(lead)
+    assert result.text.index(lead) < result.text.index("Last report:")
 
 
 @pytest.mark.anyio
@@ -9290,3 +9294,147 @@ async def test_step_on_waiting_task_names_what_it_waits_on(
     for result in (waiting, container):
         assert "or it waits" not in result.text
     assert _pursuit_calls(fake_beagle, "open") == []
+
+
+#: R16 #5's test file, trimmed to its shape: a long run_case that only dispatches
+#: each case's expectations to the module.
+R16_RUN_CASE_TEST = """\
+import json
+from pathlib import Path
+
+from interval_tree_clocks import Clock, System
+
+
+def run_case(case_name, case):
+    system = System()
+    expected = case["expected"]
+    try:
+        for op in case["ops"]:
+            getattr(system, op["name"])(*op.get("args", []))
+        if "remaining_clocks" in expected:
+            for expected_key, expected_val in expected["remaining_clocks"].items():
+                result = expected.get(expected_key)
+                assert result == expected_val, \\
+                    f"Case '{case_name}': remaining_clocks expected {expected_val}, got {result}"
+        if "clock_count" in expected:
+            count = len(system.get_all_clocks())
+            assert count == expected["clock_count"], \\
+                f"Case '{case_name}': clock_count expected {expected['clock_count']}, got {count}"
+        if "node_ids" in expected:
+            ids = [clock.node_id for clock in system.get_all_clocks()]
+            assert ids == expected["node_ids"], \\
+                f"Case '{case_name}': node_ids expected {expected['node_ids']}, got {ids}"
+        return True
+    except Exception as e:
+        raise AssertionError(f"Case '{case_name}' failed: {e}")
+
+
+def test_all_cases():
+    cases = json.loads(Path(__file__).with_name("cases.json").read_text())
+    for name, case in cases.items():
+        run_case(name, case)
+"""
+
+#: R16 #5's check output tail, verbatim.
+R16_CHECK_TAIL = """\
+>           raise AssertionError(f"Case '{case_name}' failed: {e}")
+E           AssertionError: Case 'node_deletion' failed: 'Node 2 not found in system'
+
+tests/test_known_answers.py:105: AssertionError
+=========================== short test summary info ============================
+FAILED tests/test_known_answers.py::test_all_cases - AssertionError: Case 'in...
+FAILED tests/test_known_answers.py::test_interval_advancement - AssertionErro...
+FAILED tests/test_known_answers.py::test_causality_tracking - AssertionError:...
+FAILED tests/test_known_answers.py::test_node_deletion - AssertionError: Case...
+4 failed, 9 passed in 0.03s
+"""
+
+#: R16 #6's worker report, its opening verbatim, then grown to the 350 lines W6 wrote.
+R16_LONG_REPORT = (
+    "The task is blocked because the implementation file `interval_tree_clocks.py` is "
+    "required for the tests to pass, but the system is blocking me from creating it.\n\n"
+    + "".join(
+        f"Actually, I just realized I should re-read the task description ({n}).\n"
+        for n in range(347)
+    )
+    + "**Follow-up:** Create the implementation file as part of T0001 or a separate task.\n"
+)
+
+
+def _r16_step_project(
+    tmp_path: Path, fake_beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> tuple[Path, str]:
+    project = _git_project(tmp_path, monkeypatch)
+    monkeypatch.chdir(project)
+    (project / "check.out").write_text(R16_CHECK_TAIL)
+    (project / "check.sh").write_text("cat check.out\ngrep -q done check.out\n")
+    check = "sh check.sh"
+    monkeypatch.setenv("FAKE_TAU_WRITES", json.dumps({"tests/test_cases.py": R16_RUN_CASE_TEST}))
+    _ready_task(fake_beagle, check)
+    return project, check
+
+
+@pytest.mark.anyio
+async def test_implementation_in_tests_lead_names_case_runner_not_implementation(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # R16 E14: "wrote implementation into tests/ (...: def run_case)" sent the
+    # driver after interval_tree_clocks.py, though run_case only ran the cases.
+    project, check = _r16_step_project(tmp_path, fake_beagle, monkeypatch)
+    runtime, _ = _bound(tmp_path)
+
+    result = await _tool(runtime, "pursuit_step").execute(
+        "c1", {"task": "T0002", "criteria": "c", "done_when": check, "scope": ["tests/"]}
+    )
+
+    lead = _module()._implementation_in_tests_lead(project, ["tests/"])
+    assert lead.startswith(
+        "The sub-agent wrote a case runner into the test (tests/test_cases.py: def run_case)"
+    )
+    assert "implementation" not in lead
+    assert "each case should call the module directly" in lead
+    assert "a helper the module exports" in lead
+    assert lead in result.text and "wrote implementation into tests/" not in result.text
+    text = result.text
+    assert text.index("the check still fails") < text.index("4 failed, 9 passed")
+    assert text.index("4 failed, 9 passed") < text.index(lead) < text.index("Last report:")
+
+
+@pytest.mark.anyio
+async def test_not_done_result_caps_last_report(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # R16 E16: 394 lines, 350 of them W6's report; tau's 60-line view cut the
+    # lead and the check output.
+    _, check = _r16_step_project(tmp_path, fake_beagle, monkeypatch)
+    monkeypatch.setenv("FAKE_TAU_REPORT", R16_LONG_REPORT)
+    runtime, _ = _bound(tmp_path)
+
+    result = await _tool(runtime, "pursuit_step").execute(
+        "c1", {"task": "T0002", "criteria": "c", "done_when": check, "scope": ["tests/"]}
+    )
+
+    text = result.text
+    assert "stays open" in text
+    window = "\n".join(text.splitlines()[-60:])
+    assert "The sub-agent wrote a case runner into the test" in window
+    assert R16_CHECK_TAIL.strip() in window
+    report = text.split("Last report:\n", 1)[1]
+    assert report.startswith("The task is blocked because the implementation file")
+    assert "**Follow-up:** Create the implementation file" in report
+    assert "(100)." not in report
+    cut = re.search(
+        r"\[\.\.\. 350-line report cut; the whole report is in the worker "
+        r"transcript, (\S+\.jsonl)\]",
+        report,
+    )
+    assert cut is not None
+    assert len(report) < len(R16_LONG_REPORT) // 5
