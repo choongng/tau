@@ -6850,8 +6850,24 @@ async def test_worker_timeout_names_output_limit_turns_not_the_env_var(
     # Run R15: W6 spent four turns at the 8192-token output limit, not its turn cap.
     text = await _hung_second_worker(tmp_path, fake_beagle, monkeypatch, 4)
 
-    assert "it spent 4 turn(s) at the output limit" in text
+    assert "its last 4 turn(s) ended at the output limit" in text
     assert _module().WORKER_MAX_TURNS_ENV not in text and "turn cap" not in text
+
+
+def test_timeout_blames_output_limit_only_when_last_turns_hit_it() -> None:
+    # Audit 7: length stops were counted over the whole run, so a worker cut off
+    # early and walled later was still told it wrote too much in one reply.
+    def end(stop: str) -> bytes:
+        message = {"role": "assistant", "content": [], "stopReason": stop}
+        return json.dumps({"type": "message_end", "message": message}).encode()
+
+    events = _module()._WorkerEvents()
+    for stop in ("length", "length", "toolUse", "stop"):
+        events.feed(end(stop))
+    assert events.length_stops == 0
+    for stop in ("length", "toolUse", "length", "length"):
+        events.feed(end(stop))
+    assert events.length_stops == 2
 
 
 #: Run R15 W2's last message: a whole report, then a raw tool call.
@@ -6911,6 +6927,25 @@ async def test_report_ending_in_a_raw_tool_call_keeps_the_text_before_it(
 
 
 @pytest.mark.anyio
+async def test_short_report_before_markup_is_kept(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Audit 7: text under 200 characters before the markup was dropped. It is
+    # kept now, "Let me check." too, with the changed-files lines after it.
+    _ready_task(fake_beagle)
+    text = await _raw_markup_step(tmp_path, monkeypatch, "Let me check.\n" + W2_MARKUP)
+
+    assert text.count("Let me check.") == 1 and "cut here" in text
+    assert "the sub-agent ended without a report" not in text
+    assert "Changed or new in its scope: cases.json" in text
+    assert "<tool_call>" not in text
+
+
+@pytest.mark.anyio
 async def test_bare_raw_tool_call_report_is_still_replaced(
     tmp_path: Path,
     beagle: Path,
@@ -6919,10 +6954,10 @@ async def test_bare_raw_tool_call_report_is_still_replaced(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _ready_task(fake_beagle)
-    text = await _raw_markup_step(tmp_path, monkeypatch, "Let me check.\n" + W2_MARKUP)
+    text = await _raw_markup_step(tmp_path, monkeypatch, "  \n" + W2_MARKUP)
 
     assert "the sub-agent ended without a report, on a raw tool call" in text
-    assert "Let me check." not in text and "cut here" not in text
+    assert "cut here" not in text
     assert "Changed or new in its scope: cases.json" in text
     assert "<tool_call>" not in text
 
@@ -7224,6 +7259,34 @@ async def test_worker_guard_refuses_reading_dot_beagle(
 
 
 @pytest.mark.anyio
+async def test_worker_guard_refuses_other_readers_of_dot_beagle(
+    tmp_path: Path, beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Audit 7: awk, nl, cut and a python open() read what cat is refused.
+    runtime = _scoped_worker(tmp_path, monkeypatch, scope="tests/")
+    refused = [
+        "awk 'NR<20' .beagle/tree/T0002.md",
+        "nl -ba .beagle/tree/T0002.md | head",
+        "cut -c1-80 .beagle/pursuit.toml",
+        "python3 -c \"print(open('.beagle/tree/T0002.md').read())\"",
+        "uv run python -c \"from pathlib import Path; print(Path('.beagle/x').read_text())\"",
+    ]
+    for command in refused:
+        result = await _tool_with_hooks(runtime, "bash").execute("c1", {"command": command})
+
+        assert "the brief already holds what the task needs" in result.text, command
+    allowed = [
+        "bash .beagle/checks/T0003/check.sh",
+        "awk 'NR<20' tests/test_x.py",
+        "python3 -c \"print(open('tests/test_x.py').read())\"",
+    ]
+    for command in allowed:
+        result = await _tool_with_hooks(runtime, "bash").execute("c2", {"command": command})
+
+        assert result.text == "ran", command
+
+
+@pytest.mark.anyio
 async def test_worker_guard_refuses_git_show_of_a_dot_beagle_path(
     tmp_path: Path, beagle: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -7239,6 +7302,30 @@ async def test_worker_guard_refuses_git_show_of_a_dot_beagle_path(
 
         assert "the brief already holds what the task needs" in result.text, command
     allowed = ["git log --oneline -5", "git show HEAD:tests/test_cases.py", "git show --stat HEAD"]
+    for command in allowed:
+        result = await _tool_with_hooks(runtime, "bash").execute("c2", {"command": command})
+
+        assert result.text == "ran", command
+
+
+@pytest.mark.anyio
+async def test_worker_guard_refuses_git_cat_file_of_dot_beagle(
+    tmp_path: Path, beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Audit 7: git read .beagle/ through other subcommands than show and log -p.
+    runtime = _scoped_worker(tmp_path, monkeypatch, scope="tests/")
+    refused = [
+        "git cat-file -p HEAD:.beagle/tree/T0002.md",
+        "git diff -- .beagle",
+        "git diff HEAD~1 -- .beagle/tree/T0002.md | head",
+        "git grep -n scope -- .beagle/",
+        "git grep scope HEAD:.beagle/tree",
+    ]
+    for command in refused:
+        result = await _tool_with_hooks(runtime, "bash").execute("c1", {"command": command})
+
+        assert "the brief already holds what the task needs" in result.text, command
+    allowed = ["git cat-file -p HEAD:tests/test_x.py", "git diff -- tests/", "git grep -n def"]
     for command in allowed:
         result = await _tool_with_hooks(runtime, "bash").execute("c2", {"command": command})
 

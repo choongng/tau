@@ -1252,7 +1252,9 @@ class _WorkerEvents:
     refusal: str | None = None
     #: Whether tau's breaker stopped the run after refused calls in a row.
     stopped: bool = False
-    #: How many assistant turns ended at the output-token limit.
+    #: How many assistant turns in a row, up to the last, ended at the output-token
+    #: limit. Audit 7: a count over the whole run blamed the limit for a wall a
+    #: worker hit long after its last cut-off turn.
     length_stops: int = 0
 
     def feed(self, line: bytes) -> None:
@@ -1293,8 +1295,7 @@ class _WorkerEvents:
         ).strip()
         stop = message.get("stopReason")
         self.stop_reason = stop if isinstance(stop, str) else None
-        if stop == "length":
-            self.length_stops += 1
+        self.length_stops = self.length_stops + 1 if stop == "length" else 0
         error = message.get("errorMessage")
         self.error = str(error) if stop == "error" and error else None
 
@@ -1396,10 +1397,6 @@ async def _talk(proc: asyncio.subprocess.Process, brief: str, events: _WorkerEve
 _TOOL_CALL_MARKUP = re.compile(r"<tool_call>|<function=")
 
 
-#: How long the text before raw tool-call markup must be to count as a report.
-_REPORT_BEFORE_MARKUP_CHARS = 200
-
-
 def _unreported_changes(cwd: Path, scope: list[str]) -> str:
     """The report for a worker that ended on a raw tool call: what git sees it change.
 
@@ -1414,11 +1411,12 @@ def _report_before_markup(report: str, cwd: Path, scope: list[str]) -> str:
     """A report that ends in raw tool-call markup: the text before it, or the stub.
 
     Run R15's W2 wrote a whole report and then `<tool_call><function=bash>…`;
-    replacing all of it told the driver the worker wrote nothing.
+    replacing all of it told the driver the worker wrote nothing. Audit 7: a
+    short text is kept too; the changed-files lines after it say what was done.
     """
     match = _TOOL_CALL_MARKUP.search(report)
     before = report[: match.start()].strip() if match else report.strip()
-    if len(before) < _REPORT_BEFORE_MARKUP_CHARS:
+    if not before:
         return _unreported_changes(cwd, scope)
     return "\n".join(
         [before, "\n(The report ended on a raw tool call, cut here.)", *_scope_changes(cwd, scope)]
@@ -1522,7 +1520,7 @@ async def _run_worker(
         remaining = deadline - loop.time()
         if remaining <= 0:
             problem = f"the step-executor exceeded its wall-clock budget of {timeout:.0f}s and " + (
-                f"was killed: it spent {events.length_stops} turn(s) at the output limit, "
+                f"was killed: its last {events.length_stops} turn(s) ended at the output limit, "
                 "writing more than one reply holds. Split the task, or say in the notes "
                 "to write files in smaller pieces."
                 if events.length_stops
@@ -7417,8 +7415,15 @@ NO_BEAGLE_NOTE = "Do not inspect .beagle/ or run beagle."
 #: is orienting, not working. A check script under it (`bash .beagle/checks/...`)
 #: is run, not read, and passes.
 _READERS = frozenset(
-    {"cat", "ls", "head", "tail", "less", "more", "find", "tree", "grep", "rg", "wc", "stat", "sed"}
-)
+    {
+        "cat", "ls", "head", "tail", "less", "more", "find", "tree", "grep", "rg", "wc",
+        "stat", "sed", "awk", "gawk", "nl", "cut", "od", "xxd", "strings", "sort", "uniq",
+    }
+)  # fmt: skip
+#: `git` subcommands that print what a path holds.
+_GIT_READS = frozenset({"show", "cat-file", "diff", "grep", "blame"})
+#: What an inline script does to read a file it names.
+_SCRIPT_READS = re.compile(r"\bopen\(|\.read_(?:text|bytes)\(")
 #: `git log` options that print each commit's diff.
 _GIT_LOG_PATCH = frozenset({"-p", "-u", "--patch"})
 #: The path an inline script opens or writes, as its source says it.
@@ -7474,6 +7479,8 @@ def _worker_orientation(tool: str, args: Mapping[str, Any], cwd: Path) -> str | 
             return f"run `{' '.join(argv[:3])}`"
         if Path(argv[0]).name in _READERS and any(_in_store(a) for a in argv[1:]):
             return f"run `{' '.join(argv)}`"
+        if _script_reads_store(argv):
+            return f"run `{' '.join(argv)}`"
         if _named(argv, "git") and _git_reads_store(argv[1:]):
             return f"run `{' '.join(argv)}`"
         return None
@@ -7482,17 +7489,34 @@ def _worker_orientation(tool: str, args: Mapping[str, Any], cwd: Path) -> str | 
 
 
 def _git_reads_store(args: list[str]) -> bool:
-    """Whether `git <args>` prints a `.beagle/` file: `show` of one, or `log -p` over one.
+    """Whether `git <args>` prints a `.beagle/` file: `show`, `cat-file`, `diff`,
+    `grep` or `blame` of one, or `log -p` over one.
 
     Run R15: W3 and W4, refused `cat .beagle/tree/T0002.md`, spent 11 and 13
     turns on `git show HEAD:.beagle/tree/T0002.md | grep ...` instead.
     """
-    if not args or args[0] not in ("show", "log"):
+    if not args or args[0] not in _GIT_READS | {"log"}:
         return False
     paths = [a.split(":", 1)[1] if ":" in a else a for a in args[1:] if not a.startswith("-")]
     if not any(p and _in_store(p) for p in paths):
         return False
-    return args[0] == "show" or bool(_GIT_LOG_PATCH & set(args[1:]))
+    return args[0] in _GIT_READS or bool(_GIT_LOG_PATCH & set(args[1:]))
+
+
+def _script_reads_store(argv: list[str]) -> bool:
+    """Whether `argv` is an inline Python script that opens a `.beagle/` path it names.
+
+    Audit 7: `python3 -c "print(open('.beagle/tree/T0002.md').read())"` read
+    what `cat` of the same path is refused. Running a script file is not this.
+    """
+    if argv[:2] == ["uv", "run"]:
+        argv = argv[2:]
+    if not argv or not Path(argv[0]).name.startswith("python") or "-c" not in argv[1:-1]:
+        return False
+    script = argv[argv.index("-c", 1) + 1]
+    if not _SCRIPT_READS.search(script):
+        return False
+    return any(_in_store(a or b) for a, b in _SCRIPT_LITERAL.findall(script))
 
 
 def _script_write_targets(command: str, cwd: Path) -> list[Path]:
