@@ -9438,3 +9438,132 @@ async def test_not_done_result_caps_last_report(
     )
     assert cut is not None
     assert len(report) < len(R16_LONG_REPORT) // 5
+
+
+R16_KNOWN_ANSWERS_SCOPE = "tests/cases.json\ntests/test_known_answers.py\ntests/test_case_data.py"
+
+
+@pytest.mark.anyio
+async def test_worker_guard_refuses_python_os_symlink_out_of_scope(
+    tmp_path: Path, beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Run R16: W4, refused a copy into tests/, linked /tmp's file there instead.
+    runtime = _scoped_worker(tmp_path, monkeypatch, scope=R16_KNOWN_ANSWERS_SCOPE)
+    project = tmp_path / "project"
+    w4_e67 = (
+        'python3 -c "\nimport os\n'
+        f"os.symlink('/tmp/interval_tree_clocks.py', '{project}/tests/interval_tree_clocks.py')\n"
+        "print('Symlink created')\n\""
+    )
+    out_of_scope = [
+        w4_e67,
+        "python3 -c \"import os; os.link('/tmp/itc.py', 'src/itc.py')\"",
+        "python3 -c \"from pathlib import Path; Path('src/itc.py').symlink_to('/tmp/itc.py')\"",
+        "python3 -c \"import os; os.makedirs('src/itc', exist_ok=True)\"",
+    ]
+    bash = _tool_with_hooks(runtime, "bash")
+
+    for command in out_of_scope:
+        result = await bash.execute("c1", {"command": command})
+
+        assert "outside T0003's scope" in result.text, command
+    w4 = await bash.execute("c1", {"command": w4_e67})
+    assert "refusing to write tests/interval_tree_clocks.py" in w4.text
+    # In scope, but pointing out of the project: the project would not hold the file.
+    linked_out = await bash.execute(
+        "c2",
+        {"command": "python3 -c \"import os; os.symlink('/tmp/cases.json', 'tests/cases.json')\""},
+    )
+    assert "refusing to link tests/cases.json to /tmp/cases.json" in linked_out.text
+    allowed = [
+        "python3 -c \"import os; os.symlink('/tmp/a.py', '/tmp/b.py')\"",
+        "python3 -c \"import os; os.symlink('cases.json', 'tests/test_case_data.py')\"",
+        "python3 -c \"import os; os.makedirs('/tmp/scratch/itc', exist_ok=True)\"",
+    ]
+    for command in allowed:
+        assert (await bash.execute("c3", {"command": command})).text == "ran", command
+
+
+@pytest.mark.anyio
+async def test_worker_guard_judges_in_tree_symlink_by_its_own_path(
+    tmp_path: Path, beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Run R16: W5's rm of W4's link passed, judged by the /tmp file it points at.
+    runtime = _scoped_worker(tmp_path, monkeypatch, scope=R16_KNOWN_ANSWERS_SCOPE)
+    project = tmp_path / "project"
+    (project / "tests").mkdir()
+    (project / "tests" / "interval_tree_clocks.py").symlink_to("/tmp/interval_tree_clocks.py")
+    (project / "tests" / "cases.json").symlink_to("/tmp/cases.json")
+    calls = [
+        ("bash", {"command": f"rm {project}/tests/interval_tree_clocks.py"}),
+        ("bash", {"command": "rm tests/interval_tree_clocks.py"}),
+        ("bash", {"command": "echo x > tests/interval_tree_clocks.py"}),
+        ("write", {"path": "tests/interval_tree_clocks.py", "content": "x = 1\n"}),
+    ]
+
+    for tool, arguments in calls:
+        result = await _tool_with_hooks(runtime, tool).execute("c1", arguments)
+
+        assert "refusing to write tests/interval_tree_clocks.py" in result.text, arguments
+        assert "outside T0003's scope" in result.text
+    # A link in scope is in scope by its own path; /tmp itself stays open.
+    allowed = [
+        ("bash", {"command": "echo '[]' > tests/cases.json"}),
+        ("write", {"path": "tests/cases.json", "content": "[]\n"}),
+        ("bash", {"command": "rm /tmp/interval_tree_clocks.py"}),
+    ]
+    for tool, arguments in allowed:
+        assert (await _tool_with_hooks(runtime, tool).execute("c2", arguments)).text == "ran"
+
+
+@pytest.mark.anyio
+async def test_worker_guard_refuses_reading_a_sibling_project_tree(
+    tmp_path: Path, beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Run R16: W2 found ~/itc.r08's implementation beside the project and read it.
+    runtime = _scoped_worker(tmp_path, monkeypatch, scope=R16_KNOWN_ANSWERS_SCOPE)
+    earlier = tmp_path / "itc.r08" / "itc"
+    (earlier / "src").mkdir(parents=True)
+    (earlier / "src" / "interval_tree_clocks.py").write_text("class Stamp: ...\n")
+    (earlier / "interval_tree_clocks.py").write_text("from itc.src import *\n")
+    venv = tmp_path / ".venv" / "lib" / "python3.12" / "site-packages" / "pytest"
+    venv.mkdir(parents=True)
+    site = tmp_path / ".local" / "lib" / "python3.12" / "site-packages" / "attrs"
+    site.mkdir(parents=True)
+    named_venv = tmp_path / ".cache" / "beagle" / "venv-1593966641"
+    named_venv.mkdir(parents=True)
+    (named_venv / "pyvenv.cfg").write_text("home = /usr/bin\n")
+    refused = [
+        ("bash", {"command": f"head -100 {earlier}/interval_tree_clocks.py"}),  # W2 E56
+        ("bash", {"command": f"cat {earlier}/src/interval_tree_clocks.py"}),  # W2 E58
+        ("bash", {"command": f"wc -l {earlier}/src/interval_tree_clocks.py"}),  # W2 E60
+        ("read", {"path": f"{earlier}/src/interval_tree_clocks.py"}),
+        ("read", {"path": "../itc.r08/itc/src/interval_tree_clocks.py"}),
+        ("bash", {"command": "ls ../itc.r08"}),
+        ("bash", {"command": "grep -n Stamp ../itc.r08/itc/src/interval_tree_clocks.py"}),
+        ("bash", {"command": "sed -n 1,40p ../itc.r08/itc/src/interval_tree_clocks.py"}),
+        ("bash", {"command": "tail -20 ../itc.r08/itc/interval_tree_clocks.py | less"}),
+        ("bash", {"command": "find ../itc.r08 -name '*.py'"}),
+    ]
+
+    for tool, arguments in refused:
+        result = await _tool_with_hooks(runtime, tool).execute("c1", arguments)
+
+        assert "refusing to read" in result.text, arguments
+        assert "other trees beside the project are not this task's" in result.text
+    allowed = [
+        ("bash", {"command": "cat /tmp/out.txt"}),
+        ("read", {"path": "/tmp/interval_tree_clocks.py"}),
+        ("bash", {"command": f"ls {venv}"}),
+        ("read", {"path": f"{venv}/__init__.py"}),
+        ("bash", {"command": f"head {site}/__init__.py"}),
+        ("bash", {"command": f"ls {Path(sys.prefix)}"}),
+        ("bash", {"command": f"cat {named_venv}/lib/python3.12/site.py"}),
+        ("bash", {"command": "cat /etc/hostname"}),
+        ("read", {"path": "tests/cases.json"}),
+        ("bash", {"command": "grep -rn Stamp tests src"}),
+    ]
+    for tool, arguments in allowed:
+        result = await _tool_with_hooks(runtime, tool).execute("c2", arguments)
+
+        assert result.text == "ran", arguments

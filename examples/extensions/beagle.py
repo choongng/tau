@@ -998,19 +998,30 @@ def _scope_hit(target: Path, root: Path, scope: tuple[str, ...]) -> str | None:
             if fnmatch.fnmatch(str(target), pattern) or target in (static, *static.parents):
                 return entry
             continue
-        path = _resolved(root / text)
-        if target == path or path in target.parents or target in path.parents:
-            return entry
+        # A link in the project is its own path, and also where it points.
+        for path in {_resolved(root / text), _own_path(root / text, root)}:
+            if target == path or path in target.parents or target in path.parents:
+                return entry
     return None
 
 
-def _write_targets(tool: str, args: Mapping[str, Any], cwd: Path) -> list[Path]:
-    """The paths an edit, write or bash call writes; [] for anything else."""
+def _write_targets(
+    tool: str, args: Mapping[str, Any], cwd: Path, *, resolve: bool = True
+) -> list[Path]:
+    """The paths an edit, write or bash call writes; [] for anything else.
+
+    With `resolve=False` they are absolute and normalized but links are not
+    followed, so a symlink names itself rather than what it points at.
+    """
     if tool in ("write", "edit"):
+        raw = args.get("path")
+        if not resolve and isinstance(raw, str) and raw.strip():
+            return [Path(os.path.normpath(cwd / Path(raw).expanduser()))]
         target = _goal_path_from_args(args, cwd)
         return [target] if target is not None else []
     if tool == "bash":
-        return [_resolved(t) for t in _bash_write_targets(str(args.get("command", "")), cwd) or ()]
+        found = _bash_write_targets(str(args.get("command", "")), cwd) or []
+        return [_resolved(t) for t in found] if resolve else found
     return []
 
 
@@ -6966,6 +6977,8 @@ _INTERPRETERS = ("python", "node", "perl", "ruby")
 _SCRIPT_WRITE = re.compile(
     r"""open\([^)]*['"][wax]b?\+?['"]|\.write_(?:text|bytes)\(|shutil\.(?:copy|move|rmtree)"""
     r"""|os\.(?:remove|rename|replace|unlink)\(|\.unlink\(|writeFileSync"""
+    # Run R16: W4, refused a copy into tests/, linked it there with os.symlink.
+    r"""|os\.(?:symlink|link|makedirs|mkdir)\(|\.(?:symlink_to|hardlink_to|mkdir)\("""
 )
 
 
@@ -7347,6 +7360,14 @@ _SCRIPT_PATH = re.compile(
     r"""open\(\s*['"](?P<open>[^'"]+)['"]\s*,\s*['"][wax]"""
     r"""|Path\(\s*['"](?P<path>[^'"]+)['"]\s*\)\s*\.write_(?:text|bytes)\("""
     r"""|writeFileSync\(\s*['"](?P<node>[^'"]+)['"]"""
+    r"""|os\.(?:makedirs|mkdir)\(\s*['"](?P<dir>[^'"]+)['"]"""
+    r"""|Path\(\s*['"](?P<made>[^'"]+)['"]\s*\)\s*\.(?:mkdir|symlink_to|hardlink_to)\("""
+)
+#: A link an inline script makes, and what it points at, as its source says them.
+_SCRIPT_LINK = re.compile(
+    r"""os\.(?P<os>symlink|link)\(\s*['"](?P<source>[^'"]+)['"]\s*,\s*['"](?P<link>[^'"]+)['"]"""
+    r"""|Path\(\s*['"](?P<path_link>[^'"]+)['"]\s*\)\s*\.(?P<to>symlink_to|hardlink_to)\("""
+    r"""\s*['"](?P<path_source>[^'"]+)['"]"""
 )
 #: An inline script that hands a command to the shell.
 _SCRIPT_SHELL = re.compile(r"""\bos\.(?:system|popen)\(|\bsubprocess\.\w+\(""")
@@ -7416,8 +7437,26 @@ def _script_write_targets(command: str, cwd: Path) -> list[Path]:
     does not spell out is not guessed at: the guard fails open on it.
     """
     found = [next(g for g in m.groups() if g is not None) for m in _SCRIPT_PATH.finditer(command)]
-    targets = [_resolved(Path(p) if Path(p).is_absolute() else cwd / p) for p in found]
+    found += [link for link, _ in _script_links(command, cwd)]
+    targets = [Path(os.path.normpath(cwd / Path(p).expanduser())) for p in found]
     return targets + _script_shell_targets(command, cwd)
+
+
+def _script_links(command: str, cwd: Path) -> list[tuple[Path, Path]]:
+    """Each link an inline script makes, unresolved, with the path it points at.
+
+    A symbolic link's relative target is read from the link's directory, a
+    hard link's from `cwd`, as the calls themselves read them.
+    """
+    found: list[tuple[Path, Path]] = []
+    for m in _SCRIPT_LINK.finditer(command):
+        raw_link = m.group("link") or m.group("path_link")
+        raw_source = m.group("source") or m.group("path_source")
+        link = Path(os.path.normpath(cwd / Path(raw_link).expanduser()))
+        symbolic = "symlink" in (m.group("os") or m.group("to") or "")
+        base = link.parent if symbolic else cwd
+        found.append((link, _resolved(base / Path(raw_source).expanduser())))
+    return found
 
 
 def _script_shell_targets(command: str, cwd: Path) -> list[Path]:
@@ -7441,16 +7480,82 @@ def _script_shell_targets(command: str, cwd: Path) -> list[Path]:
             if nested is None:
                 unreadable = True
             else:
-                found += [_resolved(t) for t in nested]
+                found += nested
     if unreadable:
         for source in sources:
             for m in _SCRIPT_LITERAL.finditer(source):
                 for word in (m.group(1) or m.group(2) or "").split():
                     if not _SCRIPT_PATH_WORD.fullmatch(word) or word.startswith("-"):
                         continue
-                    path = Path(word).expanduser()
-                    found.append(_resolved(path if path.is_absolute() else cwd / path))
+                    found.append(Path(os.path.normpath(cwd / Path(word).expanduser())))
     return found
+
+
+#: Path parts a worker reads its toolchain through, wherever that lives.
+_TOOLCHAIN_PARTS = frozenset({"site-packages", "dist-packages", ".venv", "venv"})
+#: Why a worker is kept out of the trees beside its project.
+SIBLING_REASON = (
+    "other trees beside the project are not this task's. Work from the brief "
+    "and the project's own files."
+)
+
+
+def _beside(path: Path, root: Path) -> bool:
+    """Whether `path`, resolved, lies under the project's parent directory but
+    not under the project: another tree beside it.
+
+    Run R16: W2 found and read an earlier run's implementation at
+    ~/itc.r08/itc/src/. A virtualenv or site-packages there is the toolchain,
+    not another tree, and is not beside the project.
+    """
+    path = _resolved(path)
+    if root.parent not in path.parents or path == root or root in path.parents:
+        return False
+    if _TOOLCHAIN_PARTS & set(path.parts):
+        return False
+    below = [p for p in (path, *path.parents) if root.parent in p.parents]
+    if any((p / "pyvenv.cfg").is_file() for p in below):
+        return False  # a virtualenv under another name, such as beagle's own
+    for prefix in (sys.prefix, os.environ.get("VIRTUAL_ENV")):
+        env = _resolved(Path(prefix)) if prefix else None
+        if env is not None and env in path.parents and env not in (root, *root.parents):
+            return False
+    return True
+
+
+def _own_path(path: Path, root: Path) -> Path:
+    """`path` with its directories resolved and its last part not followed,
+    when that lies in the project; fully resolved otherwise.
+
+    Run R16: W4 linked tests/interval_tree_clocks.py to /tmp, and W5's `rm`
+    of it passed, judged by where the link points. A link in the project is
+    the project's file.
+    """
+    own = _resolved(path.parent) / path.name if path.name else _resolved(path)
+    return own if own == root or root in own.parents else _resolved(path)
+
+
+def _sibling_read(tool: str, args: Mapping[str, Any], cwd: Path, root: Path) -> str | None:
+    """The path a read or a reading command names beside the project, or None."""
+
+    def beside(word: str) -> bool:
+        try:
+            return _beside(cwd / Path(word).expanduser(), root)
+        except RuntimeError:  # `~user` with no such user
+            return False
+
+    if tool == "read":
+        raw = str(args.get("path") or "")
+        return raw if raw.strip() and beside(raw) else None
+    if tool != "bash":
+        return None
+
+    def match(argv: list[str]) -> str | None:
+        if Path(argv[0]).name not in _READERS:
+            return None
+        return next((a for a in argv[1:] if a and not a.startswith("-") and beside(a)), None)
+
+    return _bash_find(str(args.get("command", "")), match)
 
 
 def _worker_scope() -> tuple[str, tuple[str, ...]] | None:
@@ -7463,6 +7568,26 @@ def _worker_scope() -> tuple[str, tuple[str, ...]] | None:
     return os.environ.get(WORKER_TASK_ENV, "").strip() or "this task", scope
 
 
+def _link_out(links: list[tuple[Path, Path]], root: Path) -> ToolCallHookResult | None:
+    """The refusal for a link in the project that points out of it, or None.
+
+    Run R16: W4 linked tests/interval_tree_clocks.py to /tmp, and the check
+    imported a file the project does not hold.
+    """
+    for link, source in links:
+        own = _own_path(link, root)
+        if (own == root or root in own.parents) and not (source == root or root in source.parents):
+            return ToolCallHookResult(
+                block=True,
+                reason=(
+                    f"refusing to link {own.relative_to(root)} to {source}: a link in the "
+                    "project to a file outside it is a file the project does not hold. "
+                    "Write the file where it belongs, or report it as follow-up."
+                ),
+            )
+    return None
+
+
 def make_worker_scope_guard() -> Any:
     """Build the `tool_call` guard that keeps a worker's writes inside its task's scope.
 
@@ -7470,8 +7595,10 @@ def make_worker_scope_guard() -> Any:
     `tests/` over .gitignore with two turns left, and the next three steps went
     to repairing it. A worker sent with a scope (`BEAGLE_TAU_WORKER_SCOPE`) may
     write in it, outside the project (/tmp), in beagle's store (the record guard
-    has that) and `.git/beagle/` (the task's log). A worker with no scope is
-    not held. Fails open.
+    has that) and `.git/beagle/` (the task's log). A link in the project is
+    judged by its own path, and one an inline script makes may not point out
+    of the project. A worker with no scope is not held. Any worker sent on a
+    task is kept from reading the trees beside its project. Fails open.
     """
 
     async def guard(event: Any, context: ExtensionContext) -> ToolCallHookResult | None:
@@ -7486,6 +7613,16 @@ def make_worker_scope_guard() -> Any:
                 return ToolCallHookResult(
                     block=True,
                     reason=f"refusing to {orientation}: {NO_BEAGLE_REASON}",
+                )
+            home = _find_goal(cwd) if sent_on_task and event.tool_name in ("read", "bash") else None
+            beside = (
+                _sibling_read(event.tool_name, arguments, cwd, _resolved(home.parent.parent))
+                if home is not None
+                else None
+            )
+            if beside is not None:
+                return ToolCallHookResult(
+                    block=True, reason=f"refusing to read {beside}: {SIBLING_REASON}"
                 )
             sent = _worker_scope()
             command = str(arguments.get("command", "")) if event.tool_name == "bash" else ""
@@ -7511,7 +7648,8 @@ def make_worker_scope_guard() -> Any:
                 and script.startswith(_INTERPRETERS)
                 and (_SCRIPT_WRITE.search(command) or _SCRIPT_SHELL.search(command)) is not None
             )
-            targets = _write_targets(event.tool_name, arguments, cwd)
+            targets = _write_targets(event.tool_name, arguments, cwd, resolve=False)
+            links = _script_links(command, cwd) if scripted else []
             if scripted:
                 targets += _script_write_targets(command, cwd)
             goal = _find_goal(cwd) if targets else None
@@ -7520,7 +7658,7 @@ def make_worker_scope_guard() -> Any:
             root = _resolved(goal.parent.parent)
             allowed = [_resolved(goal.parent), root / ".git" / "beagle"]
             for target in targets:
-                target = _resolved(target)
+                target = _own_path(target, root)
                 if target != root and root not in target.parents:
                     continue  # outside the project: /tmp, /dev/null
                 if any(target == a or a in target.parents for a in allowed):
@@ -7530,7 +7668,7 @@ def make_worker_scope_guard() -> Any:
                 if _scope_hit(target, root, scope) is None:
                     break
             else:
-                return None
+                return _link_out(links, root)
         except Exception:  # noqa: BLE001 - fail open, never block on a guard bug
             return None
         rel = target.relative_to(root) if target != root else target
