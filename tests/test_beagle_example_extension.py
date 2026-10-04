@@ -2907,6 +2907,151 @@ async def test_known_answers_task_whose_test_never_opens_the_cases_file_stays_op
     assert not (project / ".beagle" / "locked").exists()
 
 
+#: Run R20's cases.json, trimmed: two of its four cases, keyed as it keyed them.
+R20_CASES = json.dumps(
+    [
+        {
+            "name": "fork_basic",
+            "description": "fork splits the id without touching the event",
+            "inputs": {"clock": {"id": 1, "event": 0}, "operation": "fork"},
+            "expected": {"result": [{"id": 1, "event": 0}, {"id": 1, "event": 0}]},
+            "source": "fork(i, e) = ((i1 , e), (i2 , e))",
+        },
+        {
+            "name": "event_increment",
+            "description": "event increments the counter",
+            "inputs": {"clock": {"id": 1, "event": 0}, "operation": "event"},
+            "expected": {"result": {"id": 1, "event": 1}},
+            "source": "event(i, e) inflates e",
+        },
+    ]
+)
+R20_TEST_HEAD = (
+    "import json\n\nfrom itc.interval_tree_clocks import IntervalTreeClock\n\n\n"
+    "def load_test_cases():\n"
+    '    with open("tests/cases.json") as f:\n        return json.load(f)\n\n\n'
+)
+
+
+def _r20_task(
+    tmp_path: Path, fake_beagle: Path, monkeypatch: pytest.MonkeyPatch, cases_test: str
+) -> Path:
+    project = _cases_task(tmp_path, fake_beagle, monkeypatch, CASES_DATA_TEST)
+    writes = json.loads(os.environ["FAKE_TAU_WRITES"])
+    writes["tests/cases.json"] = R20_CASES
+    writes["tests/test_cases.py"] = R20_TEST_HEAD + cases_test
+    monkeypatch.setenv("FAKE_TAU_WRITES", json.dumps(writes))
+    return project
+
+
+async def _refused_r20(tmp_path: Path, fake_beagle: Path, project: Path) -> str:
+    scope = [*CASES_SCOPE, "tests/test_cases.py"]
+    result = await _step_cases(tmp_path, scope=scope, locks=scope)
+    assert "stays open" in result.text and "nothing is locked" in result.text, result.text
+    assert _pursuit_calls(fake_beagle, "close") == []
+    assert _pursuit_calls(fake_beagle, "commit") == []
+    assert not (project / ".beagle" / "locked").exists()
+    return result.text
+
+
+@pytest.mark.anyio
+async def test_known_answers_close_refuses_a_cases_test_naming_absent_cases(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Run R20: test_cases.py looked up send_composition, absent from cases.json.
+    cases_test = (
+        "def test_send_composition():\n"
+        '    case = next(c for c in load_test_cases() if c["name"] == "send_composition")\n'
+        '    clock = IntervalTreeClock(**case["inputs"]["clock"])\n'
+        '    assert clock.fork() == case["expected"]["result"]\n'
+    )
+    project = _r20_task(tmp_path, fake_beagle, monkeypatch, cases_test)
+
+    text = await _refused_r20(tmp_path, fake_beagle, project)
+
+    assert (
+        'tests/test_cases.py looks up case "send_composition", which tests/cases.json '
+        "does not hold"
+    ) in text
+
+
+@pytest.mark.anyio
+async def test_known_answers_close_refuses_a_cases_test_that_never_reads_expected(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Run R20: every test rebuilt its answer from the inputs, never case["expected"].
+    cases_test = (
+        "def test_fork_basic():\n"
+        '    case = next(c for c in load_test_cases() if c["name"] == "fork_basic")\n'
+        '    clock = IntervalTreeClock(**case["inputs"]["clock"])\n'
+        "    left, right = clock.fork()\n"
+        "    assert left.id != right.id\n"
+    )
+    project = _r20_task(tmp_path, fake_beagle, monkeypatch, cases_test)
+
+    text = await _refused_r20(tmp_path, fake_beagle, project)
+
+    assert (
+        "tests/test_cases.py never reads the cases' answers "
+        '("expected" in tests/cases.json)'
+    ) in text
+
+
+@pytest.mark.anyio
+async def test_known_answers_close_refuses_an_attribute_used_as_method_and_value(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Run R20: `clock.event()` in one test, `result.event == n` in another.
+    cases_test = (
+        "def test_event_increment():\n"
+        '    case = next(c for c in load_test_cases() if c["name"] == "event_increment")\n'
+        '    clock = IntervalTreeClock(**case["inputs"]["clock"])\n'
+        "    result = clock.event()\n"
+        '    assert result.event == case["expected"]["result"]["event"]\n'
+    )
+    project = _r20_task(tmp_path, fake_beagle, monkeypatch, cases_test)
+
+    text = await _refused_r20(tmp_path, fake_beagle, project)
+
+    assert "tests/test_cases.py uses .event both as a method, .event(), and as a value" in text
+
+
+@pytest.mark.anyio
+async def test_known_answers_close_locks_a_well_formed_r20_cases_test(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cases_test = (
+        "def test_cases():\n"
+        "    for case in load_test_cases():\n"
+        '        clock = IntervalTreeClock(**case["inputs"]["clock"])\n'
+        '        op = getattr(clock, case["inputs"]["operation"])\n'
+        '        assert op() == case["expected"]["result"]\n'
+    )
+    _r20_task(tmp_path, fake_beagle, monkeypatch, cases_test)
+    scope = [*CASES_SCOPE, "tests/test_cases.py"]
+
+    result = await _step_cases(tmp_path, scope=scope, locks=scope)
+
+    assert "Locked: tests/cases.json, tests/test_case_data.py, tests/test_cases.py" in (
+        result.text
+    ), result.text
+
 @pytest.mark.anyio
 async def test_cases_test_naming_the_file_only_in_a_docstring_stays_open(
     tmp_path: Path,

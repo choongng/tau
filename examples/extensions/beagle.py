@@ -4078,6 +4078,137 @@ def _unread_cases(root: Path, entries: list[str]) -> tuple[str, str] | None:
     return None
 
 
+#: Case keys that hold a case's label, inputs or provenance rather than its answer.
+_CASE_NON_ANSWER_KEYS = frozenset(
+    {
+        "name", "id", "title", "case", "source", "sources", "citation", "description",
+        "desc", "notes", "note", "comment", "input", "inputs", "in", "args", "arguments",
+        "ops", "operations", "operation", "setup", "given",
+    }
+)
+
+
+def _case_labels(cases: list[object]) -> set[str]:
+    return {
+        str(case[key])
+        for case in cases
+        if isinstance(case, dict)
+        for key in ("name", "id")
+        if isinstance(case.get(key), str | int)
+    }
+
+
+def _answer_keys(cases: list[object]) -> set[str]:
+    keys = {key for case in cases if isinstance(case, dict) for key in case}
+    return {
+        key
+        for key in keys
+        if isinstance(key, str)
+        and key.lower() not in _CASE_NON_ANSWER_KEYS
+        and not any(part in key.lower() for part in SOURCE_KEY_PARTS)
+    }
+
+
+def _str_const(node: ast.AST) -> str | None:
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return node.value
+    return None
+
+
+def _absent_case_lookup(tree: ast.AST, labels: set[str]) -> str | None:
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Compare):
+            sides = [node.left, *node.comparators]
+            keyed = any(
+                isinstance(side, ast.Subscript) and _str_const(side.slice) in {"name", "id"}
+                for side in sides
+            )
+            if keyed:
+                for side in sides:
+                    named = _str_const(side)
+                    if named is not None and named not in labels:
+                        return named
+        elif (
+            isinstance(node, ast.Subscript)
+            and isinstance(node.value, ast.Name)
+            and "cases" in node.value.id.lower()
+        ):
+            named = _str_const(node.slice)
+            if named is not None and named not in labels:
+                return named
+    return None
+
+
+def _method_and_value(tree: ast.AST) -> str | None:
+    called = {
+        node.func.attr
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+    }
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Compare):
+            operands = [node.left, *node.comparators]
+        elif isinstance(node, ast.BinOp):
+            operands = [node.left, node.right]
+        elif isinstance(node, ast.AugAssign):
+            operands = [node.target, node.value]
+        else:
+            continue
+        for operand in operands:
+            if isinstance(operand, ast.Attribute) and operand.attr in called:
+                return operand.attr
+    return None
+
+
+def _cases_test_problem(root: Path, entries: list[str]) -> tuple[str, str] | None:
+    """(test, what is wrong) when a locked test reading cases data could never judge it.
+
+    Run R20 locked a test_cases.py that looked up three case names cases.json
+    did not hold, never read a case's "expected", and used `.event` both as a
+    method and as a number. Read from each test's AST; nothing is run. The
+    unread-answers check applies only to tests importing the project, as the
+    data's own shape test reads no answers.
+    """
+    files = []
+    for entry in entries:
+        target = _project_file(root, entry)
+        if target is not None and target.is_file():
+            files.append(str(target.relative_to(root.resolve())))
+    tests = [rel for rel in files if rel.endswith(".py") and _is_test_path(rel)]
+    for data in (rel for rel in files if _is_cases_data(rel) and rel.endswith(".json")):
+        try:
+            cases = _cases_list(json.loads((root / data).read_text(encoding="utf-8")))
+        except (OSError, ValueError):
+            continue
+        labels = _case_labels(cases)
+        answers = _answer_keys(cases)
+        for test in tests:
+            if not _cases_test_reads(root / test, Path(data).name):
+                continue
+            try:
+                tree = ast.parse((root / test).read_text(encoding="utf-8"))
+            except (OSError, SyntaxError, ValueError):
+                continue
+            absent = _absent_case_lookup(tree, labels) if labels else None
+            if absent is not None:
+                return test, f'looks up case "{absent}", which {data} does not hold'
+            mentioned = {
+                text
+                for node in ast.walk(tree)
+                for text in (_str_const(node), getattr(node, "attr", None))
+                if isinstance(text, str)
+            }
+            if answers and _test_project_imports(root / test) and not answers & mentioned:
+                keys = ", ".join(f'"{key}"' for key in sorted(answers))
+                return test, f"never reads the cases' answers ({keys} in {data})"
+            both = _method_and_value(tree)
+            if both is not None:
+                return test, (
+                    f"uses .{both} both as a method, .{both}(), and as a value in a "
+                    "comparison or arithmetic, so it cannot pass against any one code"
+                )
+    return None
+
 #: Words a case's source must quote from references/*.txt to count as found.
 SOURCE_QUOTE_MIN_WORDS = 4
 #: Key fragments that mark where a case keeps its source text.
@@ -7592,6 +7723,22 @@ def make_step_tool() -> Any:
                 f"\n\nLast report:\n{shown}\n\n"
                 f'Next: pursuit_step with task="{task}" and notes saying {test} must load '
                 f"{data} and run every case against the code.",
+            )
+        flawed = _cases_test_problem(root, locks) if locks else None
+        if flawed:
+            state = "stays blocked" if retrying else "stays open"
+            test, problem = flawed
+            return _not_done(
+                root,
+                task,
+                scope,
+                f"{route}{undid}{task} — {title}: the check passes, but the task {state} "
+                f"and nothing is locked: {test} {problem}, so the known answers could "
+                "never judge the code: the sub-agent must make it look up only cases "
+                "the data holds, compare the code's results with each case's expected "
+                "value, and use each attribute one way."
+                f"\n\nLast report:\n{shown}\n\n"
+                f'Next: pursuit_step with task="{task}" and notes saying {test} {problem}.',
             )
         unquoted = _unquoted_cases(root, locks) if locks else None
         if unquoted:
