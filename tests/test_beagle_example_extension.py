@@ -4720,6 +4720,21 @@ R17_DOCS_MILESTONE = (
 )
 
 
+def test_design_fold_keeps_r17_docs_milestone_beside_known_answers() -> None:
+    # With known answers planned the design fold runs; R17's docs milestone
+    # mentions design decisions but must not be folded into Implement.
+    implement = "Implement the clock operations"
+    kept, notes = _module()._repair_milestones(
+        [R17_KNOWN_ANSWERS_MILESTONE, implement, R17_DOCS_MILESTONE]
+    )
+    assert len(kept) == 3
+    assert R17_DOCS_MILESTONE in kept
+    [kept_implement] = [part for part in kept if part.startswith("Implement")]
+    assert "Toolchain and docs" not in kept_implement
+    assert "design decisions" not in kept_implement
+    assert not any("Folded" in note for note in notes)
+
+
 async def _found_with(tmp_path: Path, fake_beagle: Path, milestones: list[str]) -> Any:
     (fake_beagle / "add.out").write_text("T0001  Implement interval tree clocks\n")
     runtime, _ = _bound(tmp_path)
