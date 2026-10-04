@@ -135,7 +135,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Collection, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -5846,10 +5846,16 @@ def _project_file(root: Path, entry: str) -> Path | None:
     return target
 
 
-def _lock(goal: Path, root: Path, entries: list[str]) -> tuple[list[str], list[str]]:
-    """Copy each named file to the locked store; (locked, why the rest were not)."""
+def _lock(
+    goal: Path, root: Path, entries: list[str], task: str = "", relock: Collection[str] = ()
+) -> tuple[list[str], list[str]]:
+    """Copy each named file to the locked store; (locked, why the rest were not).
+
+    A path in `relock` is locked again from its new content: a known-answers
+    fix task's close.
+    """
     store = goal.parent / LOCKED_DIR
-    held = set(_locked(goal))
+    held = set(_locked(goal)) - set(relock)
     locked: list[str] = []
     skipped: list[str] = []
     for entry in entries:
@@ -5874,6 +5880,8 @@ def _lock(goal: Path, root: Path, entries: list[str]) -> tuple[list[str], list[s
         for rel in locked:
             data = (store / rel).read_bytes()
             manifest[rel] = {"sha256": _sha256(data), "commit": _head_holding(root, rel, data)}
+            if task:
+                manifest[rel]["task"] = task
         _write_lock_manifest(goal, manifest)
     return locked, skipped
 
@@ -5946,8 +5954,11 @@ def _locked_bytes(root: Path, store: Path, rel: str, entry: dict[str, Any]) -> b
     return None
 
 
-def _restore_locked(goal: Path, root: Path) -> list[str]:
+def _restore_locked(goal: Path, root: Path, spare: Collection[str] = ()) -> list[str]:
     """Put back every locked file a worker changed or removed; the ones it did.
+
+    A path in `spare` is left as the worker wrote it: a known-answers fix
+    task's own scope.
 
     A path in the lock manifest is held to its recorded sha256 and restored
     from its lock commit, the store copy rewritten with it: a tool run over
@@ -5959,6 +5970,8 @@ def _restore_locked(goal: Path, root: Path) -> list[str]:
     changed_manifest = False
     restored = []
     for rel in _locked(goal):
+        if rel in spare:
+            continue
         target = root / rel
         entry = manifest.get(rel)
         try:
@@ -6030,6 +6043,54 @@ def _move_pending_locks(goal: Path, task: str, first_part: str, root: Path) -> s
     _pending_locks(goal, heir, locks)
     _drop_pending_locks(goal, task)
     return f"{task}'s pending locks ({', '.join(locks)}) moved to its first part, {heir}."
+
+
+def _fixes_known_answers(title: str) -> bool:
+    """Whether a task titled `title` re-opens the known answers, and so may hold them."""
+    return _names_known_answers(title) or title.strip().lower().startswith("known answers")
+
+
+def _locked_in_scope(scope: list[str], goal: Path) -> list[str]:
+    """The locked files `scope` names, itself or by a directory holding them."""
+    held = []
+    for rel in _locked(goal):
+        for entry in scope:
+            path = os.path.normpath(entry.strip())
+            if path == "." or rel == path or rel.startswith(path.rstrip("/") + "/"):
+                held.append(rel)
+                break
+    return held
+
+
+def _known_answers_fix_route(rel: str, goal: Path, task: str, title: str) -> str:
+    """Who locked `rel`, that its changes are put back, and how a wrong one is fixed."""
+    owner = _lock_manifest(goal).get(rel, {}).get("task")
+    return (
+        f"{rel} is locked as the known answers{f' ({owner})' if owner else ''}: a "
+        "worker's change to it is put back before every check. If the locked test is "
+        f"wrong, split {task} with a fix first: pursuit_plan task=\"{task}\" "
+        f'parts=["Known answers: fix {rel}::<what is wrong in it>", "{title}::<what '
+        f'{task} is for>"]; then run the fix step with pursuit_step, {rel} in its scope. '
+        "Its close re-locks the file."
+    )
+
+
+def _locked_scope_problem(
+    scope: list[str], root: Path, task_title: str, task: str
+) -> str | None:
+    """Why `scope` may not name a locked file, or None.
+
+    Run R20: T0010 and T0011 scoped the locked tests/test_cases.py, and every
+    edit the worker made to it was put back before the check. A directory
+    holding a locked file is allowed: put-back still guards the file, and later
+    tasks add their own tests beside it.
+    """
+    if _fixes_known_answers(task_title):
+        return None
+    goal = root / ".beagle" / GOAL_BASENAME
+    named = {os.path.normpath(entry.strip()) for entry in scope}
+    held = [rel for rel in _locked(goal) if rel in named]
+    return _known_answers_fix_route(held[0], goal, task, task_title) if held else None
 
 
 #: Retries beagle allows a task its own check blocked.
@@ -7127,6 +7188,7 @@ def make_step_tool() -> Any:
                 route_scope = scope or _strings(record.get("scope"))
                 scoped = (
                     _scope_problem(route_scope, task, nodes, root)
+                    or _locked_scope_problem(route_scope, root, title, task)
                     or _oracle_with_code_problem(route_scope, goal)
                     or _locked_test_problem(done_when or old_check, route_scope, goal)
                     or _import_scope_problem(done_when or old_check, route_scope, root)
@@ -7229,6 +7291,7 @@ def make_step_tool() -> Any:
                     done_when,
                 )
                 or _scope_problem(scope, task, nodes, root)
+                or _locked_scope_problem(scope, root, title, task)
                 or _oracle_with_code_problem(scope, goal)
                 or _cases_first_problem(scope, task, title, goal, nodes)
                 or _locked_test_problem(done_when, scope, goal)
@@ -7305,8 +7368,10 @@ def make_step_tool() -> Any:
             if amend_problem is not None:
                 return _step_result(f"pursuit_step: {task}'s check not changed — {amend_problem}")
             own_scope = scope or _strings(record.get("scope"))
-            unwritten = await _unwritten_check_problem(
-                done_when, own_scope, task, root, _predecessor_scope(record, root)
+            unwritten = _locked_scope_problem(own_scope, root, title, task) or (
+                await _unwritten_check_problem(
+                    done_when, own_scope, task, root, _predecessor_scope(record, root)
+                )
             )
             if unwritten is not None:
                 return _step_result(f"pursuit_step: {task}'s check not changed — {unwritten}")
@@ -7395,7 +7460,14 @@ def make_step_tool() -> Any:
             brief = f"{brief}\n\nFrom the driver (who has not read the reference):\n{notes}"
         brief += "\n\n" + NO_BEAGLE_NOTE
         locks = _pending_locks(goal, task, _strings(arguments.get("locks")))
-        locked = _locked(goal)
+        # A known-answers fix may change the locked files in its scope; its
+        # close locks them again from what it wrote.
+        fixing = (
+            _locked_in_scope(scope or _strings(record.get("scope")), goal)
+            if _fixes_known_answers(title)
+            else []
+        )
+        locked = [rel for rel in _locked(goal) if rel not in fixing]
         if locked:
             brief += (
                 "\n\nLocked files: known-answer cases an earlier task wrote from the "
@@ -7473,7 +7545,7 @@ def make_step_tool() -> Any:
             run = await _run_worker(
                 brief + retry_note, root, model, provider, timeout, signal, task, scope
             )
-            undone = _restore_locked(goal, root)
+            undone = _restore_locked(goal, root, fixing)
             restored.update(undone)
             if run.spent is not None:
                 spent = (spent or 0) + run.spent
@@ -7543,6 +7615,11 @@ def make_step_tool() -> Any:
                     f" It also changed locked files ({', '.join(undone)}); they were put "
                     "back. Make the code pass them as they are."
                 )
+                if any(rel in verdict[1] for rel in undone):
+                    retry_note += (
+                        " If a locked test is itself wrong, say which and why in your "
+                        "report: the driver can open a known-answers fix for it."
+                    )
             if missing:
                 retry_note += "\n\n" + missing.rstrip()
             notes = report.strip()
@@ -7563,6 +7640,11 @@ def make_step_tool() -> Any:
             if restored
             else ""
         )
+        failing_locked = [rel for rel in sorted(restored) if verdict[0] and rel in verdict[1]]
+        if failing_locked:
+            # Run R20: T0010 and T0011 had the locked test put back every check
+            # and no route out when it was the test that was wrong.
+            undid += _known_answers_fix_route(failing_locked[0], goal, task, title) + "\n\n"
 
         absent = _absent_locks(locks, root)
         if verdict[0] == 0 and absent:
@@ -7792,8 +7874,10 @@ def make_step_tool() -> Any:
         if rc == 0:
             _forget_task(root, task)
         lock_note = ""
-        if rc == 0 and locks:
-            now, skipped = _lock(goal, root, locks)
+        if rc == 0 and (locks or fixing):
+            now, skipped = _lock(
+                goal, root, [*locks, *(rel for rel in fixing if rel not in locks)], task, fixing
+            )
             _drop_pending_locks(goal, task)
             if now:
                 lock_note += (

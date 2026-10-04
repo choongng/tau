@@ -3659,6 +3659,155 @@ async def test_locks_asked_for_on_opening_hold_until_the_task_closes(
     assert (project / ".beagle" / "locked" / "cases.json").is_file()
 
 
+def _locked_cases_test(project: Path, owner: str = "T0006") -> Path:
+    """`tests/test_cases.py` locked as the known answers by `owner`; the goal."""
+    (project / "tests").mkdir(exist_ok=True)
+    (project / "tests" / "test_cases.py").write_text("def test_cases():\n    assert 1 == 2\n")
+    goal = project / ".beagle" / "pursuit.toml"
+    assert _module()._lock(goal, project, ["tests/test_cases.py"], owner)[0] == [
+        "tests/test_cases.py"
+    ]
+    return goal
+
+
+def _titled_task(fake: Path, title: str, check: str = "grep -q done done.txt") -> None:
+    ready = {"open": [], "ready": [{"id": "T0002", "title": title}], "ready_total": 1}
+    (fake / "next.out").write_text(json.dumps(ready))
+    record = {"id": "T0002", "title": title, "intent": "fix it", "status": "pending"}
+    (fake / "show.out").write_text(json.dumps({**record, "done_when": check}))
+    (fake / "brief.out").write_text(f"# T0002: {title}\nDo it.\n")
+
+
+@pytest.mark.anyio
+async def test_step_refuses_a_scope_that_names_a_locked_file(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # R20: T0010 and T0011 scoped the locked test; every edit was put back.
+    project = _pursuit_project(tmp_path)
+    monkeypatch.chdir(project)
+    _locked_cases_test(project)
+    _ready_task(fake_beagle)
+    runtime, _ = _bound(tmp_path)
+
+    result = await _tool(runtime, "pursuit_step").execute(
+        "c1",
+        {
+            "task": "T0002",
+            "criteria": "the parser passes the cases",
+            "done_when": "grep -q done done.txt",
+            "scope": ["parser.py", "tests/test_cases.py"],
+        },
+    )
+
+    assert "T0002 not opened — tests/test_cases.py is locked as the known answers (T0006)" in (
+        result.text
+    )
+    assert "put back before every check" in result.text
+    assert 'pursuit_plan task="T0002" parts=["Known answers: fix tests/test_cases.py::' in (
+        result.text
+    )
+    assert "Its close re-locks the file." in result.text
+    assert _pursuit_calls(fake_beagle, "open") == []
+    assert _runs(fake_tau) == []
+
+    module = _module()
+    assert module._locked_scope_problem(["./tests/test_cases.py"], project, "Parser", "T0002")
+    fix = "Known answers: fix tests/test_cases.py"
+    assert module._locked_scope_problem(["tests/test_cases.py"], project, fix, "T0002") is None
+
+    # A directory holding the locked file still opens: put-back guards the file.
+    opened = await _tool(runtime, "pursuit_step").execute(
+        "c2",
+        {
+            "task": "T0002",
+            "criteria": "the parser passes the cases",
+            "done_when": "grep -q done done.txt",
+            "scope": ["parser.py", "tests/"],
+        },
+    )
+    assert "not opened" not in opened.text
+    assert len(_pursuit_calls(fake_beagle, "open")) == 1
+
+
+@pytest.mark.anyio
+async def test_known_answers_fix_task_may_hold_locked_files_and_relocks_them(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project = _pursuit_project(tmp_path)
+    monkeypatch.chdir(project)
+    goal = _locked_cases_test(project)
+    _titled_task(fake_beagle, "Known answers: fix tests/test_cases.py")
+    fixed = "def test_cases():\n    assert 2 == 2\n"
+    monkeypatch.setenv("FAKE_TAU_WRITES", json.dumps({"tests/test_cases.py": fixed}))
+    runtime, _ = _bound(tmp_path)
+
+    result = await _tool(runtime, "pursuit_step").execute(
+        "c1",
+        {
+            "task": "T0002",
+            "criteria": "the locked cases test asserts the reference's answers",
+            "done_when": "grep -q done done.txt",
+            "scope": ["tests/test_cases.py", "done.txt"],
+        },
+    )
+
+    assert "not opened" not in result.text
+    assert "changed locked files" not in result.text
+    assert (project / "tests" / "test_cases.py").read_text() == fixed
+    assert (project / ".beagle" / "locked" / "tests" / "test_cases.py").read_text() == fixed
+    assert "Locked: tests/test_cases.py" in result.text
+    manifest = json.loads((goal.parent / _module().LOCK_MANIFEST).read_text())
+    assert manifest["tests/test_cases.py"]["task"] == "T0002"
+    assert "- tests/test_cases.py" not in _runs(fake_tau)[-1]["stdin"]
+    # The new content is what a later worker's change is put back to.
+    (project / "tests" / "test_cases.py").write_text("tampered")
+    assert _module()._restore_locked(goal, project) == ["tests/test_cases.py"]
+    assert (project / "tests" / "test_cases.py").read_text() == fixed
+
+
+@pytest.mark.anyio
+async def test_put_back_of_a_failing_locked_test_names_the_known_answers_route(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project = _pursuit_project(tmp_path)
+    monkeypatch.chdir(project)
+    _locked_cases_test(project)
+    (project / "check.py").write_text(
+        "import sys\nprint('FAILED tests/test_cases.py::test_cases')\nsys.exit(1)\n"
+    )
+    _ready_task(fake_beagle, "python3 check.py")
+    monkeypatch.setenv("FAKE_TAU_TAMPERS", "tests/test_cases.py")
+    runtime, _ = _bound(tmp_path)
+
+    result = await _tool(runtime, "pursuit_step").execute(
+        "c1",
+        {
+            "task": "T0002",
+            "criteria": "the parser passes the cases",
+            "done_when": "python3 check.py",
+            "scope": ["parser.py"],
+            "attempts": 2,
+        },
+    )
+
+    assert "changed locked files (tests/test_cases.py)" in result.text
+    assert "tests/test_cases.py is locked as the known answers (T0006)" in result.text
+    assert '"Known answers: fix tests/test_cases.py::' in result.text
+    assert "the driver can open a known-answers fix" in _runs(fake_tau)[-1]["stdin"]
+
+
 @pytest.mark.anyio
 async def test_pursuit_step_says_why_a_measured_spend_overran(
     tmp_path: Path,
@@ -4860,8 +5009,10 @@ async def test_step_refuses_a_scope_mixing_known_answer_data_with_source(
     (store / "cases.json").write_text("[]")
     passed = await _tool(runtime, "pursuit_step").execute("c2", arguments)
 
+    # R20: a scope naming the locked data itself is refused for that instead.
     assert "known-answer data" not in passed.text
-    assert len(_pursuit_calls(fake_beagle, "open")) == 1
+    assert "itc/tests/cases.json is locked as the known answers" in passed.text
+    assert _pursuit_calls(fake_beagle, "open") == []
 
 
 def _r13_arguments(project: Path, deliverable: str) -> dict[str, Any]:
@@ -5023,7 +5174,9 @@ async def test_opening_a_new_source_module_before_a_locked_cases_test_is_refused
     assert "imports `itc`" in other.text and "in this task's scope instead" in other.text
     assert _pursuit_calls(fake_beagle, "open") == []
 
-    # The known-answers task itself, data and tests only, is never gated.
+    # The known-answers task itself, data and tests only, is never gated; with
+    # the cases test locked, it is a known-answers fix (R20).
+    _titled_task(fake_beagle, "Known answers: fix tests/test_cases.py")
     cases = await _tool(runtime, "pursuit_step").execute(
         "c3", _open_args(["tests/cases.json", "tests/test_cases.py"])
     )
