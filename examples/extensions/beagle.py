@@ -3004,6 +3004,42 @@ def _is_leaf(task: str, nodes: list[dict[str, Any]]) -> bool:
     )
 
 
+def _part_paths(part: str) -> list[str]:
+    """The paths a plan part's text names: words with a directory or a file suffix."""
+    return [word.rstrip(".") for word in _SCRIPT_PATH_WORD.findall(part)]
+
+
+def _writes_known_answers(text: str) -> bool:
+    """Whether a part or task's text names the known answers or their cases data file."""
+    return _split_part(text)[0].lower().startswith("known answers") or any(
+        _is_cases_data(path) for path in _part_paths(text)
+    )
+
+
+def _plan_order_problem(parts: list[str], task: str, goal: Path) -> str | None:
+    """Why an ordered plan writes new source before the known answers that judge it, or None.
+
+    Run R16 planned T0006 (interval_tree_clocks.py) before T0007-T0009 (the
+    cases and their tests), each waiting on the one before; the code would
+    have been written with nothing from the reference to judge it.
+    """
+    answers = next((i for i, part in enumerate(parts) if _writes_known_answers(part)), None)
+    if answers is None:
+        return None
+    for index, part in enumerate(parts[:answers]):
+        title = _part_title(part)
+        if _cases_first_problem(_part_paths(part), task, title, goal) is None:
+            continue
+        first = _part_title(parts[answers])
+        return (
+            f"Cases first: part {index + 1} {title!r} writes new source before part "
+            f"{answers + 1} {first!r} writes the known answers that judge it, and in an "
+            f"ordered plan each part waits on the one before. Put part {answers + 1} "
+            f"{first!r} first and send the plan again."
+        )
+    return None
+
+
 def make_plan_tool() -> Any:
     """Build `pursuit_plan`: split a task into steps, or add steps to a container."""
 
@@ -3037,6 +3073,10 @@ def make_plan_tool() -> Any:
         rerun = _rerun_only_part(parts)
         if rerun is not None:
             return _step_result(f"pursuit_plan: nothing added — {rerun}")
+        ordered = arguments.get("ordered", True) is not False
+        backwards = _plan_order_problem(parts, task, goal) if ordered else None
+        if backwards is not None:
+            return _step_result(f"pursuit_plan: nothing added — {backwards}")
         # A small model re-sends the plan it already made; beagle adds every
         # part again, and the copies are then worked twice.
         existing = _children(task, root)
@@ -3072,7 +3112,6 @@ def make_plan_tool() -> Any:
             if rc != 0 and "leaf with work of its own" in out:
                 return _step_result(one_step)
         else:
-            ordered = arguments.get("ordered", True) is not False
             if uncommitted:
                 uncommitted_note = _commit_before_split(root, task, scope, uncommitted)
             rc, out = _pursuit(["split", task, *parts, *(["--ordered"] if ordered else [])], root)
@@ -4036,13 +4075,47 @@ def _locked_test_problem(command: str, scope: list[str], goal: Path) -> str | No
     )
 
 
-def _cases_first_problem(scope: list[str], task: str, title: str, goal: Path) -> str | None:
+#: The known-answers task's scope, check and locks, as the cases-first hint gives them.
+_CASES_FIRST_WORK = (
+    "with scope tests/cases.json, tests/test_cases.py, tests/test_case_data.py; "
+    'done_when="python3 -m pytest -q tests/test_case_data.py"; and '
+    "locks=[tests/cases.json, tests/test_cases.py, tests/test_case_data.py]"
+)
+
+
+def _known_answers_siblings(task: str, nodes: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """The unfinished tasks beside `task`, under its parent, that write the known answers."""
+    node = next((n for n in nodes if str(n.get("id")) == task), None)
+    parent = node.get("parent") if node else None
+    if not parent:
+        return []
+    return [
+        n
+        for n in nodes
+        if n.get("parent") == parent
+        and str(n.get("id")) != task
+        and n.get("status") in ("pending", "open")
+        and _writes_known_answers(f"{n.get('title') or ''}::{n.get('intent') or ''}")
+    ]
+
+
+def _cases_first_problem(
+    scope: list[str],
+    task: str,
+    title: str,
+    goal: Path,
+    nodes: list[dict[str, Any]] | None = None,
+) -> str | None:
     """Why a task would write new source before known answers judge it, or None.
 
     Run R12: CASES_FIRST_NOTE was advice, the driver opened the implementation
     before any cases, and a plain-int event clock was built that nothing from
     the paper bound. With references/ there, a new source module waits for a
     locked test that imports it by name.
+
+    Run R16's hint split T0006 under a new known-answers task although its
+    siblings T0007-T0009 already held the cases: given the tree, a sibling
+    that writes the known answers is named instead.
     """
     root = goal.parent.parent
     if not (root / REFERENCES_DIR).is_dir():
@@ -4075,16 +4148,41 @@ def _cases_first_problem(scope: list[str], task: str, title: str, goal: Path) ->
             f"scope instead of {entry}, and call pursuit_step again."
         )
     named = f"`{module}`" if module else "the module this task writes"
+    unjudged_text = (
+        f"Scope names new source {entry}, and no locked test imports it yet, so nothing "
+        "from the reference would judge the code."
+    )
+    siblings = _known_answers_siblings(task, nodes or [])
+    if siblings:
+        first = str(siblings[0].get("id"))
+        listed = ", ".join(f"{n.get('id')} {str(n.get('title') or '')!r}" for n in siblings)
+        drops = [
+            f'    beagle pursuit depend {n.get("id")} {task} --drop --reason "known answers '
+            'go before the code"'
+            for n in siblings
+            if task in [str(w) for w in n.get("waiting_on") or []]
+        ]
+        unwait = (
+            f"They wait on {task}, so drop each wait first. Run in bash, exactly:\n\n"
+            + "\n".join(drops)
+            + "\n\n"
+            if drops
+            else ""
+        )
+        return (
+            f"Cases first: {unjudged_text} The known answers are already planned beside "
+            f"{task}: {listed}. Do not split {task}. {unwait}Then work {first} first, "
+            f'{_CASES_FIRST_WORK}: pursuit_step task="{first}". {task} opens once its '
+            f"cases are locked, its test importing {named} by name."
+        )
     label = title.replace("::", ":").replace('"', "'").strip() or task
     return (
         "Cases first: open the known-answers milestone before the code; its test imports "
-        f"this module by name. Scope names new source {entry}, and no locked test imports "
-        "it yet, so nothing from the reference would judge the code. Add the milestone "
+        f"this module by name. {unjudged_text} Add the milestone "
         f'before this one in one call: pursuit_plan task="{task}" parts=["Known answers::'
         f"cases from references/ in tests/cases.json, and tests/test_cases.py importing "
         f'{named} by name", "{label}::the code, judged by the locked cases"]. Then work the '
-        "known-answers task first, with only tests/ in scope and locks=[tests/cases.json, "
-        "tests/test_cases.py]."
+        f"known-answers task first, {_CASES_FIRST_WORK}."
     )
 
 
@@ -6017,6 +6115,44 @@ def _bash_read_targets(command: str, cwd: Path) -> list[Path]:
     return targets
 
 
+def _not_workable(task: str, nodes: list[dict[str, Any]], workable: list[str]) -> str:
+    """Why `task`, neither open nor ready, is not worked now: what it waits on, or its parts.
+
+    Run R16 told its driver "it is a container, done when its parts are, or it
+    waits on another task" for T0011, which waited on T0010; the driver read a
+    container, then a deadlock, and went off-tool.
+    """
+    listed = ", ".join(workable)
+    waits = _hard_waits(nodes).get(task, [])
+    if waits:
+        named = [w[2] for w in waits]
+        ready = [t for t in named if t in workable]
+        said = "; ".join(
+            (f"through {w[0]}, " if w[0] != task else "") + _wait_text(w, nodes) for w in waits
+        )
+        then = (
+            f'work {ready[0]} first: pursuit_step task="{ready[0]}".'
+            if ready
+            else f"none of those is workable yet. Workable now: {listed}."
+        )
+        return f"{task} is not a task to work now: it {said}; {then}"
+    parts = [
+        str(n.get("id"))
+        for n in nodes
+        if n.get("parent") == task and n.get("status") not in ("abandoned", "superseded")
+    ]
+    if parts:
+        return (
+            f"{task} is not a task to work now: it is a container of {', '.join(parts)}, "
+            f"done when its parts are. Workable now: {listed}. Call pursuit_step with no "
+            "arguments."
+        )
+    return (
+        f"{task} is not a task to work now. Workable now: {listed}. Call pursuit_step "
+        "with no arguments."
+    )
+
+
 def make_step_tool() -> Any:
     """Build `pursuit_step`: one task, opened, done by a sub-agent, checked and closed.
 
@@ -6115,12 +6251,7 @@ def make_step_tool() -> Any:
                     f"is not ready either. {nothing_ready}"
                 )
             if open_ids or ready_ids:
-                workable = ", ".join(open_ids + ready_ids)
-                return _step_result(
-                    f"{task} is not a task to work now: it is a container, done when its "
-                    f"parts are, or it waits on another task. Workable now: {workable}. "
-                    "Call pursuit_step with no arguments."
-                )
+                return _step_result(_not_workable(task, nodes, open_ids + ready_ids))
             return _step_result(f"{task} is not a task to work now. {nothing_ready}")
 
         rc, out = _pursuit(["show", task], root)
@@ -6286,7 +6417,7 @@ def make_step_tool() -> Any:
             scoped = (
                 _scope_problem(scope, task, nodes, root)
                 or _oracle_with_code_problem(scope, goal)
-                or _cases_first_problem(scope, task, title, goal)
+                or _cases_first_problem(scope, task, title, goal, nodes)
                 or _locked_test_problem(done_when, scope, goal)
                 or _import_scope_problem(done_when, scope, root)
                 or _imports_unwritten_problem(done_when, scope, root)

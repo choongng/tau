@@ -9119,3 +9119,174 @@ def test_data_test_fallback_is_added_to_scope(tmp_path: Path) -> None:
     )
     assert inside is not None and inside[3] == ["tests/"]
     assert f"scope={json.dumps([*R16_SCOPE, fallback])}" in problem
+
+
+#: R16 #7, verbatim: the plan put the implementation before the known answers.
+R16_PLAN = {
+    "task": "T0002",
+    "parts": [
+        "Create interval_tree_clocks.py with Timestamp, Clock, and System classes "
+        "implementing the core interval tree clock logic",
+        "Write tests/cases.json with at least 4 test cases covering node creation, interval "
+        "advancement, causality tracking, and node deletion, each with source citations "
+        "from the references",
+        "Write tests/test_known_answers.py that imports the module and runs all cases",
+        "Write tests/test_case_data.py that validates the data file structure",
+    ],
+    "ordered": True,
+}
+#: R16 #9, verbatim: T0006 opened with new source while T0007 held the cases.
+R16_T0006_STEP = {
+    "task": "T0006",
+    "criteria": (
+        "interval_tree_clocks.py exists in project root with Timestamp, Clock, and System "
+        "classes; Clock has advance(), get_interval(), get_interval_end() methods; System "
+        "has create_node(), delete_node(), event(), get_cause() methods; code passes "
+        "linting with ruff and includes type hints"
+    ),
+    "done_when": (
+        'ruff check interval_tree_clocks.py && python3 -c "from interval_tree_clocks '
+        "import Timestamp, Clock, System; print('Import OK')\""
+    ),
+    "scope": ["interval_tree_clocks.py"],
+    "notes": (
+        "Read the references (https://gsd.di.uminho.pt/members/cbm/ps/itc2008.pdf and "
+        "https://ferd.ca/interval-tree-clocks.html) to understand the interval tree clock "
+        "algorithm. Implement a proper version with Timestamp, Clock, and System classes. "
+        "The Clock class manages intervals with advance(), get_interval(), "
+        "get_interval_end() methods. The System class manages multiple clocks with "
+        "create_node(), delete_node(), event(), get_cause() methods. Use modern Python "
+        "with type hints."
+    ),
+}
+#: R16 #16, verbatim: the same step on T0011, which waited on T0010.
+R16_T0011_STEP = {**R16_T0006_STEP, "task": "T0011"}
+#: R16's tree after #7: T0002 split into T0006-T0009, each waiting on the one before.
+R16_PLANNED_TREE = [
+    {"id": "T0001", "parent": "", "status": "pending", "container": True},
+    {"id": "T0002", "parent": "T0001", "status": "pending", "container": True},
+    {"id": "T0006", "parent": "T0002", "status": "pending", "title": R16_PLAN["parts"][0]},
+    *(
+        {
+            "id": f"T000{n}",
+            "parent": "T0002",
+            "status": "pending",
+            "title": R16_PLAN["parts"][n - 6],
+            "waiting_on": [f"T000{n - 1}"],
+        }
+        for n in (7, 8, 9)
+    ),
+]
+
+
+@pytest.mark.anyio
+async def test_plan_refuses_implementation_before_known_answers(
+    tmp_path: Path, beagle: Path, fake_beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(_r12_project(tmp_path))
+    _ready_task(fake_beagle)
+    runtime, _ = _bound(tmp_path)
+    plan = _tool(runtime, "pursuit_plan")
+
+    refused = await plan.execute("c1", R16_PLAN)
+
+    assert "nothing added" in refused.text and "Cases first" in refused.text
+    assert "part 1 'Create interval_tree_clocks.py" in refused.text
+    assert "Put part 2 'Write tests/cases.json" in refused.text
+    assert _pursuit_calls(fake_beagle, "split") == []
+
+    # Known answers first is the order asked for, and an unordered plan is no order.
+    parts = R16_PLAN["parts"]
+    reordered = await plan.execute("c2", {**R16_PLAN, "parts": [*parts[1:], parts[0]]})
+    unordered = await plan.execute("c3", {**R16_PLAN, "ordered": False})
+
+    for result in (reordered, unordered):
+        assert "Cases first" not in result.text
+    assert len(_pursuit_calls(fake_beagle, "split")) == 2
+
+
+def _r16_t0006_ready(fake: Path) -> None:
+    ready = {"open": [], "ready": [{"id": "T0006", "title": "Create"}], "ready_total": 1}
+    (fake / "next.out").write_text(json.dumps(ready))
+    record = {"id": "T0006", "title": R16_PLAN["parts"][0], "status": "pending"}
+    (fake / "show.out").write_text(json.dumps(record))
+    (fake / "tree.out").write_text(json.dumps({"nodes": R16_PLANNED_TREE}))
+
+
+@pytest.mark.anyio
+async def test_cases_first_hint_points_to_existing_known_answers_sibling(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.chdir(_r12_project(tmp_path))
+    _r16_t0006_ready(fake_beagle)
+    runtime, _ = _bound(tmp_path)
+
+    refused = await _tool(runtime, "pursuit_step").execute("c1", R16_T0006_STEP)
+
+    assert "T0006 not opened" in refused.text and "Cases first" in refused.text
+    assert "already planned beside T0006: T0007 'Write tests/cases.json" in refused.text
+    assert "Do not split T0006" in refused.text and "pursuit_plan" not in refused.text
+    assert "beagle pursuit depend T0007 T0006 --drop" in refused.text
+    assert "Then work T0007 first" in refused.text and 'task="T0007"' in refused.text
+    assert _pursuit_calls(fake_beagle, "open") == [] and _runs(fake_tau) == []
+
+
+@pytest.mark.anyio
+async def test_cases_first_hint_names_data_test_done_when(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.chdir(_r12_project(tmp_path))
+    _r16_t0006_ready(fake_beagle)
+    # No sibling holds the cases: the hint splits T0006, as before R16.
+    alone = [n for n in R16_PLANNED_TREE if n["id"] in ("T0001", "T0002", "T0006")]
+    (fake_beagle / "tree.out").write_text(json.dumps({"nodes": alone}))
+    runtime, _ = _bound(tmp_path)
+
+    split = await _tool(runtime, "pursuit_step").execute("c1", R16_T0006_STEP)
+    (fake_beagle / "tree.out").write_text(json.dumps({"nodes": R16_PLANNED_TREE}))
+    sibling = await _tool(runtime, "pursuit_step").execute("c2", R16_T0006_STEP)
+
+    assert 'pursuit_plan task="T0006" parts=["Known answers::' in split.text
+    for result in (split, sibling):
+        assert "tests/cases.json, tests/test_cases.py, tests/test_case_data.py" in result.text
+        assert 'done_when="python3 -m pytest -q tests/test_case_data.py"' in result.text
+    assert _pursuit_calls(fake_beagle, "open") == [] and _runs(fake_tau) == []
+
+
+@pytest.mark.anyio
+async def test_step_on_waiting_task_names_what_it_waits_on(
+    tmp_path: Path, beagle: Path, fake_beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # R16 #16: T0011 waited on open T0010, after T0006 was split in two.
+    monkeypatch.chdir(_pursuit_project(tmp_path))
+    ready = {"open": [{"id": "T0010", "title": "Known answers"}], "ready": []}
+    (fake_beagle / "next.out").write_text(json.dumps(ready))
+    tree = [
+        *R16_PLANNED_TREE,
+        {"id": "T0010", "parent": "T0006", "status": "open", "title": "Known answers"},
+        {"id": "T0011", "parent": "T0006", "status": "pending", "waiting_on": ["T0010"]},
+    ]
+    tree[2] = {**tree[2], "container": True}
+    (fake_beagle / "tree.out").write_text(json.dumps({"nodes": tree}))
+    runtime, _ = _bound(tmp_path)
+    step = _tool(runtime, "pursuit_step")
+
+    waiting = await step.execute("c1", R16_T0011_STEP)
+    container = await step.execute("c2", {**R16_T0011_STEP, "task": "T0006"})
+
+    assert "T0011 is not a task to work now: it waits on T0010 (open)" in waiting.text
+    assert 'work T0010 first: pursuit_step task="T0010"' in waiting.text
+    assert "T0006 is not a task to work now: it is a container of T0010, T0011" in (
+        container.text
+    )
+    for result in (waiting, container):
+        assert "or it waits" not in result.text
+    assert _pursuit_calls(fake_beagle, "open") == []
