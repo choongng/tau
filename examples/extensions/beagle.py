@@ -2682,6 +2682,25 @@ def _setup_abandon_route(task: str) -> str:
     )
 
 
+def _stale_known_answers_duplicate(
+    task: str, why: str, by_id: dict[str, dict[str, Any]]
+) -> str | None:
+    """The task `why` names, when `task` writes the known answers and that one is not live.
+
+    Run R18 #50 abandoned T0005, the known-answers successor, as "duplicate of
+    T0002", which was superseded: no task held the known answers after that.
+    """
+    node = by_id.get(task)
+    if node is None or not _names_known_answers(str(node.get("title") or "")):
+        return None
+    for named in _TASK_ID.findall(why):
+        if named != task and named in by_id:
+            if by_id[named].get("status") in ("done", "open"):
+                return None
+            return str(named)
+    return None
+
+
 def _abandon_problem(task: str, why: str, nodes: list[dict[str, Any]]) -> str | None:
     """Why the driver may not abandon `task` for `why`, or None.
 
@@ -2700,6 +2719,20 @@ def _abandon_problem(task: str, why: str, nodes: list[dict[str, Any]]) -> str | 
             "is missing with pursuit_plan."
         )
     by_id = {str(n.get("id")): n for n in nodes}
+    stale = _stale_known_answers_duplicate(task, why, by_id)
+    if stale is not None:
+        heir = _heir(stale, nodes)
+        work = (
+            f"{task} is its live successor: work {task}"
+            if heir == task
+            else f"its live successor is {heir} ({_state(heir, nodes)}): work {heir}"
+        )
+        return (
+            f"pursuit_step: {task} not abandoned — it writes the known answers, and "
+            f"{stale}, the task named as holding its work, is not live "
+            f"({by_id[stale].get('status')}), so dropping {task} would drop the known "
+            f'answers. {work} with pursuit_step task="{heir}" instead.'
+        )
     predecessor = str(by_id.get(task, {}).get("sibling_of") or "")
     if (
         roots
@@ -4245,6 +4278,62 @@ def _known_answers_siblings(task: str, nodes: list[dict[str, Any]]) -> list[dict
     ]
 
 
+_KNOWN_ANSWERS_FILE = re.compile(r"case|known_answer")
+
+
+def _known_answers_on_disk(root: Path) -> list[str]:
+    """The known-answers files under tests/ that git holds uncommitted."""
+    return [
+        rel
+        for rel in _changed_files(root)
+        if rel.startswith("tests/") and _KNOWN_ANSWERS_FILE.search(Path(rel).name)
+    ]
+
+
+def _cases_on_disk_route(
+    task: str,
+    title: str,
+    named: str,
+    unjudged_text: str,
+    on_disk: list[str],
+    existing: str,
+    unwait: str,
+) -> str:
+    """The Cases first refusal when the known answers are on disk, uncommitted.
+
+    Run R18 #51: the hint ordered a fresh known-answers split whose data test
+    had passed since t3.7 on W1's uncommitted files, and that open was then
+    refused as "already passes". The route named here opens on those files.
+    """
+    data = next((rel for rel in on_disk if re.search(r"test_\w*data\w*\.py$", rel)), "")
+    check = f"python3 -m pytest -q {data or 'tests/test_case_data.py'}"
+    scope = sorted({*on_disk, data or "tests/test_case_data.py"})
+    listed = ", ".join(on_disk[:8]) + (f", {len(on_disk) - 8} more" if len(on_disk) > 8 else "")
+    work = f'with scope {", ".join(scope)}; done_when="{check}"; and locks=[{", ".join(scope)}]'
+    opens = (
+        f"`{check}` may pass already: it passes only on these uncommitted files, so the "
+        "open accepts it, and the close judges them (its witness takes them away). Do "
+        "not write the cases again."
+    )
+    head = (
+        f"Cases first: {unjudged_text} The known answers are on disk already, "
+        f"uncommitted: {listed}."
+    )
+    if existing:
+        return (
+            f"{head} {existing} holds them: do not split {task}. {unwait}Open {existing} first, "
+            f'{work}: pursuit_step task="{existing}". {opens} {task} opens once its cases '
+            f"are locked, its test importing {named} by name."
+        )
+    label = title.replace("::", ":").replace('"', "'").strip() or task
+    return (
+        f"{head} No task holds them yet. Add it before this one in one call: "
+        f'pursuit_plan task="{task}" parts=["Known answers::the cases on disk ({listed}), '
+        f'locked", "{label}::the code, judged by the locked cases"]. Then open the '
+        f"known-answers task, {work}. {opens}"
+    )
+
+
 def _cases_first_problem(
     scope: list[str],
     task: str,
@@ -4298,6 +4387,7 @@ def _cases_first_problem(
         f"Scope names new source {entry}, and no locked test imports it yet, so nothing "
         "from the reference would judge the code."
     )
+    on_disk = _known_answers_on_disk(root)
     siblings = _known_answers_siblings(task, nodes or [])
     if siblings:
         first = str(siblings[0].get("id"))
@@ -4315,12 +4405,27 @@ def _cases_first_problem(
             if drops
             else ""
         )
+        if on_disk:
+            return _cases_on_disk_route(task, title, named, unjudged_text, on_disk, first, unwait)
         return (
             f"Cases first: {unjudged_text} The known answers are already planned beside "
             f"{task}: {listed}. Do not split {task}. {unwait}Then work {first} first, "
             f'{_CASES_FIRST_WORK}: pursuit_step task="{first}". {task} opens once its '
             f"cases are locked, its test importing {named} by name."
         )
+    if on_disk:
+        existing = next(
+            (
+                str(n.get("id"))
+                for n in nodes or []
+                if str(n.get("id")) != task
+                and n.get("status") in ("pending", "open")
+                and not n.get("container")
+                and _names_known_answers(str(n.get("title") or ""))
+            ),
+            "",
+        )
+        return _cases_on_disk_route(task, title, named, unjudged_text, on_disk, existing, "")
     label = title.replace("::", ":").replace('"', "'").strip() or task
     return (
         "Cases first: open the known-answers milestone before the code; its test imports "

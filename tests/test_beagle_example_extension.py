@@ -10783,3 +10783,72 @@ async def test_escalation_does_not_offer_a_data_test_that_passes_on_the_committe
     assert refused.text.startswith("pursuit_step: T0010 not run: 3 steps on it")
     assert f'done_when="{R16_DATA_CHECK}"' not in refused.text
     assert "already passes on the committed tree" in refused.text
+
+
+@pytest.mark.anyio
+async def test_abandon_of_a_known_answers_successor_as_duplicate_of_a_superseded_task_is_refused(
+    tmp_path: Path, beagle: Path, fake_beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # R18 #50 (E104): T0005, the known-answers successor of superseded T0002,
+    # was abandoned as "duplicate of T0002", and no task held the cases.
+    monkeypatch.chdir(_pursuit_project(tmp_path))
+    _ready_task(fake_beagle)
+    known = "Known answers: Write cases.json and a test that validates them"
+    tree = [
+        {"id": "T0001", "parent": "", "status": "pending", "container": True},
+        {"id": "T0002", "parent": "T0001", "status": "superseded", "title": known},
+        {"id": "T0003", "parent": "T0001", "status": "pending", "title": "Core"},
+        {"id": "T0005", "parent": "T0001", "status": "open", "title": known, "sibling_of": "T0002"},
+    ]
+    (fake_beagle / "tree.out").write_text(json.dumps({"nodes": tree}))
+    (fake_beagle / "close.out").write_text("T0005 abandoned\n")
+    runtime, _ = _bound(tmp_path)
+    step = _tool(runtime, "pursuit_step")
+
+    refused = await step.execute("c1", {"task": "T0005", "abandon": "duplicate of T0002"})
+
+    assert "T0005 not abandoned" in refused.text
+    assert "T0002, the task named as holding its work, is not live (superseded)" in refused.text
+    assert "T0005 is its live successor" in refused.text
+    assert 'pursuit_step task="T0005"' in refused.text
+    assert _pursuit_calls(fake_beagle, "close") == []
+
+
+@pytest.mark.anyio
+async def test_cases_first_names_cases_already_on_disk_instead_of_a_new_split(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # R18 #51 (E106): Cases first ordered a fresh known-answers split whose
+    # data test had passed since t3.7 on W1's uncommitted tests/ files.
+    project = _git_project(tmp_path, monkeypatch)
+    (project / "references").mkdir()
+    (project / "references" / "itc2008.txt").write_text("Interval Tree Clocks\n")
+    (project / "tests").mkdir()
+    (project / "tests" / "cases.json").write_text("[]")
+    (project / "tests" / "test_case_data.py").write_text("def test_data():\n    pass\n")
+    _r16_t0006_ready(fake_beagle)
+    alone = [n for n in R16_PLANNED_TREE if n["id"] in ("T0001", "T0002", "T0006")]
+    (fake_beagle / "tree.out").write_text(json.dumps({"nodes": alone}))
+    runtime, _ = _bound(tmp_path)
+    step = _tool(runtime, "pursuit_step")
+
+    planned = await step.execute("c1", R16_T0006_STEP)
+    held = {"id": "T0005", "parent": "T0001", "status": "pending", "title": "Known answers"}
+    (fake_beagle / "tree.out").write_text(json.dumps({"nodes": [*alone, held]}))
+    existing = await step.execute("c2", R16_T0006_STEP)
+
+    for result in (planned, existing):
+        assert "T0006 not opened" in result.text and "Cases first" in result.text
+        assert "on disk already, uncommitted: tests/cases.json, tests/test_case_data.py" in (
+            result.text
+        )
+        assert 'done_when="python3 -m pytest -q tests/test_case_data.py"' in result.text
+        assert "Do not write the cases again" in result.text
+    assert "No task holds them yet" in planned.text
+    assert "T0005 holds them" in existing.text and 'pursuit_step task="T0005"' in existing.text
+    assert "pursuit_plan" not in existing.text
+    assert _pursuit_calls(fake_beagle, "open") == [] and _runs(fake_tau) == []
