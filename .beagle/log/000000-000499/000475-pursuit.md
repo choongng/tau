@@ -1,0 +1,15 @@
++++
+id = "000475-pursuit"
+ordinal = 475
+kind = "pursuit"
+timestamp = "2026-10-04T03:00:37+00:00"
+summary = "pursuit prove T0120: WITNESSED — refuses when beagle.py's `refs = [path for path in scope if _under_refere…` is put back as `refs = []`"
+metric_command = ""
+drains = []
+hooks = []
++++
+
+check: sh -c 'echo "87143fc88d31d4e0df3c47b4118eba7d974a022b83d33796ded1c82f34b8ba6f  .beagle/checks/T0120/check.sh" | sha256sum -c --quiet && bash .beagle/checks/T0120/check.sh'
+refutes: refuses when beagle.py's `refs = [path for path in scope if _under_refere…` is put back as `refs = []` (proven 2026-10-04T02:59:47+00:00; refused at FAILED tests/test_beagle_example_extension.py::test_step_refuses_a_scope_under_references)
+refused after 1s of a 31s check at: FAILED tests/test_beagle_example_extension.py::test_step_refuses_a_scope_under_references
+refused with: 1 failed in 0.73s
