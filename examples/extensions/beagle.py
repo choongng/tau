@@ -3822,6 +3822,30 @@ async def _run_check(command: str, root: Path, timeout: float) -> tuple[int, str
     return proc.returncode or 0, f"{out}\n{note}".strip() if note else out
 
 
+def _check_broke(rc: int, output: str) -> str | None:
+    """The first error line of a check run that could not run at all, or None.
+
+    R13 bound `git diff --stat: x.md`, which exits 129 on the option before
+    reading any file, and spent two workers on it. Exit 129 (git usage), 127
+    (command not found), 2 or 64 with a `usage:` line, or a SyntaxError in an
+    inline script mean no work can make the check pass; exit 1 is a check that
+    fails, as it should before the work.
+    """
+    lines = [line.strip() for line in output.splitlines() if line.strip()]
+    raw = output.splitlines()
+    for i, line in enumerate(raw):
+        if not line.startswith("SyntaxError"):
+            continue
+        frames = [f for f in raw[:i] if f.lstrip().startswith('File "')]
+        if frames and frames[-1].lstrip().startswith(('File "<string>"', 'File "<stdin>"')):
+            return line.strip()
+    usage = rc in (2, 64) and any(line.lower().startswith("usage:") for line in lines)
+    if rc not in (127, 129) and not usage:
+        return None
+    errors = [line for line in lines if "error" in line.lower()]
+    return (errors or lines or [f"exit {rc}"])[0]
+
+
 #: What a worker is asked to end its report with: one defect `prove` can put back.
 WITNESS_NOTE = (
     "When the check passes, end your report with the WITNESS block below. It names one "
@@ -4937,10 +4961,17 @@ def make_step_tool() -> Any:
             # A check bound once it already passes closes the task on no work:
             # run 9 bound `cat docs/design.md` and a test an earlier task had
             # made pass.
-            if (await _run_check(done_when, root, DEFAULT_CHECK_TIMEOUT))[0] == 0:
+            pre_rc, pre_out = await _run_check(done_when, root, DEFAULT_CHECK_TIMEOUT)
+            if pre_rc == 0:
                 return _step_result(
                     f"pursuit_step: {task} not opened — "
                     + _already_passes(done_when, task, _tree_nodes(root))
+                )
+            broke = _check_broke(pre_rc, pre_out)
+            if broke is not None:
+                return _step_result(
+                    f"pursuit_step: {task} not opened — the check could not run: `{broke}` "
+                    f"(exit {pre_rc}). Correct the command and call pursuit_step again."
                 )
             argv = ["open", task, "--criteria", criteria, "--done-when", done_when]
             if scope:
@@ -4962,6 +4993,13 @@ def make_step_tool() -> Any:
             prose = _check_problem(done_when)
             if prose is not None:
                 return _step_result(f"pursuit_step: {task}'s check not changed — {prose}")
+            pre_rc, pre_out = await _run_check(done_when, root, DEFAULT_CHECK_TIMEOUT)
+            broke = _check_broke(pre_rc, pre_out)
+            if broke is not None:
+                return _step_result(
+                    f"pursuit_step: {task}'s check not changed — the check could not run: "
+                    f"`{broke}` (exit {pre_rc}). Correct the command and call pursuit_step again."
+                )
             argv = ["amend", task, "--done-when", done_when]
             if criteria and criteria != str(record.get("criteria") or "").strip():
                 argv += ["--criteria", criteria]

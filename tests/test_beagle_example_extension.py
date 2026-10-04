@@ -3071,6 +3071,75 @@ async def test_pursuit_step_amends_an_open_task_whose_check_cannot_judge(
 
 
 @pytest.mark.anyio
+async def test_step_refuses_a_check_that_exits_with_a_git_usage_error(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # R13 E11: `git diff --stat: x.md` exits 129 on the option before reading
+    # anything; it was bound and two workers were spent on it.
+    project = _pursuit_project(tmp_path)
+    monkeypatch.chdir(project)
+    subprocess.run(["git", "init", "-q"], cwd=project, check=True)
+    (project / "x.md").write_text("x\n")
+    _ready_task(fake_beagle)
+    runtime, _ = _bound(tmp_path)
+
+    result = await _tool(runtime, "pursuit_step").execute(
+        "c1", {"task": "T0002", "criteria": "x.md changed", "done_when": "git diff --stat: x.md"}
+    )
+
+    assert "not opened" in result.text and "could not run" in result.text
+    assert "(exit 129)" in result.text and "--stat:" in result.text
+    assert _pursuit_calls(fake_beagle, "open") == [] and _runs(fake_tau) == []
+
+
+@pytest.mark.anyio
+async def test_amend_refuses_a_check_with_a_python_syntax_error(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.chdir(_pursuit_project(tmp_path))
+    _ready_task(fake_beagle, check="grep -q done done.txt")
+    open_task = {"open": ["T0002"], "ready": [], "ready_total": 0}
+    (fake_beagle / "next.out").write_text(json.dumps(open_task))
+    runtime, _ = _bound(tmp_path)
+
+    result = await _tool(runtime, "pursuit_step").execute(
+        "c1", {"task": "T0002", "done_when": 'python3 -c "[assert x for x in ()]"'}
+    )
+
+    assert "check not changed" in result.text and "SyntaxError" in result.text
+    assert _pursuit_calls(fake_beagle, "amend") == [] and _runs(fake_tau) == []
+
+
+@pytest.mark.anyio
+async def test_step_opens_a_check_that_fails_by_assertion(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.chdir(_pursuit_project(tmp_path))
+    _ready_task(fake_beagle)
+    runtime, _ = _bound(tmp_path)
+
+    result = await _tool(runtime, "pursuit_step").execute(
+        "c1", {"task": "T0002", "criteria": "it holds", "done_when": 'python3 -c "assert False"'}
+    )
+
+    assert "could not run" not in result.text
+    [opened] = _pursuit_calls(fake_beagle, "open")
+    assert opened[opened.index("--done-when") + 1] == 'python3 -c "assert False"'
+
+
+@pytest.mark.anyio
 async def test_pursuit_step_refuses_a_check_written_as_a_sentence(
     tmp_path: Path, beagle: Path, fake_beagle: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
