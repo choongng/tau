@@ -1,0 +1,14 @@
++++
+id = "000395-pursuit"
+ordinal = 395
+kind = "pursuit"
+timestamp = "2026-10-04T00:35:17+00:00"
+summary = "pursuit open T0091: runs checks assert the launch facts"
+metric_command = ""
+drains = []
+hooks = []
++++
+
+criteria: New .beagle/checks/runs/v2/scored.sh RNN does all of runs/scored.sh plus asserts from meta.json: wall_cap_s == 3600, tau_dirty_files == 0, tau_sha is a commit in ~/tautest/tau, launch_command contains '--model <meta.model>', and the prompt in launch_command equals itc_prompt.txt byte for byte. v2/diagnosed.sh RNN does all of runs/diagnosed.sh plus: dev-notes/itc-runs/upstream.md has '## RNN' or R.md says 'upstream: none'; each ### class has an 'Evidence:' line; each [tau] class's Action names beagle.py, a tests/ path or a src/ path. v2/selftest.sh builds bad fixtures in a temp dir (wrong cap, missing --model, dirty tau, class without Evidence) and shows each v2 script refuses them, exiting 0 only if all refusals happen. The old runs/*.sh are untouched (pinned by closed tasks). Both v2 scripts pass on R10.
+decided by: sh -c 'echo "cb4c093f0b8ca5555598fafd60652abfe6d272a516e3968736dbe2554bf98bf8  .beagle/checks/T0091/check.sh" | sha256sum -c --quiet && bash .beagle/checks/T0091/check.sh'
+budget: 30000 tokens
