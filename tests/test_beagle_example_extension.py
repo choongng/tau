@@ -7466,7 +7466,9 @@ async def test_worker_write_outside_scope_refused(
         result = await _tool_with_hooks(runtime, tool).execute("c1", arguments)
 
         assert "outside T0003's scope (tests/x.py)" in result.text, (tool, arguments)
-        assert "name it in your report as follow-up" in result.text
+        assert "is lost when the step ends: do what the scope holds, and report that" in (
+            result.text
+        )
 
 
 @pytest.mark.anyio
@@ -9297,6 +9299,59 @@ async def test_worker_scope_refusal_of_source_says_not_under_tests_either(
     assert "refusing to write src/x.py: it is outside T0003's scope (tests/)" in source.text
     assert either in source.text
     assert "refusing to write docs/x.md" in doc.text and either not in doc.text
+
+
+@pytest.mark.anyio
+async def test_scope_refusal_of_project_code_does_not_point_to_tmp(
+    tmp_path: Path, beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # R20: W1 and W2, refused itc/..., built the module in /tmp, where it was lost.
+    runtime = _scoped_worker(tmp_path, monkeypatch, scope="tests/")
+    write = _tool_with_hooks(runtime, "write")
+
+    code = await write.execute("c1", {"path": "itc/core.py", "content": "class Stamp: ...\n"})
+    log = await write.execute("c2", {"path": "run.log", "content": "x\n"})
+    scratch = await write.execute("c3", {"path": "tmp/notes.txt", "content": "x\n"})
+
+    assert "refusing to write itc/core.py: it is outside T0003's scope (tests/)" in code.text
+    assert "/tmp" not in code.text
+    assert (
+        "Work written outside T0003's scope is not its work and is lost when the step ends: "
+        "do what the scope holds, and report that itc/core.py is needed."
+    ) in code.text
+    assert "check imports" not in code.text
+    for refused in (log, scratch):
+        assert "Scratch files go in /tmp." in refused.text
+        assert "is lost when the step ends" not in refused.text
+
+
+@pytest.mark.anyio
+async def test_scope_refusal_of_the_checks_import_says_the_check_cannot_pass(
+    tmp_path: Path, beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runtime = _scoped_worker(tmp_path, monkeypatch, scope="tests/")
+    project = Path.cwd()
+    (project / "tests").mkdir(exist_ok=True)
+    (project / "tests" / "test_stamp.py").write_text(
+        "from itc.core import Stamp\n\n\ndef test_seed() -> None:\n    assert Stamp\n"
+    )
+    (project / ".beagle" / "tree").mkdir(parents=True, exist_ok=True)
+    (project / ".beagle" / "tree" / "T0003.md").write_text(
+        '+++\nid = "T0003"\ndone_when = "python3 -m pytest -q tests/test_stamp.py"\n+++\n'
+    )
+    write = _tool_with_hooks(runtime, "write")
+
+    module = await write.execute("c1", {"path": "itc/core.py", "content": "class Stamp: ...\n"})
+    other = await write.execute("c2", {"path": "itc/extra.py", "content": "x = 1\n"})
+
+    cannot = (
+        "T0003's check imports itc/core.py, so the check cannot pass while it is outside "
+        "the scope: say so in your report."
+    )
+    assert cannot in module.text
+    assert "/tmp" not in module.text
+    assert "report that itc/core.py is needed" in module.text
+    assert "check imports" not in other.text
 
 
 @pytest.mark.anyio

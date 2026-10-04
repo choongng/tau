@@ -8590,6 +8590,46 @@ def _worker_scope() -> tuple[str, tuple[str, ...]] | None:
     return os.environ.get(WORKER_TASK_ENV, "").strip() or "this task", scope
 
 
+_SCRATCH_DIRS = frozenset({"tmp", "temp", "log", "logs", "scratch"})
+
+
+def _scratch_like(rel: Path) -> bool:
+    """Whether a refused project path looks like scratch: a log or temp file."""
+    return rel.suffix in {".log", ".tmp"} or bool(_SCRATCH_DIRS & {p.lower() for p in rel.parts})
+
+
+def _task_check(goal: Path, task: str) -> str:
+    """The task's bound `done_when`, read from its record in the pursuit's tree; or ""."""
+    try:
+        text = (goal.parent / "tree" / f"{task}.md").read_text(encoding="utf-8")
+        record = tomllib.loads(text.split("+++")[1])
+    except (OSError, IndexError, ValueError):
+        return ""
+    return str(record.get("done_when") or "")
+
+
+def _check_imports(check: str, root: Path, rel: Path) -> bool:
+    """Whether a test the check runs imports the module at `rel`, looking one level
+    into a shell script the check runs."""
+    commands = [check]
+    for script in re.findall(r"[\w./-]+\.sh\b", check):
+        with contextlib.suppress(OSError, ValueError):
+            commands += (root / script).read_text(encoding="utf-8").splitlines()
+    wanted = rel.as_posix()
+    for command in commands:
+        for test in _check_test_files(command, root):
+            for names in _test_imports(root / test):
+                for name in names:
+                    path = name.replace(".", "/")
+                    if wanted in {
+                        f"{base}{path}{end}"
+                        for base in ("", "src/")
+                        for end in (".py", "/__init__.py")
+                    }:
+                        return True
+    return False
+
+
 def _link_out(links: list[tuple[Path, Path]], root: Path) -> ToolCallHookResult | None:
     """The refusal for a link in the project that points out of it, or None.
 
@@ -8701,12 +8741,30 @@ def make_worker_scope_guard() -> Any:
             if rel.suffix == ".py" and not _is_test_path(rel.as_posix())
             else ""
         )
+        if _scratch_like(rel):
+            return ToolCallHookResult(
+                block=True,
+                reason=(
+                    f"refusing to write {rel}: it is outside {task}'s scope "
+                    f"({', '.join(scope)}); name it in your report as follow-up. Scratch "
+                    f"files go in /tmp.{source}"
+                ),
+            )
+        # Run R20: W1 and W2, refused the module, built it in /tmp, where it was lost.
+        imported = ""
+        with contextlib.suppress(Exception):
+            if _check_imports(_task_check(goal, task), root, rel):
+                imported = (
+                    f" {task}'s check imports {rel}, so the check cannot pass while it is "
+                    "outside the scope: say so in your report."
+                )
         return ToolCallHookResult(
             block=True,
             reason=(
                 f"refusing to write {rel}: it is outside {task}'s scope "
-                f"({', '.join(scope)}); name it in your report as follow-up. Scratch "
-                f"files go in /tmp.{source}"
+                f"({', '.join(scope)}). Work written outside {task}'s scope is not its work "
+                f"and is lost when the step ends: do what the scope holds, and report that "
+                f"{rel} is needed.{imported}{source}"
             ),
         )
 
