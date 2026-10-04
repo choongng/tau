@@ -8867,3 +8867,255 @@ async def test_plan_part_over_the_title_cap_is_cut_at_the_dash(
     assert all(len(call[0]) <= cap for call in add)
     for text in (plan.text, lone.text):
         assert "beagle refused" not in text and "over beagle's 200 characters" in text
+
+
+R16_CHECK = "python3 -m pytest -q tests/test_cases.py"
+R16_SCOPE = ["tests/cases.json", "tests/test_cases.py"]
+R16_DATA_CHECK = "python3 -m pytest -q tests/test_case_data.py"
+R16_CRITERIA = (
+    "tests/cases.json exists with at least 4 test cases (node creation, interval advancement, "
+    "causality tracking, node deletion), each with inputs, expected result, and source quoting "
+    "reference text; tests/test_cases.py imports the module and runs all cases"
+)
+#: R16 #14, verbatim: T0010's resend on its bound check, refused by the escalation.
+R16_STEP_14 = {
+    "task": "T0010",
+    "criteria": R16_CRITERIA,
+    "done_when": R16_CHECK,
+    "scope": R16_SCOPE,
+    "notes": "The implementation file interval_tree_clocks.py needs to exist in the project "
+    "root at /home/choong/itc/interval_tree_clocks.py. The test runner should use PYTHONPATH "
+    "to include the project root so the import works. Update tests/test_cases.py to set "
+    "PYTHONPATH at the module level before importing.",
+}
+#: R16 #15, verbatim: the escalation's own done_when, sent without new_route.
+R16_STEP_15 = {
+    "task": "T0010",
+    "done_when": R16_DATA_CHECK,
+    "notes": "The test files are correct. The implementation file interval_tree_clocks.py "
+    "needs to be created in the project root. This task is blocked waiting on T0011 to "
+    "create the implementation.",
+}
+R16_CASES_TEST = (
+    "import json\nfrom pathlib import Path\n\nfrom interval_tree_clocks import Clock\n\n"
+    "CASES = json.loads(Path(__file__).with_name('cases.json').read_text())\n\n\n"
+    "def test_cases():\n    assert Clock and CASES\n"
+)
+
+
+def _r16_tree(project: Path) -> None:
+    """R16's ~/itc at #12: tests/test_cases.py imports interval_tree_clocks, unwritten."""
+    tests = project / "tests"
+    tests.mkdir(parents=True, exist_ok=True)
+    (tests / "cases.json").write_text('[{"name": "seed", "result": 1}]\n')
+    (tests / "test_cases.py").write_text(R16_CASES_TEST)
+
+
+def _r16_open(fake_beagle: Path) -> None:
+    record = {"id": "T0010", "title": "Known answers", "status": "open", "scope": R16_SCOPE}
+    record |= {"criteria": R16_CRITERIA, "done_when": R16_CHECK}
+    (fake_beagle / "show.out").write_text(json.dumps(record))
+    (fake_beagle / "next.out").write_text(json.dumps({"open": ["T0010"], "ready": []}))
+    (fake_beagle / "brief.out").write_text("# T0010: Known answers\n")
+
+
+async def _escalated_r16_step(
+    tmp_path: Path, fake_beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> Any:
+    """pursuit_step after three steps left T0010, R16's known-answers task, not done."""
+    monkeypatch.setenv("FAKE_TAU_SUCCEEDS_ON", "99")
+    ready = {"open": [], "ready": [{"id": "T0010", "title": "Known answers"}]}
+    (fake_beagle / "next.out").write_text(json.dumps(ready))
+    pending = {"id": "T0010", "title": "Known answers", "status": "pending"}
+    (fake_beagle / "show.out").write_text(json.dumps(pending))
+    (fake_beagle / "brief.out").write_text("# T0010: Known answers\n")
+    runtime, _ = _bound(tmp_path)
+    step = _tool(runtime, "pursuit_step")
+    for n in range(3):
+        args: dict[str, Any] = {"task": "T0010", "attempts": 1}
+        if n == 0:
+            args |= {"criteria": "c", "done_when": "grep -q done done.txt"}
+            args |= {"scope": STAYS_OPEN_SCOPE}
+        await step.execute(f"s{n}", args)
+        record = {"id": "T0010", "title": "Known answers", "status": "open"}
+        record |= {"done_when": "grep -q done done.txt", "scope": STAYS_OPEN_SCOPE}
+        (fake_beagle / "show.out").write_text(json.dumps(record))
+        (fake_beagle / "next.out").write_text(json.dumps({"open": ["T0010"], "ready": []}))
+    _r16_open(fake_beagle)
+    return step
+
+
+@pytest.mark.anyio
+async def test_step_resend_of_open_task_refuses_check_importing_unwritten_module(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # R16 #12-#13: resends of T0010 ran four workers on a check no worker could pass.
+    project = _pursuit_project(tmp_path)
+    monkeypatch.chdir(project)
+    _r16_tree(project)
+    _r16_open(fake_beagle)
+    runtime, _ = _bound(tmp_path)
+    step = _tool(runtime, "pursuit_step")
+
+    resent = await step.execute("c12", dict(R16_STEP_14))
+    bare = await step.execute("c13", {"task": "T0010"})
+
+    for text in (resent.text, bare.text):
+        assert text.startswith("pursuit_step: T0010 not run — its bound check")
+        assert "tests/test_cases.py fails with ImportError" in text
+        assert "until a later task writes interval_tree_clocks" in text
+        assert f'done_when="{R16_DATA_CHECK}"' in text
+    assert _runs(fake_tau) == [] and _pursuit_calls(fake_beagle, "amend") == []
+
+
+@pytest.mark.anyio
+async def test_step_skips_second_attempt_when_check_imports_unwritten(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # R16 W4, W6, W8, W10 and W12 ran after attempt 1 had left such a test.
+    project = _git_project(tmp_path, monkeypatch)
+    monkeypatch.chdir(project)
+    monkeypatch.setenv("FAKE_TAU_SUCCEEDS_ON", "99")
+    monkeypatch.setenv("FAKE_TAU_WRITES", json.dumps({"tests/test_cases.py": R16_CASES_TEST}))
+    _ready_task(fake_beagle, R16_CHECK)
+    runtime, _ = _bound(tmp_path)
+
+    result = await _tool(runtime, "pursuit_step").execute(
+        "c1",
+        {"task": "T0002", "criteria": "cases", "done_when": R16_CHECK, "scope": ["tests/"]},
+    )
+
+    assert len(_runs(fake_tau)) == 1
+    assert "after 1 sub-agent run(s)" in result.text
+
+
+@pytest.mark.anyio
+async def test_not_done_leads_with_unwritten_import_and_data_test_check(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # R16 E14, E28 and E30 said "If the check itself is wrong", never that it cannot pass.
+    project = _git_project(tmp_path, monkeypatch)
+    monkeypatch.chdir(project)
+    (project / "tests").mkdir()
+    (project / "tests" / "cases.json").write_text('[{"name": "seed", "result": 1}]\n')
+    monkeypatch.setenv("FAKE_TAU_SUCCEEDS_ON", "99")
+    monkeypatch.setenv("FAKE_TAU_WRITES", json.dumps({"tests/test_cases.py": R16_CASES_TEST}))
+    _ready_task(fake_beagle, R16_CHECK)
+    runtime, _ = _bound(tmp_path)
+
+    result = await _tool(runtime, "pursuit_step").execute(
+        "c1",
+        {"task": "T0002", "criteria": "cases", "done_when": R16_CHECK, "scope": R16_SCOPE},
+    )
+
+    assert "stays open" in result.text
+    assert result.text.startswith(
+        "The check cannot pass: tests/test_cases.py imports interval_tree_clocks, which no "
+        f"task in reach writes; amend done_when to `{R16_DATA_CHECK}`."
+    )
+    assert f'scope={json.dumps([*R16_SCOPE, "tests/test_case_data.py"])}' in result.text
+    assert f'done_when="{R16_DATA_CHECK}", it is taken as this task\'s new route' in result.text
+
+
+@pytest.mark.anyio
+async def test_escalation_takes_its_proposed_data_test_done_when_as_new_route(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # R16 #15 sent E32's own done_when without new_route, and was refused eleven times.
+    project = _pursuit_project(tmp_path)
+    monkeypatch.chdir(project)
+    step = await _escalated_r16_step(tmp_path, fake_beagle, monkeypatch)
+    _r16_tree(project)
+    successor = {"id": "T0011", "title": "Known answers", "status": "pending", "done_when": ""}
+    (fake_beagle / "show-T0011.out").write_text(json.dumps(successor))
+    (fake_beagle / "spawn.out").write_text("T0010 superseded by T0011\n")
+    other = {**R16_STEP_15, "done_when": "python3 -m pytest -q tests/test_cases.py -k seed"}
+
+    escalated = await step.execute("c14", dict(R16_STEP_14))
+    refused = await step.execute("c15x", other)
+    assert _pursuit_calls(fake_beagle, "spawn") == []
+    taken = await step.execute("c15", dict(R16_STEP_15))
+
+    assert f'done_when="{R16_DATA_CHECK}"' in escalated.text
+    assert refused.text.startswith("pursuit_step: T0010 not run: 3 steps on it")
+    assert "This call has no new_route=true" in refused.text
+    assert taken.text.startswith(
+        f'Took done_when="{R16_DATA_CHECK}" as T0010\'s new route without new_route=true'
+    )
+    [spawn] = _pursuit_calls(fake_beagle, "spawn")
+    assert spawn[0] == "T0010" and "--check-defect" in spawn
+    assert spawn[spawn.index("--approach-delta") + 1] == R16_STEP_15["notes"]
+    [opened] = _pursuit_calls(fake_beagle, "open")[-1:]
+    assert opened[0] == "T0011"
+    assert opened[opened.index("--done-when") + 1] == R16_DATA_CHECK
+    assert opened[opened.index("--criteria") + 1] == R16_CRITERIA
+    scope_at = opened.index("--scope") + 1
+    assert opened[scope_at : scope_at + 3] == [*R16_SCOPE, "tests/test_case_data.py"]
+
+
+@pytest.mark.anyio
+async def test_escalation_refusal_repeats_the_full_working_call(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # R16 E34 dropped the done_when line, and the driver resent without it.
+    project = _pursuit_project(tmp_path)
+    monkeypatch.chdir(project)
+    step = await _escalated_r16_step(tmp_path, fake_beagle, monkeypatch)
+    _r16_tree(project)
+    other = "python3 -m pytest -q tests/test_cases.py -k seed"
+
+    bound = await step.execute("c14", dict(R16_STEP_14))
+    differing = await step.execute("c15x", {**R16_STEP_15, "done_when": other})
+
+    scope = json.dumps([*R16_SCOPE, "tests/test_case_data.py"])
+    notes_14 = json.dumps(R16_STEP_14["notes"])
+    assert (
+        'The call that works, whole: pursuit_step task="T0010", new_route=true, '
+        f'done_when="{R16_DATA_CHECK}", scope={scope}, notes={notes_14}'
+    ) in bound.text
+    assert (
+        'The call that works, whole: pursuit_step task="T0010", new_route=true, '
+        f'done_when="{other}", notes={json.dumps(R16_STEP_15["notes"])}'
+    ) in differing.text
+    for text in (bound.text, differing.text):
+        assert text.index("The call that works") < text.index("Choose one:")
+    assert len(_runs(fake_tau)) == 3 and _pursuit_calls(fake_beagle, "spawn") == []
+
+
+def test_data_test_fallback_is_added_to_scope(tmp_path: Path) -> None:
+    module = _module()
+    _r16_tree(tmp_path)
+    fallback = "tests/test_case_data.py"
+
+    route = module._data_test_route(R16_CHECK, R16_SCOPE, tmp_path)
+    inside = module._data_test_route(R16_CHECK, ["tests/"], tmp_path)
+    problem = module._imports_unwritten_problem(R16_CHECK, R16_SCOPE, tmp_path)
+
+    assert route == (
+        "tests/test_cases.py",
+        "interval_tree_clocks",
+        R16_DATA_CHECK,
+        [*R16_SCOPE, fallback],
+    )
+    assert inside is not None and inside[3] == ["tests/"]
+    assert f"scope={json.dumps([*R16_SCOPE, fallback])}" in problem
