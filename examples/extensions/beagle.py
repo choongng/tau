@@ -1656,12 +1656,27 @@ def _split_part(part: str) -> tuple[str, str]:
     Run R09 titled its milestones 'M1'..'M4' and its parts 'P1'..'P5', which
     carry no meaning in the tree or a commit: a bare label like that gives way
     to a title taken from the intent.
+
+    Run R15 planned a 216-character part, which beagle refuses as a title: one
+    over MAX_TASK_TITLE keeps the text before ' — ' (else a cut at a word) as
+    its title, and the whole part becomes its intent.
     """
     title, _, intent = part.partition("::")
     title, intent = title.strip(), intent.strip()
     if intent and _BARE_LABEL.fullmatch(title):
         title = _task_title(intent)
+    if len(title) > MAX_TASK_TITLE:
+        intent = f"{title} — {intent}" if intent else title
+        title = _task_title(title.split(" — ", 1)[0])
     return title, intent
+
+
+def _fit_part(part: str) -> str:
+    """`part` as `title::intent` when its title is over beagle's cap, else unchanged."""
+    if len(part.partition("::")[0].strip()) <= MAX_TASK_TITLE:
+        return part
+    title, intent = _split_part(part)
+    return f"{title}::{intent}"
 
 
 def _ensure_git_repo(root: Path) -> bool:
@@ -2905,6 +2920,39 @@ def _commit_before_split(root: Path, task: str, scope: list[str], paths: list[st
     )
 
 
+def _split_part_lines(parts: list[str]) -> tuple[list[str], list[str]]:
+    """`parts` with a part of several lines split into one part per line.
+
+    Run R15 sent one part of three lines, the last 'Run the check: …'. A line
+    that only re-runs a check is dropped with a note; a plain part that does is
+    left for the plan's own refusal.
+    """
+    lines = [line.strip() for line in parts[0].splitlines() if line.strip()] if parts else []
+    if len(parts) != 1 or len(lines) < 2:
+        return parts, []
+    kept, notes = [], []
+    for line in lines:
+        why = _rerun_only_part([line])
+        if why is None:
+            kept.append(line)
+        else:
+            notes.append(f"Dropped a line of the part: {why}")
+    if kept:
+        notes.insert(0, f"The one part held {len(lines)} lines, so each line became a part.")
+    return kept, notes
+
+
+def _is_leaf(task: str, nodes: list[dict[str, Any]]) -> bool:
+    """True when the tree shows `task` as a leaf under a parent: no container, no child."""
+    node = next((n for n in nodes if str(n.get("id")) == task), None)
+    if node is None or node.get("container") or not node.get("parent"):
+        return False
+    return not any(
+        n.get("parent") == task and n.get("status") not in ("abandoned", "superseded")
+        for n in nodes
+    )
+
+
 def make_plan_tool() -> Any:
     """Build `pursuit_plan`: split a task into steps, or add steps to a container."""
 
@@ -2922,6 +2970,16 @@ def make_plan_tool() -> Any:
         parts = _strings(arguments.get("parts"))
         if not task or not parts:
             return _step_result("pursuit_plan: 'task' and 'parts' are both required.")
+        parts, split_notes = _split_part_lines(parts)
+        if not parts:
+            return _step_result(f"pursuit_plan: nothing added — {split_notes[0]}")
+        cut = [part for part in parts if _fit_part(part) != part]
+        parts = [_fit_part(part) for part in parts]
+        for part in cut:
+            split_notes.append(
+                f"A part's title was over beagle's {MAX_TASK_TITLE} characters, so it is now "
+                f"{_part_title(part)!r}, with the whole text as its intent."
+            )
         setup = _setup_milestone(parts)
         if setup is not None:
             return _step_result(f"pursuit_plan: nothing added — {setup}")
@@ -2942,23 +3000,26 @@ def make_plan_tool() -> Any:
                 f"pursuit_plan: nothing added — {task} already has {', '.join(repeated)}. "
                 "Work them with pursuit_step; call it with no arguments for the next ready one."
             )
+        one_step = (
+            f"pursuit_plan: nothing added — {task} is already one step, so one "
+            "part does not break it down: a plan needs two or more parts, which "
+            f"split {task} into smaller tasks. Give two or more parts, or work it "
+            f"with pursuit_step task={task}."
+        )
+        # beagle refuses a one-part split as a rename. A container or the root
+        # still takes one more child; a leaf with one part is already a single
+        # step. Run R15's beagle refused the part's title before it got there.
+        if len(parts) == 1 and _is_leaf(task, _tree_nodes(root)):
+            return _step_result(one_step)
         # Read before the split, which leaves the task a container.
         scope, uncommitted = _uncommitted_in_scope(root, task)
         uncommitted_note = _uncommitted_note(task, uncommitted) if uncommitted else ""
         if len(parts) == 1:
-            # beagle refuses a one-part split as a rename. A container or the
-            # root still takes one more child; a leaf with one part is
-            # already a single step, which is the model's to work, not split.
             rc, out = _add_children(task, parts, root)
             # beagle says "a pending leaf" or, for one being worked, "a open
             # leaf": run R06's plan of one part on open T0002 came back raw.
             if rc != 0 and "leaf with work of its own" in out:
-                return _step_result(
-                    f"pursuit_plan: nothing added — {task} is already one step, so one "
-                    "part does not break it down: a plan needs two or more parts, which "
-                    f"split {task} into smaller tasks. Give two or more parts, or work it "
-                    f"with pursuit_step task={task}."
-                )
+                return _step_result(one_step)
         else:
             ordered = arguments.get("ordered", True) is not False
             if uncommitted:
@@ -2972,7 +3033,7 @@ def make_plan_tool() -> Any:
                 refused += f"\n\n{uncommitted_note}"
             return _step_result(refused)
         _forget_task(root, task)
-        notes = ""
+        notes = "".join(f"{note}\n\n" for note in split_notes)
         if uncommitted_note:
             notes += f"{uncommitted_note}\n\n"
         if repeated:
@@ -4328,7 +4389,8 @@ def _repair_milestones(milestones: list[str]) -> tuple[list[str], list[str]]:
     for index, part in enumerate(kept, 1):
         title, sep, intent = part.partition("::")
         title = title.strip()
-        if sep and title != (labelled := _split_part(part)[0]):
+        labelled = _split_part(part)[0]
+        if sep and len(title) <= MAX_TASK_TITLE and title != labelled:
             repaired.append(f"{labelled}::{intent.strip()}")
             continue
         if len(title) <= MAX_TASK_TITLE:

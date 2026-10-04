@@ -8462,3 +8462,105 @@ async def test_not_done_with_a_cwd_relative_data_open_names_the_fix(
         "tests/test_case_data.py opens 'cases.json' relative to the working directory"
     )
     assert "`Path(__file__).with_name('cases.json')` (tests/cases.json)" in result.text
+
+
+#: R15 E13: the driver's one pursuit_plan part, verbatim (423 characters).
+R15_PLAN_PART = (
+    "Write tests/test_cases.py — a case runner that imports the library module by name "
+    "(fails with ImportError until it exists) and runs every case in tests/cases.json "
+    "against the code, with no class or helper of its own.\n"
+    "Write tests/test_case_data.py — a self-check of the data file: every case has inputs, "
+    "result and citation; enough cases exist.\n"
+    "Run the check: python3 -m pytest -q tests/test_cases.py tests/test_case_data.py"
+)
+
+
+@pytest.mark.anyio
+async def test_plan_of_one_part_with_three_lines_is_split_into_parts(
+    tmp_path: Path, beagle: Path, fake_beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # R15 class 3: the part reached beagle whole, a 423-character title, twice.
+    assert len(R15_PLAN_PART) == 423
+    monkeypatch.chdir(_pursuit_project(tmp_path))
+    runtime, _ = _bound(tmp_path)
+
+    plan = await _tool(runtime, "pursuit_plan").execute(
+        "c1", {"task": "T0002", "parts": [R15_PLAN_PART]}
+    )
+
+    first, second, _rerun = R15_PLAN_PART.splitlines()
+    assert _pursuit_calls(fake_beagle, "split") == [
+        ["T0002", f"Write tests/test_cases.py::{first}", second, "--ordered"]
+    ]
+    assert "beagle refused" not in plan.text and "each line became a part" in plan.text
+
+
+@pytest.mark.anyio
+async def test_plan_drops_a_rerun_only_line_with_a_note(
+    tmp_path: Path, beagle: Path, fake_beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(_pursuit_project(tmp_path))
+    runtime, _ = _bound(tmp_path)
+
+    plan = await _tool(runtime, "pursuit_plan").execute(
+        "c1", {"task": "T0002", "parts": [R15_PLAN_PART]}
+    )
+
+    parts = _pursuit_calls(fake_beagle, "split")[0][1:-1]
+    assert len(parts) == 2 and not any(part.startswith("Run the check") for part in parts)
+    assert "nothing added" not in plan.text
+    assert "Dropped a line of the part: 'Run the check' only re-runs" in plan.text
+
+
+@pytest.mark.anyio
+async def test_plan_of_one_part_on_a_leaf_is_refused_before_beagle(
+    tmp_path: Path, beagle: Path, fake_beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(_pursuit_project(tmp_path))
+    nodes = [
+        {"id": "T0001", "title": "Ship it", "status": "pending", "container": True},
+        {"id": "T0002", "parent": "T0001", "title": "Known answers", "status": "open"},
+    ]
+    (fake_beagle / "tree.out").write_text(json.dumps({"goal": "Ship it", "nodes": nodes}))
+    runtime, _ = _bound(tmp_path)
+    plan = _tool(runtime, "pursuit_plan")
+
+    leaf = await plan.execute("c1", {"task": "T0002", "parts": ["Write the case runner"]})
+    container = await plan.execute("c2", {"task": "T0001", "parts": ["Docs::so people read"]})
+
+    assert "T0002 is already one step" in leaf.text and "two or more parts" in leaf.text
+    assert "beagle refused" not in leaf.text
+    assert _pursuit_calls(fake_beagle, "split") == []
+    assert _pursuit_calls(fake_beagle, "add") == [
+        ["Docs", "--parent", "T0001", "--intent", "so people read"]
+    ]
+    assert "already one step" not in container.text
+
+
+@pytest.mark.anyio
+async def test_plan_part_over_the_title_cap_is_cut_at_the_dash(
+    tmp_path: Path, beagle: Path, fake_beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(_pursuit_project(tmp_path))
+    runtime, _ = _bound(tmp_path)
+    dashed = R15_PLAN_PART.splitlines()[0]
+    plain = "Write the case runner " + "that reads every case " * 12
+    plain = plain.strip()
+    cap = _module().MAX_TASK_TITLE
+    assert len(dashed) > cap and len(plain) > cap
+
+    plan = await _tool(runtime, "pursuit_plan").execute(
+        "c1", {"task": "T0001", "parts": [dashed, plain]}
+    )
+    lone = await _tool(runtime, "pursuit_plan").execute("c2", {"task": "T0001", "parts": [plain]})
+
+    split = _pursuit_calls(fake_beagle, "split")
+    assert split[0][1] == f"Write tests/test_cases.py::{dashed}"
+    title, _, intent = split[0][2].partition("::")
+    assert intent == plain and len(title) <= cap
+    assert title.endswith("…") and plain.startswith(title[:-1]) and plain[len(title) - 1] == " "
+    add = _pursuit_calls(fake_beagle, "add")
+    assert add == [[title, "--parent", "T0001", "--intent", plain]]
+    assert all(len(call[0]) <= cap for call in add)
+    for text in (plan.text, lone.text):
+        assert "beagle refused" not in text and "over beagle's 200 characters" in text
