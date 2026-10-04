@@ -4869,13 +4869,57 @@ def _names_known_answers(part: str) -> bool:
     return "known answer" in text or bool(re.search(r"\bcases\b", text))
 
 
+def _design_only_milestone(part: str) -> bool:
+    """Whether milestone `part` only works out a design, judged by its head.
+
+    Run R19 kept 'Design: settle the data structure and API — … (typing,
+    tests, docs)' as its own task: the deliverable words in its parenthesis
+    are the implementation's, not the milestone's. The head, before ':' or
+    ' — ', decides, and the text outside parentheses must agree.
+    """
+    if _names_known_answers(part):
+        return False
+    head = re.split(r":| - | — ", part, maxsplit=1)[0]
+    bare = re.sub(r"\([^)]*\)", "", part)
+    return _read_or_design_only(head) and _read_or_design_only(bare)
+
+
+def _fold_design_milestones(kept: list[str]) -> tuple[list[str], list[str]]:
+    """`kept` with each design-only milestone folded into the next one's intent.
+
+    With known answers planned, a design milestone is part of the
+    implementation: its text joins the following milestone's intent, or the
+    one before it when none follows.
+    """
+    folded = list(kept)
+    notes: list[str] = []
+    index = 0
+    while index < len(folded):
+        part = folded[index]
+        if len(folded) < 2 or not _design_only_milestone(part):
+            index += 1
+            continue
+        del folded[index]
+        into = index if index < len(folded) else index - 1
+        target = folded[into]
+        joiner = "; " if "::" in target else "::"
+        folded[into] = f"{target}{joiner}{part.strip()}"
+        notes.append(
+            f"Folded the design milestone {part.split(':', 1)[0].strip()!r} into "
+            f"{target.split(':', 1)[0].strip()!r}: the design is part of the "
+            "implementation, not a milestone of its own."
+        )
+    return folded, notes
+
+
 def _repair_milestones(milestones: list[str]) -> tuple[list[str], list[str]]:
     """`milestones` with what founding can fix fixed, and a note for each fix.
 
     A setup milestone and one that only re-runs a check are dropped, the first
     milestone that only reads the reference or chooses a design is retitled as
-    the known answers, and an over-long title is cut at a word, its whole text
-    moved after '::'. With
+    the known answers (or, with known answers planned, a design-only one is
+    folded into the next milestone's intent), and an over-long title is cut at
+    a word, its whole text moved after '::'. With
     every milestone dropped, nothing is left: the list comes back empty and
     the one note says why.
     """
@@ -4906,6 +4950,10 @@ def _repair_milestones(milestones: list[str]) -> tuple[list[str], list[str]]:
     # Run R17 retitled its docs milestone as a second known-answers task
     # although milestone 1 already wrote tests/cases.json.
     retitled = any(_names_known_answers(part) for part in kept)
+    # 'edge cases' (R10) names no known answers: fold only beside real ones.
+    if any(re.search(r"known answer|\bcases(\.json| file)\b", p.lower()) for p in kept):
+        kept, fold_notes = _fold_design_milestones(kept)
+        notes.extend(fold_notes)
     for index, part in enumerate(kept, 1):
         title, sep, intent = part.partition("::")
         title = title.strip()

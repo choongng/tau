@@ -4230,6 +4230,18 @@ def test_founding_drops_a_found_the_pursuit_milestone() -> None:
     assert any("Create the interval tree clock type" in part for part in kept)
 
 
+def test_founding_folds_a_design_milestone_into_the_next_when_known_answers_exist() -> None:
+    # R19: after T0155, 'Design: settle the data structure and API …' became its
+    # own task between known answers and Implement.
+    module = _module()
+    kept, notes = module._repair_milestones(list(R19_MILESTONES))
+    assert not any(part.startswith("Design") for part in kept)
+    [implement] = [part for part in kept if part.startswith("Implement")]
+    assert "divisible key space" in implement
+    assert any("Folded the design milestone 'Design' into 'Implement'" in note for note in notes)
+    assert any(module._names_known_answers(part) for part in kept)
+
+
 @pytest.mark.anyio
 async def test_founding_r10_milestones_drops_only_the_setup_one(
     tmp_path: Path, beagle: Path, fake_beagle: Path, monkeypatch: pytest.MonkeyPatch
