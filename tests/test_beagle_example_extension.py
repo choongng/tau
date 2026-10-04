@@ -9890,3 +9890,162 @@ async def test_worker_guard_refuses_reading_a_sibling_project_tree(
         result = await _tool_with_hooks(runtime, tool).execute("c2", arguments)
 
         assert result.text == "ran", arguments
+
+
+def _open_task(fake_beagle: Path, check: str = "grep -q done done.txt") -> None:
+    _ready_task(fake_beagle, check=check)
+    open_task = {"open": ["T0002"], "ready": [], "ready_total": 0}
+    (fake_beagle / "next.out").write_text(json.dumps(open_task))
+
+
+def _case_data_test(project: Path) -> str:
+    """A data test that reads tests/cases.json beside it; returns its check."""
+    tests = project / "tests"
+    tests.mkdir(parents=True, exist_ok=True)
+    (tests / "test_case_data.py").write_text(
+        "import json\nfrom pathlib import Path\n\n\n"
+        "def test_cases():\n"
+        "    assert json.loads(Path(__file__).with_name('cases.json').read_text())\n"
+    )
+    return "python3 -m pytest -q tests/test_case_data.py"
+
+
+@pytest.mark.anyio
+async def test_amend_refuses_a_check_that_already_passes(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # R17 #26: the amended check passed before W11 ran, and closed the task.
+    project = _pursuit_project(tmp_path)
+    monkeypatch.chdir(project)
+    (project / "x.txt").write_text("x\n")
+    _open_task(fake_beagle)
+    runtime, _ = _bound(tmp_path)
+
+    result = await _tool(runtime, "pursuit_step").execute(
+        "c1", {"task": "T0002", "done_when": "grep -q x x.txt"}
+    )
+
+    assert "check not changed" in result.text and "already passes" in result.text
+    assert "Keep the bound check `grep -q done done.txt`" in result.text
+    assert _pursuit_calls(fake_beagle, "amend") == [] and _runs(fake_tau) == []
+
+
+@pytest.mark.anyio
+async def test_amend_refuses_a_collect_only_check(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project = _pursuit_project(tmp_path)
+    monkeypatch.chdir(project)
+    _open_task(fake_beagle)
+    runtime, _ = _bound(tmp_path)
+
+    result = await _tool(runtime, "pursuit_step").execute(
+        "c1", {"task": "T0002", "done_when": "python3 -m pytest --collect-only -q tests/"}
+    )
+
+    assert "check not changed" in result.text and "--collect-only" in result.text
+    assert "Keep the bound check `grep -q done done.txt`" in result.text
+    assert _pursuit_calls(fake_beagle, "amend") == [] and _runs(fake_tau) == []
+
+
+@pytest.mark.anyio
+async def test_amending_a_known_answers_check_to_one_that_reads_no_locked_file_is_refused(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # R17 #26 swapped T0008's check, which loaded tests/cases.json, for one that
+    # read no known answer.
+    project = _pursuit_project(tmp_path)
+    monkeypatch.chdir(project)
+    bound = _case_data_test(project)
+    (project / "tests" / "test_other.py").write_text("def test_x():\n    assert False\n")
+    (project / ".beagle" / "locks-pending.json").write_text(
+        json.dumps({"T0002": ["tests/cases.json"]})
+    )
+    _open_task(fake_beagle, check=bound)
+    runtime, _ = _bound(tmp_path)
+    step = _tool(runtime, "pursuit_step")
+
+    refused = await step.execute(
+        "c1", {"task": "T0002", "done_when": "python3 -m pytest -q tests/test_other.py"}
+    )
+
+    assert "check not changed" in refused.text and "tests/cases.json" in refused.text
+    assert f"Keep the bound check `{bound}`" in refused.text
+    assert _pursuit_calls(fake_beagle, "amend") == [] and _runs(fake_tau) == []
+
+    await step.execute("c2", {"task": "T0002", "done_when": f"{bound} -x"})
+    [amend] = _pursuit_calls(fake_beagle, "amend")
+    assert amend[:3] == ["T0002", "--done-when", f"{bound} -x"]
+
+
+@pytest.mark.anyio
+async def test_not_done_names_a_missing_locked_file_as_the_work(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # R17 E26/E28: FileNotFoundError on tests/cases.json, locked for the task,
+    # and then "pass a corrected done_when too; it is amended".
+    project = _git_project(tmp_path, monkeypatch)
+    monkeypatch.chdir(project)
+    check = _case_data_test(project)
+    _ready_task(fake_beagle, check)
+    runtime, _ = _bound(tmp_path)
+
+    result = await _tool(runtime, "pursuit_step").execute(
+        "c1",
+        {
+            "task": "T0002",
+            "criteria": "the known answers are written",
+            "done_when": check,
+            "scope": ["tests/cases.json", "tests/test_case_data.py"],
+            "locks": ["tests/cases.json"],
+        },
+    )
+
+    assert "stays open" in result.text and "FileNotFoundError" in result.text
+    assert (
+        "The check names tests/cases.json: it is locked for this task and not written, "
+        "so that is the work" in result.text
+    )
+    assert "corrected done_when" not in result.text
+
+
+@pytest.mark.anyio
+async def test_shell_operator_refusal_on_amend_says_the_bound_check_stands(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # R17 #23-#25 were told to name a new test in scope; the bound check was fine.
+    project = _pursuit_project(tmp_path)
+    monkeypatch.chdir(project)
+    _open_task(fake_beagle)
+    runtime, _ = _bound(tmp_path)
+
+    result = await _tool(runtime, "pursuit_step").execute(
+        "c1", {"task": "T0002", "done_when": "grep -q done done.txt | grep -q x"}
+    )
+
+    assert "check not changed" in result.text and "has a bare '|'" in result.text
+    assert (
+        "The bound check `grep -q done done.txt` stands: it is one valid command; leave "
+        "done_when out to keep it." in result.text
+    )
+    assert _pursuit_calls(fake_beagle, "amend") == [] and _runs(fake_tau) == []

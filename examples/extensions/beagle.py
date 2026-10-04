@@ -5031,6 +5031,66 @@ def _missing_scoped_test(rc: int, output: str, scope: list[str], root: Path) -> 
     return None
 
 
+def _missing_locked_file(output: str, locks: list[str], root: Path) -> str | None:
+    """A locked path the check failed on for want of it, not on disk: the work not yet
+    done, not a wrong check. Run R17 E26 failed on FileNotFoundError for
+    tests/cases.json, locked for the task, and was told to pass a corrected done_when."""
+    missing = [lock.rstrip("/") for lock in locks if not (root / lock).exists()]
+    if not missing:
+        return None
+    named = re.findall(r"No such file or directory: '([^']+)'", output)
+    named += [m.split("::")[0] for m in re.findall(r"file or directory not found:\s*(\S+)", output)]
+    for path in named:
+        path = path.rstrip("/")
+        for lock in missing:
+            if path == lock or path.endswith(f"/{lock}"):
+                return lock
+    return None
+
+
+_COLLECT_ONLY = re.compile(r"(?<![\w-])--(?:collect-only|co)(?![\w-])")
+
+
+def _reads_a_lock(check: str, locks: list[str], root: Path) -> bool:
+    """Whether `check` names a locked file, or a test (or a directory of them) that
+    reads one, as `_cases_test_reads` judges it."""
+    if any(lock.rstrip("/") in check for lock in locks):
+        return True
+    names = {Path(lock.rstrip("/")).name for lock in locks}
+    for rel in _check_targets(check, root):
+        path = root / rel
+        tests = sorted(path.rglob("test_*.py")) if path.is_dir() else [path]
+        for test in tests:
+            if test.suffix == ".py" and any(_cases_test_reads(test, n) for n in names):
+                return True
+    return False
+
+
+def _amend_problem(check: str, bound: str, locks: list[str], root: Path) -> str | None:
+    """Why `check` may not replace a task's bound check, judged before it runs.
+
+    Run R17 #26 swapped T0008's check, which loaded tests/cases.json, for
+    `pytest --collect-only -q tests/`, which passed before any work.
+    """
+    keep = (
+        f" Keep the bound check `{bound}`: leave done_when out to keep it."
+        if bound and _check_problem(bound) is None
+        else ""
+    )
+    if _COLLECT_ONLY.search(check):
+        return (
+            f"`{check}` runs pytest --collect-only, which only imports the tests and runs "
+            f"none, so it passes whatever the work does.{keep}"
+        )
+    if locks and not _reads_a_lock(check, locks, root):
+        return (
+            f"this task has locked known answers ({', '.join(locks)}), and `{check}` "
+            "names none of them and runs no test that reads one, so it passes whatever "
+            f"the known answers say.{keep}"
+        )
+    return None
+
+
 def _cwd_relative_data_lead(output: str, scope: list[str], root: Path) -> str:
     """The line a not-done result leads with when a test opened scoped data by a bare name.
 
@@ -6592,15 +6652,45 @@ def make_step_tool() -> Any:
             # repeating the old one forever is the loop this breaks.
             chained, prose = _and_chain(done_when)
             if prose is not None or chained is None:
+                if (
+                    prose is not None
+                    and "has a bare" in prose
+                    and bound_check
+                    and _check_problem(bound_check) is None
+                ):
+                    # Run R17 #23-#25 were told to name a new test in scope; the
+                    # bound check was one valid command all along.
+                    prose += (
+                        f" The bound check `{bound_check}` stands: it is one valid "
+                        "command; leave done_when out to keep it."
+                    )
                 return _step_result(f"pursuit_step: {task}'s check not changed — {prose}")
             route += _bound_note(done_when, chained)
             done_when = chained
+            amend_problem = _amend_problem(
+                done_when,
+                bound_check,
+                _pending_locks(goal, task) + _strings(arguments.get("locks")),
+                root,
+            )
+            if amend_problem is not None:
+                return _step_result(f"pursuit_step: {task}'s check not changed — {amend_problem}")
             unwritten = _imports_unwritten_problem(
                 done_when, scope or _strings(record.get("scope")), root
             )
             if unwritten is not None:
                 return _step_result(f"pursuit_step: {task}'s check not changed — {unwritten}")
             pre_rc, pre_out = await _run_check(done_when, root, DEFAULT_CHECK_TIMEOUT)
+            if pre_rc == 0:
+                keep = (
+                    f" Keep the bound check `{bound_check}`: leave done_when out to keep it."
+                    if bound_check and _check_problem(bound_check) is None
+                    else ""
+                )
+                return _step_result(
+                    f"pursuit_step: {task}'s check not changed — `{done_when}` already passes "
+                    f"before any work, so it would close {task} on no work.{keep}"
+                )
             broke = _check_broke(pre_rc, pre_out)
             if broke is not None:
                 return _step_result(
@@ -6837,6 +6927,13 @@ def make_step_tool() -> Any:
                     f"the check names {missing}: it is in the scope and not written, so "
                     "that is the work, not a wrong check."
                 )
+            if_line = f"If {if_wrong} "
+            missing_lock = _missing_locked_file(verdict[1], locks, root)
+            if missing_lock is not None:
+                if_line = (
+                    f"The check names {missing_lock}: it is locked for this task and not "
+                    "written, so that is the work, not a wrong check. "
+                )
             unpassable = ""
             if cannot_pass is not None:
                 test, module, data_check, needs = cannot_pass
@@ -6857,8 +6954,8 @@ def make_step_tool() -> Any:
                 f"{verdict[1][-CHECK_TAIL_CHARS:]}\n\n"
                 + _implementation_in_tests_lead(root, scope)
                 + f"Last report:\n{shown}\n\n"
-                f'Next: pursuit_step with task="{task}" and notes saying what to fix. If '
-                f"{if_wrong} If this route is wrong, pursuit_step with "
+                f'Next: pursuit_step with task="{task}" and notes saying what to fix. '
+                f"{if_line}If this route is wrong, pursuit_step with "
                 f'task="{task}", new_route=true and notes saying what to do instead.',
             )
         if proof is not None and not proof.proven:
