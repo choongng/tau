@@ -10434,6 +10434,139 @@ async def test_escalation_refusal_repeats_the_full_working_call(
     assert len(_runs(fake_tau)) == 3 and _pursuit_calls(fake_beagle, "spawn") == []
 
 
+#: R21 T0005: the bound check ran a data test that read tests/cases.json and
+#: imported nothing; the task's scope held only the test.
+R21_CHECK = "python3 -m pytest -q tests/test_case_data.py"
+R21_DATA_TEST = (
+    "import json\n"
+    "from pathlib import Path\n\n"
+    "CASES = Path(__file__).with_name('cases.json')\n\n\n"
+    "def test_cases_are_listed():\n"
+    "    assert json.loads(CASES.read_text())['cases']\n"
+)
+
+
+def _r21_tree(root: Path) -> None:
+    (root / "tests").mkdir(parents=True, exist_ok=True)
+    (root / "tests" / "test_case_data.py").write_text(R21_DATA_TEST)
+    (root / "tests" / "cases.json").write_text('{"cases": [{"in": 1, "out": 1}]}\n')
+
+
+def test_escalation_after_unproven_pass_keeps_the_bound_check_and_adds_the_data_file(
+    tmp_path: Path,
+) -> None:
+    # R21 E97-E144: the bound check passed unproven; every escalation asked for a
+    # new check, though the scope lacking tests/cases.json was all that was wrong.
+    module = _module()
+    _r21_tree(tmp_path)
+    record = {"id": "T0005", "done_when": R21_CHECK, "scope": ["tests/test_case_data.py"]}
+    module._UNPROVEN.add((str(tmp_path), "T0005"))
+    module._LAST_CHECK_EXIT[(str(tmp_path), "T0005")] = 0
+    notes = "Add the data file the test reads to the scope."
+    scoped = json.dumps(["tests/test_case_data.py", "tests/cases.json"])
+
+    resent = module._escalation("T0005", 3, {"task": "T0005", "notes": notes}, record, tmp_path)
+    e97 = module._escalation(
+        "T0005",
+        3,
+        {"task": "T0005", "done_when": R21_CHECK, "notes": notes, "scope": json.loads(scoped)},
+        record,
+        tmp_path,
+    )
+
+    assert "Its scope lacks tests/cases.json" in resent
+    assert f"scope={scoped}" in resent
+    assert "a new route needs a check" not in resent and "bound one" not in resent
+    working = (
+        'The call that works, whole: pursuit_step task="T0005", new_route=true, '
+        f'done_when="{R21_CHECK}", scope={scoped}, notes={json.dumps(notes)}'
+    )
+    assert working in resent and working in e97
+    lacks = e97[: e97.index("The call that works")]
+    assert "This call has no new_route=true" in lacks
+    assert "Its scope lacks" not in lacks and "done_when" not in lacks
+
+    module._UNPROVEN.clear()
+    proven_elsewhere = module._escalation(
+        "T0005", 3, {"task": "T0005", "done_when": R21_CHECK}, record, tmp_path
+    )
+    assert "Its done_when is the bound one" in proven_elsewhere
+
+
+def test_working_call_never_contains_a_placeholder(tmp_path: Path) -> None:
+    # R21: `done_when="<a check a sub-agent on this scope can pass>"` was offered as
+    # "the call that works", and no model can send it.
+    module = _module()
+    _r21_tree(tmp_path)
+    record = {"id": "T0005", "done_when": "grep -q done done.txt", "scope": ["tests/"]}
+    placeholder = re.compile(r"<[^<>]*>")
+
+    bare = module._working_call("T0005", {"task": "T0005"}, record, tmp_path)
+    bound = module._working_call(
+        "T0005", {"task": "T0005", "done_when": "grep -q done done.txt"}, record, None
+    )
+    noted = module._working_call(
+        "T0005", {"task": "T0005", "done_when": R21_CHECK, "notes": "n"}, record, tmp_path
+    )
+    module._UNPROVEN.add((str(tmp_path), "T0005"))
+    unproven = module._working_call(
+        "T0005", {"task": "T0005"}, {**record, "done_when": R21_CHECK}, tmp_path
+    )
+
+    for call in (bare, bound, noted, unproven):
+        assert placeholder.search(call) is None, call
+    for call in (bare, bound):
+        assert "done_when=" not in call and "notes=" not in call
+        assert "Add to it: done_when, a check a sub-agent on this scope can pass" in call
+        assert "notes, saying what the new route does differently" in call
+    assert f'done_when="{R21_CHECK}"' in noted and "Add to it" not in noted
+    assert f'done_when="{R21_CHECK}"' in unproven and "Add to it: notes" in unproven
+
+
+@pytest.mark.anyio
+async def test_proof_note_for_a_data_test_scoped_without_its_data_names_the_data_file(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # R21 E76: a test reading tests/cases.json and importing nothing, scoped without
+    # it, was told to "mutate the module the test imports".
+    project = _witnessed_pursuit(tmp_path, monkeypatch)
+    monkeypatch.chdir(project)
+    _r21_tree(project)
+    _ready_task(fake_beagle, R21_CHECK)
+    runtime, _ = _bound(tmp_path)
+    step = _tool(runtime, "pursuit_step")
+    scope = ["tests/test_case_data.py"]
+    args = {"task": "T0002", "criteria": "c", "done_when": R21_CHECK, "scope": scope}
+
+    first = await step.execute("c1", args)
+    record = {"id": "T0002", "title": "Parser", "status": "open"}
+    record |= {"done_when": R21_CHECK, "scope": scope}
+    (fake_beagle / "show.out").write_text(json.dumps(record))
+    (fake_beagle / "next.out").write_text(json.dumps({"open": [{"id": "T0002"}], "ready": []}))
+    again = await step.execute("c2", {"task": "T0002"})
+
+    assert "no defect could be put back" in first.text
+    added = json.dumps([*scope, "tests/cases.json"])
+    for text in (first.text, again.text):
+        assert "the data file's absence is the proof" in text
+        assert "reads tests/cases.json" in text and f"scope={added}" in text
+        assert "mutate the module the test imports" not in text
+    assert f"its done_when, `{R21_CHECK}`, which passes, kept" in first.text
+
+    module = _module()
+    importing = tmp_path / "importing"
+    _r21_tree(importing)
+    (importing / "tests" / "test_case_data.py").write_text("import itc_clocks\n" + R21_DATA_TEST)
+    assert module._tests_only_proof_note(R21_CHECK, scope, importing) == (
+        module.TESTS_ONLY_MUTATE_NOTE
+    )
+    assert module._check_data_reads(R21_CHECK, project) == ["tests/cases.json"]
+
+
 def test_data_test_fallback_is_added_to_scope(tmp_path: Path) -> None:
     module = _module()
     _r16_tree(tmp_path)

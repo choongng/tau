@@ -4795,6 +4795,68 @@ def _scope_note(needs: list[str], scope: list[str]) -> str:
     return f" Its scope must hold that test too: scope={json.dumps(needs)}."
 
 
+def _check_data_reads(command: str, root: Path) -> list[str]:
+    """The data files that tests run by `command`, importing no project module, open.
+
+    Run R21: T0005's check ran tests/test_case_data.py, which read tests/cases.json
+    and imported nothing; the scope held only the test, so the data file's absence,
+    the one proof such a test has, was out of reach. Found from the test's code (the
+    file it opens, by `_cases_test_reads`) and `CASES_DATA_SUFFIXES`; a bare name
+    resolves beside the test.
+    """
+    found: list[str] = []
+    for rel in _check_test_files(command, root):
+        test = root / rel
+        if _test_project_imports(test):
+            continue
+        try:
+            tree = ast.parse(test.read_text(encoding="utf-8"))
+        except (OSError, SyntaxError, ValueError):
+            continue
+        for node in ast.walk(tree):
+            if not (isinstance(node, ast.Constant) and isinstance(node.value, str)):
+                continue
+            named = Path(node.value.strip())
+            if named.suffix not in CASES_DATA_SUFFIXES or named.is_absolute():
+                continue
+            if not _cases_test_reads(test, named.name):
+                continue
+            beside = (test.parent / named.name).relative_to(root).as_posix()
+            data = (
+                named.as_posix()
+                if len(named.parts) > 1 and (root / named).is_file()
+                else beside
+            )
+            if data not in found:
+                found.append(data)
+    return found
+
+
+def _missing_data(command: str, scope: list[str], root: Path) -> list[str]:
+    """The data files the check's tests read that `scope` does not hold."""
+    return [rel for rel in _check_data_reads(command, root) if not _in_scope(rel, scope)]
+
+
+def _tests_only_proof_note(command: str, scope: list[str], root: Path | None) -> str:
+    """The proof note for a tests-only scope: the data file's absence where the scope
+    or the check's tests hold one, else a defect in the module the test imports.
+
+    Run R21 E76 said "mutate the module the test imports" of a test that imported
+    none and read tests/cases.json, outside its scope.
+    """
+    reads = _check_data_reads(command, root) if root is not None and command else []
+    if not _scope_has_data(scope) and not reads:
+        return TESTS_ONLY_MUTATE_NOTE
+    missing = [rel for rel in reads if not _in_scope(rel, scope)]
+    if not missing:
+        return TESTS_ONLY_PROOF_NOTE
+    return (
+        f"{TESTS_ONLY_PROOF_NOTE} The test this check runs reads {', '.join(missing)}, "
+        f"which this scope does not hold: add it to the scope, "
+        f"scope={json.dumps([*scope, *missing])}."
+    )
+
+
 def _imports_unwritten_problem(command: str, scope: list[str], root: Path) -> str | None:
     """Why a check cannot pass on this scope because a test it runs imports unwritten
     code, naming the data-only test to bind instead; or None."""
@@ -6779,8 +6841,18 @@ def _escalation_lacks(
         )
     done_when = " ".join(str(arguments.get("done_when") or "").split())
     bound_check = " ".join(str(record.get("done_when") or "").split())
+    scope = _strings(arguments.get("scope")) or _strings(record.get("scope"))
+    unproven = _unproven_data_route(task, bound_check, scope, root)
+    if unproven is not None:
+        if unproven:
+            lacks.append(
+                f"Its scope lacks {', '.join(unproven)}, the data file the bound check's "
+                f"test reads. That check, `{bound_check}`, passes, so keep it (leave "
+                "done_when out) and add the data file, whose absence is the proof: "
+                f"scope={json.dumps([*scope, *unproven])}."
+            )
+        return lacks
     if bound_check and done_when in ("", bound_check):
-        scope = _strings(arguments.get("scope")) or _strings(record.get("scope"))
         route = _data_test_route(bound_check, scope, root) if root is not None else None
         if route is not None and data_test_passes:
             lacks.append(
@@ -6817,25 +6889,65 @@ def _working_call(
     done_when = " ".join(str(arguments.get("done_when") or "").split())
     bound_check = " ".join(str(record.get("done_when") or "").split())
     scope = _strings(arguments.get("scope")) or _strings(record.get("scope"))
+    unproven = _unproven_data_route(task, bound_check, scope, root)
     route = (
         _data_test_route(bound_check, scope, root)
-        if root is not None and bound_check and not data_test_passes
+        if root is not None and bound_check and not data_test_passes and unproven is None
         else None
     )
     needs = scope
-    if done_when and done_when != bound_check:
+    check = ""
+    if unproven is not None:
+        # Run R21: the bound check passed; only the data file it reads was missing.
+        check = done_when or bound_check
+        needs = [*scope, *unproven]
+    elif done_when and done_when != bound_check:
         check = done_when
         if route is not None and done_when == route[2]:
             needs = route[3]
     elif route is not None:
         check, needs = route[2], route[3]
-    else:
-        check = "<a check a sub-agent on this scope can pass>"
-    notes = str(arguments.get("notes") or "").strip() or "<what the new route does differently>"
-    call = f"pursuit_step task={json.dumps(task)}, new_route=true, done_when={json.dumps(check)}"
-    if needs != scope:
+    notes = str(arguments.get("notes") or "").strip()
+    call = f"pursuit_step task={json.dumps(task)}, new_route=true"
+    if check:
+        call += f", done_when={json.dumps(check)}"
+    if needs != scope or unproven is not None:
         call += f", scope={json.dumps(needs)}"
-    return f"{call}, notes={json.dumps(notes, ensure_ascii=False)}"
+    if notes:
+        call += f", notes={json.dumps(notes, ensure_ascii=False)}"
+    # Run R21: a `<…>` placeholder in this call was sent as is; say what to add instead.
+    supply = []
+    if not check:
+        supply.append(
+            "done_when, a check a sub-agent on this scope can pass that fails until the "
+            "work is done"
+        )
+    if not notes:
+        supply.append("notes, saying what the new route does differently")
+    if supply:
+        call += ". Add to it: " + "; ".join(supply) + "."
+    return call
+
+
+def _unproven_data_route(
+    task: str, bound_check: str, scope: list[str], root: Path | None
+) -> list[str] | None:
+    """For a task whose bound check passed unproven and runs a test reading a data
+    file: the data files that test reads and `scope` lacks; or None.
+
+    Run R21: T0005's check passed but could not be shown to refuse, and every
+    escalation asked for a new check. The check was right; the scope lacked
+    tests/cases.json, whose absence is the proof.
+    """
+    if root is None or not bound_check:
+        return None
+    key = (str(root), task)
+    if key not in _UNPROVEN or _LAST_CHECK_EXIT.get(key, 0) != 0:
+        return None
+    reads = _check_data_reads(bound_check, root)
+    if not reads:
+        return None
+    return [rel for rel in reads if not _in_scope(rel, scope)]
 
 
 async def _offered_data_test_passes(
@@ -7516,7 +7628,8 @@ def make_step_tool() -> Any:
         scope = scope or _strings(record.get("scope"))
         unproven_key = (str(root), task)
         tests_only = _only_data_and_tests(scope)
-        proof_note = TESTS_ONLY_PROOF_NOTE if _scope_has_data(scope) else TESTS_ONLY_MUTATE_NOTE
+        proof_note = _tests_only_proof_note(check, scope, root)
+        missing_data = _missing_data(check, scope, root) if check else []
         mixed = _oracle_with_code_problem(scope, goal)
         if mixed is not None:
             # Opened before this guard, or by hand: still no worker on it.
@@ -7532,6 +7645,11 @@ def make_step_tool() -> Any:
                 "nothing, whatever check or scope this task is sent with. "
                 + (
                     TESTS_ONLY_PROOF_NOTE
+                    + f" The test it runs reads {', '.join(missing_data)}, outside this "
+                    f"scope. Give it a new route that keeps its done_when, `{check}`, "
+                    f"which passes, with scope={json.dumps([*scope, *missing_data])}"
+                    if tests_only and missing_data
+                    else TESTS_ONLY_PROOF_NOTE
                     + " Give it a new route whose done_when runs that file's test and "
                     "whose scope names the data file"
                     if tests_only and _scope_has_data(scope)
@@ -7789,7 +7907,9 @@ def make_step_tool() -> Any:
                     else f'Next: a new route, pursuit_step with task="{task}", '
                     "new_route=true, notes and "
                     + (
-                        f"a done_when that runs that file's test. {proof_note}"
+                        f"its done_when, `{check}`, which passes, kept. {proof_note}"
+                        if tests_only and missing_data
+                        else f"a done_when that runs that file's test. {proof_note}"
                         if tests_only
                         else "a done_when that runs a test of the behaviour itself, e.g. "
                         "`python3 -m pytest -q tests/test_<this task>.py`. The test must "
