@@ -4354,11 +4354,56 @@ def _rerun_only_part(parts: list[str]) -> str | None:
     return None
 
 
+#: Words of a milestone that only reads the reference or works out a design.
+_READ_DESIGN_WORDS = frozenset(
+    {
+        "read",
+        "reread",
+        "study",
+        "understand",
+        "review",
+        "analyse",
+        "analyze",
+        "research",
+        "learn",
+        "explore",
+        "investigate",
+        "notes",
+        "design",
+        "choose",
+    }
+)
+#: Words naming something such a milestone would deliver besides reading.
+_DELIVERABLE_WORDS = _MAKING_WORDS | {
+    "case",
+    "cases",
+    "test",
+    "tests",
+    "code",
+    "extract",
+    "answers",
+}
+KNOWN_ANSWERS_TITLE = "Known answers from the reference"
+
+
+def _read_or_design_only(part: str) -> bool:
+    """Whether milestone `part` only reads the reference or chooses a design.
+
+    Run R15 founded with 'Read the reference material ... and choose a design.'
+    as its only milestone; the known-answers task opened under that title and
+    its worker set up a project and designed instead of writing the cases.
+    """
+    words = set(re.findall(r"[a-z0-9]+", part.lower()))
+    return bool(words & _READ_DESIGN_WORDS) and not words & _DELIVERABLE_WORDS
+
+
 def _repair_milestones(milestones: list[str]) -> tuple[list[str], list[str]]:
     """`milestones` with what founding can fix fixed, and a note for each fix.
 
-    A setup milestone and one that only re-runs a check are dropped, and an
-    over-long title is cut at a word, its whole text moved after '::'. With
+    A setup milestone and one that only re-runs a check are dropped, the first
+    milestone that only reads the reference or chooses a design is retitled as
+    the known answers, and an over-long title is cut at a word, its whole text
+    moved after '::'. With
     every milestone dropped, nothing is left: the list comes back empty and
     the one note says why.
     """
@@ -4386,9 +4431,22 @@ def _repair_milestones(milestones: list[str]) -> tuple[list[str], list[str]]:
     for _part, why in reruns:
         notes.append(f"Dropped a milestone: {why}")
     repaired: list[str] = []
+    retitled = False
     for index, part in enumerate(kept, 1):
         title, sep, intent = part.partition("::")
         title = title.strip()
+        if not retitled and _read_or_design_only(part):
+            retitled = True
+            detail = f"{title} — {intent.strip()}" if sep and intent.strip() else title
+            repaired.append(f"{KNOWN_ANSWERS_TITLE}::{detail}")
+            notes.append(
+                f"Milestone {index} {title!r} only reads the reference or chooses a "
+                f"design, so it is now {KNOWN_ANSWERS_TITLE!r}, with its text after "
+                "'::': a sub-agent reads the reference and writes the cases file and "
+                "its test. The design is part of the implementation, not a milestone "
+                "of its own."
+            )
+            continue
         labelled = _split_part(part)[0]
         if sep and len(title) <= MAX_TASK_TITLE and title != labelled:
             repaired.append(f"{labelled}::{intent.strip()}")
@@ -7708,8 +7766,10 @@ FOUND_FIRST_SETUP_CALLS = 6
 FOUND_FIRST_NOTE = (
     "Beagle: this project is not a pursuit yet. Found it before anything else: "
     "`beagle init` if `.beagle/` is missing, then `pursuit_found`. Do not read "
-    "references or design the solution first; reading the reference and choosing "
-    "a design are milestones, which `pursuit_step` sub-agents do. Name the "
+    "references or design the solution first: the first milestone is the known "
+    "answers, which a `pursuit_step` sub-agent does: it reads the reference and "
+    "writes the cases file and its test. The design is part of the implementation, "
+    "not a milestone of its own. Name the "
     f"reference (URL) in the milestones. After {FOUND_FIRST_SETUP_CALLS} setup "
     "tool calls, every tool but the pursuit tools is refused until it is founded."
 )
@@ -7860,7 +7920,7 @@ def make_found_first_gate() -> Any:
                 f"refusing {event.tool_name}: setup is done and the pursuit is not founded. "
                 "Call pursuit_found now with the user's goal, criteria and milestones "
                 "(user_delegated=true if they told you to decide). Reading references, "
-                "designing and building are milestones for pursuit_step's sub-agents."
+                "designing and building are work for pursuit_step's sub-agents."
             ),
         )
 
@@ -8780,8 +8840,10 @@ def _unfounded_section(root: Path) -> str | None:
     lines += [
         "- Found it first. Asked to set beagle up and build something, call "
         "`pursuit_found` as your first move, before you read any reference or design "
-        "anything: reading the reference and choosing a design are themselves "
-        "milestones, which sub-agents do. Your part is to steer, a few steps at a time.",
+        "anything: the first milestone is the known answers: a sub-agent reads the "
+        "reference and writes the cases file and its test; the design is part of the "
+        "implementation, not a milestone of its own. Your part is to steer, a few "
+        "steps at a time.",
         "- Pass `pursuit_found` the user's goal, their acceptance criteria and the "
         "milestones you can already name. The goal and the criteria are the user's: use "
         "their words. If they gave none, ask, unless they told you to decide yourself "

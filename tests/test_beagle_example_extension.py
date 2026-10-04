@@ -3962,6 +3962,67 @@ async def test_founding_r10_milestones_drops_only_the_setup_one(
     assert not any("beagle" in part for part in kept)
 
 
+def test_found_first_note_names_known_answers_not_read_and_design(
+    tmp_path: Path, beagle: Path
+) -> None:
+    # R15: the note and the founding line called reading the reference and
+    # choosing a design milestones, and the driver founded with exactly that.
+    _ship_cli(beagle)
+    runtime = _load(tmp_path)
+    [section] = [s for s in runtime.prompt_sections if s.title == "Beagle"]
+    for text in (_module().FOUND_FIRST_NOTE, section.body):
+        flat = " ".join(text.split())
+        assert "the first milestone is the known answers" in flat
+        assert "writes the cases file and its test" in flat
+        assert "not a milestone of its own" in flat
+        assert "choosing a design are" not in flat
+        assert "reading the reference and choosing" not in flat
+
+
+R15_FOUNDING_MILESTONE = (
+    "Read the reference material (the 2008 UMINHO paper PDF and the ferd.ca "
+    "interval-tree-clocks notes) and choose a design."
+)
+
+
+@pytest.mark.anyio
+async def test_founding_read_and_design_milestone_is_retitled_known_answers(
+    tmp_path: Path, beagle: Path, fake_beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    monkeypatch.chdir(project)
+    (fake_beagle / "add.out").write_text("T0001  Implement interval tree clocks\n")
+    runtime, _ = _bound(tmp_path)
+
+    result = await _tool(runtime, "pursuit_found").execute(
+        "c1",
+        {
+            "statement": "Implement interval tree clocks",
+            "criteria": ["`python3 -m pytest -q` exits 0"],
+            "milestones": [R15_FOUNDING_MILESTONE, "Implement the clock operations"],
+            "user_confirmed": True,
+        },
+    )
+
+    assert "Founded the pursuit" in result.text
+    assert "is now 'Known answers from the reference'" in result.text
+    assert _pursuit_calls(fake_beagle, "split") == [
+        [
+            "T0001",
+            f"Known answers from the reference::{R15_FOUNDING_MILESTONE}",
+            "Implement the clock operations",
+            "--ordered",
+        ]
+    ]
+    only_reads = _module()._read_or_design_only
+    assert only_reads("Study the paper and take notes")
+    assert only_reads("Choose a design")
+    assert not only_reads("Read the paper and write the cases")
+    assert not only_reads("Read the reference and implement the code")
+    assert not only_reads("Implement the clock operations")
+
+
 @pytest.mark.anyio
 async def test_founding_milestone_with_a_bare_label_takes_its_title_from_the_intent(
     tmp_path: Path, beagle: Path, fake_beagle: Path, monkeypatch: pytest.MonkeyPatch
