@@ -11627,3 +11627,167 @@ async def test_cases_first_names_cases_already_on_disk_instead_of_a_new_split(
     assert "T0005 holds them" in existing.text and 'pursuit_step task="T0005"' in existing.text
     assert "pursuit_plan" not in existing.text
     assert _pursuit_calls(fake_beagle, "open") == [] and _runs(fake_tau) == []
+
+
+#: R21: T0005 writes the data, T0006 (waiting on it) writes the data test.
+R21_SPLIT_TREE = [
+    {"id": "T0001", "status": "open", "title": "Goal", "container": True},
+    {"id": "T0005", "parent": "T0001", "status": "pending", "title": "Write tests/cases.json"},
+    {
+        "id": "T0006",
+        "parent": "T0001",
+        "status": "pending",
+        "title": "Data test",
+        "waiting_on": ["T0005"],
+    },
+]
+R21_DATA_CHECK = "python3 -m pytest -q tests/test_case_data.py"
+
+
+def _r21_split(project: Path, fake: Path, status: str = "pending", check: str = "") -> None:
+    """R21's split: T0005 on tests/cases.json, T0006 owning the data test, waiting on it."""
+    _case_data_test(project)
+    tree = [{**n, "status": status} if n["id"] == "T0005" else n for n in R21_SPLIT_TREE]
+    (fake / "tree.out").write_text(json.dumps({"nodes": tree}))
+    record = {"id": "T0005", "title": "Write tests/cases.json", "intent": "the data"}
+    record |= {"status": status, "done_when": check, "scope": ["tests/cases.json"]}
+    (fake / "show-T0005.out").write_text(json.dumps(record))
+    owner = {"id": "T0006", "title": "Data test", "status": "pending"}
+    (fake / "show-T0006.out").write_text(
+        json.dumps({**owner, "scope": ["tests/test_case_data.py"]})
+    )
+    if status == "open":
+        ready = {"open": [{"id": "T0005"}], "ready": [], "ready_total": 0}
+    else:
+        ready = {"open": [], "ready": [{"id": "T0005"}], "ready_total": 1}
+    (fake / "next.out").write_text(json.dumps(ready))
+    (fake / "brief.out").write_text("# T0005: Write tests/cases.json\nDo it.\n")
+
+
+@pytest.mark.anyio
+async def test_check_running_a_waiting_siblings_file_is_refused_at_open(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # R21 E53: T0005, scope tests/cases.json, bound T0006's tests/test_case_data.py.
+    project = _pursuit_project(tmp_path)
+    monkeypatch.chdir(project)
+    _r21_split(project, fake_beagle)
+    runtime, _ = _bound(tmp_path)
+    step = {"task": "T0005", "criteria": "the cases are written", "done_when": R21_DATA_CHECK}
+
+    refused = await _tool(runtime, "pursuit_step").execute(
+        "c1", {**step, "scope": ["tests/cases.json"]}
+    )
+
+    assert (
+        "T0005 not opened — T0005's check runs tests/test_case_data.py, which T0006 writes "
+        "after T0005, so nothing can fix tests/test_case_data.py before T0005 closes. Put "
+        "tests/test_case_data.py in T0005's scope beside tests/cases.json "
+        '(scope=["tests/cases.json", "tests/test_case_data.py"]), or bind a check T0005\'s '
+        "own files decide."
+    ) in refused.text
+    assert _pursuit_calls(fake_beagle, "open") == [] and _runs(fake_tau) == []
+
+    module = _module()
+    nodes = json.loads((fake_beagle / "tree.out").read_text())["nodes"]
+    scope = ["tests/cases.json", "tests/test_case_data.py"]
+    assert (
+        module._sibling_owned_check_problem(R21_DATA_CHECK, scope, "T0005", nodes, project) is None
+    )
+    # Named only by its title, the file is still the sibling's.
+    (fake_beagle / "show-T0006.out").write_text(json.dumps({"id": "T0006", "scope": []}))
+    titled = [
+        {**n, "title": "Write tests/test_case_data.py"} if n["id"] == "T0006" else n for n in nodes
+    ]
+    assert "T0006 writes after T0005" in module._sibling_owned_check_problem(
+        R21_DATA_CHECK, ["tests/cases.json"], "T0005", titled, project
+    )
+    # A task that does not wait on T0005 owns nothing T0005 must leave alone.
+    unwaited = [{k: v for k, v in n.items() if k != "waiting_on"} for n in titled]
+    assert (
+        module._sibling_owned_check_problem(
+            R21_DATA_CHECK, ["tests/cases.json"], "T0005", unwaited, project
+        )
+        is None
+    )
+
+    opened = await _tool(runtime, "pursuit_step").execute("c2", {**step, "scope": scope})
+
+    assert "writes after T0005" not in opened.text and "not opened" not in opened.text
+    assert len(_pursuit_calls(fake_beagle, "open")) == 1
+
+
+@pytest.mark.anyio
+async def test_check_running_a_waiting_siblings_file_is_refused_at_amend_and_new_route(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project = _pursuit_project(tmp_path)
+    monkeypatch.chdir(project)
+    _r21_split(project, fake_beagle, status="open", check="grep -q done done.txt")
+    runtime, _ = _bound(tmp_path)
+    step = _tool(runtime, "pursuit_step")
+    refusal = "T0005's check runs tests/test_case_data.py, which T0006 writes after T0005"
+
+    amended = await step.execute("c1", {"task": "T0005", "done_when": R21_DATA_CHECK})
+    rerouted = await step.execute(
+        "c2",
+        {
+            "task": "T0005",
+            "new_route": True,
+            "notes": "bind the data test",
+            "done_when": R21_DATA_CHECK,
+        },
+    )
+
+    assert f"T0005's check not changed — {refusal}" in amended.text
+    assert f"no new route for T0005 — {refusal}" in rerouted.text
+    assert 'scope=["tests/cases.json", "tests/test_case_data.py"]' in rerouted.text
+    assert _pursuit_calls(fake_beagle, "amend") == [] == _pursuit_calls(fake_beagle, "spawn")
+    assert _runs(fake_tau) == []
+
+
+@pytest.mark.anyio
+async def test_not_workable_names_the_escalated_workable_tasks_working_call(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # R21 E117-E148: "Workable now: T0005" thirteen times, T0005 at three steps.
+    project = _pursuit_project(tmp_path)
+    monkeypatch.chdir(project)
+    _r21_split(project, fake_beagle, status="open", check=R21_DATA_CHECK)
+    runtime, _ = _bound(tmp_path)
+    step = _tool(runtime, "pursuit_step")
+
+    fresh = await step.execute("c1", {"task": "T0006"})
+
+    assert "T0006 is not a task to work now: it waits on T0005 (open)" in fresh.text
+    assert (
+        "T0005's check runs tests/test_case_data.py, T0006's own file, which T0005's scope "
+        "cannot change: put tests/test_case_data.py in T0005's scope with its own files, "
+        'pursuit_step task="T0005", scope=["tests/cases.json", "tests/test_case_data.py"].'
+    ) in fresh.text
+    assert "work T0005 first" not in fresh.text and "new route" not in fresh.text
+
+    _loaded_module()._NOT_DONE[(str(Path.cwd()), "T0005")] = 3
+    waiting = await step.execute("c2", {"task": "T0006"})
+    container = await step.execute("c3", {"task": "T0001"})
+
+    for result in (waiting, container):
+        head, _, call = result.text.partition(
+            "T0005 has had 3 steps and runs only by a new route: "
+        )
+        assert "is not a task to work now" in head
+        assert call.startswith('pursuit_step task="T0005", new_route=true')
+        assert "<" not in call and ">" not in call
+    assert _pursuit_calls(fake_beagle, "open") == [] and _runs(fake_tau) == []

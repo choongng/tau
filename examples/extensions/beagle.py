@@ -6615,6 +6615,54 @@ async def _unwritten_check_problem(
     return on_disk or _imports_unwritten_problem(command, scope, root)
 
 
+def _shown(task: str, root: Path) -> dict[str, Any]:
+    """`task`'s record from `beagle pursuit show`, or {}."""
+    rc, out = _pursuit(["show", task], root)
+    shown = _json_reply(out) if rc == 0 else None
+    return shown if isinstance(shown, dict) else {}
+
+
+def _text_names_path(text: str, rel: str) -> bool:
+    """Whether `text` names the project path `rel` as a whole path."""
+    return re.search(rf"(?<![\w./-]){re.escape(rel)}(?![\w/-])", text) is not None
+
+
+def _own_files(task: str, rel: str, nodes: list[dict[str, Any]], root: Path) -> bool:
+    """Whether `task` names `rel` as its own, by path, in its title or its scope."""
+    title = next((str(n.get("title") or "") for n in nodes if str(n.get("id")) == task), "")
+    shown = _shown(task, root)
+    named = {os.path.normpath(s) for s in _strings(shown.get("scope")) if s.strip()}
+    return rel in named or _text_names_path(title or str(shown.get("title") or ""), rel)
+
+
+def _sibling_owned_check_problem(
+    check: str, scope: list[str], task: str, nodes: list[dict[str, Any]], root: Path
+) -> str | None:
+    """Why `task`'s check may not run a file a task waiting on it owns, or None.
+
+    Run R21 bound T0005, scope tests/cases.json, to T0006's tests/test_case_data.py;
+    T0006 waited on T0005, so only T0005's worker could touch the failing test, and
+    its scope forbade it.
+    """
+    if not check or not scope:
+        return None
+    runs = [rel for rel in _check_test_files(check, root) if not _in_scope(rel, scope)]
+    if not runs:
+        return None
+    for waiter, waits in _hard_waits(nodes).items():
+        if waiter == task or not any(task in (w[1], w[2]) for w in waits):
+            continue
+        for rel in runs:
+            if _own_files(waiter, rel, nodes, root):
+                return (
+                    f"{task}'s check runs {rel}, which {waiter} writes after {task}, so "
+                    f"nothing can fix {rel} before {task} closes. Put {rel} in {task}'s "
+                    f"scope beside {', '.join(scope)} (scope={json.dumps([*scope, rel])}), "
+                    f"or bind a check {task}'s own files decide."
+                )
+    return None
+
+
 #: An abandon naming the done task whose commit did this one's work:
 #: "done by T0008", "Done by T0008's commit".
 _DONE_BY = re.compile(r"(?i)^\s*done\s+by\s+(t\d{4,})\b")
@@ -7079,13 +7127,59 @@ def _bash_read_targets(command: str, cwd: Path) -> list[Path]:
     return targets
 
 
-def _not_workable(task: str, nodes: list[dict[str, Any]], workable: list[str]) -> str:
+def _escalated_calls(workable: list[str], root: Path | None) -> str:
+    """For each of `workable` at the escalation count, the new-route call that runs it.
+
+    Run R21 pointed its driver at "Workable now: T0005" thirteen times; T0005 had
+    three not-done steps, so only a new route would run it.
+    """
+    if root is None:
+        return ""
+    said = ""
+    for t in workable:
+        count = _NOT_DONE.get((str(root), t), 0)
+        if count >= ESCALATE_AFTER:
+            call = _working_call(t, {}, _shown(t, root), root)
+            said += f"\n{t} has had {count} steps and runs only by a new route: {call}"
+    return said
+
+
+def _check_runs_own_file(
+    task: str, predecessor: str, nodes: list[dict[str, Any]], root: Path | None
+) -> str:
+    """The pursuit_step putting `task`'s own file, run by `predecessor`'s check, in
+    `predecessor`'s scope beside its own files; or ""."""
+    if root is None:
+        return ""
+    shown = _shown(predecessor, root)
+    check = str(shown.get("done_when") or "")
+    scope = _strings(shown.get("scope"))
+    for rel in _check_test_files(check, root) if check else []:
+        if scope and not _in_scope(rel, scope) and _own_files(task, rel, nodes, root):
+            return (
+                f"{predecessor}'s check runs {rel}, {task}'s own file, which {predecessor}'s "
+                f"scope cannot change: put {rel} in {predecessor}'s scope with its own files, "
+                f"pursuit_step task={json.dumps(predecessor)}, "
+                f"scope={json.dumps([*scope, rel])}."
+            )
+    return ""
+
+
+def _not_workable(
+    task: str, nodes: list[dict[str, Any]], workable: list[str], root: Path | None = None
+) -> str:
     """Why `task`, neither open nor ready, is not worked now: what it waits on, or its parts.
 
     Run R16 told its driver "it is a container, done when its parts are, or it
     waits on another task" for T0011, which waited on T0010; the driver read a
     container, then a deadlock, and went off-tool.
     """
+    return _not_workable_text(task, nodes, workable, root) + _escalated_calls(workable, root)
+
+
+def _not_workable_text(
+    task: str, nodes: list[dict[str, Any]], workable: list[str], root: Path | None
+) -> str:
     listed = ", ".join(workable)
     waits = _hard_waits(nodes).get(task, [])
     if waits:
@@ -7095,7 +7189,8 @@ def _not_workable(task: str, nodes: list[dict[str, Any]], workable: list[str]) -
             (f"through {w[0]}, " if w[0] != task else "") + _wait_text(w, nodes) for w in waits
         )
         then = (
-            f'work {ready[0]} first: pursuit_step task="{ready[0]}".'
+            _check_runs_own_file(task, ready[0], nodes, root)
+            or f'work {ready[0]} first: pursuit_step task="{ready[0]}".'
             if ready
             else f"none of those is workable yet. Workable now: {listed}."
         )
@@ -7220,7 +7315,7 @@ def make_step_tool() -> Any:
                     f"is not ready either. {nothing_ready}"
                 )
             if open_ids or ready_ids:
-                return _step_result(_not_workable(task, nodes, open_ids + ready_ids))
+                return _step_result(_not_workable(task, nodes, open_ids + ready_ids, root))
             return _step_result(f"{task} is not a task to work now. {nothing_ready}")
 
         rc, out = _pursuit(["show", task], root)
@@ -7321,6 +7416,9 @@ def make_step_tool() -> Any:
                 scoped = (
                     _scope_problem(route_scope, task, nodes, root)
                     or _locked_scope_problem(route_scope, root, title, task)
+                    or _sibling_owned_check_problem(
+                        done_when or old_check, route_scope, task, nodes, root
+                    )
                     or _oracle_with_code_problem(route_scope, goal)
                     or _locked_test_problem(done_when or old_check, route_scope, goal)
                     or _import_scope_problem(done_when or old_check, route_scope, root)
@@ -7424,6 +7522,7 @@ def make_step_tool() -> Any:
                 )
                 or _scope_problem(scope, task, nodes, root)
                 or _locked_scope_problem(scope, root, title, task)
+                or _sibling_owned_check_problem(done_when, scope, task, nodes, root)
                 or _oracle_with_code_problem(scope, goal)
                 or _cases_first_problem(scope, task, title, goal, nodes)
                 or _locked_test_problem(done_when, scope, goal)
@@ -7501,7 +7600,10 @@ def make_step_tool() -> Any:
             if amend_problem is not None:
                 return _step_result(f"pursuit_step: {task}'s check not changed — {amend_problem}")
             own_scope = scope or _strings(record.get("scope"))
-            unwritten = _locked_scope_problem(own_scope, root, title, task) or (
+            unwritten = (
+                _locked_scope_problem(own_scope, root, title, task)
+                or _sibling_owned_check_problem(done_when, own_scope, task, nodes, root)
+            ) or (
                 await _unwritten_check_problem(
                     done_when, own_scope, task, root, _predecessor_scope(record, root)
                 )
