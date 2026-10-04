@@ -3354,7 +3354,10 @@ def _check_problem(command: str) -> str | None:
             f"{one_command}, testing what the file must hold; for a document, `grep -q "
             "'<a phrase it must contain>' <path>`. Call pursuit_step again with that."
         )
-    if program.startswith("python") and _only_imports(words[1:]):
+    python = _past_runner(words)
+    if not (python and Path(python[0]).name.startswith("python")):
+        python = []
+    if python and _only_imports(python[1:]):
         # Run R04 bound `python3 -c "from tests.test_case_data import
         # validate_fork_seed; print('OK')"`, which passes once the name exists.
         return (
@@ -3362,7 +3365,7 @@ def _check_problem(command: str) -> str | None:
             f"file is there, whatever it says. {one_command}, testing what the code must "
             "do. Call pursuit_step again with that."
         )
-    if program.startswith("python") and _judges_nothing(words[1:]):
+    if python and _judges_nothing(python[1:]):
         # Run R14 closed T0007 on `t=IntervalTree(); t.insert(1, 5); t.search(3);
         # print('OK')`, which passes on any code that does not raise.
         return (
@@ -3522,11 +3525,36 @@ def _key_only_json_check(command: str) -> bool:
     return loads and bool(asserts) and all(key_check(test) for test in asserts)
 
 
+_TEST_FRAMEWORKS = frozenset({"pytest", "unittest"})
+
+
+def _runs_a_test_framework(tree: ast.AST) -> bool:
+    """Whether code imports or calls pytest or unittest, not just names one in a string."""
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import) and any(
+            alias.name.split(".")[0] in _TEST_FRAMEWORKS for alias in node.names
+        ):
+            return True
+        if (
+            isinstance(node, ast.ImportFrom)
+            and (node.module or "").split(".")[0] in _TEST_FRAMEWORKS
+        ):
+            return True
+        if isinstance(node, ast.Call):
+            func = node.func
+            while isinstance(func, ast.Attribute):
+                func = func.value
+            if isinstance(func, ast.Name) and func.id in _TEST_FRAMEWORKS:
+                return True
+    return False
+
+
 def _judges_nothing(args: list[str]) -> bool:
     """Whether a python argv's `-c` code can fail only by raising.
 
     Code judges when it asserts, runs pytest or unittest, reaches `raise` or
-    `sys.exit` through an `if`, or exits with a value it computed.
+    `sys.exit` through an `if`, or exits with a comparison it computed:
+    `sys.exit(S().insert(1, 5))` exits with whatever the call returns.
     """
     if "-c" not in args or args.index("-c") + 1 >= len(args):
         return False
@@ -3535,7 +3563,7 @@ def _judges_nothing(args: list[str]) -> bool:
         tree = ast.parse(code)
     except SyntaxError:
         return False
-    if not tree.body or re.search(r"\b(pytest|unittest)\b", code):
+    if not tree.body or _runs_a_test_framework(tree):
         return False
 
     def exits(node: ast.AST) -> bool:
@@ -3548,7 +3576,11 @@ def _judges_nothing(args: list[str]) -> bool:
         return name in {"exit", "_exit"}
 
     def compared(node: ast.AST) -> bool:
-        return any(isinstance(n, (ast.Compare, ast.BoolOp, ast.IfExp)) for n in ast.walk(node))
+        return any(
+            isinstance(n, (ast.Compare, ast.BoolOp, ast.IfExp))
+            or (isinstance(n, ast.UnaryOp) and isinstance(n.op, ast.Not))
+            for n in ast.walk(node)
+        )
 
     for node in ast.walk(tree):
         if isinstance(node, ast.Assert):
@@ -3557,11 +3589,7 @@ def _judges_nothing(args: list[str]) -> bool:
             exits(n) for stmt in node.body + node.orelse for n in ast.walk(stmt)
         ):
             return False
-        if (
-            isinstance(node, ast.Call)
-            and exits(node)
-            and any(not isinstance(arg, ast.Constant) for arg in node.args)
-        ):
+        if isinstance(node, ast.Call) and exits(node) and any(compared(arg) for arg in node.args):
             return False
         if isinstance(node, ast.Raise) and node.exc is not None and compared(node.exc):
             return False
@@ -7182,6 +7210,37 @@ def _bash_git_discard(command: str) -> str | None:
 
 def _named(argv: list[str], program: str) -> bool:
     return Path(argv[0]).name == program
+
+
+#: Runner options that take a value as the next word: `uv run --with pytest python ...`.
+_RUNNER_VALUE_OPTIONS = frozenset(
+    {
+        "--with",
+        "--with-editable",
+        "--with-requirements",
+        "--python",
+        "-p",
+        "--project",
+        "--directory",
+        "--extra",
+        "--group",
+        "--package",
+        "--env-file",
+        "--index",
+    }
+)
+
+
+def _past_runner(argv: list[str]) -> list[str]:
+    """`argv` past a `uv run`, `poetry run` or `pipenv run` prefix and its options."""
+    if len(argv) < 2 or Path(argv[0]).name not in ("uv", "poetry", "pipenv") or argv[1] != "run":
+        return argv
+    args = argv[2:]
+    while args and args[0].startswith("-"):
+        if args[0] == "--":
+            return args[1:]
+        args = args[2:] if args[0] in _RUNNER_VALUE_OPTIONS else args[1:]
+    return args
 
 
 #: The `beagle pursuit` verbs that only read the pursuit. A worker sent with no

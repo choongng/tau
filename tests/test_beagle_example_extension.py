@@ -7453,6 +7453,46 @@ def test_python_c_with_an_assert_is_allowed() -> None:
         assert module._check_problem(check) is None, check
 
 
+def test_check_refuses_uv_run_python_c_that_judges_nothing() -> None:
+    # Audit 7: the judge looked only at a first word starting with python.
+    module = _module()
+    for runner in ("uv run", "uv run --with pytest", "poetry run", "pipenv run"):
+        for python in ("python", "python3"):
+            check = f'{runner} {python} -c "from itc import S; S().fork()"'
+            found = module._check_problem(check)
+            assert found is not None and "with no assert" in found, check
+    asserted = 'uv run python -c "from itc import S; assert S().fork() == (1, 2)"'
+    assert module._check_problem(asserted) is None
+
+
+def test_check_refuses_python_c_naming_pytest_only_in_a_string() -> None:
+    module = _module()
+    check = "python3 -c \"from itc import S; S().fork(); print('pytest ok')\""
+
+    found = module._check_problem(check)
+
+    assert found is not None and "with no assert" in found
+    for runs in (
+        "python3 -c \"import unittest; unittest.main(module='tests.test_itc')\"",
+        "python3 -c \"from pytest import main; raise SystemExit(main(['-q']))\"",
+    ):
+        assert module._check_problem(runs) is None, runs
+
+
+def test_check_refuses_sys_exit_of_a_call_without_comparison() -> None:
+    module = _module()
+    check = 'python3 -c "import sys; from itc import S; sys.exit(S().insert(1,5))"'
+
+    found = module._check_problem(check)
+
+    assert found is not None and "with no assert" in found
+    for judged in (
+        'python3 -c "import sys; from itc import S; sys.exit(S().fork() != (1, 2))"',
+        'python3 -c "import sys; from itc import S; sys.exit(not S().ok())"',
+    ):
+        assert module._check_problem(judged) is None, judged
+
+
 @pytest.mark.anyio
 async def test_part_scoping_the_cases_module_must_run_the_locked_cases_test(
     tmp_path: Path,
