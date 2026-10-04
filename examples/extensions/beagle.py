@@ -5249,6 +5249,11 @@ WITNESS_NOTE = (
     "REPLACEMENT:\n<that text with the defect>\n"
     "END WITNESS"
 )
+ON_DISK_WITNESS_NOTE = (
+    "The check passes already on the uncommitted work; do not change the "
+    "implementation. Add or name a mutation that shows the check can refuse: a line "
+    "whose change makes it fail, given as the WITNESS block above."
+)
 _WITNESS = re.compile(
     r"^WITNESS:[ \t]*(?P<path>\S+)[ \t]*\n"
     r"NEEDLE:[ \t]*\n(?P<needle>.*?)\n"
@@ -5634,6 +5639,9 @@ class _Proof:
     #: A tests-only task had no WITNESS in the module its tests import, named in
     #: `text`: another worker can give one, so the task is not unproven.
     ask_module: bool = False
+    #: Proven only by taking away a source file: that shows the check needs the
+    #: import, not that it tests the behaviour.
+    by_absent_source: bool = False
 
 
 def _opened_commit(task: str, root: Path) -> str:
@@ -5743,7 +5751,10 @@ async def _prove(
         tail = out[-PROVE_TAIL_CHARS:]
         verdicts = {m.group(1): m.group(2) for m in _PROVE_VERDICT.finditer(out)}
         if rc == 0 and verdicts.get(task) == "PROVEN":
-            return _Proof(proven=True, text=tail)
+            by_absent_source = "--absent" in how and any(
+                rel.endswith(".py") and not _is_test_path(rel) for rel in sources
+            )
+            return _Proof(proven=True, text=tail, by_absent_source=by_absent_source)
         if verdicts.get(task) == "NOT PROVEN" and "STILL PASSES" in out:
             # The check passed over the defect: a real answer, not one a
             # different witness should be asked to overturn.
@@ -7123,6 +7134,7 @@ def make_step_tool() -> Any:
         notes = str(arguments.get("notes") or "").strip()
         opened = route = taken = ""
         retrying = False
+        passed_on_disk: tuple[int, str] | None = None
         status = record.get("status")
         new_route = arguments.get("new_route") is True
         bound_check = str(record.get("done_when") or "").strip()
@@ -7319,6 +7331,7 @@ def make_step_tool() -> Any:
                 done_when, [scope, _predecessor_scope(record, root)], root
             ):
                 route += _on_disk_note(done_when, task)
+                passed_on_disk = (pre_rc, pre_out)
             elif pre_rc == 0:
                 now = _tree_nodes(root)
                 paths = scope or _check_targets(done_when, root)
@@ -7540,6 +7553,17 @@ def make_step_tool() -> Any:
             _LAST_CHECK_EXIT[unproven_key] = verdict[0]
             if verdict[0] == 0:
                 proof = await _prove(task, "", scope, root, check_timeout, locks)
+        elif passed_on_disk is not None and check == done_when:
+            # Run R20: T0007's check passed at open on T0003's leftovers, and W11
+            # passed at turn 2 and spent 29 more: the work was done; prove and close.
+            verdict = passed_on_disk
+            _LAST_CHECK_EXIT[unproven_key] = verdict[0]
+            proof = await _prove(task, "", scope, root, check_timeout, locks)
+            if proof is not None and (not proof.proven or proof.by_absent_source):
+                if proof.proven:
+                    proof = _Proof(proven=False, text=proof.text)
+                attempts = 1
+                retry_note = "\n\n" + ON_DISK_WITNESS_NOTE
         for attempt in range(1, attempts + 1):
             if (
                 verdict[0] == 0

@@ -11150,6 +11150,81 @@ async def test_open_on_a_check_passing_only_by_uncommitted_scope_work_is_not_ref
 
 
 @pytest.mark.anyio
+async def test_open_closes_without_a_worker_when_uncommitted_work_already_passes(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # R20 class 4: T0007's check passed at open on T0003's leftovers, and W11
+    # passed at turn 2 and spent 29 more turns.
+    project = _git_project(tmp_path, monkeypatch)
+    monkeypatch.chdir(project)
+    (project / "done.txt").write_text("done")
+    _ready_task(fake_beagle)
+    (fake_beagle / "prove.out").write_text("T0002: PROVEN — refuses with done.txt gone\n")
+    runtime, _ = _bound(tmp_path)
+
+    result = await _tool(runtime, "pursuit_step").execute(
+        "c1",
+        {
+            "task": "T0002",
+            "criteria": "c",
+            "done_when": "grep -q done done.txt",
+            "scope": ["done.txt"],
+        },
+    )
+
+    assert _runs(fake_tau) == []
+    assert len(_pursuit_calls(fake_beagle, "open")) == 1
+    [prove] = _pursuit_calls(fake_beagle, "prove")
+    assert prove[:3] == ["T0002", "--absent", "done.txt"]
+    assert _pursuit_calls(fake_beagle, "close")[0][:3] == ["T0002", "--outcome", "done"]
+    assert "closed done" in result.text
+
+
+@pytest.mark.anyio
+async def test_open_on_uncommitted_pass_asks_only_for_a_witness_when_absence_is_the_only_proof(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # R20 class 4 / R14: taking away a source file shows only that the import is
+    # needed, so one worker is sent, for a mutation and nothing else.
+    project = _git_project(tmp_path, monkeypatch)
+    monkeypatch.chdir(project)
+    (project / "src").mkdir()
+    (project / "src" / "clock.py").write_text("def add(a, b):\n    return a + b\n")
+    monkeypatch.setenv("FAKE_TAU_SUCCEEDS_ON", "99")
+    monkeypatch.setenv("FAKE_TAU_REPORT", WITNESSED_REPORT)
+    _ready_task(fake_beagle, "grep -q 'a + b' src/clock.py")
+    (fake_beagle / "prove.out").write_text("T0002: PROVEN — refuses with the defect\n")
+    runtime, _ = _bound(tmp_path)
+
+    result = await _tool(runtime, "pursuit_step").execute(
+        "c1",
+        {
+            "task": "T0002",
+            "criteria": "c",
+            "done_when": "grep -q 'a + b' src/clock.py",
+            "scope": ["src/clock.py"],
+            "attempts": 3,
+        },
+    )
+
+    [run] = _runs(fake_tau)
+    assert "the check passes already on the uncommitted work" in run["stdin"].lower()
+    assert "do not change the implementation" in run["stdin"]
+    assert "a line whose change makes it fail" in run["stdin"]
+    assert [p[1] for p in _pursuit_calls(fake_beagle, "prove")] == ["--absent", "--mutate"]
+    assert _pursuit_calls(fake_beagle, "close")[0][:3] == ["T0002", "--outcome", "done"]
+    assert "closed done" in result.text
+
+
+@pytest.mark.anyio
 @pytest.mark.parametrize("committed", [False, True])
 async def test_data_test_route_is_not_offered_when_the_data_test_already_passes(
     tmp_path: Path,
