@@ -108,6 +108,8 @@ async def run_agent_loop(
     turn = 1
     first_turn = True
     pending = tuple(get_steering_messages() if get_steering_messages else ())
+    # What the call that cancelled the run said, e.g. a breaker's reason.
+    stop_note: str | None = None
 
     while True:
         has_more_tools = True
@@ -139,6 +141,19 @@ async def run_agent_loop(
                 yield MessageStartEvent(message=error)
                 yield MessageEndEvent(message=error)
                 yield TurnEndEvent(message=error)
+                yield AgentEndEvent(messages=new_messages)
+                return
+
+            if signal is not None and signal.is_cancelled():
+                # A cancel from between turns (a tool hook stopping the run)
+                # must not start another request: its read would be cut off
+                # and surface as a provider error instead of the stop.
+                aborted = _aborted_message(model, stop_note)
+                messages.append(aborted)
+                new_messages.append(aborted)
+                yield MessageStartEvent(message=aborted)
+                yield MessageEndEvent(message=aborted)
+                yield TurnEndEvent(message=aborted)
                 yield AgentEndEvent(messages=new_messages)
                 return
 
@@ -179,6 +194,7 @@ async def run_agent_loop(
             calls = list(assistant.tool_calls)
             has_more_tools = bool(calls)
             for call in calls:
+                cancelled_before = signal is not None and signal.is_cancelled()
                 async for event in _execute_tool_call(
                     call,
                     tool_by_name,
@@ -193,6 +209,14 @@ async def run_agent_loop(
                         tool_results.append(event.message)
                         messages.append(event.message)
                         new_messages.append(event.message)
+                        if (
+                            stop_note is None
+                            and not cancelled_before
+                            and signal is not None
+                            and signal.is_cancelled()
+                            and event.message.is_error
+                        ):
+                            stop_note = event.message.text or None
 
             yield TurnEndEvent(message=assistant, tool_results=tool_results)
             turn += 1
@@ -437,3 +461,13 @@ def _error_message(model: str, message: str) -> AssistantMessage:
         stop_reason="error",
         error_message=message,
     )
+
+
+def _aborted_message(model: str, reason: str | None) -> AssistantMessage:
+    return AssistantMessage(
+        model=model,
+        content=[],
+        stop_reason="aborted",
+        error_message=reason or "Operation aborted",
+    )
+

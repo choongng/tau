@@ -7452,3 +7452,22 @@ async def test_session_stops_a_run_that_keeps_repeating_a_call(tmp_path: Path) -
     results = [m for m in session.messages if m.role == "toolResult"]
     assert any("the run is stopped: 8 tool calls in a row" in r.text for r in results)
     assert len(provider.calls) < 21
+
+
+@pytest.mark.anyio
+async def test_breaker_stop_ends_as_aborted_with_its_reason(tmp_path: Path) -> None:
+    # Run R18: after the breaker's stop another request started, its cut-off
+    # stream ended the run as "Provider stream ended without a terminal event".
+    same: dict[str, JSONValue] = {"where": ".beagle/log"}
+
+    ran, session, provider = await _run_looking(tmp_path, *[same] * 20)
+
+    # Two run, eight are refused, and no request follows the eighth refusal.
+    assert len(ran) == 2
+    assert len(provider.calls) == 10
+    final = session.messages[-1]
+    assert isinstance(final, AssistantMessage)
+    assert final.stop_reason == "aborted"
+    assert final.error_message == (
+        "Not run, and the run is stopped: 8 tool calls in a row were refused."
+    )
