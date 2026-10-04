@@ -2952,6 +2952,116 @@ async def test_cases_test_that_json_loads_the_cases_file_is_locked(
     }
 
 
+ITC_REFERENCE = (
+    "Interval Tree Clocks\n\n4\n\n"
+    "fork(i) = (i1, i2), where (i1, i2) = split(i)\n"
+    "join((i1, e1), (i2, e2)) = (sum(i1, i2), join(e1, e2))\n"
+    "event((i, e)) = (i, fill(i, e)) if fill(i, e) != e\n"
+    "norm((0, 0)) = 0 and norm((1, 1)) = 1\n"
+)
+
+
+def _cases_with_reference(
+    tmp_path: Path, fake_beagle: Path, monkeypatch: pytest.MonkeyPatch, cases: list[Any]
+) -> Path:
+    """A known-answers task writing `cases`, in a project with references/itc2008.txt."""
+    project = _cases_task(tmp_path, fake_beagle, monkeypatch, CASES_DATA_TEST)
+    refs = project / "references"
+    refs.mkdir()
+    (refs / "itc2008.txt").write_text(ITC_REFERENCE)
+    writes = json.loads(os.environ["FAKE_TAU_WRITES"])
+    writes["tests/cases.json"] = json.dumps(cases)
+    monkeypatch.setenv("FAKE_TAU_WRITES", json.dumps(writes))
+    return project
+
+
+@pytest.mark.anyio
+async def test_close_keeps_cases_open_when_most_sources_quote_nothing(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Run R14: sources were `itc2008.txt:221` (the page number "4") and :251
+    # (blank); run R12: bare URLs or no quote at all.
+    cases = [
+        {"name": "fork_seed", "in": "1", "out": "((1, 0), (0, 1))", "source": "itc2008.txt:221"},
+        {"name": "join_two", "in": "x", "out": "y", "source": "itc2008.txt:251"},
+        {"name": "event_left", "in": "a", "out": "b", "source": "https://example.org/itc.pdf"},
+        {"name": "norm_one", "in": "(1, 1)", "out": "1"},
+        {
+            "name": "fork_cited",
+            "in": "1",
+            "out": "2",
+            "citation": {"line": 5, "text": "fork(i) = (i1, i2), where (i1, i2) = split(i)"},
+        },
+    ]
+    project = _cases_with_reference(tmp_path, fake_beagle, monkeypatch, cases)
+
+    result = await _step_cases(tmp_path, locks=CASES_SCOPE)
+
+    assert "stays open" in result.text and "nothing is locked" in result.text
+    assert "4 of 5 cases in tests/cases.json have no source quoting references/*.txt" in (
+        result.text
+    )
+    assert "(e.g. fork_seed, join_two, event_left)" in result.text
+    assert "norm_one" not in result.text.split("Last report")[0]
+    assert _pursuit_calls(fake_beagle, "close") == []
+    assert _pursuit_calls(fake_beagle, "commit") == []
+    assert not (project / ".beagle" / "locked").exists()
+
+
+@pytest.mark.anyio
+async def test_close_accepts_cases_whose_sources_quote_references(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cases = [
+        {"name": "fork", "in": "1", "out": "2", "source": "fork(i) = (i1, i2), where"},
+        {
+            "name": "join",
+            "in": "x",
+            "out": "y",
+            "refs": ['itc2008.txt:7 "JOIN((i1, e1),   (i2, e2)) = (sum(i1, i2)"'],
+        },
+        {"name": "norm", "in": "(1, 1)", "out": "1", "quote": "norm((0, 0)) = 0 and"},
+        {"name": "event", "in": "a", "out": "b", "source": "itc2008.txt:221"},
+    ]
+    project = _cases_with_reference(tmp_path, fake_beagle, monkeypatch, cases)
+
+    result = await _step_cases(tmp_path, locks=CASES_SCOPE)
+
+    assert "Locked: tests/cases.json, tests/test_case_data.py" in result.text
+    assert "have no source quoting" not in result.text
+    assert (project / ".beagle" / "locked").exists()
+    found = _module()._unquoted_cases
+    assert found(project, ["tests/cases.json"]) is None
+    assert found(project, ["missing.json"]) is None
+
+
+def test_known_answers_guidance_asks_for_a_quoted_source(tmp_path: Path) -> None:
+    module = _module()
+    assert "quoting the reference's own words verbatim" in module.CASES_FIRST_NOTE
+    assert "references/*.txt" in module.CASES_FIRST_NOTE
+    refs = tmp_path / "references"
+    refs.mkdir()
+    (refs / "itc2008.txt").write_text(ITC_REFERENCE)
+    (refs / "index.json").write_text(
+        json.dumps(
+            {"request": "ITC in Python", "fetched": {"itc2008.txt": "https://e.org/itc.pdf"}}
+        )
+    )
+    data_brief = module._references_brief(tmp_path, context_only=True)
+    assert module.QUOTED_SOURCE_NOTE in data_brief
+    assert "quotes, verbatim, the line of references/*.txt" in data_brief
+    assert "is not a source" in data_brief
+    assert module.QUOTED_SOURCE_NOTE not in module._references_brief(tmp_path)
+
+
 def test_a_witness_block_is_read_from_the_end_of_a_report() -> None:
     witness = _module()._witness
     assert witness(WITNESSED_REPORT) == ("src/clock.py", "    return a + b", "    return a - b")

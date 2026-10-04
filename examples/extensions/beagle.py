@@ -1990,6 +1990,17 @@ def _references_note(index: Mapping[str, Any], root: Path) -> str:
     )
 
 
+#: Asked of a known-answers task with references/ fetched. Runs R12 and R14:
+#: cases cited bare URLs, nothing, or a file:line that held a page number.
+QUOTED_SOURCE_NOTE = (
+    "Known answers: give each case a `source` that quotes, verbatim, the line of "
+    f"{REFERENCES_DIR}/*.txt it comes from, at least four words copied as written. "
+    "A bare file:line (such as `paper.txt:221`), a page number or a URL is not a "
+    "source: at close, a cases file most of whose sources quote nothing found in "
+    f"{REFERENCES_DIR}/*.txt keeps the task open."
+)
+
+
 def _references_brief(root: Path, context_only: bool = False) -> str:
     """The worker brief's part from `references/index.json`: request and references.
 
@@ -2022,6 +2033,8 @@ def _references_brief(root: Path, context_only: bool = False) -> str:
             else "The user's original request, verbatim"
         )
         parts.append(f"{lead}:\n<<<\n{request}\n>>>")
+    if context_only and fetched:
+        parts.append(QUOTED_SOURCE_NOTE)
     return "\n\n".join(parts)
 
 
@@ -3622,6 +3635,124 @@ def _unread_cases(root: Path, entries: list[str]) -> tuple[str, str] | None:
         name = Path(data).name
         if readers and not any(_cases_test_reads(root / test, name) for test in readers):
             return readers[0], data
+    return None
+
+
+#: Words a case's source must quote from references/*.txt to count as found.
+SOURCE_QUOTE_MIN_WORDS = 4
+#: Key fragments that mark where a case keeps its source text.
+SOURCE_KEY_PARTS = ("source", "cite", "quote", "ref")
+#: Pairs of marks a quote may sit between inside a longer source string.
+_QUOTE_MARKS = re.compile(r'"([^"]+)"|“([^”]+)”|`([^`]+)`|\'([^\']{12,})\'')
+
+
+def _normalised(text: str) -> str:
+    return " ".join(text.split()).lower()
+
+
+def _strings_in(value: object) -> list[str]:
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, dict):
+        return [s for item in value.values() for s in _strings_in(item)]
+    if isinstance(value, list):
+        return [s for item in value for s in _strings_in(item)]
+    return []
+
+
+def _source_strings(case: object) -> list[str]:
+    """The strings under a case's source-like keys, at any depth; else all its strings."""
+    found: list[str] = []
+    keyed = False
+
+    def walk(value: object) -> None:
+        nonlocal keyed
+        if isinstance(value, dict):
+            for key, item in value.items():
+                if any(part in str(key).lower() for part in SOURCE_KEY_PARTS):
+                    keyed = True
+                    found.extend(_strings_in(item))
+                else:
+                    walk(item)
+        elif isinstance(value, list):
+            for item in value:
+                walk(item)
+
+    walk(case)
+    return found if keyed else _strings_in(case)
+
+
+def _quotes_reference(text: str, reference: str) -> bool:
+    """Whether `text`, whole, quoted within it or split at an ellipsis, occurs in `reference`."""
+    candidates = [text]
+    candidates += [next(g for g in m.groups() if g) for m in _QUOTE_MARKS.finditer(text)]
+    candidates += [part for c in list(candidates) for part in re.split(r"\.\.\.|…", c)]
+    for candidate in candidates:
+        quote = _normalised(candidate).strip(" \"'`“”.,;:")
+        if len(quote.split()) >= SOURCE_QUOTE_MIN_WORDS and quote in reference:
+            return True
+    return False
+
+
+def _cases_list(data: object) -> list[object]:
+    if isinstance(data, list):
+        return data
+    if isinstance(data, dict):
+        lists = [v for v in data.values() if isinstance(v, list) and v]
+        if lists:
+            return max(lists, key=len)
+        if data and all(isinstance(v, dict) for v in data.values()):
+            return [{"name": k, **v} for k, v in data.items()]
+    return []
+
+
+def _case_label(case: object, index: int) -> str:
+    if isinstance(case, dict):
+        for key in ("name", "id", "title", "case"):
+            if isinstance(case.get(key), str | int) and str(case[key]).strip():
+                return str(case[key])
+    return f"#{index + 1}"
+
+
+def _unquoted_cases(
+    root: Path, entries: list[str]
+) -> tuple[str, int, int, list[str]] | None:
+    """(data file, unfound, total, up to 3 names) when most cases quote no references/*.txt.
+
+    Runs R12 and R14: cases cited bare URLs, nothing, or `itc2008.txt:221`,
+    a line that held a page number. A source counts as found when at least
+    SOURCE_QUOTE_MIN_WORDS words of it occur, whitespace-normalised, in one
+    reference text.
+    """
+    refs = root / REFERENCES_DIR
+    texts = []
+    for path in sorted(refs.glob("*.txt")) if refs.is_dir() else []:
+        try:
+            texts.append(_normalised(path.read_text(encoding="utf-8", errors="replace")))
+        except OSError:
+            continue
+    if not texts:
+        return None
+    for entry in entries:
+        target = _project_file(root, entry)
+        if target is None or not target.is_file() or target.suffix != ".json":
+            continue
+        rel = str(target.relative_to(root.resolve()))
+        if not _is_cases_data(rel):
+            continue
+        try:
+            cases = _cases_list(json.loads(target.read_text(encoding="utf-8")))
+        except (OSError, ValueError):
+            continue
+        unfound = [
+            _case_label(case, i)
+            for i, case in enumerate(cases)
+            if not any(
+                _quotes_reference(s, text) for s in _source_strings(case) for text in texts
+            )
+        ]
+        if cases and 2 * len(unfound) > len(cases):
+            return rel, len(unfound), len(cases), unfound[:3]
     return None
 
 
@@ -5702,6 +5833,26 @@ def make_step_tool() -> Any:
                 f"\n\nLast report:\n{shown}\n\n"
                 f'Next: pursuit_step with task="{task}" and notes saying {test} must load '
                 f"{data} and run every case against the code.",
+            )
+        unquoted = _unquoted_cases(root, locks) if locks else None
+        if unquoted:
+            state = "stays blocked" if retrying else "stays open"
+            data, missing, total, named = unquoted
+            return _not_done(
+                root,
+                task,
+                scope,
+                f"{route}{undid}{task} — {title}: the check passes, but the task {state} "
+                f"and nothing is locked: {missing} of {total} cases in {data} have no source "
+                f"quoting {REFERENCES_DIR}/*.txt (e.g. {', '.join(named)}), so nothing ties "
+                "them to the reference: the sub-agent must give each case a `source` that "
+                f"copies, verbatim, at least {SOURCE_QUOTE_MIN_WORDS} words of a line of "
+                f"{REFERENCES_DIR}/*.txt it comes from. A bare file:line, page number or URL "
+                "is not a source."
+                f"\n\nLast report:\n{shown}\n\n"
+                f'Next: pursuit_step with task="{task}" and notes saying each case in {data} '
+                f"must quote, verbatim, the line of {REFERENCES_DIR}/*.txt it comes from, "
+                f"starting with {named[0]}.",
             )
         # Committed while the task is still open, as beagle has a worker do:
         # the close's sweep then finds the work in history, not in the tree.
@@ -7817,7 +7968,9 @@ CASES_FIRST_NOTE = (
     "Cases first. Make the first milestone after the reference the known answers: a "
     "sub-agent reads the reference and writes, without any implementation, (a) a data "
     "file of small inputs and the exact results the reference gives for them, each "
-    "citing where in the reference it comes from (e.g. `tests/cases.json`), and (b) "
+    "with a `source` quoting the reference's own words verbatim, at least four of them "
+    "copied from a line of references/*.txt where the references are fetched there; a "
+    "bare file:line or URL is not a source (e.g. `tests/cases.json`), and (b) "
     "a test that runs every case against the code (e.g. `tests/test_cases.py`). That "
     "test imports the module later tasks will write, by name (e.g. `from <package> "
     "import …`), and defines no class or helper of its own: it fails with ImportError "
