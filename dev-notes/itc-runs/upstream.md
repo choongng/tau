@@ -184,3 +184,28 @@ guards and buffers, or in the model.
 Nothing else for beagle: the run's main failure is tau's setup-milestone
 detector (R10.md, first tau class).
 - `pursuit open` refused a check script because a *comment* in it read "…Setup beagle pursuit infrastructure…": the self-modifying-check scan matched `beagle pursuit <word>` in a comment. Suggest: skip comment lines, or only match known pursuit verbs.
+
+## R12
+
+- **`pursuit split` of an open leaf leaves its uncommitted, in-scope
+  work with no owner.** T0005 was split with tests/test_comprehensive.py
+  passing but uncommitted. beagle's split recorded nothing about the
+  file. From the first part's close on, workspace-clean was red, flagged
+  "untracked-not-ignored", with no task named (R12.md, fourth tau class).
+  This is the same as R09's tests/cases.json. tau now prints a note, but
+  beagle holds the tree. Proposal: `split` lists the open task's
+  uncommitted in-scope paths in the result and on the parent record
+  (`carried = [...]`), and workspace-clean's FAIL line names the task
+  whose scope holds each untracked path. Priority: medium.
+- **`pursuit prove`'s tests-only route is easy to miss.** For a task
+  that changed only tests, `--mutate` of the module the test imports is
+  accepted without `--predates-because`. This is in `--help` only. tau
+  (and R02/R04's notes) assumed a tests-only task could be proven only
+  by taking a data file away, and R12's T0008 died on that assumption.
+  Proposal: when `prove` is given no `--mutate`/`--absent` and the scope
+  is tests-only, its error names the modules the scoped tests import as
+  candidate `--mutate` targets. Priority: low (tau's first class is the
+  fix on the host side).
+
+Nothing else for beagle: the event-tree loss is tau's ordering and checks
+(R12.md, second tau class) and the model's invented design.
