@@ -3179,6 +3179,193 @@ def test_r15_cases_all_quote_the_reference(tmp_path: Path) -> None:
     assert module._unquoted_cases(tmp_path, ["tests/cases.json"]) is None
 
 
+#: R15's tests/cases.json, all 32 cases, verbatim as compact JSON.
+R15_FULL_CASES_JSON = (
+    '[{"id":"seed-stamp-is-one","source":"ITC makes use what we call the seed stamp,'
+    ' (1, 0), from which we can fork as desired to obtain an initial configuration.","op'
+    '":"seed","input":[],"expected":[[1,0]]},{"id":"fork-splits-id-keeps-event",'
+    '"source":"fork: takes a clock and makes a new representation of it where the event '
+    "counter is the same, but the ID part is divided as above. This is what happens at step"
+    's 1, 3, and 7","op":"fork","input":[[1,0]],"expected":[[[1,0],0],[[0,1],0]]},'
+    '{"id":"fork-keeps-event-counter","source":"fork: takes a clock and makes a new '
+    "representation of it where the event counter is the same, but the ID part is divided a"
+    's above. This is what happens at steps 1, 3, and 7","op":"fork","input":[[1,2]]'
+    ',"expected":[[[1,0],2],[[0,1],2]]},{"id":"fork-of-fork","source":"fork: takes'
+    " a clock and makes a new representation of it where the event counter is the same, but"
+    ' the ID part is divided as above. This is what happens at steps 1, 3, and 7","op":'
+    '"fork","input":[[1,0],0],"expected":[[[1,0],0],[[0,1],0]]},{"id":"fork-uses-t'
+    'wo-subtrees","source":"fork: takes a clock and makes a new representation of it wh'
+    "ere the event counter is the same, but the ID part is divided as above. This is what h"
+    'appens at steps 1, 3, and 7","op":"fork","input":[[0,1],0],"expected":[[[0,1]'
+    ',0],[[1,0],0]]},{"id":"fork-of-deeper-id","source":"fork: takes a clock and mak'
+    "es a new representation of it where the event counter is the same, but the ID part is "
+    'divided as above. This is what happens at steps 1, 3, and 7","op":"fork","input'
+    '":[[0,[1,0]],0],"expected":[[[0,[1,0]],0],[[0,[0,1]],0]]},{"id":"fork-of-deeper-'
+    'id-with-event","source":"fork: takes a clock and makes a new representation of it '
+    "where the event counter is the same, but the ID part is divided as above. This is what"
+    ' happens at steps 1, 3, and 7","op":"fork","input":[[0,[1,0]],2],"expected":['
+    '[[0,[1,0]],2],[[0,[0,1]],2]]},{"id":"fork-then-event-then-join","source":"The e'
+    "vent operation was able to fill the missing part in a tree so as to allow its simplifi"
+    'cation to a single integer.","op":"chain","input":[[1,0]],"expected":[[1,1]]}'
+    ',{"id":"peek-returns-anonymous-id","source":"peek: creates a copy of the timest'
+    "amp, but with a NULL id, such that the event counter may be read, but not incremented."
+    ' Not shown on the diagram.","op":"peek","input":[[1,3]],"expected":[[0,3]]},{'
+    '"id":"peek-of-anonymous-stamp","source":"peek: creates a copy of the timestamp,'
+    " but with a NULL id, such that the event counter may be read, but not incremented. Not"
+    ' shown on the diagram.","op":"peek","input":[[0,5]],"expected":[[0,5]]},{"id'
+    '":"event-increments-counter","source":"event: increments the counter on top of t'
+    "he clock, based off the clock's id. This is what happens at 2, 4 (bottom), and 6 (top)"
+    '.","op":"event","input":[[1,0]],"expected":[[1,1]]},{"id":"event-on-counte'
+    'd-clock","source":"event: increments the counter on top of the clock, based off th'
+    'e clock\'s id. This is what happens at 2, 4 (bottom), and 6 (top).","op":"event",'
+    '"input":[[1,2]],"expected":[[1,3]]},{"id":"event-joins-subtrees","source":"'
+    "event: increments the counter on top of the clock, based off the clock's id. This is w"
+    'hat happens at 2, 4 (bottom), and 6 (top).","op":"event","input":[[0,1],0],"ex'
+    'pected":[[0,1],1]},{"id":"event-on-anonymous-stamp-is-invalid","source":"An ev'
+    "ent cannot be applied to an anonymous stamp as no element in the domain is available t"
+    'o be inflated.","op":"event","input":[[0,2]],"expected":null},{"id":"join-'
+    'sums-ids-and-event-functions","source":"join: merge two timestamps and get a new o'
+    'ne. This is what happens at 5 and 8","op":"join","input":[[1,0],[0,1]],"expect'
+    'ed":[[1,0]]},{"id":"join-of-counters","source":"join: merge two timestamps and'
+    ' get a new one. This is what happens at 5 and 8","op":"join","input":[[1,2],[1,'
+    '1]],"expected":[[1,3]]},{"id":"join-of-forked-clocks","source":"join: merge t'
+    'wo timestamps and get a new one. This is what happens at 5 and 8","op":"join","i'
+    'nput":[[1,0],0],"expected":[[1,0]]},{"id":"join-commutative","source":"join:'
+    ' merge two timestamps and get a new one. This is what happens at 5 and 8","op":"jo'
+    'in","input":[[0,1],[1,0]],"expected":[[1,0]]},{"id":"join-of-joined","source'
+    '":"join: merge two timestamps and get a new one. This is what happens at 5 and 8",'
+    '"op":"join","input":[[1,0],[[0,1],0]],"expected":[[1,0]]},{"id":"join-of-th'
+    'ree","source":"join: merge two timestamps and get a new one. This is what happens '
+    'at 5 and 8","op":"join","input":[[1,0],[0,1],[[1,0],0]],"expected":[[1,0]]},{'
+    '"id":"join-into-deeper-id","source":"join: merge two timestamps and get a new o'
+    'ne. This is what happens at 5 and 8","op":"join","input":[[1,0],[[1,0],0]],"ex'
+    'pected":[[1,0]]},{"id":"join-into-forked-id","source":"join: merge two timesta'
+    'mps and get a new one. This is what happens at 5 and 8","op":"join","input":[[0'
+    ',[1,0]],[[0,[0,1]],0]],"expected":[[0,[1,0]]]},{"id":"join-keeps-event-max","so'
+    'urce":"join: merge two timestamps and get a new one. This is what happens at 5 and 8'
+    '","op":"join","input":[[1,2],[1,5]],"expected":[[1,5]]},{"id":"compare-equ'
+    'als-self","source":"Comparison of ITC can be derived from the pointwise comparison'
+    ' of the corresponding functions: (i1, e1) \u2264 (i2, e2) \u27fa Je1K \u2264 Je2K.",'
+    '"op":"compare","input":[[1,2]],"expected":"eq"},{"id":"compare-strictly-l'
+    'esser","source":"Comparison of ITC can be derived from the pointwise comparison of'
+    ' the corresponding functions: (i1, e1) \u2264 (i2, e2) \u27fa Je1K \u2264 Je2K.","op'
+    '":"compare","input":[[1,1]],"expected":"lt"},{"id":"compare-greater","so'
+    'urce":"Comparison of ITC can be derived from the pointwise comparison of the corresp'
+    'onding functions: (i1, e1) \u2264 (i2, e2) \u27fa Je1K \u2264 Je2K.","op":"compare'
+    '","input":[[1,3]],"expected":"gt"},{"id":"compare-equals-other-id","source'
+    '":"Comparison of ITC can be derived from the pointwise comparison of the correspondi'
+    'ng functions: (i1, e1) \u2264 (i2, e2) \u27fa Je1K \u2264 Je2K.","op":"compare",'
+    '"input":[[0,1],[1,0]],"expected":"eq"},{"id":"compare-unknown-id","source"'
+    ':"Comparison of ITC can be derived from the pointwise comparison of the corresponding'
+    ' functions: (i1, e1) \u2264 (i2, e2) \u27fa Je1K \u2264 Je2K.","op":"compare","i'
+    'nput":[[0,1],[1,0]],"expected":null},{"id":"send-is-event-then-peek","source"'
+    ':"send: This operation is the atomic composition of event followed by peek.","op":'
+    '"send","input":[[1,0]],"expected":[[0,1]]},{"id":"receive-is-join-then-event'
+    '","source":"receive: A receive is the atomic composition of join followed by event'
+    '.","op":"receive","input":[[1,0],[[0,1],0]],"expected":[[1,1]]},{"id":"syn'
+    'c-is-join-then-fork","source":"sync: A sync is the atomic composition of join foll'
+    'owed by fork.","op":"sync","input":[[1,0],[0,1]],"expected":[[[1,0],0],[[0,1]'
+    ',0]]},{"id":"fork-then-event-then-join-then-event","source":"It can be seen tha'
+    "t each event always inflates the event tree in intervals available in the id. The even"
+    "t after the final join managed to perform an inflation in a way such that the resultin"
+    'g event function is represented by a single integer.","op":"chain","input":[[1,'
+    '0]],"expected":[[1,2]]}]'
+)
+#: The lines of R15's references/*.txt that its cases quote, verbatim, by 1-based number.
+R15_QUOTED_REFERENCE_LINES = {
+    "itc2008.txt": {
+        119: (
+            "send This operation is the atomic composition of event followed by peek. E.g. in v"
+            "ector clock systems,"
+        ),
+        122: (
+            "receive A receive is the atomic composition of join followed by event. E.g. in vec"
+            "tor clocks taking the"
+        ),
+        125: (
+            "sync A sync is the atomic composition of join followed by fork. E.g. In version ve"
+            "ctor systems and in"
+        ),
+        199: (
+            "An event cannot be applied to an anonymous stamp as no element in the domain is av"
+            "ailable to be inflated."
+        ),
+        269: (
+            "     ITC makes use what we call the seed stamp, (1, 0), from which we can fork as "
+            "desired to obtain an"
+        ),
+        270: "initial configuration.",
+        282: (
+            "of the two available subtrees. The final join leads to a simplification in the id "
+            "by merging two subtrees. It"
+        ),
+        283: (
+            "can be seen that each event always inflates the event tree in intervals available "
+            "in the id. The event after the"
+        ),
+        284: (
+            "final join managed to perform an inflation in a way such that the resulting event "
+            "function is represented by"
+        ),
+        285: "a single integer.",
+        346: (
+            "Comparison of ITC can be derived from the pointwise comparison of the correspondin"
+            "g functions:"
+        ),
+        410: (
+            "The event operation was able to fill the missing part in a tree so as to allow its"
+            " simplification to a single"
+        ),
+        411: (
+            "integer. In general, the event operation can use several parts of the id, and may "
+            "simplify several subtrees"
+        ),
+    },
+    "interval-tree-clocks.txt": {
+        54: (
+            "fork: takes a clock and makes a new representation of it where the event counter i"
+            "s the same, but the ID part is divided as above. This is what happens at steps 1, "
+            "3, and 7"
+        ),
+        56: (
+            "event: increments the counter on top of the clock, based off the clock's id. This "
+            "is what happens at 2, 4 (bottom), and 6 (top)."
+        ),
+        58: "join: merge two timestamps and get a new one. This is what happens at 5 and 8",
+        60: (
+            "peek: creates a copy of the timestamp, but with a NULL id, such that the event cou"
+            "nter may be read, but not incremented. Not shown on the diagram."
+        ),
+    },
+}
+
+
+def test_r15_full_cases_file_all_quote_the_reference(tmp_path: Path) -> None:
+    module = _module()
+    cases = json.loads(R15_FULL_CASES_JSON)
+    assert len(cases) == 32
+    refs = tmp_path / "references"
+    refs.mkdir()
+    texts = []
+    for name, lines in R15_QUOTED_REFERENCE_LINES.items():
+        text = "\n".join(lines[n] for n in sorted(lines)) + "\n"
+        (refs / name).write_text(text, encoding="utf-8")
+        texts.append(module._normalised(text))
+    unfound = [
+        module._case_label(case, i)
+        for i, case in enumerate(cases)
+        if not any(
+            module._quotes_reference(s, text)
+            for s in module._source_strings(case)
+            for text in texts
+        )
+    ]
+    assert unfound == []
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "tests" / "cases.json").write_text(R15_FULL_CASES_JSON, encoding="utf-8")
+    assert module._unquoted_cases(tmp_path, ["tests/cases.json"]) is None
+
+
 def test_known_answers_guidance_asks_for_a_quoted_source(tmp_path: Path) -> None:
     module = _module()
     assert "quoting the reference's own words verbatim" in module.CASES_FIRST_NOTE
