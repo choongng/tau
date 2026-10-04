@@ -3162,6 +3162,15 @@ def _check_problem(command: str) -> str | None:
             f"file is there, whatever it says. {one_command}, testing what the code must "
             "do. Call pursuit_step again with that."
         )
+    if program.startswith("python") and _judges_nothing(words[1:]):
+        # Run R14 closed T0007 on `t=IntervalTree(); t.insert(1, 5); t.search(3);
+        # print('OK')`, which passes on any code that does not raise.
+        return (
+            f"done_when `{command}` only constructs and calls, with no assert, so it "
+            "passes on any code that does not crash, whatever it returns. "
+            f"{one_command}, asserting the values the reference gives. Call pursuit_step "
+            "again with that."
+        )
     if _key_only_json_check(command):
         # Run R12 closed T0002 on `assert 'title' in data and ...` over its
         # summary JSON, which held whatever the worker wrote under those keys.
@@ -3311,6 +3320,52 @@ def _key_only_json_check(command: str) -> bool:
 
     asserts = [node.test for node in ast.walk(tree) if isinstance(node, ast.Assert)]
     return loads and bool(asserts) and all(key_check(test) for test in asserts)
+
+
+def _judges_nothing(args: list[str]) -> bool:
+    """Whether a python argv's `-c` code can fail only by raising.
+
+    Code judges when it asserts, runs pytest or unittest, reaches `raise` or
+    `sys.exit` through an `if`, or exits with a value it computed.
+    """
+    if "-c" not in args or args.index("-c") + 1 >= len(args):
+        return False
+    code = args[args.index("-c") + 1]
+    try:
+        tree = ast.parse(code)
+    except SyntaxError:
+        return False
+    if not tree.body or re.search(r"\b(pytest|unittest)\b", code):
+        return False
+
+    def exits(node: ast.AST) -> bool:
+        if isinstance(node, ast.Raise):
+            return True
+        if not isinstance(node, ast.Call):
+            return False
+        func = node.func
+        name = func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", "")
+        return name in {"exit", "_exit"}
+
+    def compared(node: ast.AST) -> bool:
+        return any(isinstance(n, (ast.Compare, ast.BoolOp, ast.IfExp)) for n in ast.walk(node))
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assert):
+            return False
+        if isinstance(node, (ast.If, ast.While)) and any(
+            exits(n) for stmt in node.body + node.orelse for n in ast.walk(stmt)
+        ):
+            return False
+        if (
+            isinstance(node, ast.Call)
+            and exits(node)
+            and any(not isinstance(arg, ast.Constant) for arg in node.args)
+        ):
+            return False
+        if isinstance(node, ast.Raise) and node.exc is not None and compared(node.exc):
+            return False
+    return True
 
 
 def _only_imports(args: list[str]) -> bool:
@@ -3775,6 +3830,68 @@ def _locked_test_imports(goal: Path) -> dict[str, str]:
         for name in _test_project_imports(store / rel):
             imported.setdefault(name, rel)
     return imported
+
+
+def _runs_test_file(command: str, rel: str) -> bool:
+    """Whether `command` runs pytest over `rel`: the file, a node id or `-k` in it, a
+    directory holding it, or the whole suite."""
+    try:
+        words = shlex.split(command)
+    except ValueError:
+        return False
+    tokens: list[str] = []
+    for word in words:
+        tokens.append(word)
+        if " " in word:
+            with contextlib.suppress(ValueError):
+                tokens += shlex.split(word)
+    runs = [i for i, t in enumerate(tokens) if Path(t).name in {"pytest", "py.test"}]
+    for at in runs:
+        paths = []
+        for token in tokens[at + 1 :]:
+            if token in {"&&", "||", ";", "|"} or token.endswith(";"):
+                break
+            if not token.startswith("-") and ("/" in token or token.endswith(".py")):
+                paths.append(token.split("::")[0].rstrip("/"))
+        if not paths or any(p in {"", "."} or p == rel or rel.startswith(f"{p}/") for p in paths):
+            return True
+    return False
+
+
+def _locked_test_problem(command: str, scope: list[str], goal: Path) -> str | None:
+    """Why a part on a module a locked test judges is bound to a check that runs no
+    locked test, or None.
+
+    Run R14 closed T0007 and T0008, both scoped on interval_tree_clocks, on
+    construct-and-call checks; the locked cases test that imports it never ran.
+    """
+    imported = _locked_test_imports(goal)
+    if not imported or not scope:
+        return None
+    entries = [e.rstrip("/") for e in scope]
+
+    def held(module: str) -> bool:
+        rel = module.replace(".", "/")
+        for base in ("", "src/"):
+            for path in (f"{base}{rel}.py", f"{base}{rel}/__init__.py"):
+                if any(e in {"", "."} or path == e or path.startswith(f"{e}/") for e in entries):
+                    return True
+            if any(e == f"{base}{rel}" or e.startswith(f"{base}{rel}/") for e in entries):
+                return True
+        return False
+
+    judged = [(module, test) for module, test in imported.items() if held(module)]
+    if not judged or any(_runs_test_file(command, test) for _, test in judged):
+        return None
+    module, test = judged[0]
+    return (
+        f"the scope holds {module}, which the locked {test} judges, but done_when runs "
+        f"none of the locked tests, so the reference's answers would not judge this "
+        f"part. Bind `python3 -m pytest -q {test}`. A selection of that file counts as "
+        f"running it, so a small part can bind just the cases it makes pass: a node id "
+        f"(`python3 -m pytest -q {test}::<test name>`) or `python3 -m pytest -q {test} "
+        "-k <name>`. Call pursuit_step again with that."
+    )
 
 
 def _cases_first_problem(scope: list[str], task: str, title: str, goal: Path) -> str | None:
@@ -4415,6 +4532,27 @@ class _Proof:
     ask_module: bool = False
 
 
+def _opened_commit(task: str, root: Path) -> str:
+    """The commit `task` opened on: its record's, else the parent of its first
+    commit, else HEAD; "" when git has none."""
+    rc, out = _pursuit(["show", task], root)
+    record = _json_reply(out) if rc == 0 else None
+    if isinstance(record, dict) and str(record.get("opened_commit") or "").strip():
+        return str(record["opened_commit"]).strip()
+    rc, out = _run(["git", "log", "--format=%H", f"--grep=^{task}:"], root, timeout=30.0)
+    own = out.split() if rc == 0 else []
+    rev = f"{own[-1]}^" if own else "HEAD"
+    rc, out = _run(["git", "rev-parse", "--verify", "--quiet", rev], root, timeout=30.0)
+    return out.strip() if rc == 0 else ""
+
+
+def _in_commit(sha: str, rel: str, root: Path) -> bool:
+    """Whether `rel` was in the tree at commit `sha`."""
+    if not sha:
+        return False
+    return _run(["git", "cat-file", "-e", f"{sha}:{rel}"], root, timeout=30.0)[0] == 0
+
+
 async def _prove(
     task: str, report: str, scope: list[str], root: Path, timeout: float
 ) -> _Proof | None:
@@ -4423,7 +4561,8 @@ async def _prove(
     A check that passes over a defect put back into the work is not about the
     work: run 11d closed two tasks on import-only checks. The worker names the
     defect (`WITNESS_NOTE`); a missing or misshapen one falls back to taking
-    away the source files the task changed, or with none, its data files. None
+    away the source files the task changed that were not in the tree when it
+    opened, or with none, its data files. None
     when neither can be tried —
     no witness and no changed file — and the close decides.
     """
@@ -4464,6 +4603,11 @@ async def _prove(
             if _in_scope(rel, scope) and not rel.endswith(".py") and (root / rel).is_file()
         ]
     if sources:
+        # Run R14: both witnesses took away interval_tree_clocks.py, which T0003
+        # wrote, so removing it showed only that the import was needed.
+        opened = _opened_commit(task, root)
+        sources = [rel for rel in sources if not _in_commit(opened, rel, root)]
+    if sources:
         attempts.append([arg for rel in sources for arg in ("--absent", rel)])
     for how in attempts:
         argv = [BEAGLE_BIN, "pursuit", "prove", task, *how, "--check-timeout", f"{timeout:.0f}"]
@@ -4494,7 +4638,7 @@ async def _prove(
         return _Proof(
             proven=False,
             text="The worker gave no WITNESS block, and changed no source file in the "
-            "task's scope that could be taken away instead.",
+            "task's scope that is new since it opened and could be taken away instead.",
         )
     return _Proof(proven=False, text="\n\n".join(refused))
 
@@ -5519,6 +5663,7 @@ def make_step_tool() -> Any:
                 scoped = (
                     _scope_problem(route_scope, task, nodes, root)
                     or _oracle_with_code_problem(route_scope, goal)
+                    or _locked_test_problem(done_when or old_check, route_scope, goal)
                     or _import_scope_problem(done_when or old_check, route_scope, root)
                 )
                 if scoped is not None:
@@ -5600,6 +5745,7 @@ def make_step_tool() -> Any:
                 _scope_problem(scope, task, nodes, root)
                 or _oracle_with_code_problem(scope, goal)
                 or _cases_first_problem(scope, task, title, goal)
+                or _locked_test_problem(done_when, scope, goal)
                 or _import_scope_problem(done_when, scope, root)
             )
             if scoped is not None:

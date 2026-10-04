@@ -4368,7 +4368,11 @@ async def test_opening_the_module_a_locked_cases_test_imports_is_allowed(
     runtime, _ = _bound(tmp_path)
 
     opened = await _tool(runtime, "pursuit_step").execute(
-        "c1", _open_args(["src/interval_tree_clock.py"])
+        "c1",
+        {
+            **_open_args(["src/interval_tree_clock.py"]),
+            "done_when": "python3 -m pytest -q tests/test_cases.py",
+        },
     )
 
     assert "Cases first" not in opened.text
@@ -6948,6 +6952,126 @@ def test_check_problem_refuses_import_only_python_c() -> None:
     assert "passes as soon as the file is there" in found
     runs = 'python3 -c "from src.itc import Stamp; assert Stamp().fork()"'
     assert _module()._check_problem(runs) is None
+
+
+#: Run R14 E33: T0007 closed on this, a construct-and-call check with no assert.
+R14_E33_CHECK = (
+    'python3 -c "from interval_tree_clocks import IntervalTree; t=IntervalTree(); '
+    "t.insert(1, 5); t.search(3); print('OK')\""
+)
+
+
+def test_python_c_that_only_constructs_and_calls_is_refused() -> None:
+    module = _module()
+
+    found = module._check_problem(R14_E33_CHECK)
+
+    assert found is not None and "only constructs and calls, with no assert" in found
+    printed = 'python3 -c "from itc import Stamp; print(Stamp().fork() == (1, 2))"'
+    assert module._check_problem(printed) is not None
+    chained, problem = module._and_chain(R14_E33_CHECK)
+    assert chained is None and problem is not None and "with no assert" in problem
+
+
+def test_python_c_with_an_assert_is_allowed() -> None:
+    module = _module()
+    asserted = (
+        'python3 -c "from interval_tree_clocks import IntervalTree; t=IntervalTree(); '
+        't.insert(1, 5); assert t.search(3) == [(1, 5)]"'
+    )
+    exited = (
+        'python3 -c "import sys; from itc import Stamp; '
+        'sys.exit(0 if Stamp().fork() == (1, 2) else 1)"'
+    )
+    raised = (
+        'python3 -c "from itc import Stamp\nif Stamp().fork() != (1, 2):\n    raise SystemExit(1)"'
+    )
+    tested = "python3 -c \"import pytest; raise SystemExit(pytest.main(['-q', 'tests']))\""
+
+    for check in (asserted, exited, raised, tested):
+        assert module._check_problem(check) is None, check
+
+
+@pytest.mark.anyio
+async def test_part_scoping_the_cases_module_must_run_the_locked_cases_test(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # R14: T0007 and T0008 scoped interval_tree_clocks and never ran the
+    # locked cases test that imports it.
+    project = _r12_project(tmp_path)
+    _git(project, "init", "-q")
+    _lock_cases_test(project, "import interval_tree_clocks")
+    monkeypatch.chdir(project)
+    _ready_task(fake_beagle)
+    runtime, _ = _bound(tmp_path)
+    step = _tool(runtime, "pursuit_step")
+    asserted = 'python3 -c "import interval_tree_clocks as m; assert m.fork(1) == (1, 2)"'
+
+    refused = await step.execute(
+        "c1", {**_open_args(["interval_tree_clocks.py"]), "done_when": asserted}
+    )
+
+    assert "T0002 not opened" in refused.text
+    assert "the scope holds interval_tree_clocks" in refused.text
+    assert "`python3 -m pytest -q tests/test_cases.py`" in refused.text
+    assert "node id" in refused.text and "-k <name>" in refused.text
+    assert _pursuit_calls(fake_beagle, "open") == []
+
+    selected = "python3 -m pytest -q tests/test_cases.py::test_fork"
+    opened = await step.execute(
+        "c2", {**_open_args(["interval_tree_clocks.py"]), "done_when": selected}
+    )
+
+    assert "not opened" not in opened.text
+    assert len(_pursuit_calls(fake_beagle, "open")) == 1
+
+    module = _module()
+    goal = project / ".beagle" / "pursuit.toml"
+    scope = ["interval_tree_clocks.py"]
+    for runs in (
+        "python3 -m pytest -q tests/test_cases.py",
+        "python3 -m pytest -q tests/test_cases.py -k fork",
+        "python3 -m pytest -q -k fork",
+        "uv run pytest -q tests/",
+        "bash -c 'python3 -m pytest -q tests/test_cases.py && ruff check .'",
+    ):
+        assert module._locked_test_problem(runs, scope, goal) is None, runs
+    other = "python3 -m pytest -q tests/test_other.py"
+    assert module._locked_test_problem(other, scope, goal) is not None
+    assert module._locked_test_problem(other, ["docs/"], goal) is None
+
+
+@pytest.mark.anyio
+async def test_prove_does_not_offer_absent_for_a_source_that_predates_the_task(
+    tmp_path: Path, beagle: Path, fake_beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # R14: both witnesses removed interval_tree_clocks.py, which T0003 wrote.
+    project = _git_project(tmp_path, monkeypatch)
+    (project / "interval_tree_clocks.py").write_text("def fork(i):\n    return i\n")
+    _git(project, "add", "interval_tree_clocks.py")
+    _git(project, "commit", "-q", "-m", "T0003: the clock")
+    opened = _git(project, "rev-parse", "HEAD").strip()
+    record = {"id": "T0007", "status": "open", "opened_commit": opened}
+    (fake_beagle / "show.out").write_text(json.dumps(record))
+    (project / "interval_tree_clocks.py").write_text("def fork(i):\n    return (i, i)\n")
+    scope = ["interval_tree_clocks.py", "itc_extra.py"]
+    module = _module()
+    monkeypatch.setattr(module, "BEAGLE_BIN", str(fake_beagle / "beagle"))
+
+    await module._prove("T0007", "done, no witness", scope, project, 60)
+
+    assert _pursuit_calls(fake_beagle, "prove") == []
+
+    (project / "itc_extra.py").write_text("X = 1\n")
+    await module._prove("T0007", "done, no witness", scope, project, 60)
+
+    prove = _pursuit_calls(fake_beagle, "prove")
+    assert len(prove) == 1 and prove[0][:3] == ["T0007", "--absent", "itc_extra.py"]
+    assert "interval_tree_clocks.py" not in prove[0]
 
 
 @pytest.mark.anyio
