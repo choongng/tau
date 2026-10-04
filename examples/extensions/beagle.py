@@ -6061,6 +6061,79 @@ async def _passes_without_own_work(check: str, scope: list[str], root: Path) -> 
                 path.write_bytes(data)
 
 
+async def _passes_only_by_uncommitted(check: str, scopes: list[list[str]], root: Path) -> bool:
+    """Whether `check`, passing now, passes only because of uncommitted files in `scopes`.
+
+    The task's own scope and its predecessor's: the close's witness takes those
+    files away, so the close judges them. Run R18 refused T0005's open as
+    "already passes" seven times, on W1's uncommitted known-answers files.
+    """
+    combined = [entry for scope in scopes for entry in scope]
+    if not combined:
+        return False
+    return not await _passes_without_own_work(check, combined, root)
+
+
+def _predecessor_scope(record: dict[str, Any], root: Path) -> list[str]:
+    """The scope of the task `record` succeeds, or [] when it succeeds none."""
+    predecessor = str(record.get("sibling_of") or "").strip()
+    if not predecessor:
+        return []
+    rc, out = _pursuit(["show", predecessor], root)
+    shown = _json_reply(out) if rc == 0 else None
+    return _strings(shown.get("scope")) if isinstance(shown, dict) else []
+
+
+def _on_disk_note(check: str, task: str) -> str:
+    """The note on a check that passes only on uncommitted work in the task's scope."""
+    return (
+        f"`{check}` passes already, but only on uncommitted files in {task}'s scope: the "
+        "work is on disk, and the close judges it (its witness takes those files away, "
+        "and the check must then fail).\n\n"
+    )
+
+
+async def _data_route_on_disk(
+    task: str, route: tuple[str, str, str, list[str]], root: Path, extra: list[str] | None = None
+) -> str | None:
+    """What to say in place of "bind the data test" when that test already passes; or None.
+
+    Run R18: told to bind `pytest tests/test_case_data.py`, which W1's uncommitted
+    files made pass, the driver was refused as "already passes" for 14 minutes.
+    """
+    test, module, data_check, needs = route
+    if (await _run_check(data_check, root, DEFAULT_CHECK_TIMEOUT))[0] != 0:
+        return None
+    scope_arg = f", scope={json.dumps(needs)}" if needs else ""
+    if await _passes_only_by_uncommitted(data_check, [needs, extra or []], root):
+        return (
+            f"{test} imports {module}, which a later task writes, so {task} closes on its "
+            f"data test `{data_check}`. That already passes, on the known-answers work on "
+            f"disk, uncommitted in this scope: {task} closes on that work. Send "
+            f'pursuit_step task="{task}", done_when="{data_check}"{scope_arg}: it opens, '
+            "and the close judges the files on disk."
+        )
+    return (
+        f"{test} imports {module}, which a later task writes, and the data test "
+        f"`{data_check}` already passes on the committed tree, so neither check can tell "
+        f"{task}'s work from none. If a done task already did this work, call pursuit_step "
+        f'task="{task}" abandon="done by <that task>" done_when="{data_check}"; if work is '
+        "left, name a new data test file for it that fails now, put it in scope, and say "
+        "in the notes what it should test."
+    )
+
+
+async def _unwritten_check_problem(
+    command: str, scope: list[str], task: str, root: Path, extra: list[str] | None = None
+) -> str | None:
+    """`_imports_unwritten_problem`, unless the data test it prescribes already passes."""
+    route = _data_test_route(command, scope, root)
+    if route is None:
+        return None
+    on_disk = await _data_route_on_disk(task, route, root, extra)
+    return on_disk or _imports_unwritten_problem(command, scope, root)
+
+
 #: An abandon naming the done task whose commit did this one's work:
 #: "done by T0008", "Done by T0008's commit".
 _DONE_BY = re.compile(r"(?i)^\s*done\s+by\s+(t\d{4,})\b")
@@ -6651,13 +6724,14 @@ def make_step_tool() -> Any:
                     or _oracle_with_code_problem(route_scope, goal)
                     or _locked_test_problem(done_when or old_check, route_scope, goal)
                     or _import_scope_problem(done_when or old_check, route_scope, root)
-                    or _imports_unwritten_problem(done_when or old_check, route_scope, root)
+                ) or await _unwritten_check_problem(
+                    done_when or old_check, route_scope, task, root, _strings(record.get("scope"))
                 )
                 if scoped is not None:
                     return _step_result(f"pursuit_step: no new route for {task} — {scoped}")
                 new_check = done_when or old_check
-                if (await _run_check(new_check, root, DEFAULT_CHECK_TIMEOUT))[0] == 0 and (
-                    await _passes_without_own_work(new_check, route_scope, root)
+                if (await _run_check(new_check, root, DEFAULT_CHECK_TIMEOUT))[0] == 0 and not (
+                    await _passes_only_by_uncommitted(new_check, [route_scope], root)
                 ):
                     return _step_result(
                         f"pursuit_step: no new route for {task}, which stays as it is — "
@@ -6740,20 +6814,25 @@ def make_step_tool() -> Any:
                 or _cases_first_problem(scope, task, title, goal, nodes)
                 or _locked_test_problem(done_when, scope, goal)
                 or _import_scope_problem(done_when, scope, root)
-                or _imports_unwritten_problem(done_when, scope, root)
+            ) or await _unwritten_check_problem(
+                done_when, scope, task, root, _predecessor_scope(record, root)
             )
             if scoped is not None:
                 return _step_result(f"pursuit_step: {task} not opened — {scoped}")
             # A check bound once it already passes closes the task on no work:
             # run 9 bound `cat docs/design.md` and a test an earlier task had
-            # made pass.
+            # made pass. One that passes only on uncommitted files in this
+            # task's scope (or its predecessor's) is the work, and the close
+            # judges it.
             pre_rc, pre_out = await _run_check(done_when, root, DEFAULT_CHECK_TIMEOUT)
-            if pre_rc == 0:
+            if pre_rc == 0 and await _passes_only_by_uncommitted(
+                done_when, [scope, _predecessor_scope(record, root)], root
+            ):
+                route += _on_disk_note(done_when, task)
+            elif pre_rc == 0:
                 now = _tree_nodes(root)
-                done_by = ""
-                if await _passes_without_own_work(done_when, scope, root):
-                    paths = scope or _check_targets(done_when, root)
-                    done_by = _done_task_in_log(paths, task, now, root)
+                paths = scope or _check_targets(done_when, root)
+                done_by = _done_task_in_log(paths, task, now, root)
                 return _step_result(
                     f"pursuit_step: {task} not opened — "
                     + _already_passes(done_when, task, now, done_by)
@@ -6806,13 +6885,19 @@ def make_step_tool() -> Any:
             )
             if amend_problem is not None:
                 return _step_result(f"pursuit_step: {task}'s check not changed — {amend_problem}")
-            unwritten = _imports_unwritten_problem(
-                done_when, scope or _strings(record.get("scope")), root
+            own_scope = scope or _strings(record.get("scope"))
+            unwritten = await _unwritten_check_problem(
+                done_when, own_scope, task, root, _predecessor_scope(record, root)
             )
             if unwritten is not None:
                 return _step_result(f"pursuit_step: {task}'s check not changed — {unwritten}")
             pre_rc, pre_out = await _run_check(done_when, root, DEFAULT_CHECK_TIMEOUT)
-            if pre_rc == 0:
+            if pre_rc == 0 and await _passes_only_by_uncommitted(
+                done_when, [own_scope, _predecessor_scope(record, root)], root
+            ):
+                # Run R18: the T0151 refusal had the open's blind spot.
+                route += _on_disk_note(done_when, task)
+            elif pre_rc == 0:
                 keep = (
                     f" Keep the bound check `{bound_check}`: leave done_when out to keep it."
                     if bound_check and _check_problem(bound_check) is None
@@ -6847,6 +6932,11 @@ def make_step_tool() -> Any:
                 bound_check, scope or _strings(record.get("scope")), root
             )
             data_check = data_route[2]
+            on_disk = await _data_route_on_disk(
+                task, data_route, root, _predecessor_scope(record, root)
+            )
+            if on_disk is not None:
+                return _step_result(f"pursuit_step: {task} not run — {on_disk}")
             return _step_result(
                 f"pursuit_step: {task} not run — its bound check `{bound_check}` cannot pass: "
                 f"{problem}"
@@ -7101,7 +7191,14 @@ def make_step_tool() -> Any:
             if no_tests is not None:
                 if_line = ""
             unpassable = ""
-            if cannot_pass is not None:
+            on_disk = (
+                await _data_route_on_disk(task, cannot_pass, root)
+                if cannot_pass is not None
+                else None
+            )
+            if on_disk is not None:
+                unpassable = f"The check cannot pass. {on_disk}\n\n"
+            elif cannot_pass is not None:
                 test, module, data_check, needs = cannot_pass
                 unpassable = (
                     f"The check cannot pass: {test} imports {module}, which no task in reach "

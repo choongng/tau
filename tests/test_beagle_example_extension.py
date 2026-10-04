@@ -10551,3 +10551,123 @@ async def test_shell_operator_refusal_on_amend_says_the_bound_check_stands(
         "done_when out to keep it." in result.text
     )
     assert _pursuit_calls(fake_beagle, "amend") == [] and _runs(fake_tau) == []
+
+
+def _commit(project: Path, *paths: str) -> None:
+    subprocess.run(["git", "add", "--", *paths], cwd=project, check=True)
+    subprocess.run(["git", "commit", "--quiet", "-m", "x"], cwd=project, check=True)
+
+
+R18_DATA_SCOPE = ["tests/cases.json", "tests/test_case_data.py"]
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("committed", [False, True])
+async def test_open_on_a_check_passing_only_by_uncommitted_scope_work_is_not_refused_as_already_passing(  # noqa: E501
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    committed: bool,
+) -> None:
+    # R18 E44-E218: T0005's open was refused as "already passes" seven times,
+    # on W1's uncommitted tests/cases.json and tests/test_case_data.py.
+    project = _git_project(tmp_path, monkeypatch)
+    monkeypatch.chdir(project)
+    check = _case_data_test(project)
+    (project / "tests" / "cases.json").write_text('[{"name": "seed", "result": 1}]\n')
+    if committed:
+        _commit(project, *R18_DATA_SCOPE)
+    _ready_task(fake_beagle, check)
+    runtime, _ = _bound(tmp_path)
+
+    result = await _tool(runtime, "pursuit_step").execute(
+        "c1",
+        {"task": "T0002", "criteria": "cases", "done_when": check, "scope": R18_DATA_SCOPE},
+    )
+
+    if committed:
+        assert "T0002 not opened" in result.text and "already passes" in result.text
+        assert _pursuit_calls(fake_beagle, "open") == []
+    else:
+        assert "not opened" not in result.text
+        assert "only on uncommitted files in T0002's scope" in result.text
+        assert "the close judges it" in result.text
+        assert len(_pursuit_calls(fake_beagle, "open")) == 1
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("committed", [False, True])
+async def test_data_test_route_is_not_offered_when_the_data_test_already_passes(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    committed: bool,
+) -> None:
+    # R18 E12, E70, E110: "amend done_when to the data test", which already passed
+    # on W1's uncommitted files and was then refused as "already passes".
+    project = _git_project(tmp_path, monkeypatch)
+    monkeypatch.chdir(project)
+    _case_data_test(project)
+    (project / "tests" / "cases.json").write_text('[{"name": "seed", "result": 1}]\n')
+    if committed:
+        _commit(project, *R18_DATA_SCOPE)
+    monkeypatch.setenv("FAKE_TAU_SUCCEEDS_ON", "99")
+    monkeypatch.setenv("FAKE_TAU_WRITES", json.dumps({"tests/test_cases.py": R16_CASES_TEST}))
+    _ready_task(fake_beagle, R16_CHECK)
+    runtime, _ = _bound(tmp_path)
+
+    result = await _tool(runtime, "pursuit_step").execute(
+        "c1",
+        {"task": "T0002", "criteria": "cases", "done_when": R16_CHECK, "scope": R16_SCOPE},
+    )
+
+    assert "amend done_when to" not in result.text
+    assert "it is taken as this task's new route" not in result.text
+    if committed:
+        assert f"`{R16_DATA_CHECK}` already passes on the committed tree" in result.text
+        assert 'abandon="done by <that task>"' in result.text
+    else:
+        assert "on the known-answers work on disk, uncommitted in this scope" in result.text
+        assert f'pursuit_step task="T0002", done_when="{R16_DATA_CHECK}"' in result.text
+        assert "it opens, and the close judges the files on disk" in result.text
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("committed", [False, True])
+async def test_amend_to_a_check_passing_only_by_own_uncommitted_work_is_accepted(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    committed: bool,
+) -> None:
+    # R18: T0151's amend refusal had the open's blind spot, and would have
+    # refused the data-test amend on W1's uncommitted work.
+    project = _git_project(tmp_path, monkeypatch)
+    monkeypatch.chdir(project)
+    (project / "x.txt").write_text("x\n")
+    if committed:
+        _commit(project, "x.txt")
+    _open_task(fake_beagle)
+    record = json.loads((fake_beagle / "show.out").read_text())
+    (fake_beagle / "show.out").write_text(
+        json.dumps({**record, "status": "open", "scope": ["x.txt"]})
+    )
+    runtime, _ = _bound(tmp_path)
+
+    result = await _tool(runtime, "pursuit_step").execute(
+        "c1", {"task": "T0002", "done_when": "grep -q x x.txt"}
+    )
+
+    if committed:
+        assert "check not changed" in result.text and "already passes" in result.text
+        assert _pursuit_calls(fake_beagle, "amend") == []
+    else:
+        assert "check not changed" not in result.text
+        assert "only on uncommitted files in T0002's scope" in result.text
+        assert len(_pursuit_calls(fake_beagle, "amend")) == 1
