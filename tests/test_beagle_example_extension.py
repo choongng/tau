@@ -9102,6 +9102,68 @@ async def test_not_done_on_a_missing_scoped_test_file_does_not_offer_a_new_done_
     assert "corrected done_when" not in result.text
 
 
+@pytest.mark.anyio
+async def test_not_done_explains_pytest_exit_5_no_tests_collected(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # R17 E60, E80: T0009's `exit 5: no tests ran` was shown raw with "Fix the work".
+    project = _git_project(tmp_path, monkeypatch)
+    monkeypatch.chdir(project)
+    (project / "tests").mkdir()
+    (project / "tests" / "test_cases.py").write_text("CASES = []\n")
+    check = "python3 -m pytest -q tests/test_cases.py"
+    _ready_task(fake_beagle, check)
+    runtime, _ = _bound(tmp_path)
+
+    result = await _tool(runtime, "pursuit_step").execute(
+        "c1",
+        {"task": "T0002", "criteria": "cases", "done_when": check, "scope": ["tests/"]},
+    )
+
+    lead = (
+        "pytest collected no tests from tests/test_cases.py: it defines no test_ function; "
+        "adding them is the work, not a different check."
+    )
+    assert "stays open" in result.text and "exit 5" in result.text
+    assert result.text.startswith(lead)
+    assert "corrected done_when" not in result.text
+    assert _module()._check_broke(5, "no tests ran in 0.00s") is None
+
+
+@pytest.mark.anyio
+async def test_retry_note_explains_pytest_exit_5(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # R17: the retry notes for W13, W15 and W17 showed exit 5 raw.
+    project = _git_project(tmp_path, monkeypatch)
+    monkeypatch.chdir(project)
+    (project / "tests").mkdir()
+    (project / "tests" / "test_cases.py").write_text("CASES = []\n")
+    check = "python3 -m pytest -q tests/test_cases.py"
+    _ready_task(fake_beagle, check)
+    runtime, _ = _bound(tmp_path)
+
+    await _tool(runtime, "pursuit_step").execute(
+        "c1",
+        {"task": "T0002", "criteria": "cases", "done_when": check, "scope": ["tests/"]},
+    )
+
+    first, second = _runs(fake_tau)
+    lead = "pytest collected no tests from tests/test_cases.py: it defines no test_ function"
+    assert lead not in first["stdin"]
+    note = second["stdin"].split(lead, 1)
+    assert len(note) == 2 and "check still fails (exit 5)" in note[1]
+    assert note[1].index("adding them is the work") < note[1].index("Fix the work")
+
+
 def test_cases_first_note_says_to_open_the_data_beside_the_test() -> None:
     module = _module()
     assert "Path(__file__).with_name('cases.json')" in module.CASES_FIRST_NOTE

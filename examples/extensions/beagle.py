@@ -119,6 +119,7 @@ import functools
 import hashlib
 import html.parser
 import importlib.util
+import itertools
 import json
 import math
 import os
@@ -5068,6 +5069,44 @@ def _missing_scoped_test(rc: int, output: str, scope: list[str], root: Path) -> 
     return None
 
 
+def _pytest_collected_none(rc: int, check: str) -> str | None:
+    """The lead for a pytest check that exited 5 (no tests collected), or None.
+
+    Run R17 showed T0009's `exit 5: no tests ran` raw, beside "Fix the work, not
+    the check", to the driver and to three workers. Exit 5 is pytest's own code
+    for an empty collection, so the test files the check names are not written yet.
+    """
+    if rc != 5:
+        return None
+    try:
+        words = shlex.split(check)
+    except ValueError:
+        return None
+    parts: list[str] = []
+    for word in words:
+        if " " in word and not word.startswith("-"):
+            with contextlib.suppress(ValueError):
+                parts.extend(shlex.split(word))
+                continue
+        parts.append(word)
+    names = [Path(part).name for part in parts]
+    runs = any(n in ("pytest", "py.test") for n in names) or any(
+        a == "-m" and b == "pytest" for a, b in itertools.pairwise(parts)
+    )
+    if not runs:
+        return None
+    files: list[str] = []
+    for part in parts:
+        rel = part.split("::")[0]
+        if rel.endswith(".py") and not rel.startswith("-") and rel not in files:
+            files.append(rel)
+    named = ", ".join(files) if files else "the paths it was given"
+    return (
+        f"pytest collected no tests from {named}: it defines no test_ function; adding "
+        "them is the work, not a different check."
+    )
+
+
 def _missing_locked_file(output: str, locks: list[str], root: Path) -> str | None:
     """A locked path the check failed on for want of it, not on disk: the work not yet
     done, not a wrong check. Run R17 E26 failed on FileNotFoundError for
@@ -6951,6 +6990,9 @@ def make_step_tool() -> Any:
             if cannot_pass is not None:
                 # Run R16 sent W4, W6, W8, W10 and W12 after this was already known.
                 break
+            no_tests = _pytest_collected_none(verdict[0], check)
+            if no_tests is not None:
+                retry_note = f"\n\n{no_tests}" + retry_note
             retry_note += "Fix the work, not the check."
             if undone:
                 retry_note += (
@@ -7020,6 +7062,9 @@ def make_step_tool() -> Any:
                     f"The check names {missing_lock}: it is locked for this task and not "
                     "written, so that is the work, not a wrong check. "
                 )
+            no_tests = _pytest_collected_none(verdict[0], check)
+            if no_tests is not None:
+                if_line = ""
             unpassable = ""
             if cannot_pass is not None:
                 test, module, data_check, needs = cannot_pass
@@ -7033,7 +7078,8 @@ def make_step_tool() -> Any:
                 root,
                 task,
                 scope,
-                unpassable
+                (f"{no_tests}\n\n" if no_tests else "")
+                + unpassable
                 + _cwd_relative_data_lead(verdict[1], scope, root)
                 + f"{route}{undid}{task} — {title}: the check still fails after {attempt} "
                 f"sub-agent run(s), so the task {state}.\n\n`{check}` exit {verdict[0]}:\n"
