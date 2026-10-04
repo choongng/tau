@@ -4675,12 +4675,19 @@ _SETUP_WORDS = frozenset(
     }
 )
 #: A title naming beagle or the pursuit with one of `_SETUP_ACTS` sets the
-#: pursuit up, whatever else it names: R10's 'Setup beagle pursuit infrastructure'.
+#: pursuit up, whatever else it names: R10's 'Setup beagle pursuit infrastructure',
+#: R19's 'Found the pursuit: implement …'. A founding verb alone is not setup:
+#: 'Create the clock type' names neither, so it is kept.
 _PURSUIT_NAMES = frozenset({"beagle", "pursuit"})
 _SETUP_ACTS = frozenset(
     {
         "setup",
         "set",
+        "found",
+        "founding",
+        "founded",
+        "start",
+        "create",
         "init",
         "initialize",
         "initialise",

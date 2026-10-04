@@ -4202,6 +4202,34 @@ def test_setup_milestone_titled_with_a_dash_and_naming_beagle_is_dropped() -> No
     assert setup(["Implement the beagle exporter - configure its output paths"]) is None
 
 
+R19_MILESTONES = [
+    "Found the pursuit: implement interval tree clocks in modern Python (see skill) against "
+    "https://gsd.di.uminho.pt/members/cbm/ps/itc2008.pdf and "
+    "https://ferd.ca/interval-tree-clocks.html",
+    "Known answers: read both references and write the cases file plus its test, with each "
+    "case citing the reference's own words (URLs named in the pursuit, not bare filenames)",
+    "Design: settle the data structure and API — the interval tree keyed on a divisible key "
+    "space, join/leave semantics, and the modern Python shape (typing, tests, docs)",
+    "Implement: the interval tree clock core, operations, and dynamic membership handling",
+    "Verify: run the test suite, type checks, and linting; fix anything failing",
+]
+
+
+def test_founding_drops_a_found_the_pursuit_milestone() -> None:
+    # R19: 'Found the pursuit: …' survived founding because no founding verb
+    # was a setup act; every later milestone was ordered behind it.
+    module = _module()
+    kept, notes = module._repair_milestones(list(R19_MILESTONES))
+    assert not any("Found the pursuit" in part for part in kept)
+    assert any("Dropped the setup milestone 'Found the pursuit'" in note for note in notes)
+    assert any("interval tree clock core" in part for part in kept)
+    assert module._setup_milestone(["Create the interval tree clock type"]) is None
+    kept, _notes = module._repair_milestones(
+        ["Create the interval tree clock type", R19_MILESTONES[3]]
+    )
+    assert any("Create the interval tree clock type" in part for part in kept)
+
+
 @pytest.mark.anyio
 async def test_founding_r10_milestones_drops_only_the_setup_one(
     tmp_path: Path, beagle: Path, fake_beagle: Path, monkeypatch: pytest.MonkeyPatch
