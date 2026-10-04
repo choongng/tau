@@ -116,6 +116,7 @@ import asyncio
 import contextlib
 import fnmatch
 import functools
+import hashlib
 import html.parser
 import json
 import math
@@ -4555,6 +4556,10 @@ def _ids(entries: Any) -> list[str]:
 #: asked for, held until it closes done.
 LOCKED_DIR = "locked"
 PENDING_LOCKS = "locks-pending.json"
+#: Under `.beagle/`: for each locked path, its sha256 and the commit that holds
+#: it. Run R14: a worker's `ruff format .` rewrote a locked test and its copy in
+#: the store alike, so comparing the two restored nothing.
+LOCK_MANIFEST = "locks.json"
 
 
 def _locked(goal: Path) -> list[str]:
@@ -4601,24 +4606,123 @@ def _lock(goal: Path, root: Path, entries: list[str]) -> tuple[list[str], list[s
             skipped.append(f"{rel}: {exc}")
             continue
         locked.append(rel)
+    if locked:
+        manifest = _lock_manifest(goal)
+        for rel in locked:
+            data = (store / rel).read_bytes()
+            manifest[rel] = {"sha256": _sha256(data), "commit": _head_holding(root, rel, data)}
+        _write_lock_manifest(goal, manifest)
     return locked, skipped
 
 
+def _sha256(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def _lock_manifest(goal: Path) -> dict[str, dict[str, Any]]:
+    """The lock manifest: each locked path's sha256 and the commit holding it."""
+    try:
+        raw = json.loads((goal.parent / LOCK_MANIFEST).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(raw, dict):
+        return {}
+    return {
+        rel: entry
+        for rel, entry in raw.items()
+        if isinstance(entry, dict) and isinstance(entry.get("sha256"), str)
+    }
+
+
+def _write_lock_manifest(goal: Path, manifest: dict[str, dict[str, Any]]) -> None:
+    with contextlib.suppress(OSError):
+        (goal.parent / LOCK_MANIFEST).write_text(
+            json.dumps(manifest, indent=1, sort_keys=True), encoding="utf-8"
+        )
+
+
+def _committed_bytes(root: Path, commit: str, rel: str) -> bytes | None:
+    """`rel` as `commit` holds it, or None."""
+    try:
+        shown = subprocess.run(
+            ["git", "show", f"{commit}:{rel}"],
+            cwd=root,
+            capture_output=True,
+            check=False,
+            timeout=30,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return shown.stdout if shown.returncode == 0 else None
+
+
+def _head_holding(root: Path, rel: str, data: bytes) -> str | None:
+    """The HEAD commit's id when it holds `rel` as `data`, else None."""
+    if _committed_bytes(root, "HEAD", rel) != data:
+        return None
+    rc, out = _run(["git", "rev-parse", "HEAD"], root, timeout=10.0)
+    commit = out.strip()
+    return commit if rc == 0 and re.fullmatch(r"[0-9a-f]{40,64}", commit) else None
+
+
+def _locked_bytes(root: Path, store: Path, rel: str, entry: dict[str, Any]) -> bytes | None:
+    """The bytes `rel` was locked as, from its lock commit or the store; None if lost."""
+    want = entry["sha256"]
+    commit = entry.get("commit")
+    if isinstance(commit, str) and commit:
+        data = _committed_bytes(root, commit, rel)
+        if data is not None and _sha256(data) == want:
+            return data
+    with contextlib.suppress(OSError):
+        data = (store / rel).read_bytes()
+        if _sha256(data) == want:
+            return data
+    data = _committed_bytes(root, "HEAD", rel)
+    if data is not None and _sha256(data) == want:
+        return data
+    return None
+
+
 def _restore_locked(goal: Path, root: Path) -> list[str]:
-    """Put back every locked file a worker changed or removed; the ones it did."""
+    """Put back every locked file a worker changed or removed; the ones it did.
+
+    A path in the lock manifest is held to its recorded sha256 and restored
+    from its lock commit, the store copy rewritten with it: a tool run over
+    the whole tree changes the store too. A path the manifest lacks (locked
+    before it existed) is compared with its store copy, as before.
+    """
     store = goal.parent / LOCKED_DIR
+    manifest = _lock_manifest(goal)
+    changed_manifest = False
     restored = []
     for rel in _locked(goal):
         target = root / rel
+        entry = manifest.get(rel)
         try:
-            known = (store / rel).read_bytes()
-            if target.is_file() and target.read_bytes() == known:
+            current = target.read_bytes() if target.is_file() else None
+            if entry is None:
+                known = (store / rel).read_bytes()
+            else:
+                known = _locked_bytes(root, store, rel, entry)
+                if known is None:
+                    continue  # neither the commit nor the store holds it any more
+                if not entry.get("commit"):
+                    commit = _head_holding(root, rel, known)
+                    if commit is not None:
+                        entry["commit"] = commit
+                        changed_manifest = True
+                copy = store / rel
+                if not copy.is_file() or copy.read_bytes() != known:
+                    copy.write_bytes(known)
+            if current == known:
                 continue
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_bytes(known)
         except OSError:
             continue
         restored.append(rel)
+    if changed_manifest:
+        _write_lock_manifest(goal, manifest)
     return restored
 
 
@@ -6207,6 +6311,95 @@ def _worker_git_commit(argv: list[str]) -> str | None:
     return args[0] if args and args[0] in _WORKER_GIT_REFUSED else None
 
 
+#: `ruff` options that take a value as the next word, so it is not read as a path.
+_RUFF_VALUE_OPTIONS = frozenset(
+    {
+        "--config",
+        "--select",
+        "--ignore",
+        "--extend-select",
+        "--extend-ignore",
+        "--fixable",
+        "--unfixable",
+        "--exclude",
+        "--extend-exclude",
+        "--per-file-ignores",
+        "--line-length",
+        "--target-version",
+        "--output-format",
+        "--stdin-filename",
+        "--cache-dir",
+        "--range",
+    }
+)
+
+
+def _ruff_argv(argv: list[str]) -> list[str] | None:
+    """`argv` from its `ruff` subcommand on, past `uv run`, `uvx` or `python -m`; else None."""
+    args = argv
+    if args and _named(args, "uv") and len(args) > 1 and args[1] == "run":
+        args = args[2:]
+        while args and args[0].startswith("-"):
+            args = args[1:]
+    elif args and Path(args[0]).name in ("uvx", "pipx"):
+        args = args[2:] if len(args) > 1 and args[1] == "run" else args[1:]
+    elif args and Path(args[0]).name.startswith("python") and args[1:3] == ["-m", "ruff"]:
+        return args[3:]
+    if not args or not _named(args, "ruff"):
+        return None
+    return args[1:]
+
+
+def _ruff_rewrite_paths(argv: list[str]) -> tuple[str, list[str]] | None:
+    """For a `ruff format` or `ruff check --fix` argv: (what it runs, its paths); else None."""
+    args = _ruff_argv(argv)
+    if not args:
+        return None
+    sub, rest = args[0], args[1:]
+    if sub == "format":
+        what = "ruff format"
+    elif sub == "check" and {"--fix", "--fix-only"} & set(rest):
+        what = "ruff check --fix"
+    else:
+        return None
+    paths: list[str] = []
+    skip = False
+    for arg in rest:
+        if skip:
+            skip = False
+        elif arg in _RUFF_VALUE_OPTIONS:
+            skip = True
+        elif not arg.startswith("-"):
+            paths.append(arg)
+    return what, paths
+
+
+def _ruff_over_locked(command: str, cwd: Path, root: Path, locked: list[str]) -> str | None:
+    """The `ruff` rewrite in `command` that reaches past named files to locked ones, or None.
+
+    Run R14: W5 ran `uv run ruff format .` and `ruff check --fix .`, which
+    rewrote the locked tests. Refused: no path, `.`, or a directory that holds
+    a locked file. Named files pass; the scope guard holds those.
+    """
+
+    def match(argv: list[str]) -> str | None:
+        found = _ruff_rewrite_paths(argv)
+        if found is None:
+            return None
+        what, paths = found
+        if not paths:
+            return f"`{what}` with no path"
+        for raw in paths:
+            target = _resolved(cwd / raw)
+            if target == root:
+                return f"`{what} {raw}`"
+            if target.is_dir() and any(target in (root / rel).parents for rel in locked):
+                return f"`{what} {raw}`"
+        return None
+
+    return _bash_find(command, match)
+
+
 #: Why a worker is kept from beagle and its store.
 NO_BEAGLE_REASON = (
     "the brief has everything; do the task. A worker does not inspect .beagle/ or run "
@@ -6350,10 +6543,23 @@ def make_worker_scope_guard() -> Any:
                     reason=f"refusing to {orientation}: {NO_BEAGLE_REASON}",
                 )
             sent = _worker_scope()
+            command = str(arguments.get("command", "")) if event.tool_name == "bash" else ""
+            goal = _find_goal(cwd) if command and sent_on_task else None
+            if goal is not None:
+                root = _resolved(goal.parent.parent)
+                ruff = _ruff_over_locked(command, cwd, root, _locked(goal))
+                if ruff is not None:
+                    files = ", ".join(sent[1]) if sent is not None else "the files you changed"
+                    return ToolCallHookResult(
+                        block=True,
+                        reason=(
+                            f"refusing {ruff}: it reaches the pursuit's locked tests, which "
+                            f"no sub-agent may change. Name the files instead: {files}."
+                        ),
+                    )
             if sent is None:
                 return None
             task, scope = sent
-            command = str(arguments.get("command", "")) if event.tool_name == "bash" else ""
             script = _bash_find(command, _driver_change) if command else None
             scripted = (
                 script is not None
@@ -6700,6 +6906,7 @@ _STORE_RECORDS = frozenset(
         ".gate.lock",
         LOCKED_DIR,
         PENDING_LOCKS,
+        LOCK_MANIFEST,
     }
 )
 

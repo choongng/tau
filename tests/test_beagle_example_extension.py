@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import functools
+import hashlib
 import importlib.util
 import json
 import os
@@ -7744,3 +7745,115 @@ def test_worker_stopped_by_the_breaker_reports_the_refused_call() -> None:
     )
     unstopped.feed(_event_line(_PROVIDER_ERROR))
     assert "(worker error: Provider stream ended" in unstopped.final_report("")
+
+
+#: A locked test as R14's W5 found it, and as `ruff format .` left it.
+R14_LOCKED_TEST = b"def test_one():\n    assert f(1)=='a'\n"
+R14_FORMATTED_TEST = b'def test_one():\n    assert f(1) == "a"\n'
+
+
+def _locked_repo(tmp_path: Path) -> tuple[Path, Path]:
+    project = _pursuit_project(tmp_path)
+    (project / "tests").mkdir()
+    (project / "tests" / "test_cases.py").write_bytes(R14_LOCKED_TEST)
+    subprocess.run(["git", "init", "-q"], cwd=project, check=True)
+    _git(project, "add", "tests/test_cases.py")
+    _git(project, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "cases")
+    return project, project / ".beagle" / "pursuit.toml"
+
+
+def test_restore_locked_undoes_a_change_made_to_the_store_as_well(tmp_path: Path) -> None:
+    # R14 W5 E24: `uv run ruff format .` rewrote tests/ and .beagle/locked/tests/ alike.
+    module = _module()
+    project, goal = _locked_repo(tmp_path)
+    head = _git(project, "rev-parse", "HEAD").strip()
+
+    locked, skipped = module._lock(goal, project, ["tests/test_cases.py"])
+
+    assert (locked, skipped) == (["tests/test_cases.py"], [])
+    manifest = json.loads((project / ".beagle" / module.LOCK_MANIFEST).read_text())
+    assert manifest["tests/test_cases.py"] == {
+        "sha256": hashlib.sha256(R14_LOCKED_TEST).hexdigest(),
+        "commit": head,
+    }
+
+    store_copy = project / ".beagle" / "locked" / "tests" / "test_cases.py"
+    for path in (project / "tests" / "test_cases.py", store_copy):
+        path.write_bytes(R14_FORMATTED_TEST)
+
+    assert module._restore_locked(goal, project) == ["tests/test_cases.py"]
+    assert (project / "tests" / "test_cases.py").read_bytes() == R14_LOCKED_TEST
+    assert store_copy.read_bytes() == R14_LOCKED_TEST
+    assert module._restore_locked(goal, project) == []
+
+
+def test_restore_locked_without_a_manifest_entry_compares_with_the_store(
+    tmp_path: Path,
+) -> None:
+    # A pursuit locked before the manifest existed keeps working.
+    module = _module()
+    project, goal = _locked_repo(tmp_path)
+    module._lock(goal, project, ["tests/test_cases.py"])
+    (project / ".beagle" / module.LOCK_MANIFEST).unlink()
+
+    (project / "tests" / "test_cases.py").write_bytes(R14_FORMATTED_TEST)
+
+    assert module._restore_locked(goal, project) == ["tests/test_cases.py"]
+    assert (project / "tests" / "test_cases.py").read_bytes() == R14_LOCKED_TEST
+
+
+def test_lock_before_a_commit_fills_in_the_commit_once_one_holds_it(tmp_path: Path) -> None:
+    module = _module()
+    project = _pursuit_project(tmp_path)
+    subprocess.run(["git", "init", "-q"], cwd=project, check=True)
+    (project / "cases.json").write_bytes(b"[1]\n")
+    goal = project / ".beagle" / "pursuit.toml"
+    manifest_path = project / ".beagle" / module.LOCK_MANIFEST
+
+    module._lock(goal, project, ["cases.json"])
+
+    assert json.loads(manifest_path.read_text())["cases.json"]["commit"] is None
+    _git(project, "add", "cases.json")
+    _git(project, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "cases")
+    assert module._restore_locked(goal, project) == []
+    head = _git(project, "rev-parse", "HEAD").strip()
+    assert json.loads(manifest_path.read_text())["cases.json"]["commit"] == head
+
+
+@pytest.mark.anyio
+async def test_worker_guard_refuses_ruff_format_over_the_whole_tree(
+    tmp_path: Path, beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # R14 W5 E24/E26: `uv run ruff format .` and `ruff check --fix .` reformatted
+    # the locked tests.
+    runtime = _scoped_worker(tmp_path, monkeypatch, scope="src/itc.py\ntests/test_itc.py")
+    project = tmp_path / "project"
+    (project / "tests").mkdir()
+    (project / "src").mkdir()
+    (project / "tests" / "test_cases.py").write_bytes(R14_LOCKED_TEST)
+    _module()._lock(project / ".beagle" / "pursuit.toml", project, ["tests/test_cases.py"])
+    bash = _tool_with_hooks(runtime, "bash")
+
+    refused = [
+        "uv run ruff format .",
+        "ruff check --fix .",
+        "ruff format",
+        "uv run ruff check --fix",
+        "ruff format tests/",
+        "ruff check . --fix && pytest -q",
+        "python -m ruff format --config pyproject.toml",
+    ]
+    allowed = [
+        "ruff check .",
+        "ruff format src/itc.py tests/test_itc.py",
+        "uv run ruff check --fix src/",
+        "ruff format --check src/itc.py",
+    ]
+
+    for command in refused:
+        result = await bash.execute("c1", {"command": command})
+        assert "refusing `ruff" in result.text, command
+        assert "Name the files instead: src/itc.py, tests/test_itc.py." in result.text
+    for command in allowed:
+        result = await bash.execute("c2", {"command": command})
+        assert "refusing" not in result.text, command
