@@ -10671,3 +10671,115 @@ async def test_amend_to_a_check_passing_only_by_own_uncommitted_work_is_accepted
         assert "check not changed" not in result.text
         assert "only on uncommitted files in T0002's scope" in result.text
         assert len(_pursuit_calls(fake_beagle, "amend")) == 1
+
+
+@pytest.mark.anyio
+async def test_data_test_resend_on_an_open_task_amends_instead_of_spawning(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # R18 #20 and #54: the data test tau suggested, resent for open T0002 and
+    # T0006, superseded each with a successor the pre-run then refused.
+    project = _pursuit_project(tmp_path)
+    monkeypatch.chdir(project)
+    _r16_tree(project)
+    (project / "tests" / "test_case_data.py").write_text("def test_cases():\n    assert False\n")
+    _r16_open(fake_beagle)
+    (fake_beagle / "spawn.out").write_text("T0010 superseded by T0011\n")
+    runtime, _ = _bound(tmp_path)
+
+    await _tool(runtime, "pursuit_step").execute("c20", dict(R16_STEP_15))
+
+    assert _pursuit_calls(fake_beagle, "spawn") == []
+    [amend] = _pursuit_calls(fake_beagle, "amend")
+    assert amend[:3] == ["T0010", "--done-when", R16_DATA_CHECK]
+
+
+@pytest.mark.anyio
+async def test_refusal_after_a_new_route_spawn_names_the_successor(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # R18 E44: "T0005 not opened — …", with no word that T0002 was gone.
+    project = _pursuit_project(tmp_path)
+    monkeypatch.chdir(project)
+    (fake_beagle / "next.out").write_text(json.dumps({"open": [{"id": "T0002"}], "ready": []}))
+    opened = {**R06_PREDECESSOR, "status": "open", "done_when": "grep -q nothing done.txt"}
+    (fake_beagle / "show-T0002.out").write_text(json.dumps(opened))
+    (fake_beagle / "show-T0008.out").write_text(json.dumps(R06_SUCCESSOR))
+    (fake_beagle / "spawn.out").write_text("T0002 superseded by T0008\n")
+    (fake_beagle / "open.out").write_text("refused: no\n")
+    (fake_beagle / "open.rc").write_text("1")
+    runtime, _ = _bound(tmp_path)
+
+    result = await _tool(runtime, "pursuit_step").execute(
+        "c1",
+        {
+            "task": "T0002",
+            "new_route": True,
+            "notes": "check the file holds the word",
+            "done_when": "grep -q word done.txt",
+        },
+    )
+
+    assert len(_pursuit_calls(fake_beagle, "spawn")) == 1
+    assert result.text.startswith(
+        "T0002 was superseded by T0008 (new route); T0008 was not opened: "
+    )
+    assert "`beagle pursuit open` refused" in result.text
+    assert 'send T0008 next, with pursuit_step task="T0008"' in result.text
+
+
+@pytest.mark.anyio
+async def test_new_route_successor_keeps_the_predecessor_scope(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # R18 #56 and #62: T0008, spawned with scope [], was refused "no scope given".
+    project = _pursuit_project(tmp_path)
+    monkeypatch.chdir(project)
+    (project / "references").mkdir()
+    (fake_beagle / "next.out").write_text(json.dumps({"open": [], "ready": ["T0008"]}))
+    (fake_beagle / "show-T0002.out").write_text(json.dumps(R06_PREDECESSOR))
+    (fake_beagle / "show-T0008.out").write_text(json.dumps(R06_SUCCESSOR))
+    runtime, _ = _bound(tmp_path)
+
+    result = await _tool(runtime, "pursuit_step").execute(
+        "c56", {"task": "T0008", "done_when": "grep -q word done.txt"}
+    )
+
+    assert "no scope given" not in result.text
+    [opened] = _pursuit_calls(fake_beagle, "open")
+    assert opened[0] == "T0008"
+    assert opened[opened.index("--scope") + 1 :][:1] == ["done.txt"]
+
+
+@pytest.mark.anyio
+async def test_escalation_does_not_offer_a_data_test_that_passes_on_the_committed_tree(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # R18 (T0159's leftover): the escalation offered a data test the pre-run refused.
+    project = _pursuit_project(tmp_path)
+    monkeypatch.chdir(project)
+    step = await _escalated_r16_step(tmp_path, fake_beagle, monkeypatch)
+    _r16_tree(project)
+    _case_data_test(project)
+
+    refused = await step.execute("c14", dict(R16_STEP_14))
+
+    assert refused.text.startswith("pursuit_step: T0010 not run: 3 steps on it")
+    assert f'done_when="{R16_DATA_CHECK}"' not in refused.text
+    assert "already passes on the committed tree" in refused.text

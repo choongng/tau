@@ -5759,6 +5759,25 @@ def _retryable(record: Mapping[str, Any], done_when: str, arguments: Mapping[str
     )
 
 
+def _with_spawn_notice(
+    result: AgentToolResult, predecessor: str, successor: str, spawned: str
+) -> AgentToolResult:
+    """`result`, led by the spawn of `successor` when the reply would drop it.
+
+    Run R18 #20 and #54 asked about T0002 and T0006 and were told only "T0005 not
+    opened" and "T0008 not opened": the spawn that superseded each was lost.
+    """
+    text = "".join(getattr(c, "text", "") for c in result.content)
+    if spawned.strip() and spawned.strip() in text:
+        return result
+    refusal = text.removeprefix(f"pursuit_step: {successor} not opened — ")
+    return _step_result(
+        f"{predecessor} was superseded by {successor} (new route); {successor} was not "
+        f"opened: {refusal}\n\n{predecessor} is closed to work now: send {successor} next, "
+        f'with pursuit_step task="{successor}".'
+    )
+
+
 def _spawn(
     task: str, record: Mapping[str, Any], notes: str, done_when: str, root: Path
 ) -> tuple[str | None, str]:
@@ -6302,20 +6321,29 @@ def _escalation(
     arguments: dict[str, Any] | None = None,
     record: dict[str, Any] | None = None,
     root: Path | None = None,
+    data_test_passes: bool = False,
 ) -> str:
     """The refusal of a step on a task `count` steps have left not done.
 
     Given the refused call's `arguments` and the task's `record`, it first says
     what that call lacks: run R15 sent twelve calls, E19-E41, that the same
-    option list alone had refused.
+    option list alone had refused. `data_test_passes` says the data test its
+    bound check would give way to passes on the committed tree, so it is not
+    offered (see `_offered_data_test_passes`).
     """
-    lacks = _escalation_lacks(task, arguments, record, root) if arguments is not None else []
+    lacks = (
+        _escalation_lacks(task, arguments, record, root, data_test_passes)
+        if arguments is not None
+        else []
+    )
     head = f"pursuit_step: {task} not run: {count} steps on it have left it not done."
     if lacks:
         head += "\n" + "\n".join(f"- {line}" for line in lacks)
     if arguments is not None:
         # Run R16 E34 dropped the done_when line, and the driver resent without it.
-        head += "\nThe call that works, whole: " + _working_call(task, arguments, record, root)
+        head += "\nThe call that works, whole: " + _working_call(
+            task, arguments, record, root, data_test_passes
+        )
     return (
         f"{head}\nAnother sub-agent on the same task, however its scope or notes are put, "
         "is how run R04 spent 14 steps on one. Choose one:\n"
@@ -6328,7 +6356,11 @@ def _escalation(
 
 
 def _escalation_lacks(
-    task: str, arguments: dict[str, Any], record: dict[str, Any] | None, root: Path | None
+    task: str,
+    arguments: dict[str, Any],
+    record: dict[str, Any] | None,
+    root: Path | None,
+    data_test_passes: bool = False,
 ) -> list[str]:
     """What a step refused by the escalation lacks to be taken as a new route."""
     record = record or {}
@@ -6350,7 +6382,14 @@ def _escalation_lacks(
     if bound_check and done_when in ("", bound_check):
         scope = _strings(arguments.get("scope")) or _strings(record.get("scope"))
         route = _data_test_route(bound_check, scope, root) if root is not None else None
-        if route is not None:
+        if route is not None and data_test_passes:
+            lacks.append(
+                f"Its done_when is the bound check `{bound_check}`, which runs {route[0]}: "
+                f"that fails with ImportError until a later task writes {route[1]}. The data "
+                f"test `{route[2]}` already passes on the committed tree, so it cannot judge "
+                "the work either: a new route needs a check that fails now."
+            )
+        elif route is not None:
             test, module, data_check, needs = route
             lacks.append(
                 f"Its done_when is the bound check `{bound_check}`, which runs {test}: "
@@ -6367,7 +6406,11 @@ def _escalation_lacks(
 
 
 def _working_call(
-    task: str, arguments: dict[str, Any], record: dict[str, Any] | None, root: Path | None
+    task: str,
+    arguments: dict[str, Any],
+    record: dict[str, Any] | None,
+    root: Path | None,
+    data_test_passes: bool = False,
 ) -> str:
     """The new-route call an escalation takes, spelled out with every argument it needs."""
     record = record or {}
@@ -6375,7 +6418,9 @@ def _working_call(
     bound_check = " ".join(str(record.get("done_when") or "").split())
     scope = _strings(arguments.get("scope")) or _strings(record.get("scope"))
     route = (
-        _data_test_route(bound_check, scope, root) if root is not None and bound_check else None
+        _data_test_route(bound_check, scope, root)
+        if root is not None and bound_check and not data_test_passes
+        else None
     )
     needs = scope
     if done_when and done_when != bound_check:
@@ -6391,6 +6436,26 @@ def _working_call(
     if needs != scope:
         call += f", scope={json.dumps(needs)}"
     return f"{call}, notes={json.dumps(notes, ensure_ascii=False)}"
+
+
+async def _offered_data_test_passes(
+    arguments: Mapping[str, Any], record: Mapping[str, Any], root: Path
+) -> bool:
+    """Whether the data test an escalation would offer passes on the committed tree.
+
+    The pre-run refuses such a check as "already passes"; one passing only on the
+    task's own uncommitted work (or its predecessor's) opens, so is offered.
+    """
+    bound_check = " ".join(str(record.get("done_when") or "").split())
+    scope = _strings(arguments.get("scope")) or _strings(record.get("scope"))
+    route = _data_test_route(bound_check, scope, root) if bound_check else None
+    if route is None:
+        return False
+    if (await _run_check(route[2], root, DEFAULT_CHECK_TIMEOUT))[0] != 0:
+        return False
+    return not await _passes_only_by_uncommitted(
+        route[2], [route[3], _predecessor_scope(dict(record), root)], root
+    )
 
 
 def _forget_task(root: Path, task: str) -> None:
@@ -6552,6 +6617,8 @@ def make_step_tool() -> Any:
     carries the worker's measured spend.
     """
     stepped: list[str] = []
+    #: This call's new-route spawn: (predecessor, successor, what beagle said).
+    spawns: list[tuple[str, str, str]] = []
 
     async def _execute(
         tool_call_id: str,
@@ -6670,7 +6737,21 @@ def make_step_tool() -> Any:
             if status == "open" and bound_check
             else None
         )
-        if (
+        # Run R18 #20 and #54: resending the data test tau suggested for an open
+        # task superseded it with a successor the pre-run then refused. Without
+        # new_route=true, an open task whose check is rewritten is amended; the
+        # spawn is kept for an escalated one (ESCALATE_AFTER steps not done).
+        amends_open = (
+            not new_route
+            and status == "open"
+            and bool(done_when)
+            and " ".join(done_when.split()) != " ".join(bound_check.split())
+            and _NOT_DONE.get((str(root), task), 0) < ESCALATE_AFTER
+        )
+        if amends_open:
+            if data_route is not None and " ".join(done_when.split()) == data_route[2]:
+                done_when, scope = data_route[2], data_route[3]
+        elif (
             not new_route
             and data_route is not None
             and " ".join(done_when.split()) == data_route[2]
@@ -6744,6 +6825,7 @@ def make_step_tool() -> Any:
                         "Say more specifically in notes how this route differs."
                     )
                 route = f"{taken}{spawned}\n\n"
+                spawns[:] = [(task, successor, spawned)]
                 _forget_task(root, task)
                 task = successor
                 criteria = old_criteria or criteria
@@ -6755,7 +6837,16 @@ def make_step_tool() -> Any:
                     return _step_result(f"pursuit_step: cannot read {task} (exit {rc}):\n{out}")
         tried = _NOT_DONE.get((str(root), task), 0)
         if not route and tried >= ESCALATE_AFTER:
-            return _step_result(_escalation(task, tried, arguments, record, root))
+            return _step_result(
+                _escalation(
+                    task,
+                    tried,
+                    arguments,
+                    record,
+                    root,
+                    await _offered_data_test_passes(arguments, record, root),
+                )
+            )
         if not retrying and task not in open_ids and record.get("status") != "open":
             predecessor = str(record.get("sibling_of") or "").strip()
             carried = _carried_criteria(predecessor, root) if predecessor and not route else ""
@@ -6802,6 +6893,9 @@ def make_step_tool() -> Any:
                 return _step_result(f"pursuit_step: {task} not opened — {prose}")
             route += _bound_note(done_when, chained)
             done_when = chained
+            if not scope and record.get("sibling_of"):
+                # Run R18 #56: T0008, spawned with no scope, was refused "no scope given".
+                scope = _predecessor_scope(record, root)
             scoped = (
                 _no_scope_problem(
                     scope,
@@ -7382,7 +7476,10 @@ def make_step_tool() -> Any:
         on_update: ToolUpdateCallback | None = None,
     ) -> AgentToolResult:
         stepped.clear()
+        spawns.clear()
         result = await _execute(tool_call_id, arguments, signal, on_update)
+        if spawns:
+            result = _with_spawn_notice(result, *spawns[0])
         result = _with_note(result, _worker_timeout(arguments.get("timeout"))[1])
         if stepped and stepped[0]:
             text = "".join(getattr(c, "text", "") for c in result.content)
