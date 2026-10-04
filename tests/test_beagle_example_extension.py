@@ -8290,6 +8290,111 @@ def test_imports_unwritten_counts_stdlib_installed_and_project_modules(tmp_path:
     assert module._imports_unwritten("pytest -q tests/", ["pkg/absent.py"], tmp_path) is None
 
 
+R15_CHECK = "python3 -m pytest -q tests/test_cases.py tests/test_case_data.py"
+R15_SCOPE = ["tests/cases.json", "tests/test_cases.py", "tests/test_case_data.py"]
+#: R15 E19-E41: T0002's driver resent another sub-agent with its own criteria,
+#: the bound check and notes, and no new_route.
+R15_ESCALATED_CALL = {
+    "task": "T0002",
+    "criteria": "Write tests/test_cases.py (a case runner that imports the library module "
+    "by name) and tests/test_case_data.py (a self-check of cases.json).",
+    "done_when": R15_CHECK,
+    "notes": "Write the two missing test files. The existing tests/cases.json has 32 cases.",
+}
+
+
+async def _escalated_r15_step(
+    tmp_path: Path, fake_beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> Any:
+    """pursuit_step after three steps left T0002, R15's known-answers task, not done."""
+    _failing_open_task(fake_beagle, monkeypatch)
+    runtime, _ = _bound(tmp_path)
+    step = _tool(runtime, "pursuit_step")
+    await _stays_open(step, fake_beagle, 3)
+    record = {"id": "T0002", "title": "Known answers", "status": "open", "scope": R15_SCOPE}
+    record |= {"criteria": "Write the known answers from the reference.", "done_when": R15_CHECK}
+    (fake_beagle / "show.out").write_text(json.dumps(record))
+    return step
+
+
+@pytest.mark.anyio
+async def test_escalation_names_the_missing_new_route_flag(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.chdir(_pursuit_project(tmp_path))
+    step = await _escalated_r15_step(tmp_path, fake_beagle, monkeypatch)
+
+    first = await step.execute("e19", dict(R15_ESCALATED_CALL))
+    again = await step.execute("e21", dict(R15_ESCALATED_CALL))
+
+    assert len(_runs(fake_tau)) == 3
+    assert first.text == again.text
+    assert first.text.startswith("pursuit_step: T0002 not run: 3 steps on it")
+    lacks = first.text.index("This call has no new_route=true")
+    assert lacks < first.text.index("Choose one:")
+    assert "Its done_when is the bound one: a new route needs a check" in first.text
+    assert 'pursuit_step task="T0002", new_route=true' in first.text
+    assert _pursuit_calls(fake_beagle, "spawn") == []
+
+
+@pytest.mark.anyio
+async def test_escalation_says_criteria_must_be_left_out_when_they_differ(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.chdir(_pursuit_project(tmp_path))
+    step = await _escalated_r15_step(tmp_path, fake_beagle, monkeypatch)
+    bound = {**R15_ESCALATED_CALL, "criteria": "Write the known answers from the reference."}
+
+    differing = await step.execute("e21", dict(R15_ESCALATED_CALL))
+    again = await step.execute("e23", dict(R15_ESCALATED_CALL))
+    same = await step.execute("e25", bound)
+
+    assert differing.text == again.text
+    leave_out = "Its criteria differ from T0002's: leave criteria out"
+    assert differing.text.index(leave_out) < differing.text.index("Choose one:")
+    assert leave_out not in same.text
+    assert len(_runs(fake_tau)) == 3
+
+
+@pytest.mark.anyio
+async def test_escalation_on_a_check_importing_an_unwritten_module_names_the_data_test(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project = _pursuit_project(tmp_path)
+    monkeypatch.chdir(project)
+    step = await _escalated_r15_step(tmp_path, fake_beagle, monkeypatch)
+    _cases_first_tree(project)
+    no_check = {k: v for k, v in R15_ESCALATED_CALL.items() if k != "done_when"}
+
+    first = await step.execute("e19", dict(R15_ESCALATED_CALL))
+    again = await step.execute("e21", dict(R15_ESCALATED_CALL))
+    kept = await step.execute("e23", no_check)
+
+    assert first.text == again.text
+    named = (
+        f"Its done_when is the bound check `{R15_CHECK}`, which runs tests/test_cases.py: "
+        "that fails with ImportError until a later task writes itc_clocks.itc"
+    )
+    data_check = 'done_when="python3 -m pytest -q tests/test_case_data.py"'
+    for text in (first.text, kept.text):
+        assert named in text and data_check in text
+        assert text.index(data_check) < text.index("Choose one:")
+    assert "Its done_when is the bound one" not in first.text
+    assert len(_runs(fake_tau)) == 3
+
+
 @pytest.mark.anyio
 async def test_not_done_on_a_missing_scoped_test_file_does_not_offer_a_new_done_when(
     tmp_path: Path,

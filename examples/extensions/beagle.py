@@ -4135,13 +4135,8 @@ def _imports_unwritten(command: str, scope: list[str], root: Path) -> tuple[str,
     return None
 
 
-def _imports_unwritten_problem(command: str, scope: list[str], root: Path) -> str | None:
-    """Why a check cannot pass on this scope because a test it runs imports unwritten
-    code, naming the data-only test to bind instead; or None."""
-    found = _imports_unwritten(command, scope, root)
-    if found is None:
-        return None
-    test, module = found
+def _data_test(test: str, scope: list[str], root: Path) -> str:
+    """The test in `scope`, other than `test`, that imports no unwritten code."""
     data_tests = [
         rel
         for entry in scope
@@ -4151,7 +4146,17 @@ def _imports_unwritten_problem(command: str, scope: list[str], root: Path) -> st
         and _is_test_path(rel)
         and _imports_unwritten(f"pytest {shlex.quote(rel)}", scope, root) is None
     ]
-    data_test = data_tests[0] if data_tests else "tests/test_case_data.py"
+    return data_tests[0] if data_tests else "tests/test_case_data.py"
+
+
+def _imports_unwritten_problem(command: str, scope: list[str], root: Path) -> str | None:
+    """Why a check cannot pass on this scope because a test it runs imports unwritten
+    code, naming the data-only test to bind instead; or None."""
+    found = _imports_unwritten(command, scope, root)
+    if found is None:
+        return None
+    test, module = found
+    data_test = _data_test(test, scope, root)
     return (
         f"{test} fails with ImportError until a later task writes {module}, and no path "
         "in this scope creates it, so no sub-agent on this scope can pass it. This task's "
@@ -5610,18 +5615,72 @@ async def _done_by(
     )
 
 
-def _escalation(task: str, count: int) -> str:
-    """The fixed refusal of a step on a task `count` steps have left not done."""
+def _escalation(
+    task: str,
+    count: int,
+    arguments: dict[str, Any] | None = None,
+    record: dict[str, Any] | None = None,
+    root: Path | None = None,
+) -> str:
+    """The refusal of a step on a task `count` steps have left not done.
+
+    Given the refused call's `arguments` and the task's `record`, it first says
+    what that call lacks: run R15 sent twelve calls, E19-E41, that the same
+    option list alone had refused.
+    """
+    lacks = _escalation_lacks(task, arguments, record, root) if arguments is not None else []
+    head = f"pursuit_step: {task} not run: {count} steps on it have left it not done."
+    if lacks:
+        head += "\n" + "\n".join(f"- {line}" for line in lacks)
     return (
-        f"pursuit_step: {task} not run: {count} steps on it have left it not done, and "
-        "another sub-agent on the same task, however its scope or notes are put, is "
-        "how run R04 spent 14 steps on one. Choose one:\n"
+        f"{head}\nAnother sub-agent on the same task, however its scope or notes are put, "
+        "is how run R04 spent 14 steps on one. Choose one:\n"
         f'- pursuit_plan task="{task}" with two or more parts, to split it into smaller '
         "tasks (a plan of one part is refused: the task is already one step);\n"
         f'- pursuit_step task="{task}", new_route=true, with a rewritten done_when and '
         "notes saying what the new route does differently (the criteria stay);\n"
         "- stop, and tell the user what blocks it."
     )
+
+
+def _escalation_lacks(
+    task: str, arguments: dict[str, Any], record: dict[str, Any] | None, root: Path | None
+) -> list[str]:
+    """What a step refused by the escalation lacks to be taken as a new route."""
+    record = record or {}
+    lacks = []
+    if arguments.get("new_route") is not True:
+        lacks.append(
+            "This call has no new_route=true, so it asks for another sub-agent on the "
+            "same route."
+        )
+    criteria = " ".join(str(arguments.get("criteria") or "").split())
+    bound_criteria = " ".join(str(record.get("criteria") or "").split())
+    if criteria and bound_criteria and criteria != bound_criteria:
+        lacks.append(
+            f"Its criteria differ from {task}'s: leave criteria out, since a new route "
+            "keeps them."
+        )
+    done_when = " ".join(str(arguments.get("done_when") or "").split())
+    bound_check = " ".join(str(record.get("done_when") or "").split())
+    if bound_check and done_when in ("", bound_check):
+        scope = _strings(arguments.get("scope")) or _strings(record.get("scope"))
+        unwritten = _imports_unwritten(bound_check, scope, root) if root is not None else None
+        if root is not None and unwritten is not None:
+            test, module = unwritten
+            data_test = _data_test(test, scope, root)
+            lacks.append(
+                f"Its done_when is the bound check `{bound_check}`, which runs {test}: "
+                f"that fails with ImportError until a later task writes {module}, and no "
+                "path in this scope creates it. The check a sub-agent can pass is the data "
+                f"test only: done_when=\"python3 -m pytest -q {data_test}\"."
+            )
+        elif done_when:
+            lacks.append(
+                "Its done_when is the bound one: a new route needs a check a sub-agent on "
+                "this scope can pass."
+            )
+    return lacks
 
 
 def _forget_task(root: Path, task: str) -> None:
@@ -5898,7 +5957,7 @@ def make_step_tool() -> Any:
                     return _step_result(f"pursuit_step: cannot read {task} (exit {rc}):\n{out}")
         tried = _NOT_DONE.get((str(root), task), 0)
         if not route and tried >= ESCALATE_AFTER:
-            return _step_result(_escalation(task, tried))
+            return _step_result(_escalation(task, tried, arguments, record, root))
         if not retrying and task not in open_ids and record.get("status") != "open":
             predecessor = str(record.get("sibling_of") or "").strip()
             carried = _carried_criteria(predecessor, root) if predecessor and not route else ""
