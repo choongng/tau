@@ -6,13 +6,19 @@
 # or success or failure, with a strong model this task is solvable in nearly
 # one shot but the 9b model needs more structure and steps (that we are
 # learning to provide)"
+# Extended 2026-10-04 on the user's instruction ("you edit using your best
+# judgement to reflect the new extended plan"), after "i think if we just cycle
+# models and prompts (i added a second, cobs_prompt.txt), and fix the problems
+# we see, we should be able to make progress. let's do two models and two
+# prompts and authorize another 20 steps". R01-R20 ran under the ten-run
+# wording (R11-R20 authorized separately on 2026-10-03).
 [goal]
-statement = "Make tau+beagle give a 9B model enough structure to take ~/tautest/itc_prompt.txt (interval tree clocks in Python, via a beagle pursuit) toward a correct, committed result, learning from the traces of ten unattended runs and fixing tau between runs."
+statement = "Make tau+beagle give a 9B model enough structure to take a small implementation prompt (~/tautest/itc_prompt.txt, interval tree clocks; ~/tautest/cobs_prompt.txt, consistent overhead byte stuffing; each in Python via a beagle pursuit) toward a correct, committed result, learning from the traces of unattended runs and fixing tau between runs, with fixes that hold across prompts rather than fitting one."
 criteria = [
-  "Ten runs of the unchanged itc_prompt.txt have been executed, each from a clean ~/itc under a one-hour wall cap with the model passed explicitly: five on mimo-v2.6-9b-q4 and five on qwen3.5-9b-q4-mtp-thinking-coding, alternating.",
-  "Each run has a trace analysis in dev-notes/itc-runs/RNN.md with a scorecard (founded and on which try; tasks done/abandoned/stalled; witnessed share; commits; breaker, length stops and compactions; finished on its own or capped; hidden-grader result) and the failure classes the trace shows, whether the run succeeded or not.",
-  "Each run's ITC is scored by a hidden acceptance suite (fork, event, join, leq, normalisation, the paper's examples) that the model never sees.",
-  "Every tau-side failure class named in a run analysis either has a fix committed on choong-dev with a regression test, made before the next run started, or a recorded reason it was deferred; beagle-side problems are listed in dev-notes/itc-runs/upstream.md and not patched.",
-  "dev-notes/itc-runs/summary.md holds a table of all ten scorecards and the failure classes that recurred across runs.",
+  "Runs R01-R20 (itc_prompt.txt) and R21-R40 have been executed. R21-R40 cycle mimo-v2.6-9b-q4 and qwen3.5-9b-q4-mtp-thinking-coding over the unchanged itc_prompt.txt and cobs_prompt.txt, so each block of four runs pairs each model with each prompt once. Each run starts from a clean project directory under a one-hour wall cap, with the model passed explicitly.",
+  "Each run has a trace analysis in dev-notes/itc-runs/RNN.md naming its model and prompt. It holds a scorecard (founded and on which try; tasks done/abandoned/stalled; witnessed share; commits; breaker, length stops and compactions; finished on its own or capped; hidden-grader result) and the failure classes the trace shows, whether the run succeeded or not.",
+  "Each run's implementation is scored by a hidden acceptance suite for its prompt that the model never sees: for ITC, fork, event, join, leq, normalisation and the paper's examples; for COBS, the reference examples, round-trips, the no-zero and overhead properties, and malformed-input rejection.",
+  "Every tau-side failure class named in a run analysis either has a fix committed on choong-dev with a regression test, made before the next run started, or a recorded reason it was deferred. A fix is stated in terms that do not depend on one prompt's domain or wording, or the analysis says why it cannot be. Beagle-side problems are listed in dev-notes/itc-runs/upstream.md and not patched.",
+  "dev-notes/itc-runs holds summaries with a table of every run's scorecard and the failure classes that recurred: summary.md (R01-R10), summary-R11-R20.md, and a summary of R21-R40 that compares the two prompts and says which failure classes and fixes carried across them.",
 ]
 default_budget_tokens = 150000
