@@ -1402,6 +1402,13 @@ if os.environ.get("FAKE_TAU_RAMBLES"):
     }
     print("worker stderr line", file=sys.stderr)
 print(json.dumps({"type": "message_end", "message": {"role": "user", "content": brief}}))
+if attempt >= int(os.environ.get("FAKE_TAU_HANGS_ON") or 99):
+    # A worker the wall kills, after turns cut off at the output limit.
+    for _ in range(int(os.environ.get("FAKE_TAU_LENGTH_STOPS", "0"))):
+        cut = {"role": "assistant", "content": [], "stopReason": "length"}
+        print(json.dumps({"type": "message_end", "message": cut}), flush=True)
+    import time
+    time.sleep(60)
 print(json.dumps({"type": "message_end", "message": message}))
 """
 
@@ -6785,6 +6792,139 @@ async def test_worker_raw_tool_call_report_falls_back(
     assert "Changed or new in its scope: done.txt" in result.text
     [close] = _pursuit_calls(fake_beagle, "close")
     assert "<tool_call>" not in close[close.index("--body") + 1]
+
+
+async def _hung_second_worker(
+    tmp_path: Path, fake_beagle: Path, monkeypatch: pytest.MonkeyPatch, length_stops: int
+) -> str:
+    project = _git_project(tmp_path, monkeypatch)
+    monkeypatch.chdir(project)
+    monkeypatch.setenv("FAKE_TAU_SUCCEEDS_ON", "99")
+    monkeypatch.setenv("FAKE_TAU_HANGS_ON", "2")
+    monkeypatch.setenv("FAKE_TAU_LENGTH_STOPS", str(length_stops))
+    monkeypatch.setenv("FAKE_TAU_WRITES", json.dumps({"tests/test_x.py": "def test_x(): ...\n"}))
+    monkeypatch.setenv("FAKE_TAU_REPORT", "attempt 1: wrote tests/test_x.py; the check fails")
+    _ready_task(fake_beagle)
+    runtime, _ = _bound(tmp_path)
+    result = await _tool(runtime, "pursuit_step").execute(
+        "c1",
+        {
+            "task": "T0002",
+            "criteria": "c",
+            "done_when": "grep -q done done.txt",
+            "scope": ["done.txt", "tests/test_x.py"],
+            "timeout": 3,
+        },
+    )
+    return str(result.text)
+
+
+@pytest.mark.anyio
+async def test_second_worker_timeout_keeps_the_first_attempts_report_and_check(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Run R15: W6 was killed at the wall, and W5's report and the check's output went with it.
+    text = await _hung_second_worker(tmp_path, fake_beagle, monkeypatch, 0)
+
+    assert len(_runs(fake_tau)) == 2
+    assert "exceeded its wall-clock budget of 3s" in text and "stays open" in text
+    assert "The attempt before it reported:\nattempt 1: wrote tests/test_x.py" in text
+    assert "exit 2 after that attempt:\ngrep: done.txt: No such file" in text
+    assert "Changed or new in its scope: tests/test_x.py" in text
+    assert _module().WORKER_MAX_TURNS_ENV in text and "output limit" not in text
+    assert _pursuit_calls(fake_beagle, "close") == []
+
+
+@pytest.mark.anyio
+async def test_worker_timeout_names_output_limit_turns_not_the_env_var(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Run R15: W6 spent four turns at the 8192-token output limit, not its turn cap.
+    text = await _hung_second_worker(tmp_path, fake_beagle, monkeypatch, 4)
+
+    assert "it spent 4 turn(s) at the output limit" in text
+    assert _module().WORKER_MAX_TURNS_ENV not in text and "turn cap" not in text
+
+
+#: Run R15 W2's last message: a whole report, then a raw tool call.
+W2_REPORT_TAIL = (
+    "`fork` splits the id (`split`), `event` inflates the event tree on id-owned "
+    "intervals (`fill`/`grow`), `join` sums ids and joins event functions, `peek` "
+    "yields an anonymous stamp with id 0, and comparison is pointwise on the event "
+    "function via `leq`. Normalization (`norm`) collapses redundant structure.\n\n"
+    "One caveat: I could not verify the exact expected values for the more complex "
+    "cases (join chains, `fill`/`grow` simplifications) against the paper's worked "
+    "example. Those entries need a careful re-derivation against the paper's §5.3 "
+    "definitions before the test is meaningful."
+)
+W2_MARKUP = (
+    "<tool_call><function=bash><parameter=command>echo ok</parameter>"
+    "<parameter=description>noop</parameter></function></tool_call>"
+)
+
+
+async def _raw_markup_step(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, report: str) -> str:
+    project = _git_project(tmp_path, monkeypatch)
+    monkeypatch.chdir(project)
+    monkeypatch.setenv("FAKE_TAU_REPORT", report)
+    monkeypatch.setenv("FAKE_TAU_SUCCEEDS_ON", "99")
+    monkeypatch.setenv("FAKE_TAU_WRITES", json.dumps({"cases.json": "[]\n"}))
+    runtime, _ = _bound(tmp_path)
+    result = await _tool(runtime, "pursuit_step").execute(
+        "c1",
+        {
+            "task": "T0002",
+            "criteria": "c",
+            "done_when": "grep -q done done.txt",
+            "scope": ["done.txt", "cases.json"],
+            "attempts": 1,
+        },
+    )
+    return str(result.text)
+
+
+@pytest.mark.anyio
+async def test_report_ending_in_a_raw_tool_call_keeps_the_text_before_it(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Run R15: W2's report was replaced whole because it ended in `<tool_call>`.
+    _ready_task(fake_beagle)
+    text = await _raw_markup_step(tmp_path, monkeypatch, W2_REPORT_TAIL + W2_MARKUP)
+
+    assert W2_REPORT_TAIL in text
+    assert "(The report ended on a raw tool call, cut here.)" in text
+    assert "Changed or new in its scope: cases.json" in text
+    assert "<tool_call>" not in text and "<function=" not in text
+    assert "the sub-agent ended without a report" not in text
+
+
+@pytest.mark.anyio
+async def test_bare_raw_tool_call_report_is_still_replaced(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _ready_task(fake_beagle)
+    text = await _raw_markup_step(tmp_path, monkeypatch, "Let me check.\n" + W2_MARKUP)
+
+    assert "the sub-agent ended without a report, on a raw tool call" in text
+    assert "Let me check." not in text and "cut here" not in text
+    assert "Changed or new in its scope: cases.json" in text
+    assert "<tool_call>" not in text
 
 
 @pytest.mark.anyio

@@ -1199,6 +1199,8 @@ class _WorkerEvents:
     refusal: str | None = None
     #: Whether tau's breaker stopped the run after refused calls in a row.
     stopped: bool = False
+    #: How many assistant turns ended at the output-token limit.
+    length_stops: int = 0
 
     def feed(self, line: bytes) -> None:
         if b'"message_end"' not in line[:64]:
@@ -1238,6 +1240,8 @@ class _WorkerEvents:
         ).strip()
         stop = message.get("stopReason")
         self.stop_reason = stop if isinstance(stop, str) else None
+        if stop == "length":
+            self.length_stops += 1
         error = message.get("errorMessage")
         self.error = str(error) if stop == "error" and error else None
 
@@ -1339,6 +1343,10 @@ async def _talk(proc: asyncio.subprocess.Process, brief: str, events: _WorkerEve
 _TOOL_CALL_MARKUP = re.compile(r"<tool_call>|<function=")
 
 
+#: How long the text before raw tool-call markup must be to count as a report.
+_REPORT_BEFORE_MARKUP_CHARS = 200
+
+
 def _unreported_changes(cwd: Path, scope: list[str]) -> str:
     """The report for a worker that ended on a raw tool call: what git sees it change.
 
@@ -1346,16 +1354,36 @@ def _unreported_changes(cwd: Path, scope: list[str]) -> str:
     which the driver was handed as the report.
     """
     stub = f"{NO_REPORT}: the sub-agent ended without a report, on a raw tool call.)"
+    return "\n".join([stub, *_scope_changes(cwd, scope)])
+
+
+def _report_before_markup(report: str, cwd: Path, scope: list[str]) -> str:
+    """A report that ends in raw tool-call markup: the text before it, or the stub.
+
+    Run R15's W2 wrote a whole report and then `<tool_call><function=bash>…`;
+    replacing all of it told the driver the worker wrote nothing.
+    """
+    match = _TOOL_CALL_MARKUP.search(report)
+    before = report[: match.start()].strip() if match else report.strip()
+    if len(before) < _REPORT_BEFORE_MARKUP_CHARS:
+        return _unreported_changes(cwd, scope)
+    return "\n".join(
+        [before, "\n(The report ended on a raw tool call, cut here.)", *_scope_changes(cwd, scope)]
+    )
+
+
+def _scope_changes(cwd: Path, scope: list[str]) -> list[str]:
+    """What git sees changed in `scope`: the diff stat and the changed or new files."""
     rc, stat = _run(["git", "diff", "--stat", "--", *scope], cwd, timeout=30.0)
     changed = [rel for rel in _changed_files(cwd) if _in_scope(rel, scope)]
-    lines = [stub]
+    lines: list[str] = []
     if rc == 0 and stat.strip():
         lines.append(f"git diff --stat:\n{stat.strip()}")
     if changed:
         lines.append("Changed or new in its scope: " + ", ".join(changed))
     elif rc == 0 and not stat.strip():
         lines.append("git diff --stat: no change.")
-    return "\n".join(lines)
+    return lines
 
 
 async def _run_worker(
@@ -1440,10 +1468,12 @@ async def _run_worker(
             break
         remaining = deadline - loop.time()
         if remaining <= 0:
-            problem = (
-                f"the step-executor exceeded its wall-clock budget of {timeout:.0f}s and "
-                "was killed. Split the task, or lower its turn cap "
-                f"({WORKER_MAX_TURNS_ENV})."
+            problem = f"the step-executor exceeded its wall-clock budget of {timeout:.0f}s and " + (
+                f"was killed: it spent {events.length_stops} turn(s) at the output limit, "
+                "writing more than one reply holds. Split the task, or say in the notes "
+                "to write files in smaller pieces."
+                if events.length_stops
+                else f"was killed. Split the task, or lower its turn cap ({WORKER_MAX_TURNS_ENV})."
             )
             break
         await asyncio.wait({talk}, timeout=min(_WORKER_POLL_SECONDS, remaining))
@@ -1457,7 +1487,7 @@ async def _run_worker(
     stderr = talk.result()
     note = _killed_note(proc.returncode, limit)
     if _TOOL_CALL_MARKUP.search(events.report):
-        report = _unreported_changes(cwd, scope or [])
+        report = _report_before_markup(events.report, cwd, scope or [])
     else:
         report = events.final_report(f"{stderr}\n{note}".strip() if note else stderr)
     return _WorkerRun(
@@ -5812,6 +5842,35 @@ def _forget_task(root: Path, task: str) -> None:
     _NOT_DONE_SCOPE.pop(key, None)
 
 
+def _killed_attempt_context(
+    run: _WorkerRun,
+    shown: str,
+    verdict: tuple[int, str],
+    check: str,
+    root: Path,
+    scope: list[str],
+) -> str:
+    """What a killed worker's step result keeps: the attempt before it, and the tree.
+
+    Run R15's second worker was killed at the wall, and the result named only
+    the timeout: the first worker's report and the check's output were dropped,
+    so the driver went on believing the tests were unwritten.
+    """
+    parts: list[str] = []
+    if shown:
+        parts.append(f"The attempt before it reported:\n{shown}")
+        if check and verdict[1]:
+            parts.append(
+                f"`{check}` exit {verdict[0]} after that attempt:\n"
+                f"{verdict[1][-CHECK_TAIL_CHARS:]}"
+            )
+    if run.transcript is not None:
+        changes = _scope_changes(root, scope)
+        if changes:
+            parts.append("In the tree now:\n" + "\n".join(changes))
+    return "".join(f"{part}\n\n" for part in parts)
+
+
 def _not_done(root: Path, task: str, scope: list[str], text: str) -> AgentToolResult:
     """Count a result that left `task` not done, and return it."""
     key = (str(root), task)
@@ -6317,7 +6376,8 @@ def make_step_tool() -> Any:
                     scope,
                     _implementation_in_tests_lead(root, scope)
                     + f"pursuit_step: {task} stays open — {run.problem}\n\n"
-                    f'Call pursuit_step with task="{task}" to send it again.',
+                    + _killed_attempt_context(run, shown, verdict, check, root, scope)
+                    + f'Call pursuit_step with task="{task}" to send it again.',
                 )
             report, shown = run.report, run.shown_report
             if not check:
