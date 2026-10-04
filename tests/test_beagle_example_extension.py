@@ -6077,6 +6077,93 @@ async def test_worker_guard_refuses_python_one_liner_write_out_of_scope(
     assert [inside.text, reading.text] == ["ran", "ran"]
 
 
+#: R12 W10 E48, verbatim: it deleted create_node from T0004's committed src.
+R12_OS_SYSTEM_SED = (
+    'python3 -c "import os; os.system(\'sed -i \\"184,194d\\" src/interval_tree_clock.py\')"'
+)
+
+
+@pytest.mark.anyio
+async def test_worker_guard_blocks_sed_through_os_system_in_inline_python(
+    tmp_path: Path, beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # R12: W10, refused ~10 writes to src/, ran sed -i on it through os.system.
+    runtime = _scoped_worker(tmp_path, monkeypatch, scope="tests/test_cases.py")
+    bash = _tool_with_hooks(runtime, "bash")
+
+    result = await bash.execute("c1", {"command": R12_OS_SYSTEM_SED})
+    popen = await bash.execute(
+        "c2", {"command": "python3 -c 'import os; os.popen(\"echo x > src/a.py\")'"}
+    )
+    heredoc = await bash.execute(
+        "c3",
+        {"command": "python3 - <<'EOF'\nimport os\nos.system('rm src/a.py')\nEOF"},
+    )
+
+    assert "refusing to write src/interval_tree_clock.py: it is outside T0003's scope" in (
+        result.text
+    )
+    assert "(tests/test_cases.py)" in result.text
+    assert "refusing to write src/a.py" in popen.text
+    assert "refusing to write src/a.py" in heredoc.text
+
+
+@pytest.mark.anyio
+async def test_worker_guard_blocks_subprocess_write_outside_scope(
+    tmp_path: Path, beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runtime = _scoped_worker(tmp_path, monkeypatch, scope="tests/test_cases.py")
+    bash = _tool_with_hooks(runtime, "bash")
+
+    shell = await bash.execute(
+        "c1",
+        {
+            "command": 'python3 -c "import subprocess; '
+            "subprocess.run('sed -i 1d src/a.py', shell=True)\""
+        },
+    )
+    # A list argument has no command line to read: a path literal stands for it.
+    listed = await bash.execute(
+        "c2",
+        {
+            "command": 'python3 -c "import subprocess; '
+            "subprocess.run(['sed', '-i', '1d', 'src/a.py'])\""
+        },
+    )
+    reads = await bash.execute(
+        "c3", {"command": "python3 -c \"import os; os.system('cat src/a.py')\""}
+    )
+    runs = await bash.execute(
+        "c4", {"command": "python3 -c \"import subprocess; subprocess.run(['pytest', '-q'])\""}
+    )
+
+    for refused in (shell, listed):
+        assert "refusing to write src/a.py: it is outside T0003's scope" in refused.text
+    assert [reads.text, runs.text] == ["ran", "ran"]
+
+
+@pytest.mark.anyio
+async def test_worker_guard_allows_os_system_write_inside_scope(
+    tmp_path: Path, beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runtime = _scoped_worker(tmp_path, monkeypatch, scope="src/interval_tree_clock.py")
+    bash = _tool_with_hooks(runtime, "bash")
+
+    sed = await bash.execute("c1", {"command": R12_OS_SYSTEM_SED})
+    listed = await bash.execute(
+        "c2",
+        {
+            "command": 'python3 -c "import subprocess; '
+            "subprocess.run(['sed', '-i', '1d', 'src/interval_tree_clock.py'])\""
+        },
+    )
+    scratch = await bash.execute(
+        "c3", {"command": "python3 -c \"import os; os.system('echo x > /tmp/scratch.txt')\""}
+    )
+
+    assert [sed.text, listed.text, scratch.text] == ["ran", "ran", "ran"]
+
+
 def test_check_problem_refuses_import_only_python_c() -> None:
     # R04 L178: bound, and W23 was dispatched on it.
     check = "python3 -c \"from tests.test_case_data import validate_fork_seed; print('OK')\""

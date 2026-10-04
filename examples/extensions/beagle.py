@@ -5366,6 +5366,17 @@ _SCRIPT_PATH = re.compile(
     r"""|Path\(\s*['"](?P<path>[^'"]+)['"]\s*\)\s*\.write_(?:text|bytes)\("""
     r"""|writeFileSync\(\s*['"](?P<node>[^'"]+)['"]"""
 )
+#: An inline script that hands a command to the shell.
+_SCRIPT_SHELL = re.compile(r"""\bos\.(?:system|popen)\(|\bsubprocess\.\w+\(""")
+#: The plain string literal a shell-out is called with, when it is one.
+_SCRIPT_SHELL_ARG = re.compile(
+    r"""\b(?:os\.(?:system|popen)|subprocess\.\w+)\(\s*"""
+    r"""(?:r?(?P<q>['"])(?P<cmd>(?:[^'"\\]|\\.|(?!(?P=q))['"])*)(?P=q))?"""
+)
+#: A literal word that names a path: one with a directory or a file suffix.
+_SCRIPT_PATH_WORD = re.compile(r"[\w.~-]*/[\w./~-]*|[\w~-][\w./~-]*\.\w+")
+#: A string literal in a script's source.
+_SCRIPT_LITERAL = re.compile(r"'([^'\n]*)'" r'|"([^"\n]*)"')
 
 
 def _in_store(word: str) -> bool:
@@ -5407,7 +5418,41 @@ def _script_write_targets(command: str, cwd: Path) -> list[Path]:
     does not spell out is not guessed at: the guard fails open on it.
     """
     found = [next(g for g in m.groups() if g is not None) for m in _SCRIPT_PATH.finditer(command)]
-    return [_resolved(Path(p) if Path(p).is_absolute() else cwd / p) for p in found]
+    targets = [_resolved(Path(p) if Path(p).is_absolute() else cwd / p) for p in found]
+    return targets + _script_shell_targets(command, cwd)
+
+
+def _script_shell_targets(command: str, cwd: Path) -> list[Path]:
+    """The paths a command an inline script runs through the shell writes.
+
+    Run R12: W10, refused about ten writes to src/, deleted from it with
+    `python3 -c "import os; os.system('sed -i ... src/x.py')"`. A shell-out
+    called with a plain string is read as bash; one called with anything else
+    (a list, a variable) stands for every path-like literal in the script.
+    """
+    tokens = _shell_tokens(command) or []
+    sources = [command, *(t for t in tokens if _SCRIPT_SHELL.search(t))]
+    found: list[Path] = []
+    unreadable = False
+    for source in sources:
+        for m in _SCRIPT_SHELL_ARG.finditer(source):
+            if m.group("cmd") is None:
+                unreadable = True
+                continue
+            nested = _bash_write_targets(re.sub(r"\\(.)", r"\1", m.group("cmd")), cwd)
+            if nested is None:
+                unreadable = True
+            else:
+                found += [_resolved(t) for t in nested]
+    if unreadable:
+        for source in sources:
+            for m in _SCRIPT_LITERAL.finditer(source):
+                for word in (m.group(1) or m.group(2) or "").split():
+                    if not _SCRIPT_PATH_WORD.fullmatch(word) or word.startswith("-"):
+                        continue
+                    path = Path(word).expanduser()
+                    found.append(_resolved(path if path.is_absolute() else cwd / path))
+    return found
 
 
 def _worker_scope() -> tuple[str, tuple[str, ...]] | None:
@@ -5453,7 +5498,7 @@ def make_worker_scope_guard() -> Any:
             scripted = (
                 script is not None
                 and script.startswith(_INTERPRETERS)
-                and _SCRIPT_WRITE.search(command) is not None
+                and (_SCRIPT_WRITE.search(command) or _SCRIPT_SHELL.search(command)) is not None
             )
             targets = _write_targets(event.tool_name, arguments, cwd)
             if scripted:
