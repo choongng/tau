@@ -16243,6 +16243,7 @@ R32_STAYS_OPEN = (
     "against the code, with no hand-written asserts of its own.\n\nLast report:\nok"
 )
 R32_DEMAND = (
+    "tests/test_x.py does not read tests/x.json, so the known answers judge nothing: "
     "make tests/test_x.py load tests/x.json and run every case in it against the code, "
     "with no hand-written asserts of its own"
 )
@@ -16761,3 +16762,153 @@ async def test_close_next_step_agrees_with_already_passes(
     }
     again = await step.execute("c2", route)
     assert "already passes" not in again.text, again.text
+
+
+#: R35's tests/test_cases.py, trimmed: it reads the cases and imports the code,
+#: but its one function is `main`, so pytest collects nothing.
+R35_MAIN_ONLY_TEST = """\
+import json
+from pathlib import Path
+
+import cobs
+
+
+def main():
+    for case in json.loads(Path(__file__).with_name("cases.json").read_text()):
+        assert cobs.encode(case["in"]) == case["out"]
+"""
+
+
+@pytest.mark.anyio
+async def test_rerun_brief_carries_close_file_and_defect(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # R35 E20: the close kept T0005 open because tests/test_cases.py held no test
+    # function; W8 and W9 heard only "make it look up only cases the data holds".
+    project = _cases_task(tmp_path, fake_beagle, monkeypatch, CASES_DATA_TEST)
+    writes = json.loads(os.environ["FAKE_TAU_WRITES"])
+    writes["tests/test_cases.py"] = R35_MAIN_ONLY_TEST
+    monkeypatch.setenv("FAKE_TAU_WRITES", json.dumps(writes))
+    scope = [*CASES_SCOPE, "tests/test_cases.py"]
+
+    result = await _step_cases(tmp_path, scope=scope, locks=scope)
+
+    defect = "tests/test_cases.py defines no test function pytest collects"
+    fix = (
+        "rename one of its top-level functions (`main`) to test_… or add a test_ "
+        "function; change only tests/test_cases.py, and the bound check stays as it is"
+    )
+    assert "stays open" in result.text and defect in result.text
+    assert f"the sub-agent must {fix}." in result.text
+    assert "look up only cases the data holds" not in result.text
+    module = _loaded_module()
+    demand = module._NOT_DONE_DEMAND[(str(project), "T0002")]
+    assert demand.startswith(defect) and demand.endswith(f"{fix}.")
+
+    # The rerun's brief note (wired into the brief as R32's test shows) and the
+    # Next's notes carry both.
+    note = module._last_close_note((str(project), "T0002"))
+    assert note.startswith(f"\n\nThe last close kept this task open: {defect}")
+    assert fix in note
+    assert f"notes saying {defect}" in result.text and f"{fix}." in result.text
+
+    # The advice on how cases are used stays with the verdicts about that.
+    flawed = R35_MAIN_ONLY_TEST.replace("def main():", "def test_cases():").replace(
+        'case["out"]', '"x"'
+    )
+    entries = _write_cases(tmp_path, flawed)
+    closing = module._cases_close_problem(tmp_path, entries)
+    assert closing is not None and "look up only cases the data holds" in closing[1]
+    assert "change only tests/test_cases.py" in closing[1]
+
+
+#: R35 E22's check output: the data test imports the cases test, which imports
+#: the unwritten module, so pytest stops at collection.
+R35_COLLECTION_TAIL = """\
+==================================== ERRORS ====================================
+__________________ ERROR collecting tests/test_case_data.py ___________________
+ImportError while importing test module '/x/tests/test_case_data.py'.
+Hint: make sure your test modules/packages have valid Python names.
+Traceback:
+/usr/lib/python3.12/importlib/__init__.py:90: in import_module
+    return _bootstrap._gcd_import(name[level:], package)
+tests/test_case_data.py:7: in <module>
+    import test_cases
+tests/test_cases.py:6: in <module>
+    import cobs
+E   ModuleNotFoundError: No module named 'cobs'
+=========================== short test summary info ============================
+ERROR tests/test_case_data.py
+1 error in 0.05s
+"""
+
+
+@pytest.mark.anyio
+async def test_not_done_lead_names_failing_import(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # R35 E22-E32 led with the runner in tests/test_cases.py, a file the check
+    # reached only through the import that failed before anything ran.
+    project, check = _r16_step_project(tmp_path, fake_beagle, monkeypatch)
+    (project / "check.out").write_text(R35_COLLECTION_TAIL)
+    (project / "tests").mkdir(exist_ok=True)
+    (project / "tests" / "test_case_data.py").write_text("import test_cases\n")
+    runtime, _ = _bound(tmp_path)
+
+    result = await _tool(runtime, "pursuit_step").execute(
+        "c1", {"task": "T0002", "criteria": "c", "done_when": check, "scope": ["tests/"]}
+    )
+
+    text = result.text
+    lead = (
+        "The check fails at collection, before any test runs: tests/test_case_data.py:7 "
+        "`import test_cases` → tests/test_cases.py:6 `import cobs` → "
+        "ModuleNotFoundError: No module named 'cobs'."
+    )
+    assert lead in text, text
+    assert text.index(lead) < text.index("the check still fails")
+    assert "case runner" not in text
+    assert "wrote implementation into tests/" not in text
+
+    # A failing test, not a collection error, still gets the runner lead.
+    module = _loaded_module()
+    assert module._collection_failure_lead(R16_CHECK_TAIL, ["tests/"], project) == ""
+
+
+@pytest.mark.anyio
+async def test_known_answers_brief_import_error_is_a_defect(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # R35: "fails with ImportError until the code exists" reached every brief's
+    # Done means, and workers reported the red data check as the required state.
+    module = _module()
+    assert "fails with ImportError until the code exists" not in module.CASES_FIRST_NOTE
+    assert "an ImportError from it is a defect to fix" in module.CASES_FIRST_NOTE
+
+    project = _cases_task(tmp_path, fake_beagle, monkeypatch, CASES_DATA_TEST)
+    await _step_cases(tmp_path)
+    loaded = _loaded_module()
+    said = loaded.DATA_CHECK_IMPORT_DEFECT
+    assert "an ImportError from it is a defect" in said
+    assert said in _runs(fake_tau)[0]["stdin"]
+
+    (project / "tests" / "test_cases.py").write_text("import test_cases\n")
+    (project / "tests" / "test_case_data.py").write_text("import test_cases\n")
+    lead = loaded._collection_failure_lead(R35_COLLECTION_TAIL, CASES_SCOPE, project)
+    assert lead.startswith("The check fails at collection") and said in lead
+    code_scope = loaded._collection_failure_lead(
+        R35_COLLECTION_TAIL, ["cobs.py", "tests/"], project
+    )
+    assert code_scope and said not in code_scope

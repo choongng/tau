@@ -5118,6 +5118,43 @@ _MODULE_IMPLICIT_NAMES = frozenset(
 )
 
 
+NO_TEST_FUNCTION = "defines no test function pytest collects (no test* function or Test* class)"
+
+
+def _cases_problem_fix(root: Path, test: str, problem: str) -> str:
+    """What to change in `test` for the `_cases_test_problem` verdict `problem`.
+
+    Run R35: "defines no test function" got the advice on how cases are used,
+    and W8 rewrote the data test; renaming `def main` in the cases test fixed it.
+    Only a verdict on how the cases are used gets that advice.
+    """
+    if problem == NO_TEST_FUNCTION:
+        try:
+            tree = ast.parse((root / test).read_text(encoding="utf-8"))
+        except (OSError, SyntaxError, ValueError):
+            tree = ast.Module(body=[], type_ignores=[])
+        names = [
+            node.name
+            for node in tree.body
+            if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef)
+            and not node.name.startswith("test")
+        ]
+        fix = (
+            f"rename one of its top-level functions ({', '.join(f'`{n}`' for n in names)}) "
+            "to test_… or add a test_ function"
+            if names
+            else "add a test_ function that runs the cases"
+        )
+    elif problem.startswith("uses ") and " without importing " in problem:
+        fix = f"import {problem.rpartition(' without importing ')[2]} in it"
+    else:
+        fix = (
+            "make it look up only cases the data holds, compare the code's results with "
+            "each case's expected value, and use each attribute one way"
+        )
+    return f"{fix}; change only {test}, and the bound check stays as it is"
+
+
 def _test_structure_problem(tree: ast.Module) -> str | None:
     """What keeps a test module from judging anything, read from its AST alone.
 
@@ -5149,7 +5186,7 @@ def _test_structure_problem(tree: ast.Module) -> str | None:
         for node in tree.body
     ) or any(name.startswith("test") for name in imported)
     if not collectable:
-        return "defines no test function pytest collects (no test* function or Test* class)"
+        return NO_TEST_FUNCTION
     if star:
         return None
     bound = set(imported) | _MODULE_IMPLICIT_NAMES
@@ -7696,6 +7733,53 @@ def _check_test_reach(check: str, root: Path) -> set[str] | None:
     return files
 
 
+#: A traceback frame pytest prints for a test module's import: `path:line: in <module>`
+#: and, indented below it, the line that ran.
+_MODULE_FRAME = re.compile(r"^(\S+\.py):(\d+): in <module>\n[ \t]+(\S.*)$", re.MULTILINE)
+#: The exception line of a pytest error report: `E   ModuleNotFoundError: …`.
+_ERROR_LINE = re.compile(r"^E\s+(\w+(?:Error|Exception)\b.*)$", re.MULTILINE)
+#: Said whenever a data-and-tests task's own check fails at collection.
+DATA_CHECK_IMPORT_DEFECT = (
+    "The bound check must pass now; an ImportError from it is a defect, not the "
+    "pre-implementation state."
+)
+
+
+def _collection_failure_lead(output: str, scope: list[str], root: Path) -> str:
+    """The line a not-done result leads with when its check failed at collection,
+    naming the import and file that broke it; else "".
+
+    Run R35: every result led with a runner in tests/test_cases.py, which the
+    check reached only through an import that failed before anything ran.
+    """
+    outcomes = _PYTEST_OUTCOME.findall(output)
+    if not outcomes or any(kind != "ERROR" for kind, _ in outcomes):
+        return ""
+    if _IMPORT_FAILURE.search(output) is None and "ERROR collecting" not in output:
+        return ""
+    chain = []
+    for path, line, code in _MODULE_FRAME.findall(output):
+        rel = _root_relative(path, root)
+        if rel is not None and (root / rel).is_file():
+            chain.append(f"{rel}:{line} `{code.strip()}`")
+    error = _ERROR_LINE.search(output)
+    said = " → ".join([*chain, *([error.group(1).strip()] if error else [])])
+    if not said:
+        return ""
+    where = (
+        " Nothing in these files runs until that import succeeds: fix the import, not "
+        "what would run after it."
+        if chain
+        else ""
+    )
+    defect = (
+        f" {DATA_CHECK_IMPORT_DEFECT}"
+        if _scope_has_data(scope) and _only_data_and_tests(scope)
+        else ""
+    )
+    return f"The check fails at collection, before any test runs: {said}.{where}{defect}\n\n"
+
+
 def _implementation_in_tests_lead(root: Path, scope: list[str], check: str = "") -> str:
     """The line a not-done result leads with when its worker wrote code into tests/.
 
@@ -9332,14 +9416,21 @@ def _last_failure_note(key: tuple[str, str], check: str) -> str:
 
 def _close_demand(text: str) -> str:
     """The demand of a result whose check passed but whose close kept the task open:
-    its "the sub-agent must …" clause, else the reason after "the check passes, but"."""
+    the file and defect the close found, then its "the sub-agent must …" clause; else
+    the reason after "the check passes, but".
+
+    Run R35: only the clause after "the sub-agent must " reached the rerun, so
+    W8 and W9 never heard that tests/test_cases.py defined no test function.
+    """
     for para in text.split("\n\n"):
         _, passes, reason = para.partition("the check passes, but ")
         if not passes:
             continue
         if reason.startswith("the task "):
             reason = reason.partition(": ")[2] or reason
-        _, must, demand = reason.partition("the sub-agent must ")
+        found, must, demand = reason.partition("the sub-agent must ")
+        if must and found.strip():
+            return f"{found.strip()} {demand.strip()}"
         said = (demand if must else reason).strip()
         return said[:1].lower() + said[1:]
     return ""
@@ -9607,8 +9698,7 @@ def _cases_close_problem(root: Path, entries: list[str]) -> tuple[str, str] | No
         test, problem = flawed
         return (
             f"{test} {problem}, so the known answers could never judge the code",
-            f"{test} {problem}: make it look up only cases the data holds, compare the "
-            "code's results with each case's expected value, and use each attribute one way.",
+            f"{test} {problem}: {_cases_problem_fix(root, test, problem)}.",
         )
     return None
 
@@ -11422,6 +11512,10 @@ def make_step_tool() -> Any:
         if references:
             brief = f"{brief}\n\n{references}"
         brief += _last_close_note((str(root), task))
+        briefed_scope = scope or _strings(record.get("scope"))
+        if check and _scope_has_data(briefed_scope) and _only_data_and_tests(briefed_scope):
+            # Run R35: workers took the data check's ImportError for the goal.
+            brief += f"\n\n{DATA_CHECK_IMPORT_DEFECT}"
         if notes:
             brief = f"{brief}\n\nFrom the driver (who has not read the reference):\n{notes}"
         if hang:
@@ -11786,6 +11880,7 @@ def make_step_tool() -> Any:
                     f'Sent as pursuit_step task="{task}", done_when="{data_check}", it is '
                     "taken as this task's new route.\n\n"
                 )
+            collection = _collection_failure_lead(verdict[1], scope, root)
             return _not_done(
                 root,
                 task,
@@ -11793,10 +11888,11 @@ def make_step_tool() -> Any:
                 (f"{no_tests}\n\n" if no_tests else "")
                 + unpassable
                 + _cwd_relative_data_lead(verdict[1], scope, root)
+                + collection
                 + f"{route}{undid}{task} — {title}: the check still fails after {attempt} "
                 f"sub-agent run(s), so the task {state}.\n\n`{check}` exit {verdict[0]}:\n"
                 f"{verdict[1][-CHECK_TAIL_CHARS:]}\n\n"
-                + _implementation_in_tests_lead(root, scope, check)
+                + ("" if collection else _implementation_in_tests_lead(root, scope, check))
                 + _unreported_runs(unreported, attempt)
                 + f"Last report:\n{shown}\n\n"
                 f'Next: pursuit_step with task="{task}" and notes saying what to fix. '
@@ -11955,17 +12051,17 @@ def make_step_tool() -> Any:
         if flawed:
             state = "stays blocked" if retrying else "stays open"
             test, problem = flawed
+            fix = _cases_problem_fix(root, test, problem)
             return _not_done(
                 root,
                 task,
                 scope,
                 f"{route}{undid}{task} — {title}: the check passes, but the task {state} "
                 f"and nothing is locked: {test} {problem}, so the known answers could "
-                "never judge the code: the sub-agent must make it look up only cases "
-                "the data holds, compare the code's results with each case's expected "
-                "value, and use each attribute one way."
+                f"never judge the code: the sub-agent must {fix}."
                 f"\n\nLast report:\n{shown}\n\n"
-                f'Next: pursuit_step with task="{task}" and notes saying {test} {problem}.',
+                f'Next: pursuit_step with task="{task}" and notes saying {test} {problem}: '
+                f"{fix}.",
             )
         unquoted = _unquoted_cases(root, locks) if locks else None
         if unquoted and unquoted[4]:
@@ -14752,14 +14848,17 @@ CASES_FIRST_NOTE = (
     "bare file:line or URL is not a source (e.g. `tests/cases.json`), and (b) "
     "a test that runs every case against the code (e.g. `tests/test_cases.py`). That "
     "test imports the module later tasks will write, by name (e.g. `from <package> "
-    "import …`), and defines no class or helper of its own: it fails with ImportError "
-    "until the code exists. Both tests load the data file beside them: load it as "
-    "`Path(__file__).with_name('cases.json')`, since the check runs from the project "
+    "import …`), and defines no class or helper of its own; it cannot pass until the "
+    "code exists, so it is not this task's check. Both tests load the data file beside "
+    "them: load it as `Path(__file__).with_name('cases.json')`, since the check runs "
+    "from the project "
     "root. Its done_when checks only the data, with a small "
     "test of the file itself (e.g. `python3 -m pytest -q tests/test_case_data.py`: "
     "every case has its inputs, its result and its citation, and there are enough "
     "of them); not `python3 -m json.tool`, which passes once the file parses and is "
-    "refused as a check. It passes `locks` with the data file and both tests. Once it "
+    "refused as a check. That data test imports no code and no other test, and must "
+    "pass now: an ImportError from it is a defect to fix, not the pre-implementation "
+    "state. It passes `locks` with the data file and both tests. Once it "
     "closes they are locked, and every later task's done_when runs the cases test."
 )
 
