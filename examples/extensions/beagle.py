@@ -5148,7 +5148,9 @@ def _module_written(name: str, root: Path, beside: Path, scope: list[str]) -> bo
     a/__init__.py, would be written by a path in `scope`, or is stdlib or installed.
 
     A scope path beside the test does not count: code written into tests/ to satisfy
-    an import is run R09's implementation in tests, not the module.
+    an import is run R09's implementation in tests, not the module. Nor does a file
+    on disk beside a test in a tests dir: run R24's tests/interval_tree_clocks.py stub
+    made the cases test's import count as written, and the data-only rebind never fired.
     """
     rel = name.replace(".", "/")
     top = name.split(".")[0]
@@ -5161,7 +5163,7 @@ def _module_written(name: str, root: Path, beside: Path, scope: list[str]) -> bo
     ours = False
     for base in bases:
         for path in (f"{base}{rel}.py", f"{base}{rel}/__init__.py"):
-            if (root / path).is_file():
+            if (root / path).is_file() and not _in_tests_dir(path):
                 return True
             if base in {"", "src/"} and any(
                 e in {"", "."} or path == e or path.startswith(f"{e}/") for e in entries
@@ -5807,15 +5809,30 @@ def _witness(report: str) -> tuple[str, str, str] | None:
     return path, needle, last.group("replacement").strip("\n")
 
 
+def _in_tests_dir(rel: str) -> bool:
+    return bool({"test", "tests"} & set(Path(rel).parts[:-1]))
+
+
 def _is_test_path(rel: str) -> bool:
+    """Whether `rel` is a test: a test_*.py, *_test.py or conftest.py anywhere, a
+    package's __init__.py under a tests dir, or any non-.py file under one.
+
+    Run R24: tests/interval_tree_clocks.py, the module a test imported, counted as
+    a test for prove and as misplaced implementation at the close.
+    """
     parts = Path(rel).parts
     name = parts[-1] if parts else rel
-    return (
-        bool({"test", "tests"} & set(parts[:-1]))
-        or name.startswith("test_")
-        or name.endswith("_test.py")
-        or name == "conftest.py"
-    )
+    if name.startswith("test_") or name.endswith("_test.py") or name == "conftest.py":
+        return True
+    if name.endswith(".py"):
+        return name == "__init__.py" and _in_tests_dir(rel)
+    return _in_tests_dir(rel)
+
+
+def _module_beside_tests(rel: str) -> bool:
+    """Whether `rel` is a .py under a tests dir that is not a test: a module."""
+    rel = rel.strip().rstrip("/")
+    return rel.endswith(".py") and _in_tests_dir(rel) and not _is_test_path(rel)
 
 
 def _only_data_and_tests(paths: list[str]) -> bool:
@@ -5858,7 +5875,8 @@ def _implementation_in_tests(root: Path, changed: list[str]) -> list[str]:
     """
     found: list[str] = []
     for rel in changed:
-        if not (_is_test_path(rel) and rel.endswith(".py")) or rel.endswith("conftest.py"):
+        tested = _is_test_path(rel) or _module_beside_tests(rel)
+        if not (tested and rel.endswith(".py")) or rel.endswith("conftest.py"):
             continue
         try:
             tree = ast.parse((root / rel).read_text(encoding="utf-8"), filename=rel)
@@ -5921,6 +5939,56 @@ def _implementation_in_tests_lead(root: Path, scope: list[str]) -> str:
             "the test file.\n\n"
         )
     return lead
+
+
+def _module_home(rel: str, root: Path) -> str:
+    """The path a module written under a tests dir imports from outside it: its path
+    below the last tests dir, at the project root (or under src/ if there is one)."""
+    parts = Path(rel.strip().rstrip("/")).parts
+    last = max(i for i, part in enumerate(parts[:-1]) if part in {"test", "tests"})
+    base = "src/" if (root / "src").is_dir() else ""
+    return base + Path(*parts[last + 1 :]).as_posix()
+
+
+def _rehomed_scope(scope: list[str], root: Path) -> list[str] | None:
+    """`scope` with each module under a tests dir moved to its home, or None if no
+    entry is such a module."""
+    if not any(_module_beside_tests(entry) for entry in scope):
+        return None
+    moved = [_module_home(e, root) if _module_beside_tests(e) else e for e in scope]
+    return list(dict.fromkeys(moved))
+
+
+def _module_under_tests_problem(
+    scope: list[str], task: str, done_when: str, root: Path, refusal: str | None
+) -> str | None:
+    """Why a scope entry that is a module under a tests dir is refused, with the call
+    that scopes it at its home; or None.
+
+    Run R24 #8/#9 scoped tests/interval_tree_clocks.py: pytest's rootdir import made
+    every later check import that stub, prove took it for a test, and the close held
+    it as misplaced implementation. `refusal` is what the rehomed scope would itself
+    be refused with, so the call offered is one this step accepts.
+    """
+    fixed = _rehomed_scope(scope, root)
+    if fixed is None:
+        return None
+    moves = ", ".join(
+        f"{e.strip().rstrip('/')} -> {_module_home(e, root)}"
+        for e in scope
+        if _module_beside_tests(e)
+    )
+    lead = (
+        f"scope names a module under a tests dir ({moves}). A .py there that is not "
+        "test_*.py, *_test.py or conftest.py is neither a test nor the module: the test "
+        "imports it by name, and its home is outside the tests dir."
+    )
+    if refusal is not None:
+        return f"{lead} With it at that path, the step is still refused: {refusal}"
+    return (
+        f"{lead} Call pursuit_step task={json.dumps(task)}, done_when={json.dumps(done_when)}, "
+        f"scope={json.dumps(fixed)}, with the same criteria."
+    )
 
 
 def _missing_scoped_test(rc: int, output: str, scope: list[str], root: Path) -> str | None:
@@ -8214,24 +8282,35 @@ def make_step_tool() -> Any:
             if not scope and record.get("sibling_of"):
                 # Run R18 #56: T0008, spawned with no scope, was refused "no scope given".
                 scope = _predecessor_scope(record, root)
+
+            async def scope_refusal(scope: list[str]) -> str | None:
+                return (
+                    _no_scope_problem(
+                        scope,
+                        root,
+                        _pending_locks(goal, task) + _strings(arguments.get("locks")),
+                        done_when,
+                    )
+                    or _scope_problem(scope, task, nodes, root)
+                    or _locked_scope_problem(scope, root, title, task)
+                    or _sibling_owned_check_problem(done_when, scope, task, nodes, root)
+                    or _oracle_with_code_problem(scope, goal)
+                    or _cases_first_problem(
+                        scope, task, title, goal, nodes, _strings(arguments.get("locks"))
+                    )
+                    or _locked_test_problem(done_when, scope, goal)
+                    or _import_scope_problem(done_when, scope, root)
+                ) or await _unwritten_check_problem(
+                    done_when, scope, task, root, _predecessor_scope(record, root)
+                )
+
+            rehomed = _rehomed_scope(scope, root)
             scoped = (
-                _no_scope_problem(
-                    scope,
-                    root,
-                    _pending_locks(goal, task) + _strings(arguments.get("locks")),
-                    done_when,
+                _module_under_tests_problem(
+                    scope, task, done_when, root, await scope_refusal(rehomed)
                 )
-                or _scope_problem(scope, task, nodes, root)
-                or _locked_scope_problem(scope, root, title, task)
-                or _sibling_owned_check_problem(done_when, scope, task, nodes, root)
-                or _oracle_with_code_problem(scope, goal)
-                or _cases_first_problem(
-                    scope, task, title, goal, nodes, _strings(arguments.get("locks"))
-                )
-                or _locked_test_problem(done_when, scope, goal)
-                or _import_scope_problem(done_when, scope, root)
-            ) or await _unwritten_check_problem(
-                done_when, scope, task, root, _predecessor_scope(record, root)
+                if rehomed is not None
+                else await scope_refusal(scope)
             )
             if scoped is not None:
                 return _step_result(f"pursuit_step: {task} not opened — {scoped}")

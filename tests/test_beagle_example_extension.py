@@ -10314,6 +10314,59 @@ async def test_opening_with_a_check_that_imports_an_unwritten_module_outside_sco
     assert opened[opened.index("--done-when") + 1] == check
 
 
+@pytest.mark.anyio
+async def test_non_test_py_under_tests_is_refused_as_scope_with_a_root_module_call(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # R24 #9 opened T0008 on scope tests/interval_tree_clocks.py, which every later
+    # check then imported through pytest's rootdir import.
+    project = _pursuit_project(tmp_path)
+    monkeypatch.chdir(project)
+    (project / "tests").mkdir()
+    (project / "tests" / "test_module_structure.py").write_text(
+        "from interval_tree_clocks import Stamp\n\n\ndef test_stamp():\n    assert Stamp\n"
+    )
+    _ready_task(fake_beagle)
+    runtime, _ = _bound(tmp_path)
+    check = "python3 -m pytest -q tests/test_module_structure.py"
+    args = {
+        "task": "T0002",
+        "criteria": "the module exists",
+        "done_when": check,
+        "scope": ["tests/interval_tree_clocks.py", "tests/test_module_structure.py"],
+    }
+
+    refused = await _tool(runtime, "pursuit_step").execute("c1", args)
+
+    assert "not opened" in refused.text
+    assert "tests/interval_tree_clocks.py -> interval_tree_clocks.py" in refused.text
+    fixed = ["interval_tree_clocks.py", "tests/test_module_structure.py"]
+    assert f"scope={json.dumps(fixed)}" in refused.text
+    assert f"done_when={json.dumps(check)}" in refused.text
+    assert _pursuit_calls(fake_beagle, "open") == [] and _runs(fake_tau) == []
+
+    # The call it names is accepted.
+    await _tool(runtime, "pursuit_step").execute("c2", {**args, "scope": fixed})
+
+    [opened] = _pursuit_calls(fake_beagle, "open")
+    assert opened[opened.index("--scope") + 1 :][:2] == fixed
+
+    # Where that scope would itself be refused (Cases first, with references/ and
+    # no locked test importing it), the refusal says so instead of a bare call.
+    (project / "references").mkdir()
+    (project / "references" / "itc2008.txt").write_text("Interval Tree Clocks\n")
+    _ready_task(fake_beagle)
+    gated = await _tool(runtime, "pursuit_step").execute("c3", args)
+
+    assert "tests/interval_tree_clocks.py -> interval_tree_clocks.py" in gated.text
+    assert "still refused: Cases first" in gated.text
+    assert len(_pursuit_calls(fake_beagle, "open")) == 1
+
+
 def test_imports_unwritten_counts_stdlib_installed_and_project_modules(tmp_path: Path) -> None:
     module = _module()
     tests = tmp_path / "tests"
@@ -10322,10 +10375,15 @@ def test_imports_unwritten_counts_stdlib_installed_and_project_modules(tmp_path:
     (tmp_path / "pkg" / "__init__.py").write_text("")
     (tmp_path / "single.py").write_text("")
     (tests / "helpers.py").write_text("")
-    (tests / "test_ok.py").write_text(
-        "import json, pytest\nimport pkg\nfrom single import x\nfrom helpers import h\n"
-    )
+    (tests / "test_ok.py").write_text("import json, pytest\nimport pkg\nfrom single import x\n")
     (tests / "test_missing.py").write_text("from pkg.absent import thing\n")
+    # R24: a module beside the tests is not the module the test imports.
+    (tests / "test_helped.py").write_text("from helpers import h\n")
+    assert module._imports_unwritten("pytest -q tests/test_helped.py", ["tests/"], tmp_path) == (
+        "tests/test_helped.py",
+        "helpers",
+    )
+    (tests / "test_helped.py").unlink()
 
     assert module._imports_unwritten("pytest -q tests/test_ok.py", ["tests/"], tmp_path) is None
     assert module._imports_unwritten("pytest -q tests/test_missing.py", ["tests/"], tmp_path) == (
@@ -10337,6 +10395,54 @@ def test_imports_unwritten_counts_stdlib_installed_and_project_modules(tmp_path:
         "pkg.absent",
     )
     assert module._imports_unwritten("pytest -q tests/", ["pkg/absent.py"], tmp_path) is None
+
+
+def test_stub_beside_the_tests_is_not_a_written_module(tmp_path: Path) -> None:
+    # R24: T0008 wrote tests/interval_tree_clocks.py; pytest's rootdir import made
+    # test_cases.py's import resolve to it, and the data-only rebind never fired.
+    module = _module()
+    tests = tmp_path / "tests"
+    tests.mkdir()
+    (tests / "interval_tree_clocks.py").write_text(
+        "class Stamp:\n    def fork(self):\n        raise NotImplementedError\n"
+    )
+    (tests / "test_cases.py").write_text(
+        "from interval_tree_clocks import Stamp\n\n\ndef test_fork():\n    Stamp().fork()\n"
+    )
+    (tests / "test_case_data.py").write_text(
+        "import json\n\n\ndef test_cases():\n    json.load(open('tests/cases.json'))\n"
+    )
+    scope = ["tests/cases.json", "tests/test_cases.py", "tests/test_case_data.py"]
+    check = "python3 -m pytest -q tests/test_case_data.py tests/test_cases.py"
+
+    assert not module._module_written("interval_tree_clocks", tmp_path, tests, scope)
+    assert module._imports_unwritten(check, scope, tmp_path) == (
+        "tests/test_cases.py",
+        "interval_tree_clocks",
+    )
+    assert module._data_test_route(check, scope, tmp_path) == (
+        "tests/test_cases.py",
+        "interval_tree_clocks",
+        "python3 -m pytest -q tests/test_case_data.py",
+        scope,
+    )
+    # Neither a test (prove may mutate it) nor let through at the close.
+    assert not module._is_test_path("tests/interval_tree_clocks.py")
+    assert module._can_witness("tests/interval_tree_clocks.py")
+    assert module._implementation_in_tests(tmp_path, ["tests/interval_tree_clocks.py"]) == [
+        "tests/interval_tree_clocks.py: class Stamp"
+    ]
+    for rel in ("tests/test_cases.py", "tests/conftest.py", "tests/x_test.py", "tests/cases.json"):
+        assert module._is_test_path(rel), rel
+    assert module._is_test_path("tests/__init__.py")
+    assert not module._is_test_path("pkg/__init__.py")
+
+    # Scoped at its home, or written there, the module is the task's.
+    assert module._module_written(
+        "interval_tree_clocks", tmp_path, tests, [*scope, "interval_tree_clocks.py"]
+    )
+    (tmp_path / "interval_tree_clocks.py").write_text("class Stamp: ...\n")
+    assert module._imports_unwritten(check, scope, tmp_path) is None
 
 
 R15_CHECK = "python3 -m pytest -q tests/test_cases.py tests/test_case_data.py"
