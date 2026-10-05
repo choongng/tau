@@ -6172,6 +6172,37 @@ async def test_driver_bash_writing_dot_beagle_toml_is_refused(
 
 
 @pytest.mark.anyio
+async def test_dot_beagle_write_before_founding_names_pursuit_found(
+    tmp_path: Path, beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # R26 #4-#11: pursuit.toml written by hand before founding, sent to pursuit_step.
+    project = tmp_path / "project"
+    (project / ".beagle").mkdir(parents=True)
+    monkeypatch.chdir(project)
+    runtime, _ = _bound(tmp_path)
+    write = _tool_with_hooks(runtime, "write")
+    bash = _tool_with_hooks(runtime, "bash")
+    await runtime.emit_session_start("startup")
+
+    refused = [
+        await write.execute("c1", {"path": ".beagle/pursuit.toml", "content": "[goal]"}),
+        await bash.execute("c2", {"command": "printf '[goal]' > .beagle/pursuit.toml"}),
+        await bash.execute("c3", {"command": "beagle pursuit --root ."}),
+        await bash.execute("c4", {"command": "cd . && /usr/bin/beagle pursuit status"}),
+    ]
+    ran = [
+        (await bash.execute("c5", {"command": "beagle init"})).text,
+        (await bash.execute("c6", {"command": "ls .beagle"})).text,
+    ]
+
+    for result in refused:
+        assert "begins with pursuit_found" in result.text
+        assert "the goal, its criteria and the milestones" in result.text
+        assert "pursuit_step" not in result.text
+    assert ran == ["ran", "ran"]
+
+
+@pytest.mark.anyio
 async def test_driver_reading_dot_beagle_is_allowed(
     tmp_path: Path, beagle: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -7074,6 +7105,34 @@ async def test_plan_under_nonroot_refuses_part_duplicating_pending_task(
     assert 'pursuit_step task="T0003"' in refused.text
     assert "nothing added" not in own_subtree.text
     assert [call[1] for call in _pursuit_calls(fake_beagle, "split")] == ["Read the paper::again"]
+
+
+@pytest.mark.anyio
+async def test_plan_refuses_part_titled_as_the_split_task(
+    tmp_path: Path, beagle: Path, fake_beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # R26 #133: T0014, split from T0006, took T0006's own title.
+    monkeypatch.chdir(_pursuit_project(tmp_path))
+    nodes = [
+        *_r25_nodes(),
+        {"id": "T0011", "parent": "T0006", "title": "Sources", "status": "open"},
+        {"id": "T0012", "parent": "T0011", "title": "Read the paper", "status": "pending"},
+    ]
+    (fake_beagle / "tree.out").write_text(json.dumps({"nodes": nodes}))
+    runtime, _ = _bound(tmp_path)
+    plan = _tool(runtime, "pursuit_plan")
+
+    own = await plan.execute("c1", {"task": "T0006", "parts": ["known  ANSWERS::x", "Docs::y"]})
+    on_root = await plan.execute("c2", {"task": "T0001", "parts": ["goal::x", "Docs::y"]})
+    descendant = await plan.execute(
+        "c3", {"task": "T0006", "parts": ["Read the paper::z", "Docs::y"]}
+    )
+
+    assert own.text.startswith("pursuit_plan: nothing added")
+    assert "has the title of T0006, the task being split" in own.text
+    assert "has the title of T0001, the task being split" in on_root.text
+    assert "nothing added" not in descendant.text
+    assert [call[1] for call in _pursuit_calls(fake_beagle, "split")] == ["Read the paper::z"]
 
 
 @pytest.mark.anyio

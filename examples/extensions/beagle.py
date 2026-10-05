@@ -3467,6 +3467,7 @@ def _live_title_clash(task: str, parts: list[str], nodes: list[dict[str, Any]]) 
     Run R22's driver planned five parts on the root that repeated pending
     tasks, and they then ranked against the tasks they repeated. Run R25's
     split of T0006 repeated pending T0003-T0005 the same way, off the root.
+    A part may not take `task`'s own title either; its descendants' titles stay free.
     Titles are compared case-folded with whitespace normalized.
     """
     node = next((n for n in nodes if str(n.get("id")) == task), None)
@@ -3489,8 +3490,16 @@ def _live_title_clash(task: str, parts: list[str], nodes: list[dict[str, Any]]) 
         and n.get("id")
         and str(n.get("id")) not in subtree
     }
+    # Run R26's split of T0006 added T0014 under T0006's own title.
+    own = _fold(str(node.get("title") or ""))
     for part in parts:
         title = _part_title(part)
+        if own and _fold(title) == own:
+            return (
+                f"part {title!r} has the title of {task}, the task being split. A part "
+                f"is one piece of {task}: title it by the piece it does, and send the "
+                "plan again."
+            )
         same = live.get(_fold(title))
         if same is not None:
             other = str(same.get("id"))
@@ -11398,6 +11407,21 @@ def _bash_writes_dot_beagle(command: str) -> bool:
     return False
 
 
+def _bash_runs_beagle_pursuit(command: str) -> bool:
+    """Whether a shell command runs `beagle pursuit …`, judged by each segment's argv."""
+    if "pursuit" not in command:
+        return False
+    for segment in re.split(r"&&|\|\||[;|\n]", command):
+        try:
+            words = shlex.split(segment)
+        except ValueError:
+            words = segment.split()
+        for i, word in enumerate(words[:-1]):
+            if Path(word).name == "beagle" and words[i + 1] == "pursuit":
+                return True
+    return False
+
+
 def make_driver_seat_gate() -> Any:
     """Build the `tool_call` gate that keeps the driver in the directing seat.
 
@@ -11425,7 +11449,8 @@ def make_driver_seat_gate() -> Any:
                 writes = target is not None and (target == store or store in target.parents)
             elif tool == "bash":
                 writes = _bash_writes_dot_beagle(str(args.get("command", "")))
-            if writes:
+            founded = _find_goal(cwd) is not None
+            if writes and founded:
                 return ToolCallHookResult(
                     block=True,
                     reason=(
@@ -11434,7 +11459,28 @@ def make_driver_seat_gate() -> Any:
                         "you meant to change in its notes."
                     ),
                 )
-            if _find_goal(cwd) is None:
+            # Run R26's driver wrote pursuit.toml by hand seven times before
+            # founding, each time told to use pursuit_step, which needs a pursuit.
+            # A `beagle pursuit` verb is refused only once `beagle init` made a
+            # store: outside one, the project may not be a pursuit at all.
+            stored = any((d / ".beagle").is_dir() for d in (cwd, *cwd.parents))
+            if not founded and (
+                writes
+                or (
+                    tool == "bash"
+                    and stored
+                    and _bash_runs_beagle_pursuit(str(args.get("command", "")))
+                )
+            ):
+                return ToolCallHookResult(
+                    block=True,
+                    reason=(
+                        f"refusing {tool}: the pursuit tools own .beagle/, and there is no "
+                        "pursuit here yet. The pursuit begins with pursuit_found: call it "
+                        "with the goal, its criteria and the milestones."
+                    ),
+                )
+            if not founded:
                 return None
         except Exception:  # noqa: BLE001 - fail open, never block on a guard bug
             return None
