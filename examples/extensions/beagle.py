@@ -132,6 +132,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import time
 import tomllib
 import urllib.error
 import urllib.parse
@@ -6656,6 +6657,41 @@ def _check_argv(command: str, root: Path) -> list[str]:
     return shlex.split(f"{prefix} {command}" if prefix else command)
 
 
+#: The seconds each check's last run that finished took, by (project root,
+#: command): a run that was killed records nothing here.
+_CHECK_SECONDS: dict[tuple[str, str], float] = {}
+#: Each check whose last run was killed, by (project root, command): what
+#: stopped it ("the 4G memory cap", "the 60s timeout") and after how many seconds.
+_CHECK_KILLED: dict[tuple[str, str], tuple[str, float]] = {}
+#: The least timeout `_check_timeout` gives a check with a recorded run, and
+#: the multiple of that run's seconds it allows.
+CHECK_TIMEOUT_FLOOR = 60.0
+CHECK_TIMEOUT_FACTOR = 20.0
+
+
+def _check_timeout(command: str, root: Path, timeout: float) -> float:
+    """`timeout`, cut to max(CHECK_TIMEOUT_FLOOR, CHECK_TIMEOUT_FACTOR x the check's
+    last finished run) when one is recorded.
+
+    Run R30: a check that had taken 0.01 s ran 4.6 min, eleven times, before the
+    memory cap killed it; a timeout from its earlier run ends a hang first.
+    """
+    earlier = _CHECK_SECONDS.get((str(root), command))
+    if earlier is None:
+        return timeout
+    return min(timeout, max(CHECK_TIMEOUT_FLOOR, CHECK_TIMEOUT_FACTOR * earlier))
+
+
+def _check_stopped(command: str, root: Path) -> tuple[str, float, float | None] | None:
+    """What killed the check's last run, after how many seconds, and the seconds
+    its last finished run took (None when none is recorded); None if not killed."""
+    key = (str(root), command)
+    killed = _CHECK_KILLED.get(key)
+    if killed is None:
+        return None
+    return killed[0], killed[1], _CHECK_SECONDS.get(key)
+
+
 async def _run_check(command: str, root: Path, timeout: float) -> tuple[int, str]:
     """Run a task's `done_when` the way its close will, before the close does.
 
@@ -6663,6 +6699,7 @@ async def _run_check(command: str, root: Path, timeout: float) -> tuple[int, str
     learns the verdict first and keeps a failing task open for another try.
     Beagle runs the check as words, not through a shell, and so does this: a
     check that only passes under `bash -c` would pass here and block there.
+    The timeout is cut by `_check_timeout`, and each run is recorded for it.
     """
     try:
         argv = _check_argv(command, root)
@@ -6671,6 +6708,9 @@ async def _run_check(command: str, root: Path, timeout: float) -> tuple[int, str
     if not argv:
         return 2, "the check is empty"
     limit = _memory_max()
+    key = (str(root), command)
+    timeout = _check_timeout(command, root, timeout)
+    started = time.monotonic()
     try:
         proc = await asyncio.create_subprocess_exec(
             *_capped(argv, limit),
@@ -6687,9 +6727,16 @@ async def _run_check(command: str, root: Path, timeout: float) -> tuple[int, str
         with contextlib.suppress(ProcessLookupError):
             proc.kill()
         await proc.wait()
+        _CHECK_KILLED[key] = (f"the {timeout:.0f}s timeout", time.monotonic() - started)
         return 124, f"the check timed out after {timeout:.0f}s"
+    seconds = time.monotonic() - started
     out = (stdout or b"").decode("utf-8", "replace").strip()
-    note = _killed_note(proc.returncode, limit)
+    note = _killed_note(-9 if proc.returncode == 137 else proc.returncode, limit)
+    if note:
+        _CHECK_KILLED[key] = (f"the {limit} memory cap", seconds)
+    else:
+        _CHECK_KILLED.pop(key, None)
+        _CHECK_SECONDS[key] = seconds
     return proc.returncode or 0, f"{out}\n{note}".strip() if note else out
 
 
@@ -8536,6 +8583,92 @@ def _predecessor_scope(record: dict[str, Any], root: Path) -> list[str]:
     return _strings(shown.get("scope")) if isinstance(shown, dict) else []
 
 
+def _check_reach(check: str, root: Path) -> list[str]:
+    """The project files a check runs: the paths its words name (the .py files
+    under a directory), and the project modules each .py file among them imports."""
+    reached: list[str] = []
+    for rel in _check_targets(check, root):
+        target = root / rel
+        files = (
+            [rel]
+            if target.is_file()
+            else sorted(
+                p.relative_to(root).as_posix()
+                for p in target.rglob("*.py")
+                if not _CACHE_DIRS & set(p.relative_to(root).parts)
+            )
+        )
+        for found in files:
+            reached.append(found)
+            if not found.endswith(".py"):
+                continue
+            beside = Path(found).parent.as_posix()
+            bases = ["", "src/"] + ([f"{beside}/"] if beside != "." else [])
+            for names in _test_imports(root / found):
+                for name in names:
+                    base = name.replace(".", "/")
+                    reached += [
+                        path
+                        for prefix in bases
+                        for path in (f"{prefix}{base}.py", f"{prefix}{base}/__init__.py")
+                        if (root / path).is_file()
+                    ]
+    return list(dict.fromkeys(reached))
+
+
+def _uncommitted_reach(check: str, scopes: list[list[str]] | None, root: Path) -> list[str]:
+    """The uncommitted files (changed or untracked, per git) the check runs, kept
+    to those inside one of `scopes`; all of them when `scopes` is None."""
+    changed = set(_changed_files(root))
+    combined = [entry for scope in scopes or [] for entry in scope]
+    if scopes is not None and not combined:
+        return []
+    return [
+        rel
+        for rel in _check_reach(check, root)
+        if rel in changed and (scopes is None or _in_scope(rel, combined, root))
+    ]
+
+
+def _hang_note(paths: list[str], stopped: tuple[str, float, float | None]) -> str:
+    """The brief note for a check killed while running uncommitted code in scope."""
+    what, seconds, earlier = stopped
+    named = ", ".join(paths)
+    before = f", earlier run {earlier:.2f}s" if earlier is not None else ""
+    return (
+        f"The check's run of {named} does not finish (killed at {what} after "
+        f"{seconds:.0f}s{before}). Find the loop or growth in {named} that never ends, "
+        "and make it finish: a check cannot judge code that does not return.\n\n"
+    )
+
+
+#: The task whose last pursuit_step was refused on a killed check, by project
+#: root, and the pursuit_step call that opens it. Run R30: the driver edit
+#: guard pointed back at the call that had just been refused, for 51 minutes.
+_KILLED_NOT_OPENED: dict[str, tuple[str, str]] = {}
+
+
+def _killed_open_call(task: str, check: str, scope: list[str], notes: str, root: Path) -> str:
+    """The pursuit_step call that opens `task` after its check was killed on code
+    outside its scope: one whose scope holds the uncommitted code the check runs,
+    or, with none, one with a check that finishes."""
+    reached = _uncommitted_reach(check, None, root)
+    say = json.dumps(notes or "<what the check runs that does not finish>")
+    if reached:
+        wider = list(dict.fromkeys([*scope, *reached]))
+        return (
+            f"pursuit_step task={json.dumps(task)}, scope={json.dumps(wider)}, "
+            f"done_when={json.dumps(check)}, notes={say}: with the uncommitted code the "
+            "check runs in its scope, it opens, and the sub-agent is told to find what "
+            "does not finish"
+        )
+    return (
+        f'pursuit_step task={json.dumps(task)}, done_when="<a check that finishes on '
+        f'the committed code>", notes={say}: the check runs no uncommitted code, so '
+        "no task's work can make this one finish"
+    )
+
+
 def _on_disk_note(check: str, task: str) -> str:
     """The note on a check that passes only on uncommitted work in the task's scope."""
     return (
@@ -9645,6 +9778,8 @@ def make_step_tool() -> Any:
         opened = route = taken = ""
         retrying = False
         passed_on_disk: tuple[int, str] | None = None
+        killed_run: tuple[int, str] | None = None
+        hang = ""
         status = record.get("status")
         new_route = arguments.get("new_route") is True
         bound_check = str(record.get("done_when") or "").strip()
@@ -9752,7 +9887,12 @@ def make_step_tool() -> Any:
                 if scoped is not None:
                     return _step_result(f"pursuit_step: no new route for {task} — {scoped}")
                 new_check = done_when or old_check
-                if (await _run_check(new_check, root, DEFAULT_CHECK_TIMEOUT))[0] == 0 and not (
+                rehearsed = await _run_check(new_check, root, DEFAULT_CHECK_TIMEOUT)
+                if rehearsed[0] != 0 and _check_stopped(new_check, root) is not None:
+                    # Run R30 #22: a -9 here fell through to the open, which ran the
+                    # check to the cap a second time.
+                    killed_run = rehearsed
+                if rehearsed[0] == 0 and not (
                     await _passes_only_by_uncommitted(new_check, [route_scope], root)
                 ):
                     return _step_result(
@@ -9894,7 +10034,7 @@ def make_step_tool() -> Any:
             # made pass. One that passes only on uncommitted files in this
             # task's scope (or its predecessor's) is the work, and the close
             # judges it.
-            pre_rc, pre_out = await _run_check(done_when, root, DEFAULT_CHECK_TIMEOUT)
+            pre_rc, pre_out = killed_run or await _run_check(done_when, root, DEFAULT_CHECK_TIMEOUT)
             if pre_rc == 0 and await _passes_only_by_uncommitted(
                 done_when, [scope, _predecessor_scope(record, root)], root
             ):
@@ -9914,15 +10054,29 @@ def make_step_tool() -> Any:
                     f"pursuit_step: {task} not opened — the check could not run: `{broke}` "
                     f"(exit {pre_rc}). Correct the command and call pursuit_step again."
                 )
+            stopped = _check_stopped(done_when, root) if pre_rc != 0 else None
+            own_hang = (
+                _uncommitted_reach(done_when, [scope, _predecessor_scope(record, root)], root)
+                if stopped is not None
+                else []
+            )
             killed = _killed_note(-9 if pre_rc in (-9, 137) else pre_rc, _memory_max())
-            if killed:
+            if stopped is not None and own_hang:
+                # Run R30: killed at the cap on the chain's own uncommitted code,
+                # the check says that code does not finish, and finding why is the
+                # work; refused, the open deadlocked the driver for 51 minutes.
+                hang = _hang_note(own_hang, stopped)
+                route += hang
+            elif killed:
                 # R22: beagle's open rehearses the check again, and a second
                 # run past the cap outlived the open's timeout.
+                call = _killed_open_call(task, done_when, scope, notes, root)
+                _KILLED_NOT_OPENED[str(_resolved(root))] = (task, call)
                 return _step_result(
                     f"pursuit_step: {task} not opened — the check was killed before it "
-                    f"finished (exit {pre_rc}). {killed} Opening would run it again. Find "
-                    "what the check runs that keeps growing, and make it stop, before you "
-                    "call pursuit_step again."
+                    f"finished (exit {pre_rc}). {killed} It runs no uncommitted code in "
+                    f"{task}'s scope or its predecessor's, so no work here can make it "
+                    f"finish, and opening would run it again. Call {call}."
                 )
             argv = ["open", task, "--criteria", criteria, "--done-when", done_when]
             if scope:
@@ -9935,6 +10089,8 @@ def make_step_tool() -> Any:
                 return _step_result(
                     f"pursuit_step: `beagle pursuit open` refused (exit {rc}):\n{opened}"
                 )
+            if _KILLED_NOT_OPENED.get(str(_resolved(root)), ("",))[0] == task:
+                del _KILLED_NOT_OPENED[str(_resolved(root))]
             rc, out = _pursuit(["show", task], root)
             record = _json_reply(out) if rc == 0 else record
         elif done_when and done_when != str(record.get("done_when") or "").strip():
@@ -10095,6 +10251,8 @@ def make_step_tool() -> Any:
             brief = f"{brief}\n\n{references}"
         if notes:
             brief = f"{brief}\n\nFrom the driver (who has not read the reference):\n{notes}"
+        if hang:
+            brief = f"{brief}\n\n{hang.rstrip()}"
         brief += "\n\n" + NO_BEAGLE_NOTE + "\n\n" + _turn_cap_note()
         held = set(_locked(goal))
         asked = [e for e in _strings(arguments.get("locks")) if os.path.normpath(e) not in held]
@@ -10811,17 +10969,23 @@ def make_driver_edit_guard() -> Any:
                 if target is None or target == store or store in target.parents:
                     return None
                 what = f"{tool} {target}"
+            refused = _KILLED_NOT_OPENED.get(str(store.parent))
         except Exception:  # noqa: BLE001 - fail open, never block on a guard bug
             return None
+        call = (
+            "Call pursuit_step, with what you meant to change in its notes"
+            if refused is None
+            else f"{refused[0]} was last refused on a killed check, and the same call is "
+            f"refused again; call {refused[1]}"
+        )
         return ToolCallHookResult(
             block=True,
             reason=(
                 f"refusing to {what} from the driving session: in a pursuit the work, and "
-                "its commits, are done by sub-agents. Call pursuit_step, with what you "
-                "meant to change in its notes; a sub-agent does it and the task's check "
-                "decides. For work no task covers (a failing gate, a lint fix), add a task "
-                "with pursuit_plan. Reading and running (tests, `ruff check` without "
-                "`--fix`, `git status`) is fine."
+                f"its commits, are done by sub-agents. {call}; a sub-agent does it and the "
+                "task's check decides. For work no task covers (a failing gate, a lint fix), "
+                "add a task with pursuit_plan. Reading and running (tests, `ruff check` "
+                "without `--fix`, `git status`) is fine."
             ),
         )
 

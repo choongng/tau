@@ -15280,3 +15280,183 @@ async def test_not_proven_without_module_offers_abandon(
     assert "mutate the module" not in result.text
     assert "new_route=true" not in result.text
     assert _pursuit_calls(fake_beagle, "close") == []
+
+
+#: A module that kills itself, as the memory cap would, once `grow.flag` exists,
+#: and logs each import to the file `HOG_LOG` names.
+HOG_MODULE = """\
+import os, signal
+from pathlib import Path
+with open(os.environ["HOG_LOG"], "a") as log:
+    log.write("run\\n")
+if Path("grow.flag").exists():
+    os.kill(os.getpid(), signal.SIGKILL)
+"""
+HOG_TEST = "import sys\nsys.path.insert(0, 'src')\nimport hog\n"
+HOG_CHECK = "python3 tests/test_hog.py"
+
+
+def _hog_project(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, committed: bool = False
+) -> tuple[Path, Path]:
+    """A git project whose committed tests/test_hog.py imports src/hog.py, a hang
+    (uncommitted unless `committed`); and the file each run of it is logged to."""
+    project = _git_project(tmp_path, monkeypatch)
+    monkeypatch.chdir(project)
+    (project / "src").mkdir()
+    (project / "tests").mkdir()
+    (project / "tests" / "test_hog.py").write_text(HOG_TEST)
+    (project / "src" / "hog.py").write_text(HOG_MODULE)
+    (project / "grow.flag").write_text("")
+    _commit(project, "tests/test_hog.py", "grow.flag", *(["src/hog.py"] if committed else []))
+    log = tmp_path / "hog-runs.log"
+    monkeypatch.setenv("HOG_LOG", str(log))
+    _fake_systemd_run(tmp_path, monkeypatch)
+    return project, log
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("committed", [False, True])
+async def test_open_proceeds_when_check_killed_on_uncommitted_scope_code(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    committed: bool,
+) -> None:
+    # R30: the check was killed at the cap on the task's own new code eleven
+    # times, and each open was refused as a check that cannot run.
+    _hog_project(tmp_path, monkeypatch, committed=committed)
+    _ready_task(fake_beagle, HOG_CHECK)
+    runtime, _ = _bound(tmp_path)
+
+    result = await _tool(runtime, "pursuit_step").execute(
+        "c1",
+        {"task": "T0002", "criteria": "hog ends", "done_when": HOG_CHECK, "scope": ["src/hog.py"]},
+    )
+
+    if committed:
+        assert "T0002 not opened" in result.text and "(exit -9)" in result.text
+        assert _pursuit_calls(fake_beagle, "open") == [] and _runs(fake_tau) == []
+        return
+    assert "not opened" not in result.text
+    assert len(_pursuit_calls(fake_beagle, "open")) == 1
+    brief = _runs(fake_tau)[0]["stdin"]
+    assert "The check's run of src/hog.py does not finish" in brief
+    assert "killed at the 4G memory cap" in brief
+    assert "Find the loop or growth in src/hog.py" in brief
+
+
+@pytest.mark.anyio
+async def test_new_route_does_not_rerun_killed_check(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # R30 #22: the new route's rehearsal was killed at the cap, and the open
+    # path ran the same check to the cap again.
+    _, log = _hog_project(tmp_path, monkeypatch)
+    record = {"id": "T0002", "title": "Parser", "status": "open", "done_when": HOG_CHECK}
+    record["criteria"] = "hog ends"
+    (fake_beagle / "next.out").write_text(json.dumps({"open": [{"id": "T0002"}], "ready": []}))
+    (fake_beagle / "show.out").write_text(json.dumps({**record, "scope": ["src/hog.py"]}))
+    (fake_beagle / "spawn.out").write_text("T0002 superseded by T0003\n")
+    successor = {**record, "id": "T0003", "status": "pending", "sibling_of": "T0002"}
+    (fake_beagle / "show-T0003.out").write_text(json.dumps(successor))
+    (fake_beagle / "open.rc").write_text("1")
+    runtime, _ = _bound(tmp_path)
+
+    result = await _tool(runtime, "pursuit_step").execute(
+        "c1", {"task": "T0002", "new_route": True, "notes": "find the loop in hog"}
+    )
+
+    assert _pursuit_calls(fake_beagle, "spawn") and _pursuit_calls(fake_beagle, "open")
+    assert "`beagle pursuit open` refused" in result.text
+    assert log.read_text().splitlines() == ["run"]
+
+
+@pytest.mark.anyio
+async def test_check_timeout_scaled_from_recorded_duration(
+    tmp_path: Path, beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # R30: a check that had taken 0.01 s ran 4.6 min before the cap killed it.
+    ext = _module()
+    monkeypatch.setattr(ext, "CHECK_TIMEOUT_FLOOR", 1.0)
+    (tmp_path / "slow.py").write_text(
+        "import time\nfrom pathlib import Path\nif Path('hang.flag').exists():\n"
+        "    time.sleep(30)\n"
+    )
+    command = f"{sys.executable} slow.py"
+
+    assert ext._check_timeout(command, tmp_path, 600.0) == 600.0
+    assert (await ext._run_check(command, tmp_path, 600.0))[0] == 0
+    assert ext._check_timeout(command, tmp_path, 600.0) == 1.0
+    assert ext._check_timeout(command, tmp_path, 0.5) == 0.5
+    (tmp_path / "hang.flag").write_text("")
+    started = time.monotonic()
+    rc, out = await ext._run_check(command, tmp_path, 600.0)
+
+    assert (rc, time.monotonic() - started < 10) == (124, True)
+    assert out == "the check timed out after 1s"
+    stopped = ext._check_stopped(command, tmp_path)
+    assert stopped is not None and stopped[0] == "the 1s timeout" and stopped[2] is not None
+    monkeypatch.setattr(ext, "CHECK_TIMEOUT_FLOOR", 60.0)
+    assert ext._check_timeout(command, tmp_path, 600.0) == 60.0
+
+
+@pytest.mark.anyio
+async def test_guard_names_working_route_when_ready_task_cannot_open(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # R30 #44-#54: refused at open on a killed check, the driver was sent back to
+    # the call that had just been refused, by every guard it met.
+    _hog_project(tmp_path, monkeypatch)
+    _ready_task(fake_beagle, HOG_CHECK)
+    runtime, _ = _bound(tmp_path)
+    step = _tool(runtime, "pursuit_step")
+    bash = _tool_with_hooks(runtime, "bash")
+    await runtime.emit_session_start("startup")
+    call = {"task": "T0002", "criteria": "hog ends", "done_when": HOG_CHECK}
+
+    refused = await step.execute("c1", call)
+    guarded = await bash.execute("c2", {"command": "echo x > src/hog.py"})
+
+    assert "T0002 not opened" in refused.text and 'scope=["src/hog.py"]' in refused.text
+    assert "T0002 was last refused on a killed check" in guarded.text
+    assert 'call pursuit_step task="T0002", scope=["src/hog.py"]' in guarded.text
+    opened = await step.execute("c3", {**call, "scope": ["src/hog.py"]})
+    assert "not opened" not in opened.text
+    assert len(_pursuit_calls(fake_beagle, "open")) == 1
+    plain = await bash.execute("c4", {"command": "echo x > src/hog.py"})
+    assert "last refused on a killed check" not in plain.text
+
+
+@pytest.mark.anyio
+async def test_killed_note_names_non_finishing_code_when_earlier_run_was_fast(
+    tmp_path: Path, beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # R30: the same check took 0.01 s before the scoped file existed; killed at
+    # the cap, that meant the new code never finishes, and tau never said so.
+    project, _ = _hog_project(tmp_path, monkeypatch)
+    ext = _module()
+    (project / "grow.flag").unlink()
+    assert (await ext._run_check(HOG_CHECK, project, 600.0))[0] == 0
+    (project / "grow.flag").write_text("")
+    rc, _ = await ext._run_check(HOG_CHECK, project, 600.0)
+    stopped = ext._check_stopped(HOG_CHECK, project)
+    reach = ext._uncommitted_reach(HOG_CHECK, [["src/hog.py"]], project)
+
+    assert rc == -9 and stopped is not None and reach == ["src/hog.py"]
+    assert ext._uncommitted_reach(HOG_CHECK, [["tests/"]], project) == []
+    note = ext._hang_note(reach, stopped)
+    assert "The check's run of src/hog.py does not finish" in note
+    assert "killed at the 4G memory cap after" in note
+    assert re.search(r"earlier run \d+\.\d\ds\)", note)
+    assert "Find the loop or growth in src/hog.py" in note
