@@ -14770,3 +14770,225 @@ async def test_fix_task_brief_has_no_imports_none_note(
     assert "imports none of the code" not in run["stdin"]
     assert "no task has written it yet" not in run["stdin"]
     assert "tests/test_cases.py is the check: it reads" not in run["stdin"]
+
+
+def _done_by_records(fake: Path, t0004: dict[str, Any], t0003: dict[str, Any]) -> None:
+    record = {"id": "T0004", "title": "Cases test", "status": "pending", "done_when": ""}
+    (fake / "show-T0004.out").write_text(json.dumps({**record, "scope": ["tests"], **t0004}))
+    (fake / "show-T0003.out").write_text(json.dumps({"id": "T0003", "status": "done", **t0003}))
+
+
+@pytest.mark.anyio
+async def test_done_by_refuses_fix_of_done_task(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # R28: "Known answers: fix tests/cases.json" closed as satisfied by T0002's commit.
+    project, _ = _done_by_project(tmp_path, fake_beagle, monkeypatch, "T0003: Cases")
+    nodes = json.loads((fake_beagle / "tree.out").read_text())["nodes"]
+    args = {"done_when": CASES_CHECK}
+    module = _module()
+
+    _done_by_records(fake_beagle, {"title": "Known answers: fix tests/cases.json"}, {})
+    fix = await module._done_by("T0004", "T0003", args, nodes, project)
+    _done_by_records(fake_beagle, {"sibling_of": "T0003"}, {})
+    route = await module._done_by("T0004", "T0003", args, nodes, project)
+
+    assert "T0004 is to change T0003's work" in fix and "known-answers fix" in fix
+    assert "cannot be done by it" in fix
+    assert "T0004 is to change T0003's work (it is a new route for T0003)" in route
+    assert _pursuit_calls(fake_beagle, "open") == [] == _pursuit_calls(fake_beagle, "close")
+
+    _done_by_records(fake_beagle, {"title": "Add the cases test"}, {})
+    plain = await module._done_by("T0004", "T0003", args, nodes, project)
+
+    assert "closed done" in plain
+
+
+@pytest.mark.anyio
+async def test_done_by_refuses_task_created_after_done_with_same_passing_check(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # R28: T0026 "Add function", made after T0002 closed, closed on T0002's check.
+    project, _ = _done_by_project(tmp_path, fake_beagle, monkeypatch, "T0003: Cases")
+    nodes = json.loads((fake_beagle / "tree.out").read_text())["nodes"]
+    args = {"done_when": CASES_CHECK}
+    done = {"done_when": CASES_CHECK, "closed_at": "2026-10-05T10:00:00+00:00"}
+    module = _module()
+
+    _done_by_records(fake_beagle, {"created_at": "2026-10-05T11:00:00+00:00"}, done)
+    after = await module._done_by("T0004", "T0003", args, nodes, project)
+    _done_by_records(fake_beagle, {}, {"done_when": f"  {CASES_CHECK} "})
+    unknown = await module._done_by("T0004", "T0003", args, nodes, project)
+
+    for said in (after, unknown):
+        assert said.startswith("pursuit_step: T0004 not closed done by T0003 — ")
+        assert f"its check `{CASES_CHECK}` is T0003's own" in said
+        assert "cannot tell T0004's work from none" in said
+    assert _pursuit_calls(fake_beagle, "open") == [] == _pursuit_calls(fake_beagle, "close")
+
+    # Made before T0003 closed, or on a check of its own: the record does not refuse it.
+    _done_by_records(fake_beagle, {"created_at": "2026-10-05T09:00:00+00:00"}, done)
+    before = await module._done_by("T0004", "T0003", args, nodes, project)
+    _done_by_records(fake_beagle, {"created_at": "2026-10-05T11:00:00+00:00"}, done)
+    own = await module._done_by(
+        "T0004", "T0003", {"done_when": "grep -q test_cases tests/test_cases.py"}, nodes, project
+    )
+
+    assert "closed done" in before and "closed done" in own
+
+
+@pytest.mark.anyio
+async def test_done_by_unwitnessed_does_not_offer_unrelated_data_file(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # R28 E38: the refusal handed over scope=[..., "tests/cases.json"], T0002's data.
+    project, _ = _done_by_project(tmp_path, fake_beagle, monkeypatch, "T0003: Cases")
+    (project / "tests" / "cases.json").write_text("[]\n")
+    _git(project, "add", "tests/cases.json")
+    _git(project, "commit", "-q", "-m", "T0003: data")
+    _require_witness(project)
+    nodes = json.loads((fake_beagle / "tree.out").read_text())["nodes"]
+    args = {"done_when": CASES_CHECK}
+    module = _module()
+
+    _done_by_records(fake_beagle, {"title": "Add function", "scope": ["tests/test_cases.py"]}, {})
+    unrelated = await module._done_by("T0004", "T0003", args, nodes, project)
+
+    assert "Nothing was opened" in unrelated
+    assert "cases.json" not in unrelated
+    assert "bind a check that fails now" in unrelated
+
+    named = {"title": "Check tests/cases.json", "scope": ["tests/test_cases.py"]}
+    _done_by_records(fake_beagle, named, {})
+    offered = await module._done_by("T0004", "T0003", args, nodes, project)
+    criteria = {"criteria": "every case in cases.json runs", "scope": ["tests/test_cases.py"]}
+    _done_by_records(fake_beagle, criteria, {})
+    by_criteria = await module._done_by("T0004", "T0003", args, nodes, project)
+
+    for said in (offered, by_criteria):
+        assert 'scope=["tests/test_cases.py", "tests/cases.json"]' in said
+    assert _pursuit_calls(fake_beagle, "open") == [] == _pursuit_calls(fake_beagle, "close")
+
+
+def _node_guard_project(tmp_path: Path) -> Path:
+    project = tmp_path / "node_guard"
+    (project / "src").mkdir(parents=True)
+    (project / "src" / "itc.py").write_text("class Clock:\n    pass\n")
+    (project / "tests").mkdir()
+    (project / "tests" / "test_cases.py").write_text(
+        "import json\n"
+        "import pytest\n"
+        "from src.itc import Clock\n\n"
+        "SEED = Clock\n\n\n"
+        "@pytest.fixture\n"
+        "def clock():\n    return Clock()\n\n\n"
+        "@pytest.fixture\n"
+        "def cases():\n    return json.loads('[1]')\n\n\n"
+        "def test_multiple_cases(cases, tmp_path):\n    assert cases == [1]\n\n\n"
+        "@pytest.mark.parametrize('n', [1])\n"
+        "def test_param(n):\n    assert n\n\n\n"
+        "def test_uses_fixture(clock):\n    assert clock is not None\n\n\n"
+        "def test_direct():\n    assert Clock()\n\n\n"
+        "def test_seed():\n    assert SEED\n\n\n"
+        "def test_unknown_fixture(made_elsewhere):\n    assert made_elsewhere\n\n\n"
+        "class TestClock:\n    def test_it(self):\n        assert Clock()\n"
+    )
+    (project / "tests" / "test_data.py").write_text(
+        "import json\nfrom src.itc import Clock\n\n\n"
+        "def test_a():\n    assert json.loads('[]') == []\n\n\n"
+        "def test_b(tmp_path):\n    assert tmp_path\n"
+    )
+    (project / "tests" / "test_broken.py").write_text("from src.itc import Clock\ndef test_(:\n")
+    return project
+
+
+def test_import_only_guard_catches_pytest_node_not_using_import(tmp_path: Path) -> None:
+    # R28 E55: `pytest -q tests/test_cases.py::test_multiple_cases` never used the class.
+    project = _node_guard_project(tmp_path)
+    guard = _module()._pytest_node_import_only_problem
+    scope = ["src/itc.py", "tests/test_cases.py"]
+    node = "tests/test_cases.py::test_multiple_cases"
+
+    for check in (f"python3 -m pytest -q {node}", f"sh -c 'python3 -m pytest -q {node}'"):
+        said = guard(check, scope, project)
+        assert said is not None, check
+        assert f"runs {node}, which uses nothing from src/itc.py: it passes once the import" in said
+    param = guard("pytest -q tests/test_cases.py::test_param[1]", scope, project)
+    assert param is not None and "test_param[1]" in param
+    bare = guard("pytest -q tests/test_data.py", ["src/"], project)
+    assert bare is not None and "runs tests/test_data.py, which uses nothing" in bare
+
+    for check in (
+        "pytest -q tests/test_cases.py::test_uses_fixture",
+        "pytest -q tests/test_cases.py::test_direct",
+        "pytest -q tests/test_cases.py::test_seed",
+        "pytest -q tests/test_cases.py::test_unknown_fixture",
+        "pytest -q tests/test_cases.py::TestClock::test_it",
+        "pytest -q tests/test_cases.py",
+        "pytest -q tests/test_cases.py::test_missing",
+        "pytest -q tests/test_broken.py",
+        "grep -q Clock tests/test_data.py",
+    ):
+        assert guard(check, scope, project) is None, check
+    assert guard(f"pytest -q {node}", ["tests/"], project) is None
+
+    # A conftest fixture that builds the clock counts, one level down.
+    (project / "tests" / "conftest.py").write_text(
+        "import pytest\nfrom src.itc import Clock\n\n\n"
+        "@pytest.fixture\ndef cases():\n    return Clock()\n"
+    )
+    (project / "tests" / "test_conf.py").write_text(
+        "from src.itc import Clock\n\n\ndef test_c(cases):\n    assert cases\n"
+    )
+    assert guard("pytest -q tests/test_conf.py::test_c", scope, project) is None
+
+
+@pytest.mark.anyio
+async def test_witness_import_error_only_is_not_proof(
+    tmp_path: Path, beagle: Path, fake_beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # R28 E56: T0008 closed on "refuses when … interval_tree_clock.py [is] absent",
+    # refused at ERROR on the test file's import.
+    module = _module()
+    import_error = (
+        "T0007: PROVEN — refuses when itc.py is absent\n"
+        "  refused at: ERROR tests/test_cases.py - ModuleNotFoundError: No module named 'itc'\n"
+    )
+    failed = (
+        "T0007: PROVEN — refuses when itc.py is absent\n"
+        "  refused at: FAILED tests/test_cases.py::test_fork - AttributeError: x\n"
+    )
+    assert module._import_error_only(import_error)
+    assert not module._import_error_only(failed)
+    assert not module._import_error_only("T0007: PROVEN — refuses with done.txt gone\n")
+
+    project = _git_project(tmp_path, monkeypatch)
+    (project / "README").write_text("x\n")
+    _git(project, "add", "README")
+    _git(project, "commit", "-q", "-m", "start")
+    opened = _git(project, "rev-parse", "HEAD").strip()
+    record = {"id": "T0007", "status": "open", "opened_commit": opened}
+    (fake_beagle / "show.out").write_text(json.dumps(record))
+    (project / "itc.py").write_text("X = 1\n")
+    monkeypatch.setattr(module, "BEAGLE_BIN", str(fake_beagle / "beagle"))
+
+    (fake_beagle / "prove.out").write_text(import_error)
+    refused = await module._prove("T0007", "done, no witness", ["itc.py"], project, 60)
+    (fake_beagle / "prove.out").write_text(failed)
+    proven = await module._prove("T0007", "done, no witness", ["itc.py"], project, 60)
+
+    assert refused is not None and not refused.proven
+    assert "failed only on importing it" in refused.text
+    assert proven is not None and proven.proven and proven.by_absent_source

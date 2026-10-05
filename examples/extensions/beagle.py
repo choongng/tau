@@ -5474,6 +5474,291 @@ def _import_scope_problem(command: str, scope: list[str], root: Path) -> str | N
     return None
 
 
+#: Fixtures pytest provides itself: none of them can bring in the project's code.
+_PYTEST_FIXTURES = frozenset(
+    {
+        "cache",
+        "capfd",
+        "capfdbinary",
+        "caplog",
+        "capsys",
+        "capsysbinary",
+        "doctest_namespace",
+        "monkeypatch",
+        "pytestconfig",
+        "pytester",
+        "record_property",
+        "record_testsuite_property",
+        "record_xml_attribute",
+        "recwarn",
+        "request",
+        "testdir",
+        "tmp_path",
+        "tmp_path_factory",
+        "tmpdir",
+        "tmpdir_factory",
+    }
+)
+
+
+def _scope_source_modules(scope: list[str], root: Path) -> list[tuple[str, str]]:
+    """(path, dotted name) of each source module `scope` names, as a file or a
+    directory holding them; tests are not modules."""
+    found: list[tuple[str, str]] = []
+    for entry in scope:
+        rel = entry.strip().rstrip("/")
+        path = root / rel
+        if rel.endswith(".py"):
+            rels = [rel]
+        elif rel and path.is_dir():
+            rels = sorted(p.relative_to(root).as_posix() for p in path.rglob("*.py"))
+        else:
+            rels = []
+        found += [
+            (r, _module_of(r))
+            for r in rels
+            if not _is_test_path(r) and not _CACHE_DIRS & set(Path(r).parts)
+        ]
+    return found
+
+
+def _names_from(tree: ast.Module, module: str) -> set[str] | None:
+    """The names `tree` binds by importing `module` (plain or under src.), or None
+    when a star import leaves them unknown."""
+
+    def matches(name: str) -> bool:
+        return any(name == m or name.startswith(f"{m}.") for m in (module, f"src.{module}"))
+
+    bound: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                if matches(alias.name):
+                    bound.add(alias.asname or alias.name.split(".")[0])
+        elif isinstance(node, ast.ImportFrom) and node.module and not node.level:
+            for alias in node.names:
+                if not (matches(node.module) or matches(f"{node.module}.{alias.name}")):
+                    continue
+                if alias.name == "*":
+                    return None
+                bound.add(alias.asname or alias.name)
+    return bound
+
+
+def _tainted(tree: ast.Module, bound: set[str]) -> tuple[set[str], bool]:
+    """The module-level names whose definition reaches `bound`, and whether an
+    autouse fixture among them runs for every test."""
+    tainted = set(bound)
+    autouse = False
+    changed = True
+    while changed:
+        changed = False
+        for node in tree.body:
+            names: list[str] = []
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                names = [node.name]
+            elif isinstance(node, (ast.Assign, ast.AnnAssign)):
+                targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+                names = [n.id for t in targets for n in ast.walk(t) if isinstance(n, ast.Name)]
+            if not names or set(names) <= tainted or not _reaches(node, tainted):
+                continue
+            tainted.update(names)
+            changed = True
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name in tainted:
+            autouse = autouse or any(
+                isinstance(k.value, ast.Constant) and k.arg == "autouse" and k.value.value is True
+                for d in node.decorator_list
+                if isinstance(d, ast.Call)
+                for k in d.keywords
+            )
+    return tainted, autouse
+
+
+def _reaches(node: ast.AST, names: set[str]) -> bool:
+    """Whether `node` reads one of `names`, or imports from the module itself."""
+    for sub in ast.walk(node):
+        if isinstance(sub, ast.Name) and sub.id in names:
+            return True
+        if (
+            isinstance(sub, (ast.Import, ast.ImportFrom))
+            and sub is not node
+            and any((a.asname or a.name.split(".")[0]) in names for a in sub.names)
+        ):
+            return True
+    return False
+
+
+def _parametrized(node: ast.AST) -> set[str]:
+    """The argument names a test's `parametrize` decorators supply."""
+    names: set[str] = set()
+    for deco in getattr(node, "decorator_list", []):
+        if (
+            isinstance(deco, ast.Call)
+            and isinstance(deco.func, ast.Attribute)
+            and deco.func.attr == "parametrize"
+            and deco.args
+            and isinstance(deco.args[0], ast.Constant)
+            and isinstance(deco.args[0].value, str)
+        ):
+            names.update(n.strip() for n in deco.args[0].value.split(","))
+    return names
+
+
+def _conftest_fixtures(test: Path, root: Path, module: str) -> tuple[set[str], set[str], bool]:
+    """(every fixture function, those using `module`, any autouse one using it) in
+    the conftest.py files from `test`'s directory up to the root."""
+    defined: set[str] = set()
+    using: set[str] = set()
+    autouse = False
+    folder = test.parent
+    while True:
+        conftest = folder / "conftest.py"
+        if conftest.is_file():
+            try:
+                tree = ast.parse(conftest.read_text(encoding="utf-8"))
+            except (OSError, SyntaxError, ValueError):
+                tree = None
+            if tree is not None:
+                defined.update(
+                    n.name
+                    for n in tree.body
+                    if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+                )
+                bound = _names_from(tree, module)
+                if bound is None:
+                    return defined, defined, True
+                tainted, auto = _tainted(tree, bound)
+                using |= tainted & defined
+                autouse = autouse or auto
+        if folder == root or root not in folder.parents:
+            break
+        folder = folder.parent
+    return defined, using, autouse
+
+
+def _test_uses(
+    node: ast.AST,
+    tainted: set[str],
+    defined: set[str],
+    fixtures: tuple[set[str], set[str]],
+) -> bool:
+    """Whether a test function or class reads the module: in its body, or through a
+    fixture it takes, one level. A fixture beagle cannot find counts as using it."""
+    if _reaches(node, tainted):
+        return True
+    conftest_defined, conftest_using = fixtures
+    funcs = (
+        [node]
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        else [n for n in ast.walk(node) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))]
+    )
+    for func in funcs:
+        args = func.args
+        given = _parametrized(func) | {"self", "cls"}
+        for arg in [*args.posonlyargs, *args.args, *args.kwonlyargs]:
+            name = arg.arg
+            if name in given or name in _PYTEST_FIXTURES:
+                continue
+            if name in defined:
+                if name in tainted:
+                    return True
+                continue
+            if name in conftest_defined:
+                if name in conftest_using:
+                    return True
+                continue
+            return True
+    return False
+
+
+def _pytest_node_import_only_problem(command: str, scope: list[str], root: Path) -> str | None:
+    """Why a check's pytest test passes once the task's module imports, or None.
+
+    Run R28: `python3 -c "from src.interval_tree_clock import ..."` was refused as
+    import-only, and its resend `pytest -q tests/test_cases.py::test_multiple_cases`
+    ran a test that never used the class: it failed only on the file's import. A
+    bare test file counts as running all its tests, refused only when none of them
+    uses the module. A file beagle cannot parse is not judged.
+    """
+    modules = _scope_source_modules(scope, root)
+    if not modules:
+        return None
+    try:
+        words = shlex.split(command)
+    except ValueError:
+        return None
+    parts: list[str] = []
+    for word in words:
+        parts.append(word)
+        if " " in word:
+            with contextlib.suppress(ValueError):
+                parts += shlex.split(word)
+    for part in parts:
+        rel, _, node_id = part.partition("::")
+        rel = rel.rstrip("/")
+        if (
+            not rel.endswith(".py")
+            or not _is_test_path(rel)
+            or Path(rel).is_absolute()
+            or ".." in Path(rel).parts
+            or not (root / rel).is_file()
+            or not _runs_test_file(command, rel)
+        ):
+            continue
+        try:
+            tree = ast.parse((root / rel).read_text(encoding="utf-8"))
+        except (OSError, SyntaxError, ValueError):
+            continue
+        names = [n.split("[", 1)[0] for n in node_id.split("::")] if node_id else []
+        if names:
+            scopes: list[ast.AST] = [tree]
+            for name in names:
+                scopes = [
+                    child
+                    for parent in scopes
+                    for child in getattr(parent, "body", [])
+                    if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+                    and child.name == name
+                ]
+            tests = scopes
+        else:
+            tests = [
+                n
+                for n in tree.body
+                if (
+                    isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+                    and n.name.startswith("test")
+                )
+                or (isinstance(n, ast.ClassDef) and n.name.startswith("Test"))
+            ]
+        if not tests:
+            continue
+        defined = {
+            n.name for n in tree.body if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+        }
+        for source, module in modules:
+            bound = _names_from(tree, module)
+            if not bound:
+                continue
+            tainted, autouse = _tainted(tree, bound)
+            conftest_defined, conftest_using, conftest_auto = _conftest_fixtures(
+                root / rel, root, module
+            )
+            if autouse or conftest_auto:
+                continue
+            fixtures = (conftest_defined, conftest_using)
+            if any(_test_uses(test, tainted, defined, fixtures) for test in tests):
+                continue
+            return (
+                f"done_when `{command}` runs {part}, which uses nothing from {source}: it "
+                f"passes once the import does, whatever {source} does. {_ONE_COMMAND}, "
+                f"running a test that calls {source}'s code and asserts what it returns. "
+                "Call pursuit_step again with that."
+            )
+    return None
+
+
 def _test_imports(test_path: Path) -> list[tuple[str, ...]]:
     """Each absolute import of a test file: (module,) or (module, module.name, ...)."""
     try:
@@ -7063,6 +7348,26 @@ def _in_commit(sha: str, rel: str, root: Path) -> bool:
     return _run(["git", "cat-file", "-e", f"{sha}:{rel}"], root, timeout=30.0)[0] == 0
 
 
+#: A pytest summary line naming where a run went wrong: `FAILED <node>` or `ERROR <path>`.
+_PYTEST_OUTCOME = re.compile(r"\b(FAILED|ERROR) (\S+\.py\S*)")
+_IMPORT_FAILURE = re.compile(r"\b(?:ModuleNotFoundError|ImportError)\b|No module named")
+
+
+def _import_error_only(output: str) -> bool:
+    """Whether a refusal `prove` reports is only pytest failing to import a module.
+
+    Run R28: T0008's witness took src/interval_tree_clock.py away, and the check
+    refused at ERROR on the test file's import. That shows the test imports the
+    file, not that any test runs its code.
+    """
+    outcomes = _PYTEST_OUTCOME.findall(output)
+    return (
+        bool(outcomes)
+        and all(kind == "ERROR" for kind, _ in outcomes)
+        and _IMPORT_FAILURE.search(output) is not None
+    )
+
+
 async def _prove(
     task: str,
     report: str,
@@ -7152,6 +7457,13 @@ async def _prove(
             by_absent_source = "--absent" in how and any(
                 rel.endswith(".py") and not _is_test_path(rel) for rel in sources
             )
+            if by_absent_source and _import_error_only(out):
+                refused.append(
+                    f"{tail}\n\nNot proof: with {', '.join(sources)} taken away the check "
+                    "failed only on importing it, which any file of that name passes. Give "
+                    "a WITNESS: a NEEDLE in that code which a test the check runs must catch."
+                )
+                continue
             return _Proof(proven=True, text=tail, by_absent_source=by_absent_source)
         if verdicts.get(task) == "NOT PROVEN" and "STILL PASSES" in out:
             # The check passed over the defect: a real answer, not one a
@@ -8285,6 +8597,24 @@ async def _done_by(
     if prose is not None or chained is None:
         return f"{refused}{prose}"
     check = chained
+    title = str(record.get("title") or "")
+    changes = _changes_done_work(task, done, title, record, nodes)
+    if changes:
+        return (
+            f"{refused}{task} is to change {done}'s work ({changes}); it cannot be done by "
+            f'it. Work it with pursuit_step task="{task}", with a done_when that fails until '
+            "that change is made."
+        )
+    done_record = _shown(done, root)
+    if _same_check(check, str(done_record.get("done_when") or "")) and not _created_before(
+        record, done_record
+    ):
+        return (
+            f"{refused}its check `{check}` is {done}'s own, which passed when {done} closed, "
+            f"before {task} was made, so it cannot tell {task}'s work from none. Work it "
+            f'with pursuit_step task="{task}", with a done_when that fails until its work '
+            "is done."
+        )
     scope = _strings(arguments.get("scope")) or _strings(record.get("scope"))
     paths = scope or _check_targets(check, root)
     if not paths:
@@ -8333,8 +8663,8 @@ async def _done_by(
             if _in_scope(rel, paths, root) and _can_witness(rel) and (root / rel).is_file()
         ]
         if not witness:
-            return _done_by_unwitnessed(task, done, check, paths, committed, root)
-    title = str(record.get("title") or "")
+            named = f"{title}\n{record.get('criteria') or ''}\n{arguments.get('criteria') or ''}"
+            return _done_by_unwitnessed(task, done, check, paths, committed, root, named)
     criteria = (
         str(arguments.get("criteria") or "").strip()
         or str(record.get("criteria") or "").strip()
@@ -8359,6 +8689,12 @@ async def _done_by(
                 f"{', '.join(witness)} taken away (prove exit {rc})"
             )
             return _done_by_released(task, why, proved, root)
+        if any(rel.endswith(".py") for rel in witness) and _import_error_only(proved):
+            why = (
+                f"its check refused with {', '.join(witness)} taken away only on importing "
+                "it, which shows the test imports the file, not that it runs its code"
+            )
+            return _done_by_released(task, why, proved, root)
     because = f"satisfied by {done}'s commit {sha[:12]}; no sub-agent ran"
     argv = ["close", task, "--outcome", "done", "--body", because]
     argv += ["--spent", "0", "--spent-because", because]
@@ -8373,19 +8709,74 @@ async def _done_by(
     )
 
 
+def _changes_done_work(
+    task: str, done: str, title: str, record: Mapping[str, Any], nodes: list[dict[str, Any]]
+) -> str:
+    """How `task` is to change `done`'s work, by tau's own fix-route titles or the
+    tree; "" when neither says so.
+
+    Run R28: "Fix known answers" and "Known answers: fix tests/cases.json" closed
+    as satisfied by T0002's commit, the work they were made to change.
+    """
+    if _fixes_known_answers(title):
+        return f"{title!r} is a known-answers fix"
+    by_id = {str(n.get("id")): n for n in nodes}
+    seen = {task}
+    up = str(record.get("sibling_of") or (by_id.get(task) or {}).get("sibling_of") or "")
+    while up and up not in seen:
+        if up == done:
+            return f"it is a new route for {done}"
+        seen.add(up)
+        up = str((by_id.get(up) or {}).get("sibling_of") or "")
+    return ""
+
+
+def _same_check(check: str, other: str) -> bool:
+    """Whether two checks are one command, spacing aside."""
+    try:
+        return bool(other.strip()) and shlex.split(check) == shlex.split(other)
+    except ValueError:
+        return check.split() == other.split()
+
+
+def _created_before(record: Mapping[str, Any], done_record: Mapping[str, Any]) -> bool:
+    """Whether the record shows the task was made before `done` closed; False when
+    it cannot tell."""
+    try:
+        made = datetime.fromisoformat(str(record.get("created_at") or ""))
+        closed = datetime.fromisoformat(str(done_record.get("closed_at") or ""))
+        return made < closed
+    except (TypeError, ValueError):
+        return False
+
+
 def _can_witness(rel: str) -> bool:
     """Whether taking `rel` away can witness a check: a source or data file, not a test."""
     return not (_is_test_path(rel) and rel.endswith(".py"))
 
 
 def _done_by_unwitnessed(
-    task: str, done: str, check: str, paths: list[str], committed: list[str], root: Path
+    task: str,
+    done: str,
+    check: str,
+    paths: list[str],
+    committed: list[str],
+    root: Path,
+    named: str = "",
 ) -> str:
-    """The up-front refusal of a done-by close the witness rule would refuse."""
+    """The up-front refusal of a done-by close the witness rule would refuse.
+
+    Run R28: the offer widened eleven tasks' scope with tests/cases.json, T0002's
+    data, and each then closed as done by T0002. A file outside the paths is
+    offered only when the task's title or criteria (`named`) names it.
+    """
     outside = [
         rel
         for rel in committed
-        if not _in_scope(rel, paths, root) and _can_witness(rel) and (root / rel).is_file()
+        if not _in_scope(rel, paths, root)
+        and _can_witness(rel)
+        and (root / rel).is_file()
+        and (rel in named or re.search(rf"(?<![\w./-]){re.escape(Path(rel).name)}\b", named))
     ]
     said = (
         f"pursuit_step: {task} not closed done by {done} — this pursuit closes done only on "
@@ -8400,9 +8791,10 @@ def _done_by_unwitnessed(
             f"done_when={json.dumps(check)}, scope={json.dumps([*paths, *outside])}."
         )
     return (
-        f"{said} Its check does not depend on any file {done} wrote, so {done}'s commit "
-        f'is not shown to have done this work: call pursuit_step task="{task}" with a '
-        "done_when that fails now and a scope naming the files the work changes."
+        f"{said} No file {done} wrote that this task names could show it either, so "
+        f"{done}'s commit is not shown to have done this work: call pursuit_step "
+        f'task="{task}" and bind a check that fails now, with a scope naming the files '
+        "the work changes."
     )
 
 
@@ -9189,6 +9581,7 @@ def make_step_tool() -> Any:
                     or _oracle_with_code_problem(route_scope, goal)
                     or _locked_test_problem(done_when or old_check, route_scope, goal)
                     or _import_scope_problem(done_when or old_check, route_scope, root)
+                    or _pytest_node_import_only_problem(done_when or old_check, route_scope, root)
                 ) or await _unwritten_check_problem(
                     done_when or old_check, route_scope, task, root, _strings(record.get("scope"))
                 )
@@ -9316,6 +9709,7 @@ def make_step_tool() -> Any:
                     )
                     or _locked_test_problem(done_when, scope, goal)
                     or _import_scope_problem(done_when, scope, root)
+                    or _pytest_node_import_only_problem(done_when, scope, root)
                 ) or await _unwritten_check_problem(
                     done_when, scope, task, root, _predecessor_scope(record, root)
                 )
@@ -9411,6 +9805,7 @@ def make_step_tool() -> Any:
             unwritten = (
                 _locked_scope_problem(own_scope, root, title, task)
                 or _sibling_owned_check_problem(done_when, own_scope, task, nodes, root)
+                or _pytest_node_import_only_problem(done_when, own_scope, root)
             ) or (
                 await _unwritten_check_problem(
                     done_when, own_scope, task, root, _predecessor_scope(record, root)
