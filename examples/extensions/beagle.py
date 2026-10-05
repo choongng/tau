@@ -4376,16 +4376,52 @@ def _first_few(paths: list[str], few: int = 5) -> list[str]:
     return paths if len(paths) <= few else [*paths[:few], f"{len(paths) - few} more"]
 
 
-def _oracle_with_code_problem(scope: list[str], goal: Path) -> str | None:
-    """Why a scope writes known answers beside the code they judge, or None.
+def _module_names(rel: str) -> list[str]:
+    """The dotted names `rel`, a .py file, may be imported as: each tail of its path."""
+    parts = list(Path(rel).with_suffix("").parts)
+    if parts and parts[-1] == "__init__":
+        parts = parts[:-1]
+    return [".".join(parts[i:]) for i in range(len(parts))]
 
-    Run R08: T0004's scope held itc/tests/cases.json, its test and the module,
-    so the worker wrote wrong expected values to fit its code, and every later
-    task was graded against them. A data file locked by an earlier task is
-    restored before each check, so it is no oracle the worker can bend.
+
+def _judged_sources(
+    entries: list[str], root: Path, check: str = ""
+) -> tuple[list[str], list[str]]:
+    """(source, helpers) among `entries`' non-test .py files.
+
+    Run R31: a worker saved tests/casegen.py, a generator no test imported and the
+    check did not name, beside tests/cases.json, and 51 calls were refused for
+    holding "the code it judges". A .py under a test directory that is on disk
+    counts as judged code only when a scope test, or one the check names,
+    imports it or the check names it; otherwise it is a helper.
     """
-    locked = set(_locked(goal))
-    root = goal.parent.parent
+    named = set(_check_path_words(check)) if check else set()
+    tests = [
+        rel
+        for rel in dict.fromkeys([*entries, *named])
+        if rel.endswith(".py") and _is_test_path(rel) and (root / rel).is_file()
+    ]
+    imported = {name for test in tests for name in _test_project_imports(root / test)}
+    source: list[str] = []
+    helpers: list[str] = []
+    for rel in dict.fromkeys(e.rstrip("/") for e in entries):
+        if not rel.endswith(".py") or _is_test_path(rel):
+            continue
+        names = _module_names(rel)
+        used = rel in named or any(
+            name == module or name.startswith(module + ".") or module.startswith(name + ".")
+            for name in imported
+            for module in names
+        )
+        if _in_tests_dir(rel) and (root / rel).is_file() and not used:
+            helpers.append(rel)
+        else:
+            source.append(rel)
+    return source, helpers
+
+
+def _scope_entries(scope: list[str], root: Path) -> list[str]:
+    """`scope`'s entries, each directory followed by its files."""
     entries: list[str] = []
     for rel in scope:
         entries.append(rel)
@@ -4393,22 +4429,105 @@ def _oracle_with_code_problem(scope: list[str], goal: Path) -> str | None:
         # and a directory entry has neither suffix, so it is judged by its files.
         if (root / rel).is_dir():
             entries.extend(_scope_dir_files(root, rel.rstrip("/")))
+    return entries
+
+
+def _oracle_with_code_parts(
+    scope: list[str], goal: Path, task: str = "", check: str = ""
+) -> tuple[list[str], list[str], list[str]]:
+    """(unlocked data, judged source, helpers) a scope holds."""
+    # Run R31: the driver passed locks= 59 times; they were filed as the task's
+    # pending locks, restored before each check as a manifest lock is.
+    locked = set(_locked(goal)) | set(_pending_locks(goal, task) if task else [])
+    root = goal.parent.parent
+    entries = _scope_entries(scope, root)
     data = [
-        rel
+        rel.rstrip("/")
         for rel in entries
         if _is_test_path(rel.rstrip("/"))
         and Path(rel.rstrip("/")).suffix not in {"", ".py"}
         and rel.rstrip("/") not in locked
     ]
-    source = [rel for rel in entries if rel.endswith(".py") and not _is_test_path(rel)]
-    data, source = _first_few(list(dict.fromkeys(data))), _first_few(list(dict.fromkeys(source)))
+    source, helpers = _judged_sources(entries, root, check)
+    return list(dict.fromkeys(data)), source, helpers
+
+
+def _helper_note(helpers: list[str]) -> str:
+    if not helpers:
+        return ""
+    return (
+        f" {', '.join(_first_few(helpers))}: a helper script no test imports and the check "
+        "does not name; delete it or leave it out of scope."
+    )
+
+
+def _oracle_with_code_problem(
+    scope: list[str], goal: Path, task: str = "", check: str = ""
+) -> str | None:
+    """Why a scope writes known answers beside the code they judge, or None.
+
+    Run R08: T0004's scope held itc/tests/cases.json, its test and the module,
+    so the worker wrote wrong expected values to fit its code, and every later
+    task was graded against them. A data file locked by an earlier task, or
+    filed as this task's pending lock, is restored before each check, so it is
+    no oracle the worker can bend.
+    """
+    data, source, helpers = _oracle_with_code_parts(scope, goal, task, check)
     if not data or not source:
         return None
+    data, source = _first_few(data), _first_few(source)
     return (
         f"scope holds known-answer data ({', '.join(data)}) and the code it judges "
         f"({', '.join(source)}). Split it: first a task with only the data and its cases "
         f"test in scope, passing locks=[{', '.join(data)}]; then the code in a later task."
+        + _helper_note(helpers)
     )
+
+
+def _narrowed_scope(scope: list[str], goal: Path, task: str, check: str) -> list[str] | None:
+    """`scope` without its judged source, when that leaves a scope the guard passes."""
+    root = goal.parent.parent
+    _, source, helpers = _oracle_with_code_parts(scope, goal, task, check)
+    drop = set(source) | set(helpers)
+    narrowed: list[str] = []
+    for rel in scope:
+        bare = rel.rstrip("/")
+        if (root / bare).is_dir() and any(d.startswith(bare + "/") for d in drop):
+            narrowed.extend(f for f in _scope_dir_files(root, bare) if f not in drop)
+        elif bare not in drop:
+            narrowed.append(rel)
+    narrowed = list(dict.fromkeys(narrowed))
+    if not narrowed or _oracle_with_code_problem(narrowed, goal, task, check) is not None:
+        return None
+    return narrowed
+
+
+def _open_mixed_refusal(scope: list[str], goal: Path, task: str, check: str) -> str | None:
+    """The open-task refusal for a mixed scope, naming the narrowed call that runs."""
+    data, source, helpers = _oracle_with_code_parts(scope, goal, task, check)
+    if not data or not source:
+        return None
+    narrowed = _narrowed_scope(scope, goal, task, check)
+    held = (
+        f"scope holds known-answer data ({', '.join(_first_few(data))}) and the code it "
+        f"judges ({', '.join(_first_few(source))})."
+    )
+    if narrowed is None:
+        return (
+            f"{held} Narrow the scope to the data and its cases test, passing "
+            f"locks=[{', '.join(_first_few(data))}]; the code goes to a later task."
+            + _helper_note(helpers)
+        )
+    removed = [*source, *helpers]
+    return (
+        f"{held} This call runs a worker: pursuit_step task={task} "
+        f"scope=[{', '.join(narrowed)}] notes=\"delete {', '.join(_first_few(removed))} if "
+        "this task wrote it; the code belongs to a later task\"." + _helper_note(helpers)
+    )
+
+
+#: (root, task) -> (scope, text) of the last open-task mixed-scope refusal.
+_LAST_MIXED_REFUSAL: dict[tuple[str, str], tuple[tuple[str, ...], str]] = {}
 
 
 def _check_path_words(check: str) -> list[str]:
@@ -10019,7 +10138,7 @@ def make_step_tool() -> Any:
                     or _sibling_owned_check_problem(
                         done_when or old_check, route_scope, task, nodes, root
                     )
-                    or _oracle_with_code_problem(route_scope, goal)
+                    or _oracle_with_code_problem(route_scope, goal, task, done_when or old_check)
                     or _locked_test_problem(done_when or old_check, route_scope, goal)
                     or _import_scope_problem(done_when or old_check, route_scope, root)
                     or _pytest_node_import_only_problem(done_when or old_check, route_scope, root)
@@ -10149,7 +10268,7 @@ def make_step_tool() -> Any:
                     or _scope_problem(scope, task, nodes, root)
                     or _locked_scope_problem(scope, root, title, task)
                     or _sibling_owned_check_problem(done_when, scope, task, nodes, root)
-                    or _oracle_with_code_problem(scope, goal)
+                    or _oracle_with_code_problem(scope, goal, task, done_when)
                     or _doc_only_check_problem(done_when, scope, task, root)
                     or _cases_first_problem(
                         scope, task, title, goal, nodes, _strings(arguments.get("locks"))
@@ -10447,10 +10566,20 @@ def make_step_tool() -> Any:
         self_import = _self_import_note(check, scope, root) if check else ""
         retry_note = self_import + retry_note
         missing_data = _missing_data(check, scope, root) if check else []
-        mixed = _oracle_with_code_problem(scope, goal)
+        mixed = _open_mixed_refusal(scope, goal, task, check)
         if mixed is not None:
             # Opened before this guard, or by hand: still no worker on it.
+            # Run R31: the same refusal came back 49 times while only locks grew.
+            refusal_key = (str(root), task)
+            if _LAST_MIXED_REFUSAL.get(refusal_key) == (tuple(scope), mixed):
+                mixed += (
+                    " This is the same answer as last time for this scope: locks do not "
+                    "change it; the scope, or deleting the flagged file, does."
+                )
+            else:
+                _LAST_MIXED_REFUSAL[refusal_key] = (tuple(scope), mixed)
             return _step_result(f"pursuit_step: {task} not run — {mixed}")
+        _LAST_MIXED_REFUSAL.pop((str(root), task), None)
         if unproven_key in _UNPROVEN:
             # Run R23: the breaker quotes only a result's first line; the call goes there.
             call = _unproven_call(task, check, scope, root, missing_data, nodes)

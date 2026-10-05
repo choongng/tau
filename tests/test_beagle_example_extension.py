@@ -5721,6 +5721,156 @@ async def test_step_refuses_directory_scopes_holding_unlocked_data_and_source(
     assert len(_pursuit_calls(fake_beagle, "open")) == 1
 
 
+def _r31_project(tmp_path: Path) -> Path:
+    """R31's tree: data, its tests importing the module, and an unimported helper."""
+    project = _pursuit_project(tmp_path)
+    (project / "src").mkdir(exist_ok=True)
+    (project / "src" / "codec.py").write_text("def encode(b):\n    return b\n")
+    tests = project / "tests"
+    tests.mkdir(exist_ok=True)
+    (tests / "cases.json").write_text("[]")
+    (tests / "test_cases.py").write_text("import json\n\nfrom codec import encode\n")
+    (tests / "casegen.py").write_text("import json\n\nprint(json.dumps([]))\n")
+    return project
+
+
+def test_oracle_with_code_ignores_unimported_helper_under_tests_dir(tmp_path: Path) -> None:
+    beagle = _module()
+    project = _r31_project(tmp_path)
+    goal = project / ".beagle" / "pursuit.toml"
+
+    assert beagle._oracle_with_code_problem(["tests/"], goal) is None
+
+    # The check naming it, or a scope test importing it, makes it judged code.
+    named = beagle._oracle_with_code_problem(
+        ["tests/"], goal, "T0002", "python3 tests/casegen.py"
+    )
+    assert named is not None and "the code it judges (tests/casegen.py)" in named
+    (project / "tests" / "test_gen.py").write_text("from casegen import main\n")
+    imported = beagle._oracle_with_code_problem(["tests/"], goal)
+    assert imported is not None and "tests/casegen.py" in imported
+
+    # Beside judged code, the helper is named as one, not as the code.
+    (project / "tests" / "test_gen.py").unlink()
+    mixed = beagle._oracle_with_code_problem(["src/", "tests/"], goal)
+    assert mixed is not None
+    assert "the code it judges (src/codec.py)" in mixed
+    assert "tests/casegen.py: a helper script" in mixed
+
+
+def test_oracle_with_code_counts_pending_locks_of_same_task(tmp_path: Path) -> None:
+    beagle = _module()
+    project = _r31_project(tmp_path)
+    goal = project / ".beagle" / "pursuit.toml"
+    scope = ["src/codec.py", "tests/cases.json", "tests/test_cases.py"]
+
+    assert beagle._oracle_with_code_problem(scope, goal, "T0002") is not None
+    beagle._pending_locks(goal, "T0002", ["tests/cases.json"])
+
+    assert beagle._oracle_with_code_problem(scope, goal, "T0002") is None
+    # Another task's pending lock is not this task's.
+    assert beagle._oracle_with_code_problem(scope, goal, "T0003") is not None
+
+
+R31_SCOPE = ["src/", "tests/"]
+R31_NARROWED = "scope=[tests/cases.json, tests/test_cases.py]"
+
+
+def _r31_open_task(fake: Path) -> None:
+    (fake / "next.out").write_text(json.dumps({"open": ["T0002"], "ready": []}))
+    record = {"id": "T0002", "title": "Parser", "intent": "reads input", "status": "open"}
+    record |= {"scope": R31_SCOPE, "done_when": "grep -q done done.txt"}
+    (fake / "show.out").write_text(json.dumps(record))
+    (fake / "brief.out").write_text("# T0002: Parser\nDo the parser.\n")
+
+
+@pytest.mark.anyio
+async def test_open_task_mixed_scope_refusal_names_narrowed_scope_call(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project = _r31_project(tmp_path)
+    monkeypatch.chdir(project)
+    _r31_open_task(fake_beagle)
+    runtime, _ = _bound(tmp_path)
+
+    refused = await _tool(runtime, "pursuit_step").execute(
+        "c1", {"task": "T0002", "scope": R31_SCOPE}
+    )
+
+    assert refused.text.startswith("pursuit_step: T0002 not run"), refused.text
+    assert "Split it" not in refused.text
+    assert f"pursuit_step task=T0002 {R31_NARROWED}" in refused.text
+    assert "notes=" in refused.text and "src/codec.py" in refused.text
+    assert "tests/casegen.py: a helper script" in refused.text
+    assert _runs(fake_tau) == []
+    module = _module()
+    goal = project / ".beagle" / "pursuit.toml"
+    narrowed = ["tests/cases.json", "tests/test_cases.py"]
+    assert module._oracle_with_code_problem(narrowed, goal, "T0002") is None
+
+
+@pytest.mark.anyio
+async def test_open_task_mixed_scope_narrowed_scope_runs_worker(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project = _r31_project(tmp_path)
+    monkeypatch.chdir(project)
+    _r31_open_task(fake_beagle)
+    runtime, _ = _bound(tmp_path)
+
+    ran = await _tool(runtime, "pursuit_step").execute(
+        "c1", {"task": "T0002", "scope": ["tests/cases.json", "tests/test_cases.py"]}
+    )
+
+    assert "not run" not in ran.text, ran.text
+    assert "known-answer data" not in ran.text
+    runs = _runs(fake_tau)
+    assert runs and runs[0]["scope"] == "tests/cases.json\ntests/test_cases.py"
+
+
+@pytest.mark.anyio
+async def test_repeated_mixed_scope_refusal_says_locks_do_not_change_it(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project = _r31_project(tmp_path)
+    monkeypatch.chdir(project)
+    _r31_open_task(fake_beagle)
+    runtime, _ = _bound(tmp_path)
+    step = _tool(runtime, "pursuit_step")
+    # R31 #7-#31: each call added one more duplicate lock on a test file.
+    first = await step.execute(
+        "c1", {"task": "T0002", "scope": R31_SCOPE, "locks": ["tests/test_cases.py"]}
+    )
+    second = await step.execute(
+        "c2",
+        {
+            "task": "T0002",
+            "scope": R31_SCOPE,
+            "locks": ["tests/test_cases.py", "tests/test_cases.py"],
+        },
+    )
+
+    assert "locks do not change it" not in first.text
+    assert second.text.startswith("pursuit_step: T0002 not run"), second.text
+    assert "locks do not change it" in second.text
+    assert f"pursuit_step task=T0002 {R31_NARROWED}" in second.text
+    goal = project / ".beagle" / "pursuit.toml"
+    assert _module()._pending_locks(goal, "T0002") == ["tests/test_cases.py"]
+    assert _runs(fake_tau) == []
+
+
 def _r12_project(tmp_path: Path, *, references: bool = True) -> Path:
     project = _pursuit_project(tmp_path)
     if references:
