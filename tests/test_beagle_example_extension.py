@@ -3652,6 +3652,97 @@ def test_cases_test_reads_requires_the_read_to_name_the_file(tmp_path: Path) -> 
         assert _module()._cases_test_reads(test, "cases.json") is expected, label
 
 
+def test_cases_test_reads_counts_path_open_and_with_as_handle(tmp_path: Path) -> None:
+    # R33 E22-E32: `.open()` on a path and json.load on a with-as handle were not reads.
+    head = "import json\nfrom pathlib import Path\n\nHERE = Path(__file__).parent\n"
+    shapes = {
+        "joinpath(...).open() with-as, json.load": (
+            head + "\n\ndef test_cases():\n"
+            '    with HERE.joinpath("cases.json").open() as fh:\n'
+            '        assert json.load(fh)["cases"]\n',
+            True,
+        ),
+        "name assigned the path, .open() with-as": (
+            head + 'CASES = HERE / "cases.json"\n\n\ndef test_cases():\n'
+            "    with CASES.open() as fh:\n        cases = json.load(fh)\n"
+            "    assert cases\n",
+            True,
+        ),
+        "read_bytes on a path": (
+            head + '\n\ndef test_cases():\n    assert (HERE / "cases.json").read_bytes()\n',
+            True,
+        ),
+        "with-as on another file, message names the data": (
+            head + "\n\ndef test_cases():\n"
+            '    with HERE.joinpath("other.json").open() as fh:\n'
+            '        assert json.load(fh), "see cases.json"\n',
+            False,
+        ),
+        "open() on a path not naming the data": (
+            head + "\n\ndef test_cases():\n    with Path(__file__).open() as fh:\n"
+            '        assert fh.read(), "cases.json"\n',
+            False,
+        ),
+    }
+    for label, (source, expected) in shapes.items():
+        test = tmp_path / "test_cases.py"
+        test.write_text(source)
+        assert _module()._cases_test_reads(test, "cases.json") is expected, label
+
+
+def _write_cases(tmp_path: Path, source: str) -> list[str]:
+    (tmp_path / "tests").mkdir(exist_ok=True)
+    (tmp_path / "tests" / "cases.json").write_text(R22_CASES)
+    (tmp_path / "tests" / "test_cases.py").write_text(source)
+    return ["tests/cases.json", "tests/test_cases.py"]
+
+
+def test_cases_test_problem_names_no_collectable_test(tmp_path: Path) -> None:
+    # R33: test_cases.py defined only _run_case/main helpers; pytest ran no tests.
+    module = _module()
+    helpers = R22_CASES_TEST.replace("def test_cases(cases):", "def _run_cases(cases):")
+    stray = "\n\nclass Cases:\n    def test_x(self):\n        pass\n"
+    entries = _write_cases(tmp_path, helpers + stray)
+    found = module._cases_test_problem(tmp_path, entries)
+    assert found is not None and found[0] == "tests/test_cases.py"
+    assert "defines no test function pytest collects" in found[1]
+    closing = module._cases_close_problem(tmp_path, entries)
+    assert closing is not None and "defines no test function pytest collects" in closing[0]
+
+    in_class = helpers + "\n\nclass TestCases:\n    def test_all(self, cases):\n"
+    in_class += '        assert encode(b"") != cases\n'
+    entries = _write_cases(tmp_path, in_class)
+    assert module._cases_test_problem(tmp_path, entries) is None
+
+    parametrized = (
+        "import json\n\nimport pytest\n\nfrom cobs import encode\n\n"
+        'CASES = json.load(open("tests/cases.json"))["cases"]\n\n\n'
+        '@pytest.mark.parametrize("case", CASES)\ndef test_case(case):\n'
+        '    assert encode(bytes.fromhex(case["input"])).hex() == case["expected"]\n'
+    )
+    assert module._cases_test_problem(tmp_path, _write_cases(tmp_path, parametrized)) is None
+
+
+def test_cases_test_problem_names_unimported_module_name(tmp_path: Path) -> None:
+    # R33 W7: test_cases.py called itc.seed(), itc.fork(), ... and never imported itc.
+    module = _module()
+    source = R22_CASES_TEST.replace("from cobs import encode\n", "").replace(
+        "encode(bytes", "codec.encode(bytes"
+    )
+    found = module._cases_test_problem(tmp_path, _write_cases(tmp_path, source))
+    assert found == ("tests/test_cases.py", "uses codec.encode() without importing codec")
+
+    bound = R22_CASES_TEST + (
+        "\n\ndef test_bound(cases, tmp_path):\n"
+        "    for case in cases['cases']:\n        text = str(case)\n"
+        "        assert text.strip() and tmp_path.exists() and int.from_bytes(b'')== 0\n"
+    )
+    assert module._cases_test_problem(tmp_path, _write_cases(tmp_path, bound)) is None
+
+    imported = "import cobs as codec\n" + source
+    assert module._cases_test_problem(tmp_path, _write_cases(tmp_path, imported)) is None
+
+
 ITC_REFERENCE = (
     "Interval Tree Clocks\n\n4\n\n"
     "fork(i) = (i1, i2), where (i1, i2) = split(i)\n"

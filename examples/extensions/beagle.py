@@ -114,6 +114,7 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import builtins
 import contextlib
 import fnmatch
 import functools
@@ -4759,6 +4760,9 @@ def _cases_test_reads(test_path: Path, data_basename: str) -> bool:
     cases.json, so the locked known answers judged nothing. The read call
     (open, Path, read_text, json.load) must take the file: a string naming it,
     or a name assigned from one. A message string naming it elsewhere does not.
+    Run R33: `<path>.open()` and `json.load(fh)` on a `with ... as fh` handle
+    went uncounted, so the receiver of open/read_text/read_bytes counts as
+    taken, and a `with ... as` target binds a name the way an assignment does.
     """
     try:
         tree = ast.parse(test_path.read_text(encoding="utf-8"))
@@ -4789,14 +4793,20 @@ def _cases_test_reads(test_path: Path, data_basename: str) -> bool:
             for sub in ast.walk(node)
         )
 
-    assigns = [n for n in ast.walk(tree) if isinstance(n, (ast.Assign, ast.AnnAssign))]
+    bindings: list[tuple[ast.AST, list[ast.AST]]] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign):
+            bindings.append((node.value, node.targets))
+        elif isinstance(node, ast.AnnAssign) and node.value is not None:
+            bindings.append((node.value, [node.target]))
+        elif isinstance(node, ast.withitem) and node.optional_vars is not None:
+            bindings.append((node.context_expr, [node.optional_vars]))
     grew = True
     while grew:
         grew = False
-        for node in assigns:
-            if node.value is None or not mentions(node.value):
+        for value, targets in bindings:
+            if not mentions(value):
                 continue
-            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
             for target in targets:
                 if isinstance(target, ast.Name) and target.id not in names:
                     names.add(target.id)
@@ -4809,12 +4819,12 @@ def _cases_test_reads(test_path: Path, data_basename: str) -> bool:
         if isinstance(func, ast.Name):
             reads = func.id in {"open", "Path"}
         elif isinstance(func, ast.Attribute):
-            reads = func.attr in {"read_text", "Path"} or (
+            reads = func.attr in {"read_text", "read_bytes", "open", "Path"} or (
                 func.attr in {"load", "loads"}
                 and isinstance(func.value, ast.Name)
                 and func.value.id == "json"
             )
-            if func.attr == "read_text":
+            if func.attr in {"read_text", "read_bytes", "open"}:
                 given.append(func.value)
         else:
             reads = False
@@ -5043,6 +5053,72 @@ def _answers_compared(tree: ast.AST, answers: Collection[str]) -> bool:
     return False
 
 
+#: Names a module has bound without an import or assignment in its own source.
+_MODULE_IMPLICIT_NAMES = frozenset(
+    {*dir(builtins), "__file__", "__name__", "__doc__", "__spec__", "__loader__"}
+)
+
+
+def _test_structure_problem(tree: ast.Module) -> str | None:
+    """What keeps a test module from judging anything, read from its AST alone.
+
+    Run R33: a cases test defined only helpers, so pytest collected nothing,
+    and called `name.attr(...)` on a module it never imported, so it could not
+    run. Collected: a module-level `test*` function, or a `test*` method of a
+    module-level `Test*` class.
+    """
+
+    def is_test(node: ast.AST) -> bool:
+        return isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef) and node.name.startswith(
+            "test"
+        )
+
+    imported: set[str] = set()
+    star = False
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import | ast.ImportFrom):
+            for alias in node.names:
+                star = star or alias.name == "*"
+                imported.add(alias.asname or alias.name.split(".")[0])
+    collectable = any(
+        is_test(node)
+        or (
+            isinstance(node, ast.ClassDef)
+            and node.name.startswith("Test")
+            and any(is_test(sub) for sub in node.body)
+        )
+        for node in tree.body
+    ) or any(name.startswith("test") for name in imported)
+    if not collectable:
+        return "defines no test function pytest collects (no test* function or Test* class)"
+    if star:
+        return None
+    bound = set(imported) | _MODULE_IMPLICIT_NAMES
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store | ast.Del):
+            bound.add(node.id)
+        elif isinstance(node, ast.arg):
+            bound.add(node.arg)
+        elif isinstance(
+            node, ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef
+        ) or (isinstance(node, ast.ExceptHandler | ast.MatchAs | ast.MatchStar) and node.name):
+            bound.add(node.name)
+        elif isinstance(node, ast.MatchMapping) and node.rest:
+            bound.add(node.rest)
+        elif isinstance(node, ast.Global | ast.Nonlocal):
+            bound.update(node.names)
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id not in bound
+        ):
+            name = node.func.value.id
+            return f"uses {name}.{node.func.attr}() without importing {name}"
+    return None
+
+
 def _cases_test_problem(root: Path, entries: list[str]) -> tuple[str, str] | None:
     """(test, what is wrong) when a locked test reading cases data could never judge it.
 
@@ -5074,6 +5150,9 @@ def _cases_test_problem(root: Path, entries: list[str]) -> tuple[str, str] | Non
                 tree = ast.parse((root / test).read_text(encoding="utf-8"))
             except (OSError, SyntaxError, ValueError):
                 continue
+            broken = _test_structure_problem(tree)
+            if broken is not None:
+                return test, broken
             absent = _absent_case_lookup(tree, labels, keys) if labels else None
             if absent is not None:
                 return test, f'looks up case "{absent}", which {data} does not hold'
