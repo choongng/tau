@@ -5309,6 +5309,52 @@ def _data_test_route(
     return test, module, f"python3 -m pytest -q {data_test}", needs
 
 
+def _absent_test_route(
+    command: str, scope: list[str], root: Path
+) -> tuple[list[str], str, list[str]] | None:
+    """For a known-answers open whose check names, beside a data test, a test in
+    scope not yet on disk: the absent tests, the data-test command to bind instead,
+    and the scope it needs; or None.
+
+    Run R24 #4 opened T0002 on `pytest tests/test_case_data.py tests/test_cases.py`
+    before tests/test_cases.py existed, so `_data_test_route` had no imports to read;
+    the cases test then imported a module no scope path could hold. The data test is
+    told apart by existence: the named tests on disk that import nothing unwritten,
+    or with none on disk, the first named.
+    """
+    if not (_scope_has_data(scope) and _only_data_and_tests(scope)):
+        return None
+    try:
+        words = shlex.split(command)
+    except ValueError:
+        return None
+    if any(" " in w or w in {"&&", "||", ";", "|"} for w in words):
+        return None
+    named = sorted(
+        (
+            rel
+            for rel in _check_run_files(command, root)
+            if rel.endswith(".py") and _is_test_path(rel) and _runs_test_file(command, rel)
+        ),
+        key=command.find,
+    )
+    absent = [rel for rel in named if not (root / rel).exists()]
+    if len(named) < 2 or not absent or not all(_in_scope(r, scope, root) for r in absent):
+        return None
+    data = [
+        rel
+        for rel in named
+        if rel not in absent
+        and _imports_unwritten(f"pytest {shlex.quote(rel)}", scope, root) is None
+    ]
+    if not data and len(absent) == len(named):
+        data, absent = named[:1], named[1:]
+    if not data or len(data) + len(absent) != len(named):
+        return None
+    needs = [*scope, *(rel for rel in data if not _in_scope(rel, scope, root))]
+    return absent, f"python3 -m pytest -q {' '.join(data)}", needs
+
+
 def _scope_note(needs: list[str], scope: list[str]) -> str:
     """What to send as scope when the data test is outside `scope`, or nothing."""
     if needs == scope:
@@ -8354,6 +8400,17 @@ def make_step_tool() -> Any:
                 return _step_result(f"pursuit_step: {task} not opened — {prose}")
             route += _bound_note(done_when, chained)
             done_when = chained
+            absent_route = _absent_test_route(done_when, scope, root) if scope else None
+            if absent_route is not None:
+                # Run R24 #4: the cases test, not yet written, later imported a
+                # module no path in this scope could hold.
+                absent, done_when, scope = absent_route
+                route += (
+                    f"Bound the data test only: `{done_when}`. {', '.join(absent)} "
+                    f"{'is' if len(absent) == 1 else 'are'} in scope but not on disk yet, so "
+                    "nothing shows whether the code it will import is one this scope can "
+                    "write; a later task whose scope holds that code runs it.\n\n"
+                )
             if not scope and record.get("sibling_of"):
                 # Run R18 #56: T0008, spawned with no scope, was refused "no scope given".
                 scope = _predecessor_scope(record, root)

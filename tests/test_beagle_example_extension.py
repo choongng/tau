@@ -10329,6 +10329,65 @@ async def test_opening_with_a_check_that_imports_an_unwritten_module_outside_sco
 
 
 @pytest.mark.anyio
+async def test_known_answers_open_binds_data_test_when_the_cases_test_is_not_on_disk(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # R24 #4 opened T0002 on the data test and tests/test_cases.py before the latter
+    # existed: no imports to read, so the data-only rebind never fired.
+    project = _pursuit_project(tmp_path)
+    monkeypatch.chdir(project)
+    (project / "tests").mkdir()
+    (project / "tests" / "test_case_data.py").write_text(
+        "import json\nfrom pathlib import Path\n\n\ndef test_cases():\n"
+        "    assert json.loads((Path(__file__).parent / 'cases.json').read_text())\n"
+    )
+    scope = ["tests/cases.json", "tests/test_cases.py", "tests/test_case_data.py"]
+    data_check = "python3 -m pytest -q tests/test_case_data.py"
+
+    async def open_with(check: str, scope: list[str] = scope) -> tuple[str, list[str]]:
+        _ready_task(fake_beagle)
+        runtime, _ = _bound(tmp_path)
+        args = {"task": "T0002", "criteria": "cases", "done_when": check, "scope": scope}
+        result = await _tool(runtime, "pursuit_step").execute("c1", args)
+        opened = _pursuit_calls(fake_beagle, "open")[-1]
+        return result.text, opened
+
+    text, opened = await open_with(
+        "python3 -m pytest -q tests/test_case_data.py tests/test_cases.py"
+    )
+    assert opened[opened.index("--done-when") + 1] == data_check
+    assert opened[opened.index("--scope") + 1 :][:3] == scope
+    assert f"Bound the data test only: `{data_check}`" in text
+    assert "tests/test_cases.py is in scope but not on disk yet" in text
+
+    # Named the other way round, the test on disk is still the one bound.
+    _, opened = await open_with("python3 -m pytest -q tests/test_cases.py tests/test_case_data.py")
+    assert opened[opened.index("--done-when") + 1] == data_check
+
+    # Neither on disk: the first named is bound.
+    (project / "tests" / "test_case_data.py").unlink()
+    text, opened = await open_with(
+        "python3 -m pytest -q tests/test_case_data.py tests/test_cases.py"
+    )
+    assert opened[opened.index("--done-when") + 1] == data_check
+    assert "Bound the data test only" in text
+
+    # The only named test absent: unchanged.
+    only = "python3 -m pytest -q tests/test_cases.py"
+    text, opened = await open_with(only)
+    assert opened[opened.index("--done-when") + 1] == only
+    assert "Bound the data test only" not in text
+
+    # A scope that holds code is not known answers: no rebind.
+    both = "python3 -m pytest -q tests/test_case_data.py tests/test_cases.py"
+    assert _module()._absent_test_route(both, [*scope, "clocks.py"], project) is None
+
+
+@pytest.mark.anyio
 async def test_non_test_py_under_tests_is_refused_as_scope_with_a_root_module_call(
     tmp_path: Path,
     beagle: Path,
