@@ -7153,6 +7153,136 @@ async def test_plan_refuses_part_titled_as_the_split_task(
     assert [call[1] for call in _pursuit_calls(fake_beagle, "split")] == ["Read the paper::z"]
 
 
+def _r28_nodes() -> list[dict[str, Any]]:
+    """Run R28's tree: T0010, titled as the fix, a pending container over T0012-T0013."""
+    fix = "Known answers: fix tests/test_cases.py"
+    return [
+        {"id": "T0001", "parent": "", "title": "Goal", "status": "open", "container": True},
+        {"id": "T0002", "parent": "T0001", "title": "Implement", "status": "open"},
+        {"id": "T0010", "parent": "T0001", "title": fix, "status": "pending"},
+        {"id": "T0012", "parent": "T0010", "title": "Cases", "status": "pending"},
+        {"id": "T0013", "parent": "T0010", "title": "Docs", "status": "pending"},
+    ]
+
+
+def test_fix_route_reuses_existing_fix_leaf(tmp_path: Path) -> None:
+    # R28: the lock refusal offered a part titled as T0010; a fix leaf is stepped instead.
+    goal = tmp_path / ".beagle" / "pursuit.toml"
+    module = _module()
+    fix = "Known answers: fix tests/test_cases.py"
+    rel = "tests/test_cases.py"
+    leaf = [
+        *_r28_nodes()[:2],
+        {"id": "T0010", "parent": "T0001", "title": fix, "status": "pending"},
+    ]
+    route = module._known_answers_fix_route(rel, goal, "T0002", "Implement", leaf)
+    assert 'fix it in T0010: pursuit_step task="T0010", scope=["tests/test_cases.py"]' in route
+    assert "pursuit_plan" not in route
+
+    nested = [
+        *_r28_nodes(),
+        {"id": "T0014", "parent": "T0013", "title": f"{fix} case 3", "status": "pending"},
+    ]
+    route = module._known_answers_fix_route(rel, goal, "T0002", "Implement", nested)
+    assert 'pursuit_step task="T0014"' in route
+    assert 'task="T0010"' not in route
+
+    # The container answer for T0010 offers that fix leaf while a file is locked.
+    project = _pursuit_project(tmp_path)
+    _locked_cases_test(project)
+    said = module._not_workable_text("T0010", nested, ["T0012"], project)
+    assert 'fix that first in T0014: pursuit_step task="T0014"' in said
+    assert module._not_workable_text("T0010", nested, ["T0012"], None).endswith(
+        "with no arguments."
+    )
+
+
+def test_fix_route_title_unique_when_title_exists(tmp_path: Path) -> None:
+    # R28: T0010 held the offered title and had no fix leaf, so the plan always clashed.
+    goal = tmp_path / ".beagle" / "pursuit.toml"
+    module = _module()
+    rel = "tests/test_cases.py"
+    route = module._known_answers_fix_route(rel, goal, "T0002", "Implement", _r28_nodes())
+    unique = "Known answers: fix tests/test_cases.py for T0002"
+    assert f'pursuit_plan task="T0002" parts=["{unique}::' in route
+    part = f"{unique}::the stamp case is wrong"
+    rest = "Implement, on the fixed answers::x"
+    assert '"Implement, on the fixed answers::<what T0002 is for>"]' in route
+    assert module._live_title_clash("T0002", [part, rest], _r28_nodes()) is None
+
+    done = [{**n, "status": "done"} if n["id"] == "T0010" else n for n in _r28_nodes()[:3]]
+    route = module._known_answers_fix_route(rel, goal, "T0002", "Implement", done)
+    assert unique in route
+
+    fresh = module._known_answers_fix_route(rel, goal, "T0002", "Implement", _r28_nodes()[:2])
+    assert 'parts=["Known answers: fix tests/test_cases.py::' in fresh
+
+
+def test_title_clash_ignores_ancestor_and_container() -> None:
+    module = _module()
+    nodes = [
+        *_r28_nodes(),
+        {"id": "T0020", "parent": "T0001", "title": "Parser", "status": "pending"},
+        {"id": "T0021", "parent": "T0020", "title": "Lexer", "status": "open"},
+        {"id": "T0022", "parent": "T0021", "title": "Tokens", "status": "open"},
+        {"id": "T0030", "parent": "T0001", "title": "Flagged", "status": "pending"},
+    ]
+    nodes[-1]["container"] = True
+    clash = module._live_title_clash
+    fix = "Known answers: fix tests/test_cases.py"
+    assert clash("T0002", [f"{fix}::x", "Rest::y"], nodes) is None
+    assert clash("T0022", ["Parser::x", "Lexer::y"], nodes) is None
+    assert clash("T0002", ["Flagged::x", "B::y"], nodes) is None
+    # A pending leaf off the subtree still clashes (R22, R25), and the split
+    # task's own title still does (R26).
+    assert "has the title of T0013" in clash("T0002", ["Docs::x", "B::y"], nodes)
+    assert "the task being split" in clash("T0022", ["Tokens::x", "B::y"], nodes)
+
+
+def test_title_clash_never_says_work_a_container() -> None:
+    module = _module()
+    nodes = _r28_nodes()
+    fix = "Known answers: fix tests/test_cases.py"
+    named = []
+    for task in ("T0002", "T0012", "T0013"):
+        for title in (fix, "Goal", "Cases", "Docs", "Implement"):
+            said = module._live_title_clash(task, [f"{title}::x", "Other::y"], nodes) or ""
+            assert "Work T0001" not in said and "Work T0010" not in said
+            named += re.findall(r'pursuit_step task="(T\d+)"', said)
+    assert "T0013" in named
+    assert not any(module._is_container(t, nodes) for t in named)
+
+
+@pytest.mark.anyio
+async def test_workable_list_never_names_a_container(
+    tmp_path: Path, beagle: Path, fake_beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # R28 E1035-E1047: "Workable now: T0012" named an open container; the driver
+    # stepped it seven times in a row and tripped the breaker.
+    monkeypatch.chdir(_pursuit_project(tmp_path))
+    nodes = [
+        *_r28_nodes(),
+        {"id": "T0030", "parent": "T0012", "title": "Case data", "status": "pending"},
+    ]
+    nodes[3] = {**nodes[3], "status": "open"}
+    (fake_beagle / "tree.out").write_text(json.dumps({"nodes": nodes}))
+    ready = {"open": ["T0012"], "ready": [{"id": "T0030", "title": "Case data"}]}
+    (fake_beagle / "next.out").write_text(json.dumps(ready))
+    runtime, _ = _bound(tmp_path)
+    step = _tool(runtime, "pursuit_step")
+
+    on_parent = await step.execute("c1", {"task": "T0010"})
+    on_container = await step.execute("c2", {"task": "T0012"})
+
+    for said in (on_parent.text, on_container.text):
+        assert "Workable now: T0030." in said
+        assert not re.search(r"Workable now: [^.]*T0012", said)
+    assert "T0012 is not a task to work now: it is a container of T0030" in on_container.text
+    assert _pursuit_calls(fake_beagle, "open") == []
+    module = _module()
+    assert module._steppable(["T0012", "T0030", "T0013"], nodes) == ["T0030", "T0013"]
+
+
 @pytest.mark.anyio
 async def test_a_later_milestone_can_be_abandoned_as_a_duplicate(
     tmp_path: Path, beagle: Path, fake_beagle: Path, monkeypatch: pytest.MonkeyPatch

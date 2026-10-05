@@ -3516,6 +3516,48 @@ def _plan_order_problem(parts: list[str], task: str, goal: Path) -> str | None:
     return None
 
 
+def _ancestors(task: str, nodes: list[dict[str, Any]]) -> set[str]:
+    """The ids above `task` in the tree."""
+    parent = {str(n.get("id")): str(n.get("parent") or "") for n in nodes}
+    seen: set[str] = set()
+    up = parent.get(task, "")
+    while up and up not in seen:
+        seen.add(up)
+        up = parent.get(up, "")
+    return seen
+
+
+def _is_container(task: str, nodes: list[dict[str, Any]]) -> bool:
+    """True when the tree shows `task` as a container or with a live child."""
+    node = next((n for n in nodes if str(n.get("id")) == task), None)
+    if node is not None and node.get("container"):
+        return True
+    return any(
+        n.get("parent") == task and n.get("status") not in ("abandoned", "superseded")
+        for n in nodes
+    )
+
+
+def _live_leaves(task: str, nodes: list[dict[str, Any]]) -> list[str]:
+    """The pending or open leaves under `task`, depth first in tree order."""
+    found: list[str] = []
+    for n in nodes:
+        nid = str(n.get("id"))
+        if n.get("parent") != task or n.get("status") not in ("pending", "open"):
+            continue
+        found += _live_leaves(nid, nodes) if _is_container(nid, nodes) else [nid]
+    return found
+
+
+def _steppable(ids: list[str], nodes: list[dict[str, Any]]) -> list[str]:
+    """`ids` without the containers the tree shows: those are not a task to step.
+
+    Run R28 listed open container T0012 as workable; the driver stepped it
+    seven times in a row and the breaker stopped the run.
+    """
+    return [t for t in ids if not _is_container(t, nodes)]
+
+
 def _live_title_clash(task: str, parts: list[str], nodes: list[dict[str, Any]]) -> str | None:
     """Why a plan may not add `parts`, one titled as a live task off `task`'s subtree is, or None.
 
@@ -3523,6 +3565,7 @@ def _live_title_clash(task: str, parts: list[str], nodes: list[dict[str, Any]]) 
     tasks, and they then ranked against the tasks they repeated. Run R25's
     split of T0006 repeated pending T0003-T0005 the same way, off the root.
     A part may not take `task`'s own title either; its descendants' titles stay free.
+    Ancestors of `task` and containers are left out: neither is a task to step.
     Titles are compared case-folded with whitespace normalized.
     """
     node = next((n for n in nodes if str(n.get("id")) == task), None)
@@ -3538,12 +3581,17 @@ def _live_title_clash(task: str, parts: list[str], nodes: list[dict[str, Any]]) 
             if n.get("parent") in subtree and nid not in subtree:
                 subtree.add(nid)
                 grew = True
+    # Run R28: a clash with pending container T0010 said work T0010, and
+    # stepping T0010 said container; ancestors are no more steppable.
+    ancestors = _ancestors(task, nodes)
     live = {
         _fold(str(n.get("title") or "")): n
         for n in nodes
         if n.get("status") in ("pending", "open")
         and n.get("id")
         and str(n.get("id")) not in subtree
+        and str(n.get("id")) not in ancestors
+        and not _is_container(str(n.get("id")), nodes)
     }
     # Run R26's split of T0006 added T0014 under T0006's own title.
     own = _fold(str(node.get("title") or ""))
@@ -7362,16 +7410,44 @@ def _locked_in_scope(scope: list[str], goal: Path) -> list[str]:
     return held
 
 
-def _known_answers_fix_route(rel: str, goal: Path, task: str, title: str) -> str:
-    """Who locked `rel`, that its changes are put back, and how a wrong one is fixed."""
+def _known_answers_fix_route(
+    rel: str, goal: Path, task: str, title: str, nodes: list[dict[str, Any]] | None = None
+) -> str:
+    """Who locked `rel`, that its changes are put back, and how a wrong one is fixed.
+
+    Run R28 offered a fix part titled as pending container T0010, which the
+    plan refused as a clash; a live fix leaf is offered instead, and a title
+    already in the tree is made distinct.
+    """
     owner = _lock_manifest(goal).get(rel, {}).get("task")
-    return (
+    head = (
         f"{rel} is locked as the known answers{f' ({owner})' if owner else ''}: a "
-        "worker's change to it is put back before every check. If the locked test is "
-        f"wrong, split {task} with a fix first: pursuit_plan task=\"{task}\" "
-        f'parts=["Known answers: fix {rel}::<what is wrong in it>", "{title}::<what '
-        f'{task} is for>"]; then run the fix step with pursuit_step, {rel} in its scope. '
-        "Its close re-locks the file."
+        "worker's change to it is put back before every check. "
+    )
+    if nodes is None:
+        nodes = _tree_nodes(goal.parent.parent)
+    fix = f"Known answers: fix {rel}"
+    same = [n for n in nodes if _fold(str(n.get("title") or "")) == _fold(fix)]
+    titled = {str(m.get("id")): str(m.get("title") or "") for m in nodes}
+    for n in same:
+        nid = str(n.get("id"))
+        if n.get("status") not in ("pending", "open"):
+            continue
+        leaves = _live_leaves(nid, nodes) if _is_container(nid, nodes) else [nid]
+        leaf = next((t for t in leaves if _fixes_known_answers(titled.get(t, ""))), None)
+        if leaf is not None:
+            return (
+                f'{head}If the locked test is wrong, fix it in {leaf}: pursuit_step task="'
+                f'{leaf}", scope={json.dumps([rel])}. Its close re-locks the file.'
+            )
+    if same:
+        fix = f"{fix} for {task}"
+    # The second part may not take {task}'s own title: the plan refuses that (T0240).
+    return (
+        f"{head}If the locked test is wrong, split {task} with a fix first: "
+        f'pursuit_plan task="{task}" parts=["{fix}::<what is wrong in it>", "{title}, on '
+        f'the fixed answers::<what {task} is for>"]; then run the fix step with pursuit_step, '
+        f"{rel} in its scope. Its close re-locks the file."
     )
 
 
@@ -8679,6 +8755,29 @@ def _check_runs_own_file(
     return ""
 
 
+def _locked_fix_leaf(task: str, nodes: list[dict[str, Any]], root: Path | None) -> str:
+    """The step for the first live fix leaf under container `task` while files are locked.
+
+    Run R28: T0010's parts needed the locked test, and its container answer
+    named only T0012, itself a container, so no worker ran.
+    """
+    if root is None:
+        return ""
+    locked = _locked(root / ".beagle" / GOAL_BASENAME)
+    if not locked:
+        return ""
+    titled = {str(n.get("id")): str(n.get("title") or "") for n in nodes}
+    leaf = next(
+        (t for t in _live_leaves(task, nodes) if _fixes_known_answers(titled.get(t, ""))), None
+    )
+    if leaf is None:
+        return ""
+    return (
+        f" If its parts are held back by the locked {', '.join(locked)}, fix that first "
+        f'in {leaf}: pursuit_step task="{leaf}", scope={json.dumps(locked)}.'
+    )
+
+
 def _not_workable(
     task: str, nodes: list[dict[str, Any]], workable: list[str], root: Path | None = None
 ) -> str:
@@ -8718,7 +8817,7 @@ def _not_workable_text(
         return (
             f"{task} is not a task to work now: it is a container of {', '.join(parts)}, "
             f"done when its parts are. Workable now: {listed}. Call pursuit_step with no "
-            "arguments."
+            "arguments." + _locked_fix_leaf(task, nodes, root)
         )
     return (
         f"{task} is not a task to work now. Workable now: {listed}. Call pursuit_step "
@@ -8771,6 +8870,8 @@ def make_step_tool() -> Any:
         ready_ids = _ids(ready.get("ready"))
         blocked = _blocked_tasks(root)
         nodes = _tree_nodes(root)
+        open_ids = _steppable(open_ids, nodes)
+        ready_ids = _steppable(ready_ids, nodes)
         left = _unfinished(nodes)
         cycle = _wait_cycle(nodes)
         dead = _dead_waits(nodes)
@@ -11518,8 +11619,9 @@ def make_state_after_compaction(tau: ExtensionAPI) -> Any:
         if goal is None:
             return
         rc, ready, _raw = _next_ready(root)
-        ready_ids = _ids(ready.get("ready")) if isinstance(ready, dict) else []
-        open_ids = _ids(ready.get("open")) if isinstance(ready, dict) else []
+        nodes = _tree_nodes(root)
+        ready_ids = _steppable(_ids(ready.get("ready")) if isinstance(ready, dict) else [], nodes)
+        open_ids = _steppable(_ids(ready.get("open")) if isinstance(ready, dict) else [], nodes)
         if ready_ids:
             now = f"Ready now: {', '.join(ready_ids)}."
         elif open_ids:
