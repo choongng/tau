@@ -114,6 +114,7 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import bisect
 import builtins
 import contextlib
 import fnmatch
@@ -5305,23 +5306,222 @@ def _case_label(case: object, index: int) -> str:
     return f"#{index + 1}"
 
 
+#: Key fragments that mark a case's expected result.
+RESULT_KEY_PARTS = ("expect", "result", "output", "want", "answer")
+#: A scalar or string result shorter than this is not searched for: "1", "ok"
+#: or a bool occurs in, or is absent from, any source by chance.
+RESULT_MIN_CHARS = 4
+#: A number-like token in a source: decimal, hex with 0x or \x, or bare hex digits.
+_VALUE_TOKEN = re.compile(r"(0x|\\x)?([0-9a-fA-F]+)(?![0-9a-zA-Z])", re.IGNORECASE)
+#: What may sit between two tokens of one rendered sequence.
+_VALUE_SEPARATOR = re.compile(r"[\s,;\[\]()\-]*")
+_ELLIPSIS = re.compile(r"\s*(?:\.\.\.|…)\s*[,;]?\s*")
+_GAP = "…"
+
+
+def _value_runs(text: str, base: int) -> list[list[int | str]]:
+    """The runs of values `text` renders in `base` (10, or 16 as bytes), split where
+    anything but a separator or an ellipsis (kept as _GAP) sits between tokens."""
+    runs: list[list[int | str]] = []
+    run: list[int | str] = []
+    end = 0
+    for match in _VALUE_TOKEN.finditer(text):
+        between = text[end : match.start()]
+        if _ELLIPSIS.fullmatch(between) and run:
+            run.append(_GAP)
+        elif not _VALUE_SEPARATOR.fullmatch(between):
+            if run:
+                runs.append(run)
+            run = []
+        end = match.end()
+        prefix, digits = match.group(1), match.group(2)
+        values: list[int | str] | None
+        if match.start() > 0 and text[match.start() - 1].isalnum() and not prefix:
+            values = None  # the tail of a word, not a token
+        elif base == 10:
+            values = [int(digits)] if not prefix and digits.isdigit() else None
+        elif prefix:
+            values = [int(digits, 16)]
+        else:
+            values = (
+                [int(digits[i : i + 2], 16) for i in range(0, len(digits), 2)]
+                if len(digits) % 2 == 0
+                else None
+            )
+        if values is None:
+            if run:
+                runs.append(run)
+            run = []
+        else:
+            run.extend(values)
+    if run:
+        runs.append(run)
+    return runs
+
+
+def _holds_sequence(run: list[int | str], want: list[int]) -> bool:
+    """Whether `run` is `want` exactly, or its head and tail around an ellipsis.
+
+    Whole runs, not a slice of one: run R34's wrong [1, 0] sits inside the
+    reference's `01 01 00`.
+    """
+    pieces: list[list[int]] = [[]]
+    for value in run:
+        if value == _GAP:
+            pieces.append([])
+        else:
+            pieces[-1].append(int(value))
+    if len(pieces) == 1:
+        return pieces[0] == want
+    head, *middle, tail = pieces
+    if not head or not tail or len(head) + len(tail) >= len(want):
+        return False
+    if want[: len(head)] != head or want[len(want) - len(tail) :] != tail:
+        return False
+    at, stop = len(head), len(want) - len(tail)
+    for part in middle:
+        found = next(
+            (i for i in range(at + 1, stop - len(part)) if want[i : i + len(part)] == part), -1
+        )
+        if not part or found < 0:
+            return False
+        at = found + len(part)
+    return True
+
+
+def _renders_result(text: str, result: object) -> bool:
+    """Whether `text` holds `result` as the reference would print it.
+
+    A list of ints as decimal tokens or two-digit hex bytes (with or without 0x
+    or \\x, with or without separators), a long one by its head and tail around
+    an ellipsis; a number by str() or hex; a string by itself, whitespace aside,
+    or as the bytes it spells in hex.
+    """
+    if isinstance(result, list):
+        want = [int(v) for v in result]
+        bases = (10, 16) if all(0 <= v <= 255 for v in want) else (10,)
+        return any(
+            _holds_sequence(run, want) for base in bases for run in _value_runs(text, base)
+        )
+    if isinstance(result, int | float):
+        tokens = {str(v) for run in _value_runs(text, 10) for v in run}
+        tokens |= {
+            str(int(m.group(2), 16)) for m in _VALUE_TOKEN.finditer(text) if m.group(1)
+        }
+        return str(result) in tokens or str(result) in text
+    flat = "".join(str(result).split()).lower()
+    if flat in "".join(text.split()).lower():
+        return True
+    spelled = str(result).strip().lower()
+    if not re.fullmatch(r"(?:(?:0x|\\x)?[0-9a-f]{2}[\s,:\-]*)+", spelled):
+        return False
+    digits = re.sub(r"0x|\\x", "", spelled)
+    return _renders_result(text, [int(b, 16) for b in re.findall(r"[0-9a-f]{2}", digits)])
+
+
+def _searchable_result(value: object) -> bool:
+    """Whether a case's result has a rendering worth searching a source for."""
+    if isinstance(value, bool) or value is None:
+        return False
+    if isinstance(value, list):
+        return bool(value) and all(
+            isinstance(v, int) and not isinstance(v, bool) for v in value
+        )
+    if isinstance(value, int | float | str):
+        return len(str(value).strip()) >= RESULT_MIN_CHARS
+    return False
+
+
+def _case_results(case: object) -> list[object]:
+    """The searchable results under a case's result-like keys that are not one of its inputs.
+
+    Run R34: expected_decoded equalled the input a source quoted, so it shows
+    nothing about whether the source gives the result.
+    """
+    if not isinstance(case, dict):
+        return []
+    inputs = [
+        value
+        for key, value in case.items()
+        if str(key).lower() in _CASE_NON_ANSWER_KEYS
+        and not any(part in str(key).lower() for part in SOURCE_KEY_PARTS)
+    ]
+    results: list[object] = []
+
+    def walk(value: object) -> None:
+        if isinstance(value, dict):
+            for item in value.values():
+                walk(item)
+        elif _searchable_result(value) and value not in inputs:
+            results.append(value)
+
+    for key, value in case.items():
+        name = str(key).lower()
+        if name == "out" or any(part in name for part in RESULT_KEY_PARTS):
+            walk(value)
+    return results
+
+
+def _lines_after(source: str, lines: list[str]) -> list[str]:
+    """The next non-blank reference line after each line a quote in `source` ends on."""
+    found: list[str] = []
+    joined = " ".join(lines)
+    starts = list(itertools.accumulate((len(line) + 1 for line in lines), initial=0))
+    candidates = [source]
+    candidates += [next(g for g in m.groups() if g) for m in _QUOTE_MARKS.finditer(source)]
+    for candidate in candidates:
+        quote = _normalised(candidate).strip(" \"'`“”.,;:")
+        if not quote:
+            continue
+        at = joined.find(quote)
+        while at >= 0:
+            line = bisect.bisect_right(starts, at + len(quote) - 1) - 1
+            if line + 1 < len(lines):
+                found.append(lines[line + 1])
+            at = joined.find(quote, at + 1)
+    return found
+
+
+def _result_unquoted(case: object, references: list[list[str]]) -> bool:
+    """Whether `case` has a searchable result that neither its source nor the reference
+    line after the quoted one holds."""
+    results = _case_results(case)
+    if not results:
+        return False
+    sources = _source_strings(case)
+    texts = [*sources]
+    for lines in references:
+        for source in sources:
+            texts += _lines_after(source, lines)
+    return not any(_renders_result(text, result) for text in texts for result in results)
+
+
 def _unquoted_cases(
     root: Path, entries: list[str]
-) -> tuple[str, int, int, list[str]] | None:
-    """(data file, unfound, total, up to 3 names) when most cases quote no references/*.txt.
+) -> tuple[str, int, int, list[str], bool] | None:
+    """(data file, unfound, total, up to 3 names, whether by result) for cases whose source
+    does not tie them to references/*.txt.
 
     Runs R12 and R14: cases cited bare URLs, nothing, or `itc2008.txt:221`,
     a line that held a page number. A source counts as found when at least
     SOURCE_QUOTE_MIN_WORDS words of it occur, whitespace-normalised, in one
-    reference text.
+    reference text; most must be found.
+
+    Run R34: every source was verbatim, but 11 of 13 quoted the case's input
+    line or prose, and 8 expected values were wrong. Any case with a searchable
+    result (`_case_results`) must have it in its source or the reference line
+    after the one quoted; the last element is then True.
     """
     refs = root / REFERENCES_DIR
     texts = []
+    references: list[list[str]] = []
     for path in sorted(refs.glob("*.txt")) if refs.is_dir() else []:
         try:
-            texts.append(_normalised(path.read_text(encoding="utf-8", errors="replace")))
+            raw = path.read_text(encoding="utf-8", errors="replace")
         except OSError:
             continue
+        texts.append(_normalised(raw))
+        references.append([_normalised(line) for line in raw.splitlines() if line.strip()])
     if not texts:
         return None
     for entry in entries:
@@ -5343,7 +5543,14 @@ def _unquoted_cases(
             )
         ]
         if cases and 2 * len(unfound) > len(cases):
-            return rel, len(unfound), len(cases), unfound[:3]
+            return rel, len(unfound), len(cases), unfound[:3], False
+        wrong = [
+            _case_label(case, i)
+            for i, case in enumerate(cases)
+            if _result_unquoted(case, references)
+        ]
+        if wrong:
+            return rel, len(wrong), len(cases), wrong[:3], True
     return None
 
 
@@ -6751,6 +6958,32 @@ def _missing_data(command: str, scope: list[str], root: Path) -> list[str]:
     return [rel for rel in _check_data_reads(command, root) if not _in_scope(rel, scope, root)]
 
 
+def _changed_locked_only(scope: list[str], goal: Path, root: Path) -> list[str]:
+    """The locked, tracked files in `scope` the work changed, when it changed nothing else
+    there: a known-answers fix, whose data file's absence proves nothing."""
+    changed = [rel for rel in _changed_files(root) if _in_scope(rel, scope, root)]
+    locked = set(_locked(goal))
+    if not changed or any(
+        rel not in locked or not _in_commit("HEAD", rel, root) for rel in changed
+    ):
+        return []
+    return changed
+
+
+def _locked_data_proof_note(held: list[str]) -> str:
+    """Said instead of TESTS_ONLY_PROOF_NOTE for a fix to tracked locked data.
+
+    Run R34 E66-E68: the note asked for a check failing with tests/cases.json
+    removed; that check already passed, and the open refused it.
+    """
+    rels = ", ".join(held)
+    return (
+        f"The check must fail on the locked version of {rels}: assert the cases that "
+        f"change. {rels} is tracked, so taking it away proves nothing; the close puts "
+        "its locked version back as the defect, and the check must refuse it."
+    )
+
+
 def _tests_only_proof_note(command: str, scope: list[str], root: Path | None) -> str:
     """The proof note for a tests-only scope: the data file's absence where the scope
     or the check's tests hold one, else a defect in the module the test imports.
@@ -8117,6 +8350,9 @@ async def _prove(
     # took away itc.py instead; for a known-answers task the data is the work.
     opened = _opened_commit(task, root)
     changed = _changed_files(root)
+    reverted = _locked_fix_reversion(task, scope, root, changed)
+    if reverted:
+        attempts.insert(0, reverted)
     sources = [
         rel
         for rel in (lock.rstrip("/") for lock in locks or [])
@@ -8184,6 +8420,74 @@ async def _prove(
             "task's scope that is new since it opened and could be taken away instead.",
         )
     return _Proof(proven=False, text="\n\n".join(refused))
+
+
+def _reversion_edit(current: str, locked: str) -> tuple[str, str] | None:
+    """(needle, replacement) that turns `current` back into `locked`: the differing
+    span, widened to whole lines until it occurs once in `current`; None if equal."""
+    if current == locked:
+        return None
+    head = 0
+    limit = min(len(current), len(locked))
+    while head < limit and current[head] == locked[head]:
+        head += 1
+    tail = 0
+    while (
+        tail < limit - head and current[len(current) - 1 - tail] == locked[len(locked) - 1 - tail]
+    ):
+        tail += 1
+    start, end = current.rfind("\n", 0, head) + 1, len(current) - tail
+    newline = current.find("\n", end)
+    end = len(current) if newline < 0 else newline + 1
+    while True:
+        needle = current[start:end]
+        if needle and current.count(needle) == 1:
+            break
+        if start == 0 and end == len(current):
+            return None
+        start = current.rfind("\n", 0, max(start - 1, 0)) + 1
+        newline = current.find("\n", end)
+        end = len(current) if newline < 0 else newline + 1
+    replacement = locked[start : len(locked) - (len(current) - end)]
+    return needle, replacement
+
+
+def _locked_fix_reversion(
+    task: str, scope: list[str], root: Path, changed: list[str]
+) -> list[str] | None:
+    """`prove` arguments putting each locked file a known-answers fix changed back to
+    its locked version: the defect the fix's check must refuse.
+
+    Run R34 E66: T0011 fixed the locked tests/cases.json, which was tracked, so no
+    file new since it opened could be taken away and the fix could not be proved.
+    """
+    goal = root / ".beagle" / GOAL_BASENAME
+    manifest = _lock_manifest(goal)
+    held = [
+        rel
+        for rel in _locked_in_scope(scope, goal)
+        if rel in changed and (root / rel).is_file() and rel in manifest
+    ]
+    if not held:
+        return None
+    rc, out = _pursuit(["show", task], root)
+    record = _json_reply(out) if rc == 0 else None
+    title = str(record.get("title") or "") if isinstance(record, dict) else ""
+    if not _fixes_known_answers_in(title, scope, goal):
+        return None
+    argv: list[str] = []
+    for rel in held:
+        locked = _locked_bytes(root, goal.parent / LOCKED_DIR, rel, manifest[rel])
+        if locked is None:
+            continue
+        try:
+            current = (root / rel).read_text(encoding="utf-8")
+            edit = _reversion_edit(current, locked.decode("utf-8"))
+        except (OSError, UnicodeDecodeError):
+            continue
+        if edit is not None:
+            argv += ["--mutate", rel, "--needle", edit[0], "--replacement", edit[1]]
+    return argv or None
 
 
 def _requires_witness(root: Path) -> bool:
@@ -11488,6 +11792,21 @@ def make_step_tool() -> Any:
             )
         if proof is not None and not proof.proven:
             state = "stays blocked" if retrying else "stays open"
+            held = _changed_locked_only(scope, goal, root)
+            if held:
+                proof_note = _locked_data_proof_note(held)
+            # The new route the Next offers keeps this check only where the route's
+            # open would not refuse it as already passing: one rule for both.
+            keeps = (
+                tests_only
+                and missing_data
+                and await _passes_only_by_uncommitted(check, [[*scope, *missing_data]], root)
+            )
+            fresh_check = (
+                "a done_when that runs a new test file, e.g. `python3 -m pytest -q "
+                f"tests/test_<this task>.py`, in scope: `{check}` passes on the committed "
+                "files too, so a route on it is refused as already passing. "
+            )
             why = (
                 "the check passes even with a defect put back into the work, so it does "
                 "not test what this task built"
@@ -11531,7 +11850,9 @@ def make_step_tool() -> Any:
                     "new_route=true, notes and "
                     + (
                         f"its done_when, `{check}`, which passes, kept. {proof_note}"
-                        if tests_only and missing_data
+                        if keeps
+                        else fresh_check + proof_note
+                        if tests_only and (held or missing_data)
                         else f"a done_when that runs that file's test. {proof_note}"
                         if tests_only
                         else "a done_when that runs a test of the behaviour itself, e.g. "
@@ -11629,9 +11950,32 @@ def make_step_tool() -> Any:
                 f'Next: pursuit_step with task="{task}" and notes saying {test} {problem}.',
             )
         unquoted = _unquoted_cases(root, locks) if locks else None
+        if unquoted and unquoted[4]:
+            state = "stays blocked" if retrying else "stays open"
+            data, missing, total, named, _ = unquoted
+            return _not_done(
+                root,
+                task,
+                scope,
+                f"{route}{undid}{task} — {title}: the check passes, but the task {state} "
+                f"and nothing is locked: {missing} of {total} cases in {data} have a source "
+                "that does not give the case's expected result, so a wrong answer would be "
+                f"locked as known: case {named[0]}'s source quotes its input or prose, not "
+                "its expected result: quote the line that gives the result"
+                + (f" (also {', '.join(named[1:])})" if named[1:] else "")
+                + f". A source holds the result when it, or the line of {REFERENCES_DIR}/*.txt "
+                "after the one it quotes, gives every value of it, as decimal, hex bytes or "
+                "the string; a long sequence may be elided with `...` between its head "
+                "and tail. Where the reference gives a different result, the case's "
+                "expected value is wrong: change it to the reference's."
+                f"\n\nLast report:\n{shown}\n\n"
+                f'Next: pursuit_step with task="{task}" and notes saying case {named[0]}\'s '
+                f"source in {data} quotes its input, not its expected result: quote the line "
+                "that gives the result, and make the expected value match it.",
+            )
         if unquoted:
             state = "stays blocked" if retrying else "stays open"
-            data, missing, total, named = unquoted
+            data, missing, total, named, _ = unquoted
             return _not_done(
                 root,
                 task,

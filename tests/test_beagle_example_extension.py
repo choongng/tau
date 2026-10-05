@@ -16436,3 +16436,193 @@ def test_missing_pytest_node_in_unwritable_file_refused(tmp_path: Path) -> None:
         ("pytest -q tests/test_new.py::test_x", ["parser.py"]),
     ):
         assert guard(check, scope, project) is None, check
+
+
+#: R34's reference table, two rows: each input line, then the line giving its result.
+R34_REFERENCE = (
+    "Example | Unencoded data (hex)\n"
+    "| Data bytes | Encoded with COBS (hex)\n"
+    "\n"
+    "3 | 00 11 00\n"
+    "| 3 | 01 02 11 01 00\n"
+    "\n"
+    "4 | 11 22 00 33\n"
+    "| 4 | 03 11 22 02 33 00\n"
+    "\n"
+    "7 | 01 02 03 ... FD FE\n"
+    "| 254 | FF 01 02 03 ... FD FE 00\n"
+)
+
+
+@pytest.mark.anyio
+async def test_known_answer_source_must_hold_expected_result(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # R34: single_zero_byte's source was its input line, "1 | 00", and its expected
+    # [1, 0] was wrong; the reference's next line gives 01 01 00.
+    module = _module()
+    reference = [
+        module._normalised(line) for line in R34_REFERENCE.splitlines() if line.strip()
+    ]
+    right = [3, 17, 34, 2, 51, 0]
+    long = [255, *range(1, 255), 0]
+    held = {
+        "next-line": {"in": [17, 34, 0, 51], "expected": right, "source": "4 | 11 22 00 33"},
+        "result-line": {"in": [1], "expected": right, "source": "| 4 | 03 11 22 02 33 00"},
+        "0x": {"in": [1], "expected": right, "source": "0x03, 0x11, 0x22, 0x02, 0x33, 0x00"},
+        "escaped": {"in": [1], "expected": right, "source": r"\x03\x11\x22\x02\x33\x00"},
+        "bare-hex": {"in": [1], "expected": right, "source": "031122023300"},
+        "decimal": {"in": [1], "expected": right, "source": "gives [3, 17, 34, 2, 51, 0]"},
+        "elided": {"in": [1], "expected": long, "source": "7 | 01 02 03 ... FD FE"},
+        "string": {"in": "a", "output": "(1, (0, 1))", "source": "is (1, (0, 1)) here"},
+        "hex-string": {"in": "a", "result": "03 11 22", "source": "0x03 0x11 0x22"},
+        "bool": {"in": [0], "expected": True, "source": "prose without values"},
+        "short": {"in": [0], "expected": 7, "source": "prose without values"},
+        "as-input": {"in": [0, 17, 0], "decoded": [0, 17, 0], "source": "3 | 00 11 00"},
+    }
+    for name, case in held.items():
+        assert not module._result_unquoted(case, [reference]), name
+    wrong = {
+        "input-line": {"in": [0, 17, 0], "expected": [1, 17, 0], "source": "3 | 00 11 00"},
+        "slice": {"in": [0, 17, 0], "expected": [1, 0], "source": "| 3 | 01 02 11 01 00"},
+        "prose": {"in": [42], "expected_encoded": [1, 42, 0], "source": "Bold is data."},
+        "elided-wrong": {"in": [1], "expected": long[:-1], "source": "7 | 01 02 03 ... FD FE"},
+        "number": {"in": [0], "expected": 1234, "source": "prose without values"},
+        "string": {"in": "a", "output": "(1, (0, 1))", "source": "is (1, (1, 0)) here"},
+    }
+    for name, case in wrong.items():
+        assert module._result_unquoted(case, [reference]), name
+
+    cases = [
+        {"name": "zero_with_data", "in": [0, 17, 0], "out": [1, 17, 0]},
+        {"name": "data_with_zero", "in": [17, 34, 0, 51], "out": right},
+        {"name": "flag", "in": [0], "out": True},
+    ]
+    for case, source in zip(cases, ["3 | 00 11 00", *2 * ["4 | 11 22 00 33"]], strict=True):
+        case["source"] = source
+    project = _cases_task(tmp_path, fake_beagle, monkeypatch, CASES_DATA_TEST)
+    (project / "references").mkdir()
+    (project / "references" / "cobs.txt").write_text(R34_REFERENCE)
+    writes = json.loads(os.environ["FAKE_TAU_WRITES"])
+    writes["tests/cases.json"] = json.dumps(cases)
+    monkeypatch.setenv("FAKE_TAU_WRITES", json.dumps(writes))
+
+    result = await _step_cases(tmp_path, locks=CASES_SCOPE)
+
+    assert "stays open" in result.text and "nothing is locked" in result.text
+    assert "1 of 3 cases in tests/cases.json have a source that does not give" in result.text
+    assert (
+        "case zero_with_data's source quotes its input or prose, not its expected result: "
+        "quote the line that gives the result" in result.text
+    )
+    assert not (project / ".beagle" / "locked").exists()
+    assert _pursuit_calls(fake_beagle, "close") == []
+    found = module._unquoted_cases(project, ["tests/cases.json"])
+    assert found == ("tests/cases.json", 1, 3, ["zero_with_data"], True)
+    cases[0]["out"] = [1, 2, 17, 1, 0]
+    (project / "tests" / "cases.json").write_text(json.dumps(cases))
+    assert module._unquoted_cases(project, ["tests/cases.json"]) is None
+
+
+@pytest.mark.anyio
+async def test_locked_data_fix_proved_by_putting_back_committed(
+    tmp_path: Path, beagle: Path, fake_beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # R34 E66: T0011 fixed the tracked, locked tests/cases.json; no file new since it
+    # opened could be taken away, so `prove` was never even asked.
+    project = _git_project(tmp_path, monkeypatch)
+    locked = '[\n {"in": [0], "out": [1, 0]},\n {"in": [1], "out": [2, 1, 0]}\n]\n'
+    (project / "tests").mkdir()
+    (project / "tests" / "cases.json").write_text(locked)
+    _git(project, "add", "tests")
+    _git(project, "commit", "-q", "-m", "T0002: Known answers")
+    _store_lock(project / ".beagle", "tests/cases.json", locked)
+    fixed = locked.replace("[1, 0]", "[1, 1, 0]")
+    (project / "tests" / "cases.json").write_text(fixed)
+    opened = _git(project, "rev-parse", "HEAD").strip()
+    record = {"id": "T0011", "status": "open", "opened_commit": opened}
+    record["title"] = "Known answers: fix tests/cases.json"
+    (fake_beagle / "show.out").write_text(json.dumps(record))
+    module = _module()
+    monkeypatch.setattr(module, "BEAGLE_BIN", str(fake_beagle / "beagle"))
+    scope = ["tests/cases.json"]
+
+    await module._prove("T0011", "done, no witness", scope, project, 60)
+
+    prove = _pursuit_calls(fake_beagle, "prove")
+    assert len(prove) == 1 and prove[0][:3] == ["T0011", "--mutate", "tests/cases.json"]
+    needle = prove[0][prove[0].index("--needle") + 1]
+    replacement = prove[0][prove[0].index("--replacement") + 1]
+    assert fixed.count(needle) == 1 and fixed.replace(needle, replacement) == locked
+
+    goal = project / ".beagle" / module.GOAL_BASENAME
+    assert module._changed_locked_only(scope, goal, project) == ["tests/cases.json"]
+    note = module._locked_data_proof_note(["tests/cases.json"])
+    assert "must fail on the locked version of tests/cases.json" in note
+    assert "absence is the proof" not in note
+    record["title"] = "Implement the encoder"
+    (fake_beagle / "show.out").write_text(json.dumps(record))
+    assert module._locked_fix_reversion("T0011", ["src.py"], project, ["tests/cases.json"]) is None
+
+    edits = [("a\nb\nc\n", "a\nB\nc\n"), ("x\nx\ny\n", "x\ny\n"), ("p\nq\n", "p\nq\nr\n")]
+    for current, old in edits:
+        edit = module._reversion_edit(current, old)
+        assert edit is not None and current.count(edit[0]) == 1
+        assert current.replace(edit[0], edit[1]) == old
+    assert module._reversion_edit("same", "same") is None
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("committed", [False, True])
+async def test_close_next_step_agrees_with_already_passes(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    committed: bool,
+) -> None:
+    # R34 E66-E68: the failed-prove close's Next named a check the next open
+    # refused as "already passes, before any work".
+    project = _witnessed_pursuit(tmp_path, monkeypatch)
+    monkeypatch.chdir(project)
+    _r21_tree(project)
+    if committed:
+        _commit(project, "tests/test_case_data.py", "tests/cases.json")
+    _ready_task(fake_beagle, R21_CHECK)
+    runtime, _ = _bound(tmp_path)
+    step = _tool(runtime, "pursuit_step")
+    scope = ["tests/test_case_data.py"]
+    record = {"id": "T0002", "title": "Parser", "status": "open"}
+    record |= {"done_when": R21_CHECK, "scope": scope}
+    if committed:
+        # Opened before the files were committed: the open's gate never ran.
+        (fake_beagle / "show.out").write_text(json.dumps(record))
+        (fake_beagle / "next.out").write_text(json.dumps({"open": [{"id": "T0002"}]}))
+        args: dict[str, Any] = {"task": "T0002"}
+    else:
+        args = {"task": "T0002", "criteria": "c", "done_when": R21_CHECK, "scope": scope}
+
+    first = await step.execute("c1", args)
+
+    assert "no defect could be put back" in first.text, first.text
+    kept = f"its done_when, `{R21_CHECK}`, which passes, kept" in first.text
+    assert kept is not committed
+    if committed:
+        assert "refused as already passing" in first.text
+        return
+    (fake_beagle / "show.out").write_text(json.dumps(record))
+    (fake_beagle / "next.out").write_text(json.dumps({"open": [{"id": "T0002"}], "ready": []}))
+    route = {
+        "task": "T0002",
+        "new_route": True,
+        "done_when": R21_CHECK,
+        "scope": [*scope, "tests/cases.json"],
+        "notes": "Add the data file the test reads to the scope.",
+    }
+    again = await step.execute("c2", route)
+    assert "already passes" not in again.text, again.text
