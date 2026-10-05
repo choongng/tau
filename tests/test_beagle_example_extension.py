@@ -12577,3 +12577,100 @@ def test_sibling_check_ignores_files_committed_by_a_done_task(
     _git(project, "commit", "-q", "-m", "T0002: Data test")
 
     assert module._sibling_owned_check_problem(*check) is None
+
+
+@pytest.mark.anyio
+async def test_amended_check_is_not_refused_as_already_passing(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # R23 #11: the amend rebound T0002, then the old check's unproven mark
+    # refused the new, failing check as "already passes".
+    project = _pursuit_project(tmp_path)
+    monkeypatch.chdir(project)
+    monkeypatch.setenv("FAKE_TAU_SUCCEEDS_ON", "99")
+    _open_on_done_txt(project, fake_beagle, ["done.txt", "notes.txt"])
+    (project / "notes.txt").write_text("draft\n")
+    runtime, _ = _bound(tmp_path)
+    module = _loaded_module()
+    key = (str(Path.cwd()), "T0002")
+    module._UNPROVEN.add(key)
+    module._LAST_CHECK_EXIT[key] = 0
+
+    result = await _tool(runtime, "pursuit_step").execute(
+        "c1", {"task": "T0002", "done_when": "grep -q ready notes.txt", "attempts": 1}
+    )
+
+    [amend] = _pursuit_calls(fake_beagle, "amend")
+    assert amend[:3] == ["T0002", "--done-when", "grep -q ready notes.txt"]
+    assert "already passes" not in result.text and len(_runs(fake_tau)) == 1
+    assert "T0002's check is now `grep -q ready notes.txt`" in result.text
+    assert 'scope ["done.txt", "notes.txt"]' in result.text
+    assert key not in module._UNPROVEN
+
+
+@pytest.mark.anyio
+async def test_refusals_without_a_worker_do_not_count_toward_escalation(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # R23 #11-#14: two refusals that ran nothing made "3 steps on it" after one
+    # worker run, and the escalation followed.
+    project = _pursuit_project(tmp_path)
+    monkeypatch.chdir(project)
+    _open_on_done_txt(project, fake_beagle, ["done.txt"])
+    runtime, _ = _bound(tmp_path)
+    module = _loaded_module()
+    key = (str(Path.cwd()), "T0002")
+    module._UNPROVEN.add(key)
+    step = _tool(runtime, "pursuit_step")
+
+    results = [await step.execute(f"c{n}", {"task": "T0002"}) for n in range(4)]
+    _open_on_done_txt(project, fake_beagle, [])
+    module._UNPROVEN.discard(key)
+    results += [await step.execute(f"e{n}", {"task": "T0002"}) for n in range(4)]
+
+    assert _runs(fake_tau) == []
+    assert module._NOT_DONE.get(key, 0) == 0
+    for result in results:
+        assert "not run" in result.text and "steps on it" not in result.text
+        assert "runs no sub-agent" not in result.text
+
+
+@pytest.mark.anyio
+async def test_new_route_binds_a_bare_and_chain_like_open(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # R23 #10: new_route refused the bare '&&' that open had bound at #7.
+    project = _pursuit_project(tmp_path)
+    monkeypatch.chdir(project)
+    monkeypatch.setenv("FAKE_TAU_SUCCEEDS_ON", "99")
+    _open_on_done_txt(project, fake_beagle, ["done.txt", "notes.txt"])
+    (project / "notes.txt").write_text("draft\n")
+    check = "grep -q ready notes.txt && grep -q done done.txt"
+    (fake_beagle / "spawn.out").write_text("T0002 superseded by T0003\n")
+    successor = {"id": "T0003", "title": "Parser", "status": "open"}
+    successor |= {"done_when": "grep -q done done.txt", "scope": ["done.txt", "notes.txt"]}
+    (fake_beagle / "show-T0003.out").write_text(json.dumps(successor))
+    runtime, _ = _bound(tmp_path)
+
+    result = await _tool(runtime, "pursuit_step").execute(
+        "c1",
+        {"task": "T0002", "new_route": True, "notes": "write the notes", "done_when": check},
+    )
+
+    assert "no new route" not in result.text
+    assert f"bound through bash -c because of its bare '&&': `bash -c {shlex.quote(check)}`" in (
+        result.text
+    )
+    assert len(_pursuit_calls(fake_beagle, "spawn")) == 1

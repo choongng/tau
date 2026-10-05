@@ -7605,10 +7605,18 @@ def _killed_attempt_context(
     return "".join(f"{part}\n\n" for part in parts)
 
 
-def _not_done(root: Path, task: str, scope: list[str], text: str) -> AgentToolResult:
-    """Count a result that left `task` not done, and return it."""
+def _not_done(
+    root: Path, task: str, scope: list[str], text: str, *, ran: bool = True
+) -> AgentToolResult:
+    """Count a result that left `task` not done, and return it.
+
+    Only a result where a sub-agent ran counts toward ESCALATE_AFTER: run R23
+    counted two refusals that ran nothing, and escalated after one worker run.
+    """
     key = (str(root), task)
-    count = _NOT_DONE[key] = _NOT_DONE.get(key, 0) + 1
+    count = _NOT_DONE.get(key, 0) + (1 if ran else 0)
+    if ran:
+        _NOT_DONE[key] = count
     if scope:
         _NOT_DONE_SCOPE[key] = tuple(scope)
     if count >= ESCALATE_AFTER:
@@ -7949,6 +7957,13 @@ def make_step_tool() -> Any:
                         "differently, specifically. Call pursuit_step again with them."
                     )
                 old_check = str(record.get("done_when") or "").strip()
+                if done_when:
+                    # Run R23 #10: open and amend bound a bare '&&' that this refused.
+                    chained, prose = _and_chain(done_when)
+                    if prose is not None or chained is None:
+                        return _step_result(f"pursuit_step: no new route for {task} — {prose}")
+                    taken += _bound_note(done_when, chained)
+                    done_when = chained
                 problem = _check_problem(done_when or old_check)
                 if problem is not None:
                     if not done_when:
@@ -8210,6 +8225,18 @@ def make_step_tool() -> Any:
                 )
             opened = amended
             record = {**record, "done_when": done_when}
+            # Run R23 #11: the old check's unproven mark refused the new check as
+            # already passing. `beagle pursuit amend` takes no --scope, so the
+            # record keeps its scope and this step runs on the call's.
+            _UNPROVEN.discard((str(root), task))
+            _LAST_CHECK_EXIT.pop((str(root), task), None)
+            kept = _strings(record.get("scope"))
+            route += f"{task}'s check is now `{done_when}`, run on scope {json.dumps(own_scope)}"
+            route += (
+                f"; its record keeps scope {json.dumps(kept)}.\n\n"
+                if scope and kept and list(scope) != kept
+                else ".\n\n"
+            )
         elif not retrying and data_route is not None:
             # Run R16 resent T0002 and T0010 on such a check (#5, #6, #12, #13): the
             # open check had passed only because the test was not written yet.
@@ -8256,6 +8283,7 @@ def make_step_tool() -> Any:
                 f"it a new route that names its files: {call}. Add to it: "
                 + "; ".join(supply)
                 + ".",
+                ran=False,
             )
 
         if retrying:
@@ -8356,6 +8384,7 @@ def make_step_tool() -> Any:
                 )
                 + f': pursuit_step task="{task}", new_route=true, the new done_when and '
                 "notes; or split it with pursuit_plan.",
+                ran=False,
             )
         brief += "\n\n" + WITNESS_NOTE
         if retrying:
