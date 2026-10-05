@@ -4096,6 +4096,63 @@ async def test_compaction_leaves_half_threshold_headroom(tmp_path: Path) -> None
 
 
 @pytest.mark.anyio
+async def test_compaction_headroom_holds_for_a_long_summary(tmp_path: Path) -> None:
+    # R26's summaries ran 2.4-3.7k chars, well past the template the cut was
+    # sized with, so a fine-grained tail cut to the template left over half.
+    threshold = 34_000
+    summary = "## Goal\n" + "Implement the module, keeping every detail.\n" * 93
+    assert 3_900 <= len(summary) <= 4_200
+    storage = JsonlSessionStorage(tmp_path / "session.jsonl")
+    entries: list[AgentMessage] = [UserMessage(content="Implement the module.")]
+    for index in range(130):
+        call = ToolCall(id=f"call-{index}", name="read", arguments={"path": f"f{index}.py"})
+        entries.append(
+            AssistantMessage(content=assistant_content(f"step {index} " + "plan " * 80, [call]))
+        )
+        entries.append(
+            ToolResultMessage(tool_call_id=f"call-{index}", tool_name="read", content="line " * 80)
+        )
+    entries.append(AssistantMessage(content="Done reading."))
+    parent: str | None = None
+    for index, message in enumerate(entries):
+        await storage.append(MessageEntry(id=f"m{index}", parent_id=parent, message=message))
+        parent = f"m{index}"
+    provider = FakeProvider(
+        [
+            [
+                assistant_start(model="fake"),
+                assistant_done(message=AssistantMessage(content=summary)),
+            ],
+            [assistant_start(model="fake"), assistant_done(message=AssistantMessage(content="Ok"))],
+        ]
+    )
+    session = await CodingSession.load(
+        CodingSessionConfig(
+            provider=provider,
+            model="fake",
+            system="You are Tau.\n" + "rule " * 9_600,
+            storage=storage,
+            cwd=tmp_path,
+            auto_compact_token_threshold=threshold,
+        )
+    )
+    assert session.context_token_estimate > threshold
+
+    await _collect_session_events(session.prompt("Next."))
+
+    compactions = [entry for entry in await storage.read_all() if entry.type == "compaction"]
+    assert len(compactions) == 1
+    _model, system, sent, tools = provider.calls[1]
+    assert sent[0].text == "Previous conversation summary:\n" + summary.strip()
+    assert sent[-1].text == "Next."
+    after = estimate_context_tokens(system=system, messages=tuple(sent[:-1]), tools=tuple(tools))
+    assert after <= threshold // 2
+    kept = sent[1:-1]
+    assert kept[-1].text == "Done reading."
+    assert kept[0].role != "toolResult"
+
+
+@pytest.mark.anyio
 async def test_session_continue_auto_compacts_before_the_run_not_after(
     tmp_path: Path,
 ) -> None:

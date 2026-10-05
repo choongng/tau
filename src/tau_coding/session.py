@@ -70,7 +70,6 @@ from tau_coding.context_window import (
     COMPACTION_SUMMARY_PREFIX,
     DEFAULT_COMPACTION_KEEP_RECENT_TOKENS,
     DEFAULT_CONTEXT_WINDOW_TOKENS,
-    SUMMARIZATION_PROMPT,
     SUMMARIZATION_SYSTEM_PROMPT,
     ContextUsageEstimate,
     auto_compaction_threshold_for_context_window,
@@ -213,6 +212,11 @@ REPEATED_CALL_QUOTE = 300
 #: Tools that change the workspace: after one, a call's earlier result no
 #: longer predicts what it gives now, so the calls before it are forgotten.
 WORKSPACE_CHANGING_TOOLS = frozenset({"pursuit_step", "write", "edit"})
+#: Characters a compaction summary is held to. The cut reserves this much for
+#: the summary before it is written, so a long summary cannot push the
+#: compacted context past the headroom the cut left.
+COMPACTION_SUMMARY_MAX_CHARS = 8_000
+COMPACTION_SUMMARY_TRUNCATED = "\n\n[Summary truncated to fit the compaction budget.]"
 MAX_OUTPUT_LIMIT_CONTINUATIONS = 2
 MAX_OUTPUT_LIMIT_CONTINUATIONS_PER_RUN = 6
 OUTPUT_LIMIT_NUDGE = (
@@ -4229,6 +4233,9 @@ class CodingSession:
             messages,
             custom_instructions="\n\n".join(focus) or None,
         )
+        prompt += (
+            f"\n\nKeep the whole summary under {COMPACTION_SUMMARY_MAX_CHARS} characters."
+        )
         text_parts: list[str] = []
         final_text: str | None = None
         response_usages: list[Usage] = []
@@ -4255,7 +4262,7 @@ class CodingSession:
         if not summary:
             raise RuntimeError("Compaction summarization returned an empty summary")
         return _GeneratedSummary(
-            text=summary,
+            text=_hold_summary_to_budget(summary),
             usage=sum_usage(response_usages) if response_usages else None,
             provider=self.provider_name,
             model=self.model,
@@ -4326,22 +4333,17 @@ class CodingSession:
         The kept tail alone is sized by `_keep_recent_tokens`, but the system
         prompt, tools and summary come on top of it, so a small window could be
         left close to the threshold and compact again a few turns later. The
-        summary does not exist yet: the previous summary stands in for it, or
-        the summary template when there is none. A cut only lands on a message
-        that is not a tool result, and never past the last exchange: the last
-        such message, with the user message it answers when it is a reply.
+        summary does not exist yet, so it is counted at the size it is held to,
+        plus the open question carried after it for that cut. A cut only lands
+        on a message that is not a tool result, and never past the last
+        exchange: the last such message, with the user message it answers when
+        it is a reply.
         """
         threshold = self.auto_compact_token_threshold
         if threshold is None or threshold <= 0:
             return first_kept_index
         target = threshold // 2
-        previous = rows[0][1]
-        if isinstance(previous, UserMessage) and previous.text.startswith(
-            COMPACTION_SUMMARY_PREFIX
-        ):
-            summary = UserMessage(content=previous.text)
-        else:
-            summary = UserMessage(content=COMPACTION_SUMMARY_PREFIX + SUMMARIZATION_PROMPT)
+        reserved = "x" * COMPACTION_SUMMARY_MAX_CHARS
         system = self._harness.config.system
         tools = tuple(self._harness.config.tools)
         cuts = [
@@ -4357,6 +4359,11 @@ class CodingSession:
             cuts.pop()
         for index in cuts:
             kept = tuple(message for _entry_id, message in rows[index:])
+            question = self._open_question_before(rows[index][0])
+            summary = UserMessage(
+                content=COMPACTION_SUMMARY_PREFIX
+                + (reserved if question is None else with_open_question(reserved, question))
+            )
             total = estimate_context_tokens(system=system, messages=(summary, *kept), tools=tools)
             if total <= target:
                 return index
@@ -4437,6 +4444,18 @@ def _keep_recent_tokens(threshold: int | None) -> int:
     if threshold is None or threshold <= 0:
         return DEFAULT_COMPACTION_KEEP_RECENT_TOKENS
     return min(DEFAULT_COMPACTION_KEEP_RECENT_TOKENS, max(2_000, threshold // 4))
+
+
+def _hold_summary_to_budget(summary: str) -> str:
+    """Cut a summary longer than the budget back at a line break, marked as cut."""
+    if len(summary) <= COMPACTION_SUMMARY_MAX_CHARS:
+        return summary
+    room = COMPACTION_SUMMARY_MAX_CHARS - len(COMPACTION_SUMMARY_TRUNCATED)
+    head = summary[:room]
+    line_end = head.rfind("\n")
+    if line_end > room // 2:
+        head = head[:line_end]
+    return head.rstrip() + COMPACTION_SUMMARY_TRUNCATED
 
 
 def _first_recent_context_index(
