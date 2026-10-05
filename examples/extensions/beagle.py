@@ -6905,6 +6905,9 @@ _NOT_DONE_SCOPE: dict[tuple[str, str], tuple[str, ...]] = {}
 
 #: Not-done results after which a further step on the task dispatches no worker.
 ESCALATE_AFTER = 3
+# The breaker quotes a refused result's first line up to 300 characters
+# (REPEATED_CALL_QUOTE in tau core); an escalation's call must fit in it.
+ESCALATION_HEAD_CHARS = 290
 
 #: Not-done results after which the driver may not read the task's files.
 DRIVER_READS_UNTIL = 2
@@ -7381,6 +7384,7 @@ def _escalation(
     record: dict[str, Any] | None = None,
     root: Path | None = None,
     data_test_passes: bool = False,
+    bound_fails: bool = False,
 ) -> str:
     """The refusal of a step on a task `count` steps have left not done.
 
@@ -7388,21 +7392,36 @@ def _escalation(
     what that call lacks: run R15 sent twelve calls, E19-E41, that the same
     option list alone had refused. `data_test_passes` says the data test its
     bound check would give way to passes on the committed tree, so it is not
-    offered (see `_offered_data_test_passes`).
+    offered (see `_offered_data_test_passes`). `bound_fails` says the bound
+    check fails on the tree now, so a sub-agent can make it pass.
     """
-    lacks = (
-        _escalation_lacks(task, arguments, record, root, data_test_passes)
-        if arguments is not None
-        else []
+    if arguments is None:
+        return _escalation_options(
+            task, count, f"pursuit_step: {task} not run: {count} steps on it have left it not done."
+        )
+    lacks = _escalation_lacks(task, arguments, record, root, data_test_passes, bound_fails)
+    # Run R16 E34 dropped the done_when line, and the driver resent without it.
+    call = _working_call(task, arguments, record, root, data_test_passes, bound_fails)
+    # Run R23 E34-E46: the breaker quotes only a result's first line, so the call
+    # goes there, short enough to survive its quote, with notes elided if need be.
+    lead = f"pursuit_step: {task} not run — call instead: "
+    short = _working_call(
+        task, arguments, record, root, data_test_passes, bound_fails, bare=True
     )
-    head = f"pursuit_step: {task} not run: {count} steps on it have left it not done."
+    if len(lead) + len(short) > ESCALATION_HEAD_CHARS:
+        short = _working_call(
+            task, arguments, record, root, data_test_passes, bound_fails, bare=True,
+            notes="…",
+        )
+    head = f"{lead}{short}\n{count} steps on it have left it not done."
     if lacks:
         head += "\n" + "\n".join(f"- {line}" for line in lacks)
-    if arguments is not None:
-        # Run R16 E34 dropped the done_when line, and the driver resent without it.
-        head += "\nThe call that works, whole: " + _working_call(
-            task, arguments, record, root, data_test_passes
-        )
+    head += "\nThe call that works, whole: " + call
+    return _escalation_options(task, count, head)
+
+
+def _escalation_options(task: str, count: int, head: str) -> str:
+    """An escalation's `head`, then the options a task left not done has."""
     return (
         f"{head}\n{task} has had {count} steps without a pass, and another sub-agent on "
         "it, however its scope or notes are put, would only add one more. Choose one:\n"
@@ -7420,6 +7439,7 @@ def _escalation_lacks(
     record: dict[str, Any] | None,
     root: Path | None,
     data_test_passes: bool = False,
+    bound_fails: bool = False,
 ) -> list[str]:
     """What a step refused by the escalation lacks to be taken as a new route."""
     record = record or {}
@@ -7466,7 +7486,7 @@ def _escalation_lacks(
                 "path in this scope creates it. The check a sub-agent can pass is the data "
                 f"test only: done_when=\"{data_check}\".{_scope_note(needs, scope)}"
             )
-        elif done_when:
+        elif done_when and not _keeps_bound_check(bound_check, scope, root, bound_fails):
             lacks.append(
                 "Its done_when is the bound one: a new route needs a check a sub-agent on "
                 "this scope can pass."
@@ -7480,9 +7500,17 @@ def _working_call(
     record: dict[str, Any] | None,
     root: Path | None,
     data_test_passes: bool = False,
+    bound_fails: bool = False,
+    *,
+    bare: bool = False,
+    notes: str | None = None,
 ) -> str:
-    """The new-route call an escalation takes, spelled out with every argument it needs."""
+    """The new-route call an escalation takes, spelled out with every argument it needs.
+
+    `bare` leaves out what to add to it; `notes` stands in for the call's own.
+    """
     record = record or {}
+    record_scope = _strings(record.get("scope"))
     done_when = " ".join(str(arguments.get("done_when") or "").split())
     bound_check = " ".join(str(record.get("done_when") or "").split())
     scope = _strings(arguments.get("scope")) or _strings(record.get("scope"))
@@ -7504,14 +7532,20 @@ def _working_call(
             needs = route[3]
     elif route is not None:
         check, needs = route[2], route[3]
-    notes = str(arguments.get("notes") or "").strip()
+    elif _keeps_bound_check(bound_check, scope, root, bound_fails):
+        # Run R23 E30: the model's own amended check failed on the tree and ran a
+        # test in its scope, and the escalation called it the bound one.
+        check = bound_check
+    given = str(arguments.get("notes") or "").strip()
     call = f"pursuit_step task={json.dumps(task)}, new_route=true"
     if check:
         call += f", done_when={json.dumps(check)}"
-    if needs != scope or unproven is not None:
+    if needs != scope or needs != record_scope or unproven is not None:
         call += f", scope={json.dumps(needs)}"
-    if notes:
-        call += f", notes={json.dumps(notes, ensure_ascii=False)}"
+    if given:
+        call += f", notes={json.dumps(given if notes is None else notes, ensure_ascii=False)}"
+    if bare:
+        return call
     # Run R21: a `<…>` placeholder in this call was sent as is; say what to add instead.
     supply = []
     if not check:
@@ -7519,11 +7553,67 @@ def _working_call(
             "done_when, a check a sub-agent on this scope can pass that fails until the "
             "work is done"
         )
-    if not notes:
+    if not given:
         supply.append("notes, saying what the new route does differently")
     if supply:
         call += ". Add to it: " + "; ".join(supply) + "."
     return call
+
+
+async def _bound_check_fails(
+    task: str, arguments: dict[str, Any], record: dict[str, Any], root: Path
+) -> bool:
+    """Whether the task's bound check, which the call leaves as is, fails on the tree
+    now: by its last run, or else by a run now that `_check_broke` does not refuse."""
+    bound_check = " ".join(str(record.get("done_when") or "").split())
+    done_when = " ".join(str(arguments.get("done_when") or "").split())
+    if not bound_check or done_when not in ("", bound_check):
+        return False
+    last = _LAST_CHECK_EXIT.get((str(root), task))
+    if last is not None:
+        return last != 0
+    rc, out = await _run_check(bound_check, root, DEFAULT_CHECK_TIMEOUT)
+    return rc != 0 and _check_broke(rc, out) is None
+
+
+def _keeps_bound_check(
+    bound_check: str, scope: list[str], root: Path | None, bound_fails: bool
+) -> bool:
+    """Whether a new route keeps `bound_check`: it fails on the tree now, every file
+    it runs is in `scope`, and it does not wait on a module no path there writes."""
+    if not (bound_fails and bound_check and root is not None):
+        return False
+    runs = _check_run_files(bound_check, root)
+    return (
+        bool(runs)
+        and all(_in_scope(rel, scope, root) for rel in runs)
+        and _imports_unwritten(bound_check, scope, root) is None
+    )
+
+
+def _check_run_files(check: str, root: Path) -> list[str]:
+    """The project paths a check names, with the .py files it names not yet written."""
+    found = _check_targets(check, root)
+    try:
+        words = shlex.split(check)
+        parts = [
+            part
+            for word in words
+            for part in (shlex.split(word) if " " in word and not word.startswith("-") else [word])
+        ]
+    except ValueError:
+        return found
+    for part in parts:
+        rel = part.split("::")[0].rstrip("/")
+        path = Path(rel)
+        if (
+            rel.endswith(".py")
+            and not path.is_absolute()
+            and ".." not in path.parts
+            and rel not in found
+        ):
+            found.append(rel)
+    return found
 
 
 def _unproven_data_route(
@@ -8031,6 +8121,7 @@ def make_step_tool() -> Any:
                     record,
                     root,
                     await _offered_data_test_passes(arguments, record, root),
+                    await _bound_check_fails(task, arguments, record, root),
                 )
             )
         if not retrying and task not in open_ids and record.get("status") != "open":
@@ -8356,34 +8447,51 @@ def make_step_tool() -> Any:
             # Opened before this guard, or by hand: still no worker on it.
             return _step_result(f"pursuit_step: {task} not run — {mixed}")
         if unproven_key in _UNPROVEN:
+            # Run R23: the breaker quotes only a result's first line; the call goes there.
+            call = f'pursuit_step task="{task}", new_route=true'
+            if tests_only and missing_data:
+                call += (
+                    f", done_when={json.dumps(check)}, "
+                    f'scope={json.dumps([*scope, *missing_data])}, notes="…"'
+                )
+                how = (
+                    TESTS_ONLY_PROOF_NOTE
+                    + f" The test it runs reads {', '.join(missing_data)}, outside this "
+                    f"scope: the new route keeps its done_when, `{check}`, which passes, "
+                    "and adds that file to its scope"
+                )
+            elif tests_only and _scope_has_data(scope):
+                call += ", a done_when running the data file's test, scope naming that file, notes"
+                how = (
+                    TESTS_ONLY_PROOF_NOTE
+                    + " The new route's done_when runs that file's test and its scope "
+                    "names the data file"
+                )
+            elif tests_only:
+                call += ", a done_when running the test that imports the module, notes"
+                how = (
+                    TESTS_ONLY_MUTATE_NOTE
+                    + " The new route's done_when runs the test that imports it"
+                )
+            else:
+                call += ", a done_when running a test that imports this task's code, notes"
+                how = (
+                    "The new route's done_when imports the code this task tests and runs "
+                    "it (e.g. `python3 -m pytest -q tests/test_<this task>.py`, a test "
+                    "that imports the module), with that code's source file in scope"
+                )
             return _not_done(
                 root,
                 task,
                 scope,
-                f"pursuit_step: {task} not run: this check already passes and cannot be "
+                f"pursuit_step: {task} not run — call instead: {call}; or split it with "
+                "pursuit_plan.\n"
+                "This check already passes and cannot be "
                 f"shown to refuse, since no defect could be put back into a file in its "
                 f"scope ({', '.join(scope) or 'none'}). Another sub-agent would change "
                 "nothing, whatever check or scope this task is sent with. "
-                + (
-                    TESTS_ONLY_PROOF_NOTE
-                    + f" The test it runs reads {', '.join(missing_data)}, outside this "
-                    f"scope. Give it a new route that keeps its done_when, `{check}`, "
-                    f"which passes, with scope={json.dumps([*scope, *missing_data])}"
-                    if tests_only and missing_data
-                    else TESTS_ONLY_PROOF_NOTE
-                    + " Give it a new route whose done_when runs that file's test and "
-                    "whose scope names the data file"
-                    if tests_only and _scope_has_data(scope)
-                    else TESTS_ONLY_MUTATE_NOTE
-                    + " Give it a new route whose done_when runs the test that imports it"
-                    if tests_only
-                    else "Give it a new route whose done_when imports the code this task "
-                    "tests and runs it (e.g. `python3 -m pytest -q "
-                    "tests/test_<this task>.py`, a test that imports the module), with "
-                    "that code's source file in scope"
-                )
-                + f': pursuit_step task="{task}", new_route=true, the new done_when and '
-                "notes; or split it with pursuit_plan.",
+                + how
+                + ". Its notes say what the new route does differently.",
                 ran=False,
             )
         brief += "\n\n" + WITNESS_NOTE

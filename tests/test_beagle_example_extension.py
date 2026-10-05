@@ -6619,7 +6619,8 @@ async def test_unprovable_restep_spawns_no_worker(
     assert len(_runs(fake_tau)) == 1
     assert "no defect could be put back" in first.text and "stays open" in first.text
     for refused in (again, same):
-        assert "not run: this check already passes and cannot be shown to refuse" in refused.text
+        assert "not run — call instead: " in refused.text
+        assert "This check already passes and cannot be shown to refuse" in refused.text
         # R12: a tests-only scope with no data file proves through the module it imports.
         assert "mutate the module the test imports" in refused.text
         assert "the data file's absence is the proof" not in refused.text
@@ -8250,7 +8251,11 @@ async def test_fourth_step_after_three_not_done_is_refused_with_choices(
     assert all("stays open" in r.text for r in results)
     assert "The next step on it runs no sub-agent" in results[2].text
     for refused in (fourth, fifth):
-        assert refused.text.startswith("pursuit_step: T0002 not run: 3 steps on it")
+        assert refused.text.startswith(
+            'pursuit_step: T0002 not run — call instead: pursuit_step task="T0002", '
+            "new_route=true"
+        )
+        assert "\n3 steps on it have left it not done." in refused.text
         assert 'pursuit_plan task="T0002"' in refused.text
         assert 'pursuit_step task="T0002", new_route=true' in refused.text
         assert "tell the user what blocks it" in refused.text
@@ -8336,7 +8341,8 @@ async def test_unproven_memory_keyed_by_task_survives_scope_change(
     assert len(_runs(fake_tau)) == 1
     assert "no defect could be put back" in first.text
     assert "new_route=true" in first.text
-    assert "not run: this check already passes and cannot be shown to refuse" in rescoped.text
+    assert "not run — call instead: " in rescoped.text
+    assert "This check already passes and cannot be shown to refuse" in rescoped.text
     assert "whatever check or scope" in rescoped.text
     assert 'pursuit_step task="T0002", new_route=true' in rescoped.text
 
@@ -10320,12 +10326,123 @@ async def test_escalation_names_the_missing_new_route_flag(
 
     assert len(_runs(fake_tau)) == 3
     assert first.text == again.text
-    assert first.text.startswith("pursuit_step: T0002 not run: 3 steps on it")
+    assert first.text.startswith(
+        'pursuit_step: T0002 not run — call instead: pursuit_step task="T0002", new_route=true'
+    )
+    assert "\n3 steps on it have left it not done." in first.text
     lacks = first.text.index("This call has no new_route=true")
     assert lacks < first.text.index("Choose one:")
-    assert "Its done_when is the bound one: a new route needs a check" in first.text
-    assert 'pursuit_step task="T0002", new_route=true' in first.text
+    # Run R23: a bound check that fails now and runs files in scope is kept.
+    assert "Its done_when is the bound one" not in first.text
+    assert f"done_when={json.dumps(R15_CHECK)}" in first.text.splitlines()[0]
     assert _pursuit_calls(fake_beagle, "spawn") == []
+
+
+#: R23 #11-#14: the model's own check, amended onto T0002, failed (the test was
+#: unwritten); the record kept scope docs/reference-notes.md.
+R23_CHECK = "python3 -m pytest -q tests/test_case_data.py"
+R23_CALL_SCOPE = ["tests/cases.json", "tests/test_case_data.py"]
+R23_RECORD = {
+    "id": "T0002",
+    "status": "open",
+    "criteria": "c",
+    "done_when": R23_CHECK,
+    "scope": ["docs/reference-notes.md"],
+}
+
+
+def _quoted_head(text: str) -> str:
+    """What tau core's breaker quotes of a refused result: its first non-empty line,
+    up to REPEATED_CALL_QUOTE characters."""
+    from tau_coding.session import REPEATED_CALL_QUOTE
+
+    first = next(line.strip() for line in text.splitlines() if line.strip())
+    return first[:REPEATED_CALL_QUOTE]
+
+
+def test_escalation_first_line_holds_the_working_call(tmp_path: Path) -> None:
+    # R23 E34-E46: the breaker quoted only "T0002 not run: 3 steps on it have left
+    # it not done."; the working call was on line 4, and the model saw none.
+    module = _module()
+    call = {"task": "T0002", "done_when": R23_CHECK, "scope": R23_CALL_SCOPE}
+    short = {**call, "notes": "Write the data test."}
+    long = {**call, "notes": "Write the data test. " * 30}
+
+    for arguments in (short, long):
+        text = module._escalation("T0002", 3, arguments, R23_RECORD, tmp_path, False, True)
+        head = _quoted_head(text)
+        assert head == text.splitlines()[0]
+        assert head.startswith(
+            'pursuit_step: T0002 not run — call instead: pursuit_step task="T0002", '
+            f"new_route=true, done_when={json.dumps(R23_CHECK)}, "
+            f"scope={json.dumps(R23_CALL_SCOPE)}, notes="
+        )
+        assert "\n3 steps on it have left it not done." in text
+        assert text.index("Choose one:") > len(head)
+    assert _quoted_head(
+        module._escalation("T0002", 3, short, R23_RECORD, tmp_path, False, True)
+    ).endswith('notes="Write the data test."')
+    elided = module._escalation("T0002", 3, long, R23_RECORD, tmp_path, False, True)
+    assert _quoted_head(elided).endswith('notes="…"')
+    assert json.dumps(long["notes"].strip()) in elided
+
+
+def test_escalation_keeps_a_failing_bound_check_in_the_working_call(tmp_path: Path) -> None:
+    # R23 E30: "Its done_when is the bound one", of the model's own check that
+    # failed on the tree and ran a test in the call's scope; the call dropped it.
+    module = _module()
+    arguments = {"task": "T0002", "done_when": R23_CHECK, "scope": R23_CALL_SCOPE, "notes": "n"}
+    kept = f"done_when={json.dumps(R23_CHECK)}"
+
+    failing = module._escalation("T0002", 3, arguments, R23_RECORD, tmp_path, False, True)
+    passing = module._escalation("T0002", 3, arguments, R23_RECORD, tmp_path, False, False)
+    outside = module._escalation(
+        "T0002", 3, {**arguments, "scope": ["src/x.py"]}, R23_RECORD, tmp_path, False, True
+    )
+
+    assert kept in failing.splitlines()[0]
+    assert "is the bound one" not in failing and "Add to it: done_when" not in failing
+    for refused in (passing, outside):
+        assert kept not in refused
+        assert "Its done_when is the bound one" in refused
+
+
+@pytest.mark.anyio
+async def test_bound_check_fails_by_its_last_run_or_a_pre_run(tmp_path: Path) -> None:
+    module = _module()
+    check = "test -f tests/test_case_data.py"
+    record = {**R23_RECORD, "done_when": check}
+    key = (str(tmp_path), "T0002")
+    module._LAST_CHECK_EXIT.pop(key, None)
+
+    assert await module._bound_check_fails("T0002", {}, record, tmp_path)
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "tests" / "test_case_data.py").write_text("", encoding="utf-8")
+    assert not await module._bound_check_fails("T0002", {}, record, tmp_path)
+    assert not await module._bound_check_fails(
+        "T0002", {"done_when": "true"}, record, tmp_path
+    )
+    module._LAST_CHECK_EXIT[key] = 1
+    try:
+        assert await module._bound_check_fails("T0002", {}, record, tmp_path)
+    finally:
+        module._LAST_CHECK_EXIT.pop(key, None)
+
+
+def test_working_call_names_scope_when_it_differs_from_the_record(tmp_path: Path) -> None:
+    # R23 E30/E32: the call's scope was tests/, the record's docs/reference-notes.md,
+    # and the working call named none, so a new route would have kept the record's.
+    module = _module()
+    arguments = {"task": "T0002", "done_when": "grep -q x tests/cases.json", "notes": "n"}
+    scoped = module._working_call(
+        "T0002", {**arguments, "scope": R23_CALL_SCOPE}, R23_RECORD, tmp_path
+    )
+    same = module._working_call(
+        "T0002", {**arguments, "scope": R23_RECORD["scope"]}, R23_RECORD, tmp_path
+    )
+
+    assert f"scope={json.dumps(R23_CALL_SCOPE)}" in scoped
+    assert "scope=" not in same
 
 
 @pytest.mark.anyio
@@ -10876,7 +10993,10 @@ async def test_escalation_takes_its_proposed_data_test_done_when_as_new_route(
     taken = await step.execute("c15", dict(R16_STEP_15))
 
     assert f'done_when="{R16_DATA_CHECK}"' in escalated.text
-    assert refused.text.startswith("pursuit_step: T0010 not run: 3 steps on it")
+    assert refused.text.startswith(
+        'pursuit_step: T0010 not run — call instead: pursuit_step task="T0010", new_route=true'
+    )
+    assert "\n3 steps on it have left it not done." in refused.text
     assert "This call has no new_route=true" in refused.text
     assert taken.text.startswith(
         f'Took done_when="{R16_DATA_CHECK}" as T0010\'s new route without new_route=true'
@@ -10973,7 +11093,7 @@ def test_escalation_after_unproven_pass_keeps_the_bound_check_and_adds_the_data_
         f'done_when="{R21_CHECK}", scope={scoped}, notes={json.dumps(notes)}'
     )
     assert working in resent and working in e97
-    lacks = e97[: e97.index("The call that works")]
+    lacks = e97[e97.index("steps on it") : e97.index("The call that works")]
     assert "This call has no new_route=true" in lacks
     assert "Its scope lacks" not in lacks and "done_when" not in lacks
 
@@ -12046,7 +12166,10 @@ async def test_escalation_does_not_offer_a_data_test_that_passes_on_the_committe
 
     refused = await step.execute("c14", dict(R16_STEP_14))
 
-    assert refused.text.startswith("pursuit_step: T0010 not run: 3 steps on it")
+    assert refused.text.startswith(
+        'pursuit_step: T0010 not run — call instead: pursuit_step task="T0010", new_route=true'
+    )
+    assert "\n3 steps on it have left it not done." in refused.text
     assert f'done_when="{R16_DATA_CHECK}"' not in refused.text
     assert "already passes on the committed tree" in refused.text
 
@@ -12530,7 +12653,8 @@ async def test_no_worker_when_the_check_passes_and_was_unproven(
 
     result = await _tool(runtime, "pursuit_step").execute("c1", {"task": "T0002"})
 
-    assert "T0002 not run: this check already passes" in result.text
+    assert "T0002 not run — call instead: " in result.text
+    assert "This check already passes" in result.text
     assert 'pursuit_step task="T0002", new_route=true' in result.text
     assert _runs(fake_tau) == []
 
