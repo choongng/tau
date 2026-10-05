@@ -5543,13 +5543,65 @@ def _self_import_note(command: str, scope: list[str], root: Path) -> str:
     Run R26 W5 put `import cobs` into tests/test_case_data.py; `_data_test_route`
     then proposed binding that same test, and no worker ran to drop the import.
     """
-    found = _imports_unwritten(command, scope, root) if scope else None
-    if found is None or _data_test(found[0], scope, root) != found[0]:
+    found = _self_import(command, scope, root)
+    if found is None:
         return ""
     test, module = found
     return (
         f"\n\n{test} imports {module}, which no path in this scope creates; a data test "
         "reads only the data file and imports none of the code: remove that import."
+    )
+
+
+def _self_import(command: str, scope: list[str], root: Path | None) -> tuple[str, str] | None:
+    """(test, module) for a check whose data test imports unwritten code, or None."""
+    found = _imports_unwritten(command, scope, root) if scope and root and command else None
+    if found is None or _data_test(found[0], scope, root) != found[0]:
+        return None
+    return found
+
+
+def _data_self_import(
+    command: str, scope: list[str], root: Path | None
+) -> tuple[str, str] | None:
+    """`_self_import` for a scope of data and tests only, where the test is a data test."""
+    if not (_scope_has_data(scope) and _only_data_and_tests(scope)):
+        return None
+    return _self_import(command, scope, root)
+
+
+def _drop_self_import_restore(notes: str, command: str, scope: list[str], root: Path | None) -> str:
+    """`notes`, or the self-import note in their place when they name the module the
+    check's data test must not import, together with an import.
+
+    Run R27 #15/#16 asked to "restore the module-level `from cobs import …`", and E32's
+    offered call carried that note verbatim against the self-import note.
+    """
+    found = _data_self_import(command, scope, root)
+    if found is None or root is None:
+        return notes
+    module = found[1].split(".")[0]
+    if re.search(rf"\b{re.escape(module)}\b", notes) and "import" in notes.lower():
+        return _self_import_note(command, scope, root).strip()
+    return notes
+
+
+def _known_answers_note(command: str, scope: list[str], root: Path) -> str:
+    """The brief's proof note for a scope of data and tests: the data test imports no code.
+
+    Run R27 W3's brief held only `WITNESS_NOTE`, pointing at "the code they test", and
+    W3 wrote `from cobs import …` into tests/test_case_data.py.
+    """
+    data = next(r.rstrip("/") for r in scope if Path(r.rstrip("/")).suffix not in {"", ".py"})
+    runs = [rel for rel in _check_test_files(command, root) if rel.endswith(".py")]
+    test = next(
+        (t for t in runs if _cases_test_reads(root / t, Path(data).name)),
+        next((t for t in runs if _in_scope(t, scope, root)), _data_test("", scope, root)),
+    )
+    return (
+        f"{test} is the check: it reads {data} and imports none of the code (no task has "
+        "written it yet); a test that imports the code is not run by this check. "
+        + _tests_only_proof_note(command, scope, root)
     )
 
 
@@ -6833,6 +6885,7 @@ def _unproven_call(
         test = tests[0] if tests else "the test"
         done_when = check or (f"python3 -m pytest -q {tests[0]}" if tests else "")
         notes = f"Make {test} import the module it tests, from a file added to scope"
+    notes = _drop_self_import_restore(notes, check, scope, root)
     routed = [*scope, *[rel for rel in added if rel not in scope]]
     call = (
         f'pursuit_step task="{task}", new_route=true, done_when={json.dumps(done_when)}, '
@@ -8347,7 +8400,9 @@ def _working_call(
         # Run R23 E30: the model's own amended check failed on the tree and ran a
         # test in its scope, and the escalation called it the bound one.
         check = bound_check
-    given = str(arguments.get("notes") or "").strip()
+    given = _drop_self_import_restore(
+        str(arguments.get("notes") or "").strip(), bound_check, record_scope or scope, root
+    )
     call = f"pursuit_step task={json.dumps(task)}, new_route=true"
     if check:
         call += f", done_when={json.dumps(check)}"
@@ -9372,7 +9427,11 @@ def make_step_tool() -> Any:
                 + ". Its notes say what the new route does differently.",
                 ran=False,
             )
-        brief += "\n\n" + WITNESS_NOTE
+        brief += "\n\n" + (
+            _known_answers_note(check, scope, root)
+            if tests_only and _scope_has_data(scope)
+            else WITNESS_NOTE
+        )
         asked_scope = _strings(arguments.get("scope"))
         kept = _strings(record.get("scope"))
         if (
@@ -10729,8 +10788,15 @@ def make_worker_scope_guard() -> Any:
             )
         # Run R20: W1 and W2, refused the module, built it in /tmp, where it was lost.
         imported = ""
+        needed = f", and report that {rel} is needed."
         with contextlib.suppress(Exception):
-            if _check_imports(_task_check(goal, task), root, rel):
+            bound = _task_check(goal, task)
+            # Run R27 W4-W6: "the check imports cobs/__init__.py" kept the data test's
+            # import that the self-import note said to remove.
+            if _data_self_import(bound, scope, root):
+                needed = "."
+                imported = " " + _self_import_note(bound, scope, root).strip()
+            elif _check_imports(bound, root, rel):
                 imported = (
                     f" {task}'s check imports {rel}, so the check cannot pass while it is "
                     "outside the scope: say so in your report."
@@ -10740,8 +10806,8 @@ def make_worker_scope_guard() -> Any:
             reason=(
                 f"refusing to write {rel}: it is outside {task}'s scope "
                 f"({', '.join(scope)}). Work written outside {task}'s scope is not its work "
-                f"and is lost when the step ends: do what the scope holds, and report that "
-                f"{rel} is needed.{imported}{source}"
+                f"and is lost when the step ends: do what the scope holds{needed}"
+                f"{imported}{source}"
             ),
         )
 

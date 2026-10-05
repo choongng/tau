@@ -13985,6 +13985,119 @@ async def test_data_test_route_does_not_propose_the_importing_test_itself(
     ) in run["stdin"]
 
 
+async def _first_known_answers_brief(
+    tmp_path: Path, fake_beagle: Path, fake_tau: Path, monkeypatch: pytest.MonkeyPatch
+) -> str:
+    project = _pursuit_project(tmp_path)
+    monkeypatch.chdir(project)
+    check = _case_data_test(project)
+    monkeypatch.setenv("FAKE_TAU_SUCCEEDS_ON", "99")
+    record = {"id": "T0003", "title": "Known answers", "status": "open"}
+    record |= {"scope": R26_DATA_SCOPE, "criteria": "cases", "done_when": check}
+    (fake_beagle / "show.out").write_text(json.dumps(record))
+    (fake_beagle / "next.out").write_text(json.dumps({"open": ["T0003"], "ready": []}))
+    (fake_beagle / "brief.out").write_text("# T0003: Known answers\n")
+    runtime, _ = _bound(tmp_path)
+    await _tool(runtime, "pursuit_step").execute("c1", {"task": "T0003", "attempts": 1})
+    [run] = _runs(fake_tau)
+    return run["stdin"]
+
+
+@pytest.mark.anyio
+async def test_known_answers_first_brief_says_data_test_imports_nothing(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # R27 W3's brief never said the data test imports no code; W3 wrote
+    # `from cobs import ...` into it.
+    brief = await _first_known_answers_brief(tmp_path, fake_beagle, fake_tau, monkeypatch)
+
+    assert (
+        "tests/test_case_data.py is the check: it reads tests/cases.json and imports none "
+        "of the code (no task has written it yet)"
+    ) in brief
+    assert _module().TESTS_ONLY_PROOF_NOTE in brief
+
+
+@pytest.mark.anyio
+async def test_known_answers_brief_omits_code_witness_note(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    brief = await _first_known_answers_brief(tmp_path, fake_beagle, fake_tau, monkeypatch)
+
+    assert _module().WITNESS_NOTE not in brief
+    assert "in the code they test" not in brief
+
+
+def _self_importing_data_test(project: Path) -> str:
+    check = _case_data_test(project)
+    data_test = project / "tests" / "test_case_data.py"
+    data_test.write_text("from cobs import cobs_decode\n" + data_test.read_text())
+    (project / ".beagle" / "tree").mkdir(parents=True, exist_ok=True)
+    (project / ".beagle" / "tree" / "T0003.md").write_text(
+        f'+++\nid = "T0003"\ndone_when = "{check}"\n+++\n'
+    )
+    return check
+
+
+SELF_IMPORT_NOTE = (
+    "tests/test_case_data.py imports cobs, which no path in this scope creates; a data "
+    "test reads only the data file and imports none of the code: remove that import."
+)
+
+
+@pytest.mark.anyio
+async def test_scope_guard_out_of_scope_import_from_data_test_says_remove_import(
+    tmp_path: Path, beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # R27 W4-W6 were told the check needs cobs/__init__.py, against the self-import note.
+    runtime = _scoped_worker(tmp_path, monkeypatch, scope="\n".join(R26_DATA_SCOPE))
+    _self_importing_data_test(Path.cwd())
+    write = _tool_with_hooks(runtime, "write")
+
+    result = await write.execute("c1", {"path": "cobs/__init__.py", "content": "x = 1\n"})
+
+    assert "refusing to write cobs/__init__.py" in result.text
+    assert SELF_IMPORT_NOTE in result.text
+    assert "cannot pass while it is outside" not in result.text
+    assert "is needed" not in result.text
+
+
+def test_not_run_call_does_not_carry_notes_restoring_self_import(tmp_path: Path) -> None:
+    # R27 E32's call that works, whole, carried the driver's "restore the
+    # module-level `from cobs import ...`" note verbatim.
+    project = _pursuit_project(tmp_path)
+    check = _self_importing_data_test(project)
+    module = _module()
+    record = {"id": "T0003", "scope": R26_DATA_SCOPE, "done_when": check}
+    restore = (
+        "restore the module-level `from cobs import cobs_decode, cobs_encode` in "
+        "tests/test_case_data.py, and confirm cobs/__init__.py exists"
+    )
+
+    refusal = module._escalation(
+        "T0003", 3, {"task": "T0003", "notes": restore}, record, project
+    )
+    kept = module._escalation(
+        "T0003", 3, {"task": "T0003", "notes": "Fix the hex of case 4"}, record, project
+    )
+
+    assert "restore the module-level" not in refusal
+    assert "The call that works, whole: " in refusal
+    whole = refusal.split("The call that works, whole: ", 1)[1]
+    assert json.dumps(SELF_IMPORT_NOTE) in whole
+    assert "Fix the hex of case 4" in kept
+    notes = module._drop_self_import_restore(restore, check, R26_DATA_SCOPE, project)
+    assert notes == SELF_IMPORT_NOTE
+
+
 def test_runs_test_file_sees_python_script_run(tmp_path: Path) -> None:
     # R26 bound T0007-T0011 to `python3 tests/test_case_data.py`; no helper saw the
     # test run, so the proof note said to mutate a module it did not import.
