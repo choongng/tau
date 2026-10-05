@@ -2019,7 +2019,8 @@ def _reference_name(url: str, taken: set[str]) -> str:
 
 
 class _HtmlText(html.parser.HTMLParser):
-    """An HTML page's text, script and style left out, block elements on their own lines."""
+    """An HTML page's text: script, style and page chrome left out, blocks and table rows on
+    their own lines, cells in a row kept apart by " | "."""
 
     _SKIP = frozenset({"script", "style", "noscript", "template", "svg", "head"})
     _BLOCK = frozenset(
@@ -2049,25 +2050,65 @@ class _HtmlText(html.parser.HTMLParser):
         }
     )
 
+    # Page chrome: always left out, or (header, footer) only outside the article or main body,
+    # where a header can hold the article's own title.
+    _CHROME = frozenset({"nav", "aside"})
+    _PAGE_CHROME = frozenset({"header", "footer"})
+    _CONTENT = frozenset({"article", "main"})
+
     def __init__(self) -> None:
         super().__init__(convert_charrefs=True)
         self.parts: list[str] = []
         self._skipping = 0
+        self._chrome_tag = ""
+        self._chrome_depth = 0
+        self._in_content = 0
+        self._row_has_cell = False
+
+    def _is_chrome(self, tag: str, attrs: Any) -> bool:
+        if tag in self._CHROME:
+            return True
+        if tag in self._PAGE_CHROME and not self._in_content:
+            return True
+        return any(k == "role" and (v or "").strip().lower() == "navigation" for k, v in attrs)
 
     def handle_starttag(self, tag: str, attrs: Any) -> None:
+        if self._chrome_depth:
+            if tag == self._chrome_tag:
+                self._chrome_depth += 1
+            return
         if tag in self._SKIP:
             self._skipping += 1
-        elif tag in self._BLOCK:
+        elif self._is_chrome(tag, attrs):
+            self._chrome_tag, self._chrome_depth = tag, 1
             self.parts.append("\n")
+        else:
+            if tag in self._CONTENT:
+                self._in_content += 1
+            if tag == "tr":
+                self._row_has_cell = False
+            elif tag in ("td", "th"):
+                if self._row_has_cell and not self._skipping:
+                    self.parts.append(" | ")
+                self._row_has_cell = True
+            if tag in self._BLOCK:
+                self.parts.append("\n")
 
     def handle_endtag(self, tag: str) -> None:
+        if self._chrome_depth:
+            if tag == self._chrome_tag:
+                self._chrome_depth -= 1
+            return
         if tag in self._SKIP:
             self._skipping = max(0, self._skipping - 1)
-        elif tag in self._BLOCK:
-            self.parts.append("\n")
+        else:
+            if tag in self._CONTENT:
+                self._in_content = max(0, self._in_content - 1)
+            if tag in self._BLOCK:
+                self.parts.append("\n")
 
     def handle_data(self, data: str) -> None:
-        if not self._skipping:
+        if not self._skipping and not self._chrome_depth:
             self.parts.append(data)
 
     def text(self) -> str:

@@ -2287,6 +2287,62 @@ def test_reference_extract_is_title_and_opening() -> None:
     assert module._reference_extract(html_page) == "ITC paper\n\nShort body."
 
 
+def _html_text(page: str) -> str:
+    parser = _module()._HtmlText()
+    parser.feed(page)
+    parser.close()
+    return parser.text()
+
+
+def test_html_text_keeps_table_cells_apart_and_drops_page_chrome() -> None:
+    page = (
+        "<html><head><title>COBS</title></head><body>"
+        '<a href="#content">Jump to content</a>'
+        '<header class="mw-header"><a>Main menu</a> Search <a>Donate</a></header>'
+        '<div role="navigation" class="vector-main-menu"><div><ul><li>Contents</li></ul></div>'
+        "<li>Random article</li></div>"
+        "<nav><ul><li>Create account</li><li>Log in</li></ul></nav>"
+        '<main id="content"><header class="mw-body-header"><h1>Consistent Overhead Byte '
+        "Stuffing</h1></header>"
+        "<div><p>COBS encodes a <b>packet</b> so that it holds no zero byte.</p>"
+        "<aside>Related articles</aside>"
+        "<table><tr><th>Example</th><th>Unencoded data (hex)</th><th>Encoded with COBS</th></tr>"
+        "<tr><td>7</td><td>01 02 03 ... FD FE</td><td>FF 01 02 03 ... FD FE 00</td></tr>"
+        "<tr><td>8</td><td><table><tr><td>a</td><td>b</td></tr></table></td><td>c</td></tr>"
+        "</table>"
+        "<p>Overhead is at most one byte in 254.</p></div></main>"
+        "<footer><ul><li>Privacy policy</li></ul></footer>"
+        "</body></html>"
+    )
+    text = _html_text(page)
+    lines = text.splitlines()
+
+    assert "Example | Unencoded data (hex) | Encoded with COBS" in lines
+    assert "7 | 01 02 03 ... FD FE | FF 01 02 03 ... FD FE 00" in lines
+    assert "701 02 03" not in text
+    assert "a | b" in lines
+    assert "a | b | c" not in text
+
+    for chrome in (
+        "Main menu",
+        "Donate",
+        "Contents",
+        "Random article",
+        "Create account",
+        "Log in",
+        "Related articles",
+        "Privacy policy",
+    ):
+        assert chrome not in text, chrome
+    assert "Consistent Overhead Byte Stuffing" in lines
+    assert "COBS encodes a packet so that it holds no zero byte." in lines
+    assert "Overhead is at most one byte in 254." in lines
+
+    article = "<article><header><h1>Join</h1></header><p>Join merges two stamps.</p></article>"
+    assert _html_text(article) == "Join\n\nJoin merges two stamps.\n"
+    assert _html_text("<p>One para.</p><p>Two <i>para</i>.</p>") == "One para.\n\nTwo para.\n"
+
+
 @pytest.mark.anyio
 async def test_step_brief_carries_references_and_prompt(
     tmp_path: Path,
