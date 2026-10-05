@@ -6354,6 +6354,31 @@ def _check_imports_code(command: str, root: Path) -> bool:
     return any(_project_imports(root / rel, root) for rel in _check_test_files(command, root))
 
 
+def _cases_test_close_note(test: str, data: str, scope: list[str], root: Path) -> str:
+    """What the close requires of the cases test: `test` when it reads `data`, else
+    the other test in scope; empty when there is none."""
+    name = Path(data).name
+    if (root / test).is_file() and _cases_test_reads(root / test, name):
+        cases = test
+    else:
+        entries = [e.rstrip("/") for e in scope]
+        others = [e for e in entries if e.endswith(".py") and _is_test_path(e)] + [
+            p.relative_to(root).as_posix()
+            for e in entries
+            if (root / e).is_dir()
+            for p in sorted((root / e).rglob("*.py"))
+            if _is_test_path(p.relative_to(root).as_posix()) and _cases_test_reads(p, name)
+        ]
+        cases = next((o for o in others if o != test), "")
+    if not cases:
+        return ""
+    return (
+        f"{cases} is the cases test, whether or not this check runs it: the close "
+        f"requires it to load {data} and run every case in it against the code, with no "
+        "hand-written asserts of its own. "
+    )
+
+
 def _known_answers_note(command: str, scope: list[str], root: Path) -> str:
     """The brief's proof note for a scope of data and tests: what the data test imports.
 
@@ -6365,11 +6390,23 @@ def _known_answers_note(command: str, scope: list[str], root: Path) -> str:
     """
     data = next(r.rstrip("/") for r in scope if Path(r.rstrip("/")).suffix not in {"", ".py"})
     runs = [rel for rel in _check_test_files(command, root) if rel.endswith(".py")]
+    # Run R32: on a fresh repository the check's test was not on disk yet, and the
+    # note named the other test in scope as the check.
+    runs += [
+        rel
+        for rel in _check_run_files(command, root)
+        if rel.endswith(".py")
+        and rel not in runs
+        and _is_test_path(rel)
+        and _runs_test_file(command, rel)
+    ]
     test = next(
         (t for t in runs if _cases_test_reads(root / t, Path(data).name)),
-        next((t for t in runs if _in_scope(t, scope, root)), _data_test("", scope, root)),
+        next((t for t in runs if _in_scope(t, scope, root)), runs[0] if runs else ""),
+    ) or _data_test("", scope, root)
+    proof = _cases_test_close_note(test, data, scope, root) + _tests_only_proof_note(
+        command, scope, root
     )
-    proof = _tests_only_proof_note(command, scope, root)
     imports = _project_imports(root / test, root)
     present = [module for module, here in imports if here]
     if present:
@@ -8749,6 +8786,34 @@ def _last_failure_note(key: tuple[str, str], check: str) -> str:
         + f"\n\nThe check failed last step (exit {rc}). Its output ends:\n{tail}\n"
         + "Fix the work, not the check."
     )
+
+
+def _close_demand(text: str) -> str:
+    """The demand of a result whose check passed but whose close kept the task open:
+    its "the sub-agent must …" clause, else the reason after "the check passes, but"."""
+    for para in text.split("\n\n"):
+        _, passes, reason = para.partition("the check passes, but ")
+        if not passes:
+            continue
+        if reason.startswith("the task "):
+            reason = reason.partition(": ")[2] or reason
+        _, must, demand = reason.partition("the sub-agent must ")
+        said = (demand if must else reason).strip()
+        return said[:1].lower() + said[1:]
+    return ""
+
+
+def _last_close_note(key: tuple[str, str]) -> str:
+    """The brief note for a rerun after a close whose check passed kept the task open."""
+    demand = _NOT_DONE_DEMAND.get(key)
+    if not demand:
+        return ""
+    return (
+        f"\n\nThe last close kept this task open: {demand.rstrip('.')}. Fix that; "
+        "the check alone is not enough."
+    )
+
+
 SPLIT_WIP_TITLE = "work in progress before split"
 
 #: Step results that left a task not done (stays open or blocked, not run,
@@ -8756,6 +8821,9 @@ SPLIT_WIP_TITLE = "work in progress before split"
 #: R04 sent 14 such steps at one task, none of which offered another way.
 _NOT_DONE: dict[tuple[str, str], int] = {}
 _NOT_DONE_SCOPE: dict[tuple[str, str], tuple[str, ...]] = {}
+#: Why the last close whose check passed kept the task open, by (project root,
+#: task). Run R32: the rerun's worker never heard what the close refused.
+_NOT_DONE_DEMAND: dict[tuple[str, str], str] = {}
 
 #: Not-done results after which a further step on the task dispatches no worker.
 ESCALATE_AFTER = 3
@@ -9793,6 +9861,7 @@ def _forget_task(root: Path, task: str) -> None:
     _LAST_CHECK_FAILURE.pop(key, None)
     _NOT_DONE.pop(key, None)
     _NOT_DONE_SCOPE.pop(key, None)
+    _NOT_DONE_DEMAND.pop(key, None)
 
 
 def _killed_attempt_context(
@@ -9838,6 +9907,11 @@ def _not_done(
         _NOT_DONE[key] = count
     if scope:
         _NOT_DONE_SCOPE[key] = tuple(scope)
+    demand = _close_demand(text)
+    if demand:
+        _NOT_DONE_DEMAND[key] = demand
+    elif ran:
+        _NOT_DONE_DEMAND.pop(key, None)
     if count >= ESCALATE_AFTER:
         text += "\n\n" + _escalation(task, count).replace(
             f"pursuit_step: {task} not run: ", "The next step on it runs no sub-agent: ", 1
@@ -9987,9 +10061,11 @@ def _not_workable_text(
         said = "; ".join(
             (f"through {w[0]}, " if w[0] != task else "") + _wait_text(w, nodes) for w in waits
         )
+        demand = _NOT_DONE_DEMAND.get((str(root), ready[0]), "") if ready and root else ""
+        with_notes = f", notes={json.dumps(demand)}" if demand else ""
         then = (
             _check_runs_own_file(task, ready[0], nodes, root)
-            or f'work {ready[0]} first: pursuit_step task="{ready[0]}".'
+            or f'work {ready[0]} first: pursuit_step task="{ready[0]}"{with_notes}.'
             if ready
             else f"none of those is workable yet. Workable now: {listed}."
         )
@@ -10691,6 +10767,7 @@ def make_step_tool() -> Any:
         )
         if references:
             brief = f"{brief}\n\n{references}"
+        brief += _last_close_note((str(root), task))
         if notes:
             brief = f"{brief}\n\nFrom the driver (who has not read the reference):\n{notes}"
         if hang:

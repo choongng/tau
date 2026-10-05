@@ -15931,3 +15931,114 @@ async def test_data_route_refusal_leads_with_its_call(
     else:
         assert text.startswith(f'Send pursuit_step task="T0002", done_when="{data_check}"')
         assert "closes on that work" in text
+
+
+R32_STAYS_OPEN = (
+    "T0002 — Cases: the check passes, but the task stays open and nothing is locked: "
+    "tests/test_x.py does not read tests/x.json, so the known answers judge nothing: the "
+    "sub-agent must make tests/test_x.py load tests/x.json and run every case in it "
+    "against the code, with no hand-written asserts of its own.\n\nLast report:\nok"
+)
+R32_DEMAND = (
+    "make tests/test_x.py load tests/x.json and run every case in it against the code, "
+    "with no hand-written asserts of its own"
+)
+
+
+@pytest.mark.anyio
+async def test_rerun_after_stays_open_close_brief_carries_reason(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # R32 #11: a bare rerun of T0002 briefed W2 with no word of why E14 kept it open.
+    project = _git_project(tmp_path, monkeypatch)
+    monkeypatch.chdir(project)
+    _ready_task(fake_beagle)
+    runtime, _ = _bound(tmp_path)
+    module = _loaded_module()
+    key = (str(project), "T0002")
+    module._not_done(project, "T0002", ["tests/"], R32_STAYS_OPEN)
+    assert module._NOT_DONE_DEMAND[key] == R32_DEMAND + "."
+
+    await _tool(runtime, "pursuit_step").execute(
+        "c1",
+        {
+            "task": "T0002",
+            "criteria": "parsed",
+            "done_when": "grep -q done done.txt",
+            "scope": ["done.txt"],
+            "notes": "DRIVER-NOTES",
+        },
+    )
+
+    brief = _runs(fake_tau)[0]["stdin"]
+    said = f"The last close kept this task open: {R32_DEMAND}. Fix that; the check alone"
+    assert said in brief
+    assert brief.index(said) < brief.index("DRIVER-NOTES")
+
+    # A not-done result that ran and kept nothing back drops it; a close forgets it.
+    module._not_done(project, "T0002", [], "T0002 stays open — the check fails.")
+    assert module._last_close_note(key) == ""
+    module._not_done(project, "T0002", [], R32_STAYS_OPEN)
+    module._forget_task(project, "T0002")
+    assert module._last_close_note(key) == ""
+
+
+def test_not_workable_after_stays_open_names_call_with_notes(tmp_path: Path) -> None:
+    # R32 E20, E24, E30 pointed at the same bare rerun of T0002.
+    module = _module()
+    nodes = [
+        {"id": "T0001", "parent": "", "title": "Goal", "status": "open", "container": True},
+        {"id": "T0002", "parent": "T0001", "title": "Cases", "status": "open"},
+        {
+            "id": "T0003",
+            "parent": "T0001",
+            "title": "Code",
+            "status": "pending",
+            "waiting_on": ["T0002"],
+        },
+    ]
+    bare = module._not_workable_text("T0003", nodes, ["T0002"], tmp_path)
+    assert bare.endswith('work T0002 first: pursuit_step task="T0002".')
+
+    module._not_done(tmp_path, "T0002", ["tests/"], R32_STAYS_OPEN)
+    said = module._not_workable_text("T0003", nodes, ["T0002"], tmp_path)
+    assert said.endswith(
+        f'work T0002 first: pursuit_step task="T0002", notes={json.dumps(R32_DEMAND + ".")}.'
+    )
+    module._forget_task(tmp_path, "T0002")
+
+
+R32_CHECK = "python3 -m pytest -q tests/test_case_data.py"
+R32_SCOPE = ["tests/cases.json", "tests/test_cases.py", "tests/test_case_data.py"]
+
+
+def test_known_answers_note_names_check_file_not_yet_on_disk(tmp_path: Path) -> None:
+    # R32 W1's brief named tests/test_cases.py as the check, which runs test_case_data.py.
+    project = _pursuit_project(tmp_path)
+
+    note = _module()._known_answers_note(R32_CHECK, R32_SCOPE, project)
+
+    assert note.startswith("tests/test_case_data.py is the check: it reads tests/cases.json")
+    assert "tests/test_cases.py is the check" not in note
+
+
+def test_known_answers_brief_states_cases_test_must_load_data(tmp_path: Path) -> None:
+    project = _pursuit_project(tmp_path)
+    module = _module()
+    required = (
+        "tests/test_cases.py is the cases test, whether or not this check runs it: the "
+        "close requires it to load tests/cases.json and run every case in it against the "
+        "code, with no hand-written asserts of its own."
+    )
+
+    assert required in module._known_answers_note(R32_CHECK, R32_SCOPE, project)
+
+    # A check that runs the cases test names it as both.
+    on_disk = _known_answers_project(tmp_path / "disk", "")
+    note = module._known_answers_note(R28_FIX_CHECK, R28_FIX_SCOPE, on_disk)
+    assert note.startswith("tests/test_cases.py is the check")
+    assert required in note
