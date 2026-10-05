@@ -14995,6 +14995,49 @@ async def test_witness_import_error_only_is_not_proof(
 
 
 @pytest.mark.anyio
+async def test_done_by_import_error_only_witness_is_released(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # T0255: a done-by prove PROVEN only by an ImportError on the witness is
+    # released, not closed done; a FAILED refusal still closes done.
+    project, _ = _done_by_project(tmp_path, fake_beagle, monkeypatch, "T0003: Cases")
+    _require_witness(project)
+    (project / "itc.py").write_text("X = 1\n")
+    _git(project, "add", "itc.py")
+    _git(project, "commit", "-q", "-m", "T0003: Clock")
+    nodes = json.loads((fake_beagle / "tree.out").read_text())["nodes"]
+    args = {"done_when": CASES_CHECK, "scope": ["tests", "itc.py"]}
+    module = _module()
+
+    (fake_beagle / "prove.out").write_text(
+        "T0004: PROVEN — refuses when itc.py is absent\n"
+        "  refused at: ERROR tests/test_cases.py - ModuleNotFoundError: No module named 'itc'\n"
+    )
+    released = await module._done_by("T0004", "T0003", args, nodes, project)
+
+    [proved] = _pursuit_calls(fake_beagle, "prove")
+    assert proved[:3] == ["T0004", "--absent", "itc.py"]
+    [closed] = _pursuit_calls(fake_beagle, "close")
+    assert closed[:3] == ["T0004", "--outcome", "blocked"]
+    assert "itc.py taken away only on importing it" in released
+    assert "closed blocked rather than left open" in released
+
+    (fake_beagle / "calls.jsonl").unlink()
+    (fake_beagle / "prove.out").write_text(
+        "T0004: PROVEN — refuses when itc.py is absent\n"
+        "  refused at: FAILED tests/test_cases.py::test_cases - AttributeError: X\n"
+    )
+    done = await module._done_by("T0004", "T0003", args, nodes, project)
+
+    assert [c[2] for c in _pursuit_calls(fake_beagle, "close")] == ["done"]
+    assert "closed done" in done
+
+
+@pytest.mark.anyio
 async def test_step_locks_made_root_relative(
     tmp_path: Path,
     beagle: Path,
