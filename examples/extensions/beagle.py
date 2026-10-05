@@ -9309,7 +9309,30 @@ def make_step_tool() -> Any:
             for rel in _changed_files(root)
             if _in_scope(rel, scope, root) and (root / rel).is_file()
         ]
-        misplaced = _implementation_in_tests(root, changed)
+        # Run R26: the gate counted tests/test_cases.py, which the bound check never
+        # ran, and held a passing, proven known-answers task open five times.
+        reach = _check_test_reach(check, root) if check else None
+        misplaced = _implementation_in_tests(
+            root, [rel for rel in changed if reach is None or rel in reach]
+        )
+        unrun_note = ""
+        if (
+            tests_only
+            and verdict[0] == 0
+            and proof is not None
+            and proof.proven
+            and not proof.by_absent_source
+            and reach is not None
+        ):
+            unrun = _implementation_in_tests(root, [rel for rel in changed if rel not in reach])
+            if unrun:
+                unrun_note = (
+                    "Note for the next task whose check runs these files: they define "
+                    "implementation a test file should not hold, to move into the module "
+                    "the test imports or delete:\n"
+                    + "\n".join(f"- {where}" for where in unrun)
+                    + "\n\n"
+                )
         if misplaced:
             state = "stays blocked" if retrying else "stays open"
             return _not_done(
@@ -9398,7 +9421,7 @@ def make_step_tool() -> Any:
             )
             argv = ["retry", task, "--because", because]
         else:
-            body = report[:CLOSE_BODY_CHARS] or "-"
+            body = (unrun_note + report)[:CLOSE_BODY_CHARS] or "-"
             argv = ["close", task, "--outcome", "done", "--body", body]
         if spent is not None:
             argv += ["--spent", str(spent)]
@@ -9434,7 +9457,7 @@ def make_step_tool() -> Any:
         superseded = _SUPERSEDED_REPORT_NOTE if rc == 0 and _report_claims_failure(shown) else ""
         return _step_result(
             f"{route}{task} — {title}: {state}.\n\n{committed}\n\n{closed}\n\n"
-            f"{undid}{lock_note}"
+            f"{undid}{lock_note}{unrun_note}"
             f"{superseded}Sub-agent report:\n{shown}\n\n"
             "Next: call pursuit_step with no arguments for the next task."
         )

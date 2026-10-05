@@ -3037,6 +3037,94 @@ async def test_cases_task_with_implementation_in_test_file_stays_open(
     assert not (project / ".beagle" / "locked").exists()
 
 
+#: R26's tests/test_cases.py: a long case runner the bound check never ran.
+R26_UNRUN_TEST = (
+    "from cobs import encode\n\n\ndef run_case(case):\n"
+    + "    case = case\n" * 16
+    + "    return encode(case)\n"
+)
+R26_CHECK = "python3 -m pytest -q tests/test_case_data.py"
+
+
+@pytest.mark.anyio
+async def test_known_answers_task_closes_done_when_proven_by_data_absence(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # R26 E34: T0002's check passed and cases.json's absence proved it, yet a def
+    # in tests/test_cases.py, which the check never runs, held it open.
+    project = _cases_task(tmp_path, fake_beagle, monkeypatch, CASES_DATA_TEST)
+    _ready_task(fake_beagle, R26_CHECK)
+    writes = json.loads(os.environ["FAKE_TAU_WRITES"])
+    writes["tests/test_cases.py"] = R26_UNRUN_TEST
+    monkeypatch.setenv("FAKE_TAU_WRITES", json.dumps(writes))
+
+    result = await _step_cases(
+        tmp_path,
+        done_when=R26_CHECK,
+        scope=[*CASES_SCOPE, "tests/test_cases.py"],
+        locks=CASES_SCOPE,
+    )
+
+    assert "closed done" in result.text, result.text
+    assert "implementation belongs in the module" not in result.text
+    assert "Note for the next task whose check runs these files" in result.text
+    assert "tests/test_cases.py: def run_case" in result.text
+    (close,) = _pursuit_calls(fake_beagle, "close")
+    assert "tests/test_cases.py: def run_case" in " ".join(close)
+    assert "Locked: tests/cases.json, tests/test_case_data.py" in result.text
+    assert (project / ".beagle" / "locked").exists()
+
+
+@pytest.mark.anyio
+async def test_misplaced_gate_ignores_test_file_the_check_does_not_run(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project = _git_project(tmp_path, monkeypatch)
+    monkeypatch.chdir(project)
+    writes = {
+        "cobs.py": "def encode(data):\n    return data\n",
+        "tests/test_case_data.py": CASES_DATA_TEST,
+        "tests/cases.json": '[{"in": 1, "out": 2}]',
+        "tests/test_cases.py": R26_UNRUN_TEST,
+    }
+    monkeypatch.setenv("FAKE_TAU_WRITES", json.dumps(writes))
+    _ready_task(fake_beagle, R26_CHECK)
+    (fake_beagle / "prove.out").write_text("T0002: PROVEN — refuses with cobs.py broken\n")
+    runtime, _ = _bound(tmp_path)
+
+    result = await _tool(runtime, "pursuit_step").execute(
+        "c1",
+        {
+            "task": "T0002",
+            "criteria": "c",
+            "done_when": R26_CHECK,
+            "scope": ["cobs.py", "tests/"],
+        },
+    )
+
+    assert "closed done" in result.text, result.text
+    assert "implementation belongs in the module" not in result.text
+    assert len(_pursuit_calls(fake_beagle, "close")) == 1
+
+    # The same file, once the check runs it, is counted.
+    module = _module()
+    changed = ["tests/test_case_data.py", "tests/test_cases.py"]
+    reach = module._check_test_reach("python3 -m pytest -q tests/test_cases.py", project)
+    assert reach is not None
+    counted = [rel for rel in changed if rel in reach]
+    assert module._implementation_in_tests(project, counted) == [
+        "tests/test_cases.py: def run_case"
+    ]
+
+
 @pytest.mark.anyio
 async def test_known_answers_task_whose_test_never_opens_the_cases_file_stays_open(
     tmp_path: Path,
