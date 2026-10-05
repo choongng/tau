@@ -6,6 +6,7 @@ checkout, so these exercise its wiring without a beagle install.
 
 from __future__ import annotations
 
+import ast
 import asyncio
 import functools
 import hashlib
@@ -6652,6 +6653,108 @@ async def test_abandon_milestone_refused(
     assert "pursuit_plan" in result.text and 'abandon="done by Tnnnn"' in result.text
 
 
+def _later_milestone_nodes() -> list[dict[str, Any]]:
+    """Founding made T0002 and T0003; a plan then split T0002 and added T0005 to the root."""
+    return [
+        {"id": "T0001", "parent": "", "title": "Goal", "status": "open", "container": True},
+        {"id": "T0002", "parent": "T0001", "title": "Clock", "status": "open", "container": True},
+        {"id": "T0003", "parent": "T0001", "title": "Encode", "status": "pending"},
+        {"id": "T0004", "parent": "T0002", "title": "Fork and join", "status": "open"},
+        {"id": "T0005", "parent": "T0001", "title": "Encoding", "status": "pending"},
+    ]
+
+
+@pytest.mark.anyio
+async def test_root_plan_refuses_a_part_titled_like_a_live_task(
+    tmp_path: Path, beagle: Path, fake_beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # R22 #46-#66: plans on the root added T0011-T0015, each repeating a live task.
+    monkeypatch.chdir(_pursuit_project(tmp_path))
+    (fake_beagle / "tree.out").write_text(json.dumps({"nodes": _later_milestone_nodes()}))
+    runtime, _ = _bound(tmp_path)
+    plan = _tool(runtime, "pursuit_plan")
+
+    refused = await plan.execute(
+        "c1", {"task": "T0001", "parts": ["Docs::write them", "  FORK   and join ::again"]}
+    )
+    under_a_milestone = await plan.execute(
+        "c2", {"task": "T0002", "parts": ["Encode::again", "Tests::write"]}
+    )
+
+    assert refused.text.startswith("pursuit_plan: nothing added")
+    assert "T0004" in refused.text and 'pursuit_step task="T0004"' in refused.text
+    assert "nothing added" not in under_a_milestone.text
+    added = _pursuit_calls(fake_beagle, "add") + _pursuit_calls(fake_beagle, "split")
+    assert added and all("T0001" not in call for call in added)
+
+
+@pytest.mark.anyio
+async def test_a_later_milestone_can_be_abandoned_as_a_duplicate(
+    tmp_path: Path, beagle: Path, fake_beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # R22: T0011-T0015, added to the root by plans, were refused as milestones.
+    module = _module()
+    nodes = _later_milestone_nodes()
+    problem = module._abandon_problem
+
+    assert module._founding_milestones(nodes) == {"T0002", "T0003"}
+    assert problem("T0005", "duplicate of T0003", nodes) is None
+    assert problem("T0005", "duplicate of T0004", nodes) is None
+    founding = problem("T0003", "duplicate of T0005", nodes) or ""
+    assert "it is a milestone" in founding and "added after founding" not in founding
+    for why in ("duplicate of T0009", "duplicate of T0001", "already done by T0003"):
+        later = problem("T0005", why, nodes) or ""
+        assert 'abandon="duplicate of Tnnnn"' in later, why
+
+    monkeypatch.chdir(_pursuit_project(tmp_path))
+    _ready_task(fake_beagle)
+    (fake_beagle / "tree.out").write_text(json.dumps({"nodes": nodes}))
+    (fake_beagle / "add.out").write_text(
+        "T0005  Encode bytes\n  it reads like T0003 (pending): Encode. If it is the same work, "
+        '`beagle pursuit close T0005 --outcome abandoned --reason "duplicate of T0003"` '
+        "retires this one. If what it adds is an order, `beagle pursuit depend T0003 "
+        "<earlier> --hard` puts it on the task that exists"
+    )
+    runtime, _ = _bound(tmp_path)
+
+    planned = await _tool(runtime, "pursuit_plan").execute(
+        "c1", {"task": "T0001", "parts": ["Encode bytes::as COBS"]}
+    )
+    dropped = await _tool(runtime, "pursuit_step").execute(
+        "c2", {"task": "T0005", "abandon": "duplicate of T0003"}
+    )
+
+    assert "beagle pursuit close" not in planned.text and "--hard" not in planned.text
+    assert 'pursuit_step task="T0005", abandon="duplicate of T0003"' in planned.text
+    assert _pursuit_calls(fake_beagle, "close") == [
+        ["T0005", "--outcome", "abandoned", "--reason", "duplicate of T0003"]
+    ]
+    assert "T0005 abandoned" in dropped.text
+
+
+def test_model_facing_text_names_no_past_run() -> None:
+    # R22: escalations told the driver "is how run R04 spent 14 steps on one".
+    source = Path(EXTENSION).read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    docstrings = {
+        id(node.body[0].value)
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef))
+        and node.body
+        and isinstance(node.body[0], ast.Expr)
+        and isinstance(node.body[0].value, ast.Constant)
+    }
+    named = [
+        f"L{node.lineno}: {node.value[:80]!r}"
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Constant)
+        and isinstance(node.value, str)
+        and id(node) not in docstrings
+        and re.search(r"\bR\d{2}\b", node.value)
+    ]
+    assert named == []
+
+
 CASES_CHECK = "grep -q def tests/test_cases.py"
 
 
@@ -6787,13 +6890,13 @@ async def test_pending_milestone_abandon_refusal_offers_no_new_route(
     _milestones(
         fake_beagle,
         {"id": "T0003", "parent": "T0001", "status": "done"},
-        {"id": "T0005", "parent": "T0001", "status": "open"},
+        {"id": "T0004", "parent": "T0001", "status": "open"},
     )
     runtime, _ = _bound(tmp_path)
     step = _tool(runtime, "pursuit_step")
 
     pending = await step.execute("c1", {"task": "T0002", "abandon": "duplicate of T0003"})
-    opened = await step.execute("c2", {"task": "T0005", "abandon": "duplicate of T0003"})
+    opened = await step.execute("c2", {"task": "T0004", "abandon": "duplicate of T0003"})
 
     assert _pursuit_calls(fake_beagle, "close") == []
     assert "T0002 not abandoned — it is a milestone" in pending.text

@@ -2846,13 +2846,64 @@ def _stale_known_answers_duplicate(
     return None
 
 
+def _task_number(task: str) -> int | None:
+    digits = task.lstrip("T")
+    return int(digits) if digits.isdigit() else None
+
+
+def _founding_milestones(nodes: list[dict[str, Any]]) -> set[str]:
+    """The root's children that `pursuit_found` made, as the tree shows them.
+
+    Founding adds the root and then splits it, so its milestones are the root's
+    children numbered straight after it, with no other task between. A child
+    of the root numbered after any other task was added later, by a plan.
+    """
+    roots = [n for n in nodes if not n.get("parent")]
+    if len(roots) != 1:
+        return set()
+    root = str(roots[0].get("id"))
+    number = _task_number(root)
+    if number is None:
+        return set()
+    by_number = {_task_number(str(n.get("id"))): n for n in nodes}
+    found: set[str] = set()
+    while True:
+        node = by_number.get(number + len(found) + 1)
+        if node is None or str(node.get("parent") or "") != root:
+            return found
+        found.add(str(node.get("id")))
+
+
+def _live_duplicate_of(why: str, task: str, nodes: list[dict[str, Any]]) -> str | None:
+    """The task `why` names as the one `task` duplicates, when it still holds that work.
+
+    It is pending, open or done, and neither the root nor under `task`.
+    """
+    if not why.strip().lower().startswith("duplicate of"):
+        return None
+    by_id = {str(n.get("id")): n for n in nodes}
+    for named in _TASK_ID.findall(why):
+        node = by_id.get(named)
+        if named == task or node is None or not node.get("parent"):
+            continue
+        up, seen = named, set()
+        while up and up not in seen and up != task:
+            seen.add(up)
+            up = str(by_id.get(up, {}).get("parent") or "")
+        if up != task and node.get("status") in ("pending", "open", "done"):
+            return str(named)
+    return None
+
+
 def _abandon_problem(task: str, why: str, nodes: list[dict[str, Any]]) -> str | None:
     """Why the driver may not abandon `task` for `why`, or None.
 
     Run R02's driver abandoned four of five milestones in 0.3 min, each as
     "already exists / passes", right after tau's own hint offered abandoning
     work "already done". A task is dropped only as a duplicate of one that
-    holds its work; a milestone is the goal's and is never dropped here.
+    holds its work; a milestone from founding is the goal's and is never dropped
+    here. One a plan added later may go as a duplicate of a task that holds its
+    work: run R22's driver planned five such on the root, and none could go.
     """
     parent = {str(n.get("id")): str(n.get("parent") or "") for n in nodes}
     roots = [t for t, p in parent.items() if not p]
@@ -2891,6 +2942,15 @@ def _abandon_problem(task: str, why: str, nodes: list[dict[str, Any]]) -> str | 
     if roots and parent.get(task) == roots[0]:
         if _setup_abandonable(task, nodes) or _founding_did(task, why, nodes):
             return None
+        later = task not in _founding_milestones(nodes)
+        if later and _live_duplicate_of(why, task, nodes) is not None:
+            return None
+        duplicate = (
+            " It was added after founding, so if a pending, open or done task holds its "
+            f'work, pursuit_step task="{task}", abandon="duplicate of Tnnnn" drops it.'
+            if later
+            else ""
+        )
         if by_id.get(task, {}).get("status") == "pending":
             # Run R14: beagle refuses a new route for a task never opened.
             return (
@@ -2898,12 +2958,12 @@ def _abandon_problem(task: str, why: str, nodes: list[dict[str, Any]]) -> str | 
                 "is the goal's. Split it with pursuit_plan, or, if a done task's commit "
                 f'already did its work, call pursuit_step task="{task}", abandon="done by '
                 'Tnnnn" and done_when, naming that task; it closes done on that commit '
-                "if the check passes now."
+                f"if the check passes now.{duplicate}"
             )
         return (
             f"pursuit_step: {task} not abandoned — it is a milestone, and a milestone is "
             "the goal's. Split it with pursuit_plan, or give it a new route with "
-            f'pursuit_step task="{task}", new_route=true and notes.'
+            f'pursuit_step task="{task}", new_route=true and notes.{duplicate}'
         )
     if _duplicate_of(why, task, nodes) is not None:
         container = parent.get(task, "")
@@ -3302,6 +3362,64 @@ def _plan_order_problem(parts: list[str], task: str, goal: Path) -> str | None:
     return None
 
 
+def _live_title_clash(task: str, parts: list[str], nodes: list[dict[str, Any]]) -> str | None:
+    """Why a plan on the root may not add `parts`, one titled as a live task is, or None.
+
+    Run R22's driver planned five parts on the root that repeated pending
+    tasks, and they then ranked against the tasks they repeated. Titles are
+    compared case-folded with whitespace normalized.
+    """
+    node = next((n for n in nodes if str(n.get("id")) == task), None)
+    if node is None or node.get("parent"):
+        return None
+    live = {
+        _fold(str(n.get("title") or "")): n
+        for n in nodes
+        if n.get("status") in ("pending", "open") and n.get("id")
+    }
+    for part in parts:
+        title = _part_title(part)
+        same = live.get(_fold(title))
+        if same is not None:
+            other = str(same.get("id"))
+            return (
+                f"part {title!r} has the title of {other} ({same.get('status')}), which is "
+                f'still to be done. Work {other} with pursuit_step task="{other}", and send '
+                "the plan again without that part."
+            )
+    return None
+
+
+#: beagle's note on a task it added that reads like another, with the bash it
+#: suggests, which the driver's guard refuses.
+_RESEMBLANCE_ROUTE = re.compile(
+    r"If it is the same work, `beagle pursuit close (T\d+) --outcome abandoned --reason "
+    r'"duplicate of (T\d+)"` retires this one\.'
+    r"(?: If what it adds is an order, `beagle pursuit depend [^`]*` puts it on the task "
+    r"that exists\.?)?"
+)
+
+
+def _steer_resemblance(out: str, root: Path) -> str:
+    """`out` with beagle's bash route for a look-alike task replaced by the tool call.
+
+    The call is offered only where `_abandon_problem` would take it; otherwise
+    the route is left out, as is the `depend --hard` the guard refuses too.
+    """
+    if _RESEMBLANCE_ROUTE.search(out) is None:
+        return out
+    nodes = _tree_nodes(root)
+
+    def route(match: re.Match[str]) -> str:
+        added, like = match.group(1), match.group(2)
+        why = f"duplicate of {like}"
+        if _abandon_problem(added, why, nodes) is not None:
+            return ""
+        return f'If it is the same work, pursuit_step task="{added}", abandon="{why}" drops it.'
+
+    return _RESEMBLANCE_ROUTE.sub(route, out)
+
+
 def make_plan_tool() -> Any:
     """Build `pursuit_plan`: split a task into steps, or add steps to a container."""
 
@@ -3353,6 +3471,9 @@ def make_plan_tool() -> Any:
                 f"pursuit_plan: nothing added — {task} already has {', '.join(repeated)}. "
                 "Work them with pursuit_step; call it with no arguments for the next ready one."
             )
+        clash = _live_title_clash(task, parts, _tree_nodes(root))
+        if clash is not None:
+            return _step_result(f"pursuit_plan: nothing added — {clash}")
         one_step = (
             f"pursuit_plan: nothing added — {task} is already one step, so one "
             "part does not break it down: a plan needs two or more parts, which "
@@ -3397,7 +3518,8 @@ def make_plan_tool() -> Any:
             notes += f"Not added again, {task} already has: {', '.join(repeated)}.\n\n"
         if "--outcome abandoned" in out:
             notes += f"{ABANDON_HINT}\n\n"
-        return _step_result(f"{out}\n\n{_tree(root)}\n\n{notes}Next: pursuit_step.")
+        shown = _steer_resemblance(out, root)
+        return _step_result(f"{shown}\n\n{_tree(root)}\n\n{notes}Next: pursuit_step.")
 
     return execute
 
@@ -7221,8 +7343,8 @@ def _escalation(
             task, arguments, record, root, data_test_passes
         )
     return (
-        f"{head}\nAnother sub-agent on the same task, however its scope or notes are put, "
-        "is how run R04 spent 14 steps on one. Choose one:\n"
+        f"{head}\n{task} has had {count} steps without a pass, and another sub-agent on "
+        "it, however its scope or notes are put, would only add one more. Choose one:\n"
         f'- pursuit_plan task="{task}" with two or more parts, to split it into smaller '
         "tasks (a plan of one part is refused: the task is already one step);\n"
         f'- pursuit_step task="{task}", new_route=true, with a rewritten done_when and '
