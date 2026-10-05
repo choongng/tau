@@ -34,6 +34,7 @@ from tau_coding.events import AgentSettledEvent, CompactionEndEvent
 from tau_coding.extensions import ExtensionRuntime
 from tau_coding.resources import TauResourcePaths, parse_markdown_resource
 from tau_coding.skills import parse_skill_invocation
+from tau_coding.tools import DEFAULT_BASH_TIMEOUT_SECONDS
 from test_extensions import RecordingSession, RecordingUiBridge
 
 
@@ -1369,7 +1370,9 @@ brief = sys.stdin.read()
 runs = here / "runs.jsonl"
 with runs.open("a") as log:
     scope = os.environ.get("BEAGLE_TAU_WORKER_SCOPE")
-    log.write(json.dumps({"argv": sys.argv[1:], "stdin": brief, "scope": scope}) + "\\n")
+    bash_timeout = os.environ.get("TAU_BASH_TIMEOUT_SECONDS")
+    record = {"argv": sys.argv[1:], "stdin": brief, "scope": scope, "bash_timeout": bash_timeout}
+    log.write(json.dumps(record) + "\\n")
 attempt = len(runs.read_text().splitlines())
 if attempt >= int(os.environ.get("FAKE_TAU_SUCCEEDS_ON", "1")):
     Path("done.txt").write_text("done")
@@ -10781,6 +10784,100 @@ async def test_worker_guard_refuses_reads_past_half_cap_with_nothing_written(
     assert own.text == "ran" and wrote.text == "ran" and after.text == "ran"
 
 
+@pytest.mark.anyio
+async def test_no_write_guard_counts_in_scope_paging(
+    tmp_path: Path, beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # R34: W9 paged the in-scope tests/cases.json 27 times and wrote nothing.
+    monkeypatch.setenv(_module().WORKER_MAX_TURNS_ENV, "20")
+    runtime = _scoped_worker(tmp_path, monkeypatch, scope="tests/")
+    window = _module().WINDOW_LINES
+    project = tmp_path / "project"
+    (project / "tests").mkdir()
+    (project / "tests" / "cases.json").write_text("1\n" * (window * 3 - 5))
+    (project / "tests" / "small.py").write_text("x = 1\n")
+    read = _tool_with_hooks(runtime, "read")
+    write = _tool_with_hooks(runtime, "write")
+
+    pages = [
+        await read.execute(f"r{i}", {"path": "tests/cases.json", "offset": 1 + window * (i % 3)})
+        for i in range(10)
+    ]
+    small = await read.execute("s1", {"path": "tests/small.py"})
+    again = await read.execute("s2", {"path": "tests/small.py"})
+    wrote = await write.execute("w1", {"path": "tests/x.py", "content": "x"})
+    after = await read.execute("r10", {"path": "tests/cases.json"})
+
+    # Calls 1-10 are within half the cap of 20, so all ten pages pass.
+    assert all(page.text == "ran" for page in pages)
+    # Call 11 is past half: tests/small.py's first read fits one pass; its second does not.
+    assert small.text == "ran"
+    assert again.text != "ran"
+    assert "this is read 2 of a 1-line file that one pass reads in 1" in again.text
+    assert "11 of 20 calls are used with nothing written" in again.text
+    assert "`python3 -c` over the file" in again.text and "write tests/ now" in again.text
+    assert wrote.text == "ran" and after.text == "ran"
+
+    refusal = _module()._reread_refusal(
+        "read", {"path": "tests/cases.json"}, project, ("tests/",), 11, {}
+    )
+    assert refusal is None
+    counted = {(project / "tests" / "cases.json").resolve(): 3}
+    paged = _module()._reread_refusal(
+        "read", {"path": "tests/cases.json"}, project, ("tests/",), 11, counted
+    )
+    assert paged is not None
+    assert f"read 4 of a {window * 3 - 5}-line file that one pass reads in 3" in paged
+
+    # R34 W9: a 4048-line file takes 68 reads, more than a cap of 20 allows; it is
+    # refused after a quarter of the cap.
+    (project / "tests" / "cases.json").write_text("1\n" * 4048)
+    cases = (project / "tests" / "cases.json").resolve()
+    within = _module()._reread_refusal(
+        "read", {"path": "tests/cases.json"}, project, ("tests/",), 11, {cases: 4}
+    )
+    assert within is None
+    long = _module()._reread_refusal(
+        "read", {"path": "tests/cases.json"}, project, ("tests/",), 11, {cases: 5}
+    )
+    assert long is not None
+    assert "read 6 of a 4048-line file that takes 68 reads at 60 lines per read" in long
+    assert "more than the 5 a file gets under a cap of 20" in long
+
+
+@pytest.mark.anyio
+async def test_no_write_guard_counts_bash_runs_without_writes(
+    tmp_path: Path, beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # R34: W7's encoder trials and W8's analysis scripts wrote nothing, never refused.
+    monkeypatch.setenv(_module().WORKER_MAX_TURNS_ENV, "8")
+    runtime = _scoped_worker(tmp_path, monkeypatch, scope="tests/x.py")
+    project = tmp_path / "project"
+    (project / ".beagle" / "tree").mkdir(parents=True, exist_ok=True)
+    (project / ".beagle" / "tree" / "T0003.md").write_text(
+        '+++\nid = "T0003"\ndone_when = "python3 -m pytest -q tests/x.py"\n+++\n'
+    )
+    bash = _tool_with_hooks(runtime, "bash")
+    write = _tool_with_hooks(runtime, "write")
+
+    early = [await bash.execute(f"b{i}", {"command": "python3 -c 'print(1)'"}) for i in range(6)]
+    trial = await bash.execute("b6", {"command": "python3 -c 'print(2)' > /tmp/out.txt"})
+    check = await bash.execute("b7", {"command": "python3  -m pytest -q tests/x.py 2>&1 | tail"})
+    scripted = await bash.execute("b8", {"command": "printf x > tests/x.py"})
+    after = await bash.execute("b9", {"command": "python3 -c 'print(3)'"})
+    wrote = await write.execute("w1", {"path": "tests/x.py", "content": "x"})
+
+    # Calls 1-6 are within three-quarters of the cap of 8.
+    assert all(result.text == "ran" for result in early)
+    assert trial.text != "ran"
+    assert "6 of 8 calls used and nothing written" in trial.text
+    assert "Write tests/x.py now with `write` or `edit`" in trial.text
+    assert "run the check: python3 -m pytest -q tests/x.py" in trial.text
+    assert check.text == "ran"
+    assert scripted.text == "ran"
+    assert after.text == "ran" and wrote.text == "ran"
+
+
 def test_truncated_call_advice_keeps_generator_out_of_scope() -> None:
     # R31: told to generate data with a script, W2 saved its generator in the scope.
     raw = '{"path":"tests/cases.json","content":"' + "0a1b" * 2500
@@ -10970,6 +11067,44 @@ async def test_brief_states_worker_turn_cap(
     assert cap == 24 == _module()._worker_max_turns()
     assert f"You have {cap} tool calls in all." in run["stdin"]
     assert f"Write the files by about call {cap // 2}," in run["stdin"]
+
+
+@pytest.mark.anyio
+async def test_worker_bash_default_timeout_is_short(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # R34: W2's endless inline encoder held tau's 600 s bash default, 10 of 13 min.
+    monkeypatch.chdir(_pursuit_project(tmp_path))
+    monkeypatch.delenv(_module().WORKER_BASH_TIMEOUT_ENV, raising=False)
+    monkeypatch.setenv("TAU_BASH_TIMEOUT_SECONDS", "999")
+    _ready_task(fake_beagle)
+    runtime, _ = _bound(tmp_path)
+    args = {
+        "task": "T0002",
+        "criteria": "done.txt exists",
+        "done_when": "grep -q done done.txt",
+        "scope": ["done.txt"],
+    }
+
+    await _tool(runtime, "pursuit_step").execute("c1", args)
+    default = _module().DEFAULT_WORKER_BASH_TIMEOUT
+    run = _runs(fake_tau)[0]
+
+    assert 0 < default < DEFAULT_BASH_TIMEOUT_SECONDS
+    assert run["bash_timeout"] == f"{default:g}"
+    assert f"A bash command is stopped after {default:g} s" in run["stdin"]
+    assert "unless the call passes a longer `timeout`" in run["stdin"]
+
+    monkeypatch.setenv(_module().WORKER_BASH_TIMEOUT_ENV, "45")
+    assert _module()._worker_bash_timeout() == 45.0
+    assert "stopped after 45 s" in _module()._turn_cap_note()
+    for bad in ("soon", "0", "-1"):
+        monkeypatch.setenv(_module().WORKER_BASH_TIMEOUT_ENV, bad)
+        assert _module()._worker_bash_timeout() == default
 
 
 def _stop_gate_sends(monkeypatch: pytest.MonkeyPatch, cwd: Path, *, has_ui: bool) -> list[str]:

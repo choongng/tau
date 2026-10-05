@@ -44,6 +44,10 @@ DEFAULT_MAX_OUTPUT_LINES = 2_000
 #: Long enough for a test suite or a pinned check; short enough that a command
 #: that never ends hands control back instead of wedging the agent for good.
 DEFAULT_BASH_TIMEOUT_SECONDS = 600.0
+#: Environment variable that overrides `DEFAULT_BASH_TIMEOUT_SECONDS` for the
+#: tools `create_coding_tools` builds, so a launcher can give one session (a
+#: delegated worker, say) a shorter bound without changing anyone else's.
+BASH_TIMEOUT_ENV_VAR = "TAU_BASH_TIMEOUT_SECONDS"
 IMAGE_SNIFF_BYTES = 64 * 1024
 UTF8_BOM = "\ufeff"
 
@@ -180,6 +184,22 @@ DEFAULT_READ_OPERATIONS = ReadOperations(
 )
 
 
+def bash_default_timeout_seconds() -> float:
+    """Return the bash default timeout: `TAU_BASH_TIMEOUT_SECONDS` if set, else 600 s.
+
+    An unset, empty, non-numeric or non-positive value falls back to
+    `DEFAULT_BASH_TIMEOUT_SECONDS` rather than unbounding or breaking the tool.
+    """
+    raw = os.environ.get(BASH_TIMEOUT_ENV_VAR, "").strip()
+    if not raw:
+        return DEFAULT_BASH_TIMEOUT_SECONDS
+    try:
+        value = float(raw)
+    except ValueError:
+        return DEFAULT_BASH_TIMEOUT_SECONDS
+    return value if value > 0 else DEFAULT_BASH_TIMEOUT_SECONDS
+
+
 def create_coding_tools(
     *,
     cwd: str | Path | None = None,
@@ -193,14 +213,19 @@ def create_coding_tools(
     is omitted, the process current working directory at factory-call time is
     used. The tools share per-path write/edit locks within this process so
     concurrent mutations of the same file do not interleave. When configured,
-    `shell_command_prefix` is prepended to every bash tool command.
+    `shell_command_prefix` is prepended to every bash tool command. The bash
+    tool's default timeout is `bash_default_timeout_seconds()`.
     """
     root = Path.cwd() if cwd is None else Path(cwd)
     return [
         create_read_tool(cwd=root, image_support=image_support),
         create_write_tool(cwd=root),
         create_edit_tool(cwd=root),
-        create_bash_tool(cwd=root, shell_command_prefix=shell_command_prefix),
+        create_bash_tool(
+            cwd=root,
+            shell_command_prefix=shell_command_prefix,
+            default_timeout=bash_default_timeout_seconds(),
+        ),
     ]
 
 

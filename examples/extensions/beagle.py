@@ -163,6 +163,7 @@ from tau_coding.paths import TauPaths
 from tau_coding.resources import parse_markdown_resource
 from tau_coding.skills import Skill, format_skill_invocation
 from tau_coding.tool_buffers import WINDOW_LINES
+from tau_coding.tools import BASH_TIMEOUT_ENV_VAR
 
 #: The beagle checkout. `BEAGLE_ROOT` overrides the default `~/beagle`.
 BEAGLE = Path(os.environ.get("BEAGLE_ROOT") or Path.home() / "beagle").expanduser()
@@ -224,6 +225,12 @@ DEFAULT_WORKER_MAX_TURNS = 30
 #: it is told to write in. Runs R15 and R33 were cut off at 8192.
 WORKER_OUTPUT_TOKENS_ENV = "BEAGLE_TAU_WORKER_OUTPUT_TOKENS"
 DEFAULT_WORKER_OUTPUT_TOKENS = 8192
+
+#: Seconds a worker's bash command runs when the call names no `timeout`, passed
+#: to the worker's tau as its bash default. Run R34: W2's inline encoder never
+#: ended and held tau's 600 s default, 10 of its 13 minutes.
+WORKER_BASH_TIMEOUT_ENV = "BEAGLE_TAU_WORKER_BASH_TIMEOUT"
+DEFAULT_WORKER_BASH_TIMEOUT = 120.0
 
 #: The worker's thinking level; unset runs it with thinking off, since most of
 #: R01's worker time went to reasoning spirals.
@@ -1281,6 +1288,16 @@ def _worker_max_turns() -> int:
         return DEFAULT_WORKER_MAX_TURNS
 
 
+def _worker_bash_timeout() -> float:
+    """The worker's bash default timeout: env, else DEFAULT_WORKER_BASH_TIMEOUT."""
+    raw = os.environ.get(WORKER_BASH_TIMEOUT_ENV, "").strip()
+    try:
+        value = float(raw) if raw else DEFAULT_WORKER_BASH_TIMEOUT
+    except ValueError:
+        return DEFAULT_WORKER_BASH_TIMEOUT
+    return value if value > 0 else DEFAULT_WORKER_BASH_TIMEOUT
+
+
 def _worker_timeout(raw: Any) -> tuple[float, str]:
     """A model-supplied worker timeout, clamped to DEFAULT_DISPATCH_TIMEOUT.
 
@@ -1738,7 +1755,7 @@ async def _run_worker(
     cmd += ["--thinking", os.environ.get(WORKER_THINKING_ENV, "").strip() or "off"]
 
     limit = _memory_max()
-    env = {**os.environ, WORKER_ENV: "1"}
+    env = {**os.environ, WORKER_ENV: "1", BASH_TIMEOUT_ENV_VAR: f"{_worker_bash_timeout():g}"}
     env.pop(WORKER_TASK_ENV, None)
     env.pop(WORKER_SCOPE_ENV, None)
     if task:
@@ -2552,7 +2569,8 @@ def _turn_cap_note() -> str:
     cap = _worker_max_turns()
     return (
         f"You have {cap} tool calls in all. Write the files by about call {cap // 2}, "
-        "then use the rest to run the check and fix them."
+        "then use the rest to run the check and fix them. A bash command is stopped "
+        f"after {_worker_bash_timeout():g} s unless the call passes a longer `timeout`."
     )
 
 
@@ -12881,17 +12899,34 @@ def _truncated_call(arguments: Mapping[str, Any], earlier: int = 0) -> str | Non
     return refusal
 
 
+def _reads_needed(path: Path) -> tuple[int, int] | None:
+    """A file's line count and the reads one pass through it takes, or None."""
+    try:
+        count = len(path.read_text(encoding="utf-8", errors="replace").splitlines())
+    except OSError:
+        return None
+    return count, max(1, -(-count // WINDOW_LINES))
+
+
 def _reread_refusal(
-    tool: str, arguments: Mapping[str, Any], cwd: Path, scope: tuple[str, ...], calls: int
+    tool: str,
+    arguments: Mapping[str, Any],
+    cwd: Path,
+    scope: tuple[str, ...],
+    calls: int,
+    reads: dict[Path, int] | None = None,
 ) -> str | None:
     """Why a worker's read is refused once half its calls went with nothing written, or None.
 
     Run R33: W3 and W7 spent their calls re-reading references in short windows
     and wrote their file at the last call, or never ran the check. A read of a
-    file in the scope still passes: a write may need it.
+    file in the scope passes while its reads fit one pass through the file and a
+    quarter of the cap: a write may need it, and a file too long to page within
+    the cap is queried instead. `reads` counts each file's reads so far. Run
+    R34: W9 paged the in-scope 4048-line tests/cases.json 27 times and wrote nothing.
     """
     cap = _worker_max_turns()
-    if tool != "read" or calls <= cap // 2:
+    if tool != "read":
         return None
     path = arguments.get("path")
     goal = _find_goal(cwd)
@@ -12899,11 +12934,55 @@ def _reread_refusal(
         return None
     root = _resolved(goal.parent.parent)
     target = _own_path(cwd / Path(path).expanduser(), root)
-    if (target == root or root in target.parents) and _scope_hit(target, root, scope) is not None:
+    seen = 1
+    if reads is not None:
+        seen = reads[target] = reads.get(target, 0) + 1
+    if calls <= cap // 2:
         return None
+    if (target == root or root in target.parents) and _scope_hit(target, root, scope) is not None:
+        size = _reads_needed(target)
+        budget = max(1, cap // 4)
+        if size is None or seen <= min(size[1], budget):
+            return None
+        count, needed = size
+        paging = (
+            f"that one pass reads in {needed} at {WINDOW_LINES} lines per read"
+            if needed <= budget
+            else f"that takes {needed} reads at {WINDOW_LINES} lines per read, more than "
+            f"the {budget} a file gets under a cap of {cap}"
+        )
+        return (
+            f"refusing to read {path} again: this is read {seen} of a {count}-line file "
+            f"{paging}, and "
+            f"{calls - 1} of {cap} calls are used with nothing written. Query it instead, "
+            "e.g. `python3 -c` over the file for the case or line you need, and write "
+            f"{', '.join(scope)} now."
+        )
     return (
         f"refusing to read {path}: {calls - 1} of {cap} calls used and nothing written. "
         f"Write {', '.join(scope)} now; re-read only what a write needs."
+    )
+
+
+def _idle_bash_refusal(
+    command: str, goal: Path, task: str, scope: tuple[str, ...], calls: int
+) -> str | None:
+    """Why a bash command that writes nothing in scope is refused late, or None.
+
+    Past three-quarters of the cap with nothing written, only the task's check
+    runs. Run R34: W7's ~12 encoder trials and W8's analysis scripts wrote no
+    file and ran into the cap. Fails open when the task has no bound check.
+    """
+    cap = _worker_max_turns()
+    if calls <= cap * 3 // 4:
+        return None
+    check = " ".join(_task_check(goal, task).split())
+    if not check or check in " ".join(command.split()):
+        return None
+    return (
+        f"refusing to run this command: {calls - 1} of {cap} calls used and nothing "
+        f"written, and a command that is not the check changes nothing in the scope. "
+        f"Write {', '.join(scope)} now with `write` or `edit`, then run the check: {check}"
     )
 
 
@@ -12923,6 +13002,7 @@ def make_worker_scope_guard() -> Any:
     cut_offs = 0
     calls = 0
     wrote = False
+    reads: dict[Path, int] = {}
 
     async def guard(event: Any, context: ExtensionContext) -> ToolCallHookResult | None:
         nonlocal cut_offs, calls, wrote
@@ -12972,7 +13052,9 @@ def make_worker_scope_guard() -> Any:
                 return None
             task, scope = sent
             reread = (
-                None if wrote else _reread_refusal(event.tool_name, arguments, cwd, scope, calls)
+                None
+                if wrote
+                else _reread_refusal(event.tool_name, arguments, cwd, scope, calls, reads)
             )
             if reread is not None:
                 return ToolCallHookResult(block=True, reason=reread)
@@ -12986,7 +13068,8 @@ def make_worker_scope_guard() -> Any:
             links = _script_links(command, cwd) if scripted else []
             if scripted:
                 targets += _script_write_targets(command, _cwd_after_cd(command, cwd))
-            goal = _find_goal(cwd) if targets else None
+            idle = bool(command) and not wrote and sent_on_task
+            goal = _find_goal(cwd) if targets or idle else None
             if goal is None:
                 return None
             root = _resolved(goal.parent.parent)
@@ -13005,6 +13088,10 @@ def make_worker_scope_guard() -> Any:
                 hits += 1
             else:
                 refused = _link_out(links, root)
+                if idle and hits == 0 and refused is None:
+                    late = _idle_bash_refusal(command, goal, task, scope, calls)
+                    if late is not None:
+                        return ToolCallHookResult(block=True, reason=late)
                 wrote = wrote or (hits > 0 and refused is None)
                 return refused
         except Exception:  # noqa: BLE001 - fail open, never block on a guard bug

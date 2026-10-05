@@ -25,7 +25,7 @@ from tau_coding import (
     create_write_tool,
 )
 from tau_coding.image_processing import DEFAULT_MAX_SOURCE_IMAGE_BYTES
-from tau_coding.tools import DEFAULT_BASH_TIMEOUT_SECONDS
+from tau_coding.tools import BASH_TIMEOUT_ENV_VAR, DEFAULT_BASH_TIMEOUT_SECONDS
 
 
 def image_bytes(format_name: str = "PNG", *, size: tuple[int, int] = (8, 6)) -> bytes:
@@ -528,6 +528,37 @@ def test_bash_tool_default_timeout_is_bounded_and_advertised(tmp_path: Path) -> 
 
     unbounded = create_bash_tool_definition(cwd=tmp_path, default_timeout=None)
     assert "no default timeout" in unbounded.input_schema["properties"]["timeout"]["description"]
+
+
+@pytest.mark.anyio
+async def test_bash_default_timeout_from_env(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def bash_of(tools: list) -> object:
+        return next(tool for tool in tools if tool.name == "bash")
+
+    monkeypatch.delenv(BASH_TIMEOUT_ENV_VAR, raising=False)
+    unset = bash_of(create_coding_tools(cwd=tmp_path))
+    assert f"default {DEFAULT_BASH_TIMEOUT_SECONDS:g}" in str(unset.parameters)
+
+    for bad in ("", "soon", "0", "-3"):
+        monkeypatch.setenv(BASH_TIMEOUT_ENV_VAR, bad)
+        fallback = bash_of(create_coding_tools(cwd=tmp_path))
+        assert f"default {DEFAULT_BASH_TIMEOUT_SECONDS:g}" in str(fallback.parameters)
+
+    monkeypatch.setenv(BASH_TIMEOUT_ENV_VAR, "0.05")
+    tool = bash_of(create_coding_tools(cwd=tmp_path))
+    start = monotonic()
+    result = await tool.execute("test-call", {"command": "sleep 5"})
+    assert monotonic() - start < 1.0
+    assert result.details is not None
+    assert result.details["timed_out"] is True
+    assert result.details["timeout_seconds"] == 0.05
+
+    explicit = await tool.execute("test-call", {"command": "sleep 0.1; echo done", "timeout": 5})
+    assert explicit.details is not None
+    assert explicit.details["timed_out"] is False
+    assert "done" in explicit.text
 
 
 @pytest.mark.anyio
