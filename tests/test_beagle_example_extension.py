@@ -9295,6 +9295,34 @@ async def test_worker_guard_refuses_other_readers_of_dot_beagle(
 
 
 @pytest.mark.anyio
+async def test_worker_guard_refuses_heredoc_store_read(
+    tmp_path: Path, beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # R31: refused `cat .beagle/...`, W1 printed both task records from a heredoc script.
+    runtime = _scoped_worker(tmp_path, monkeypatch, scope="tests/")
+    refused = [
+        "python3 - <<'EOF'\nprint(open('/home/u/p/.beagle/tree/T0002.md').read())\nEOF",
+        "cd tests && python <<EOF\nfrom pathlib import Path\n"
+        "print(Path('../.beagle/x').read_text())\nEOF",
+        "uv run python3 -u - <<-'PY'\n\tprint(open('.beagle/pursuit.toml').read())\n\tPY",
+    ]
+    for command in refused:
+        result = await _tool_with_hooks(runtime, "bash").execute("c1", {"command": command})
+
+        assert "the brief already holds what the task needs" in result.text, command
+    allowed = [
+        "python3 - <<'EOF'\nprint(open('tests/test_x.py').read())\nEOF",
+        # The body is data for cat, not a script.
+        "cat <<'EOF' > tests/notes.txt\nopen('.beagle/x')\nEOF",
+        "python3 tests/gen.py <<'EOF'\nopen('.beagle/x')\nEOF",
+    ]
+    for command in allowed:
+        result = await _tool_with_hooks(runtime, "bash").execute("c2", {"command": command})
+
+        assert "the brief already holds what the task needs" not in result.text, command
+
+
+@pytest.mark.anyio
 async def test_worker_guard_refuses_git_show_of_a_dot_beagle_path(
     tmp_path: Path, beagle: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -9428,6 +9456,45 @@ async def test_step_result_flags_report_paths_not_on_disk(
     assert "The report names tests/cases.json, which is not on disk." in result.text
     for named in ("src/real.py,", "w/x.py", ".beagle", "T0002.md,", "and/or", "3.12,"):
         assert f"The report names {named}" not in result.text, named
+
+
+@pytest.mark.anyio
+async def test_step_report_names_unimported_helper_left_in_scope(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # R31: W2 saved a generator beside its data; the driver heard of it from 51 refusals.
+    project = _git_project(tmp_path, monkeypatch)
+    monkeypatch.chdir(project)
+    (project / "tests").mkdir()
+    (project / "tests" / "named.py").write_text("print(2)\n")
+    writes = {
+        "tests/gen.py": "print(1)\n",
+        "tests/util.py": "X = 1\n",
+        "tests/test_x.py": "from util import X\n\ndef test_x():\n    assert X\n",
+    }
+    monkeypatch.setenv("FAKE_TAU_WRITES", json.dumps(writes))
+    check = "sh -c 'grep -q done done.txt && grep -q print tests/named.py'"
+    _ready_task(fake_beagle, check)
+    runtime, _ = _bound(tmp_path)
+
+    result = await _tool(runtime, "pursuit_step").execute(
+        "c1",
+        {
+            "task": "T0002",
+            "criteria": "done.txt exists",
+            "done_when": check,
+            "scope": ["done.txt", "tests/"],
+        },
+    )
+
+    assert "Helper left in scope: tests/gen.py: new, untracked" in result.text, result.text
+    for used in ("tests/named.py", "tests/util.py", "tests/test_x.py"):
+        assert f"{used}: new, untracked" not in result.text, used
+        assert f"scope: {used}" not in result.text, used
 
 
 @pytest.mark.anyio
@@ -10542,8 +10609,19 @@ def test_truncated_call_names_char_budget() -> None:
     assert f"cut off after {len(raw)} characters" in refusal
     assert f"parts of at most {len(raw) // 2} characters" in refusal
     assert "lines" not in refusal
-    assert "short script run by bash" in refusal
+    assert "short script run inline by bash" in refusal
     assert "cut off again" not in refusal
+
+
+def test_truncated_call_advice_keeps_generator_out_of_scope() -> None:
+    # R31: told to generate data with a script, W2 saved its generator in the scope.
+    raw = '{"path":"tests/cases.json","content":"' + "0a1b" * 2500
+
+    refusal = _module()._truncated_call({"_raw_arguments": raw})
+
+    assert refusal is not None
+    assert "run inline by bash (`python3 - <<'EOF'` ... `EOF`)" in refusal
+    assert "a scratch path outside the project, never saved in scope" in refusal
 
 
 @pytest.mark.anyio

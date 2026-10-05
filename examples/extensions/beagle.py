@@ -633,17 +633,27 @@ def _strip_heredocs(command: str) -> str:
     A body is data fed to a command, not shell: `cat <<EOF > notes.md` followed
     by a paragraph that mentions `> pursuit.toml` writes only notes.md.
     """
+    return _split_heredocs(command)[0]
+
+
+def _split_heredocs(command: str) -> tuple[str, list[tuple[str, str]]]:
+    """`command` without its here-document bodies, and each body with the line
+    that opened it."""
     kept: list[str] = []
-    pending: list[tuple[str, bool]] = []
+    bodies: list[tuple[str, str]] = []
+    pending: list[tuple[str, bool, str, list[str]]] = []
     for line in command.split("\n"):
         if pending:
-            delimiter, dash = pending[0]
+            delimiter, dash, opener, body = pending[0]
             if (line.lstrip("\t") if dash else line).strip() == delimiter:
                 pending.pop(0)
+                bodies.append((opener, "\n".join(body)))
+            else:
+                body.append(line)
             continue
         kept.append(line)
-        pending += [(m.group(3), bool(m.group(1))) for m in _HEREDOC.finditer(line)]
-    return "\n".join(kept)
+        pending += [(m.group(3), bool(m.group(1)), line, []) for m in _HEREDOC.finditer(line)]
+    return "\n".join(kept), bodies
 
 
 def _shell_tokens(command: str) -> list[str] | None:
@@ -1611,6 +1621,33 @@ def _report_before_markup(report: str, cwd: Path, scope: list[str]) -> str:
         return _unreported_changes(cwd, scope)
     return "\n".join(
         [before, "\n(The report ended on a raw tool call, cut here.)", *_scope_changes(cwd, scope)]
+    )
+
+
+def _helpers_left_in_scope(root: Path, scope: list[str], check: str) -> str:
+    """A line naming each untracked .py in `scope` that no test imports and the
+    check does not name, or "".
+
+    Run R31: W2 saved a generator script beside the data it wrote, and the driver
+    first heard of it from 51 refusals that counted it as the code under test.
+    """
+    if not scope:
+        return ""
+    rc, out = _run(
+        ["git", "ls-files", "--others", "--exclude-standard", "-z", "--", *scope],
+        root,
+        timeout=30.0,
+    )
+    new = {rel for rel in out.split("\0") if rel.endswith(".py")} if rc == 0 else set()
+    if not new:
+        return ""
+    _, helpers = _judged_sources(_scope_entries(scope, root), root, check)
+    left = [rel for rel in helpers if rel in new]
+    if not left:
+        return ""
+    return (
+        f"Helper left in scope: {', '.join(left)}: new, untracked, no test imports it "
+        "and the check does not name it; delete it or leave it out of scope.\n"
     )
 
 
@@ -10720,6 +10757,9 @@ def make_step_tool() -> Any:
             missing = _report_missing_paths(report, root)
             if missing:
                 shown = f"{shown}\n\n{missing.rstrip()}"
+            helpers_left = _helpers_left_in_scope(root, scope, check)
+            if helpers_left:
+                shown = f"{shown}\n\n{helpers_left.rstrip()}"
             if not check:
                 verdict = (0, "")
                 break
@@ -11622,7 +11662,26 @@ def _worker_orientation(tool: str, args: Mapping[str, Any], cwd: Path) -> str | 
             return f"run `{' '.join(argv)}`"
         return None
 
-    return _bash_find(command, match)
+    found = _bash_find(command, match)
+    if found is not None:
+        return found
+    # Run R31: W1, refused `cat .beagle/...` four times, printed both task
+    # records with `python3 - <<'EOF'`; a heredoc body is not in the shell words.
+    for opener, body in _split_heredocs(command)[1]:
+        python = _bash_find(opener, lambda argv: argv[0] if _reads_stdin_script(argv) else None)
+        if python is not None and _source_reads_store(body):
+            return f"run a `{Path(python).name}` script fed by a heredoc that reads `.beagle/`"
+    return None
+
+
+def _reads_stdin_script(argv: list[str]) -> bool:
+    """Whether `argv` is Python running the script on its stdin: `python3 -` or bare."""
+    if argv[:2] == ["uv", "run"]:
+        argv = argv[2:]
+    if not argv or not Path(argv[0]).name.startswith("python"):
+        return False
+    words = [a for a in argv[1:] if not a.startswith("-") or a == "-"]
+    return not words or words[0] == "-"
 
 
 def _git_reads_store(args: list[str]) -> bool:
@@ -11650,7 +11709,11 @@ def _script_reads_store(argv: list[str]) -> bool:
         argv = argv[2:]
     if not argv or not Path(argv[0]).name.startswith("python") or "-c" not in argv[1:-1]:
         return False
-    script = argv[argv.index("-c", 1) + 1]
+    return _source_reads_store(argv[argv.index("-c", 1) + 1])
+
+
+def _source_reads_store(script: str) -> bool:
+    """Whether Python source `script` opens a `.beagle/` path it names."""
     if not _SCRIPT_READS.search(script):
         return False
     return any(_in_store(a or b) for a, b in _SCRIPT_LITERAL.findall(script))
@@ -11882,7 +11945,8 @@ def _truncated_call(arguments: Mapping[str, Any], earlier: int = 0) -> str | Non
     same 30k-character file four times. Run R27: told to write "a few hundred
     lines", W2 resent the same 10k characters four times; the budget is now
     in characters, and `earlier` (this worker's cut-off calls before this
-    one) says from the second on that the same size is cut off again.
+    one) says from the second on that the same size is cut off again. Run R31:
+    told to generate data with a script, W2 saved its generator in the scope.
     """
     if set(arguments) != {"_raw_arguments"}:
         return None
@@ -11897,7 +11961,8 @@ def _truncated_call(arguments: Mapping[str, Any], earlier: int = 0) -> str | Non
         f"{CUT_OFF_REFUSAL} after {len(text)} characters and are not valid JSON ({error}), "
         f"so nothing was written. Write it in parts of at most {len(text) // 2} characters: "
         "`write` the first part, then append the rest with `edit`; data with a pattern is "
-        "shorter to generate with a short script run by bash."
+        "shorter to generate with a short script run inline by bash (`python3 - <<'EOF'` "
+        "... `EOF`) or saved to a scratch path outside the project, never saved in scope."
     )
     if earlier:
         refusal += (
