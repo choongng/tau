@@ -67,12 +67,15 @@ from tau_coding.codex_model_store import (
 from tau_coding.commands import CommandRegistry, CommandResult, create_default_command_registry
 from tau_coding.context import discover_project_context_with_diagnostics
 from tau_coding.context_window import (
+    COMPACTION_SUMMARY_PREFIX,
     DEFAULT_COMPACTION_KEEP_RECENT_TOKENS,
     DEFAULT_CONTEXT_WINDOW_TOKENS,
+    SUMMARIZATION_PROMPT,
     SUMMARIZATION_SYSTEM_PROMPT,
     ContextUsageEstimate,
     auto_compaction_threshold_for_context_window,
     build_compaction_summary_prompt,
+    estimate_context_tokens,
     estimate_context_usage,
     estimate_message_tokens,
     summarize_messages_for_compaction,
@@ -4305,12 +4308,59 @@ class CodingSession:
         if first_kept_index >= len(rows):
             return None
 
+        first_kept_index = self._cut_for_half_threshold(rows, first_kept_index)
         replaced = rows[:first_kept_index]
         return CompactionPlan(
             first_kept_entry_id=rows[first_kept_index][0],
             replaced_entry_count=len(replaced),
             messages_to_summarize=tuple(message for _entry_id, message in replaced),
         )
+
+    def _cut_for_half_threshold(
+        self,
+        rows: tuple[tuple[str, AgentMessage], ...],
+        first_kept_index: int,
+    ) -> int:
+        """Move the cut forward until the compacted context fits half the threshold.
+
+        The kept tail alone is sized by `_keep_recent_tokens`, but the system
+        prompt, tools and summary come on top of it, so a small window could be
+        left close to the threshold and compact again a few turns later. The
+        summary does not exist yet: the previous summary stands in for it, or
+        the summary template when there is none. A cut only lands on a message
+        that is not a tool result, and never past the last exchange: the last
+        such message, with the user message it answers when it is a reply.
+        """
+        threshold = self.auto_compact_token_threshold
+        if threshold is None or threshold <= 0:
+            return first_kept_index
+        target = threshold // 2
+        previous = rows[0][1]
+        if isinstance(previous, UserMessage) and previous.text.startswith(
+            COMPACTION_SUMMARY_PREFIX
+        ):
+            summary = UserMessage(content=previous.text)
+        else:
+            summary = UserMessage(content=COMPACTION_SUMMARY_PREFIX + SUMMARIZATION_PROMPT)
+        system = self._harness.config.system
+        tools = tuple(self._harness.config.tools)
+        cuts = [
+            candidate
+            for candidate in range(first_kept_index, len(rows))
+            if rows[candidate][1].role != "toolResult"
+        ]
+        if (
+            len(cuts) >= 2
+            and rows[cuts[-1]][1].role == "assistant"
+            and rows[cuts[-1] - 1][1].role == "user"
+        ):
+            cuts.pop()
+        for index in cuts:
+            kept = tuple(message for _entry_id, message in rows[index:])
+            total = estimate_context_tokens(system=system, messages=(summary, *kept), tools=tools)
+            if total <= target:
+                return index
+        return cuts[-1] if cuts else first_kept_index
 
     def _active_context_rows(self) -> tuple[tuple[str, AgentMessage], ...]:
         return tuple(zip(self._state.context_entry_ids, self._state.messages, strict=True))
