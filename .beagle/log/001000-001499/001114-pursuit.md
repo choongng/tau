@@ -1,0 +1,14 @@
++++
+id = "001114-pursuit"
+ordinal = 1114
+kind = "pursuit"
+timestamp = "2026-10-05T14:13:03+00:00"
+summary = "pursuit open T0268: Oracle-with-code judges only imported or named code, honours pending locks, names the narrowed-scope call"
+metric_command = ""
+drains = []
+hooks = []
++++
+
+criteria: _oracle_with_code_problem counts as the judged code only non-test source a scope test imports or the check names (an unimported .py under a test dir is a helper, named as such); it treats the task's own pending locks as locked; on an open task the refusal names a pursuit_step call with the narrowed scope (scope minus the flagged source), checked by the same function, and a narrowed scope runs the worker; a repeated identical refusal for the same task and scope says locks do not change it and names what does; locks are de-duplicated.
+decided by: sh -c 'echo "942d53faec5f26f1369af04ca8a6008e7ac2a7071840977bc5678963ef03205b  .beagle/checks/T0268/check.sh" | sha256sum -c --quiet && bash .beagle/checks/T0268/check.sh'
+budget: 90000 tokens
