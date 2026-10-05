@@ -10968,6 +10968,69 @@ async def test_retry_note_explains_pytest_exit_5(
     assert note[1].index("adding them is the work") < note[1].index("Fix the work")
 
 
+@pytest.mark.anyio
+async def test_first_worker_of_step_is_briefed_with_last_failure(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # R25: W4, W6, W8 and W10 each opened a step blind on the exit 5 the step
+    # before had already seen; only the second worker of a step was told.
+    project = _git_project(tmp_path, monkeypatch)
+    monkeypatch.chdir(project)
+    (project / "tests").mkdir()
+    (project / "tests" / "test_cases.py").write_text("CASES = []\n")
+    check = "python3 -m pytest -q tests/test_cases.py"
+    _ready_task(fake_beagle, check)
+    runtime, _ = _bound(tmp_path)
+    args = {"task": "T0002", "criteria": "cases", "done_when": check, "scope": ["tests/"]}
+
+    await _tool(runtime, "pursuit_step").execute("c1", args)
+    shown = json.loads((fake_beagle / "show.out").read_text())
+    opened = {**shown, "status": "open", "scope": ["tests/"]}
+    (fake_beagle / "show.out").write_text(json.dumps(opened))
+    await _tool(runtime, "pursuit_step").execute("c2", args)
+
+    runs = _runs(fake_tau)
+    assert len(runs) == 4
+    seeded = "The check failed last step (exit 5). Its output ends:"
+    lead = "pytest collected no tests from tests/test_cases.py: it defines no test_ function"
+    assert seeded not in runs[0]["stdin"] and lead not in runs[0]["stdin"]
+    third = runs[2]["stdin"]
+    assert seeded in third and lead in third
+    assert "no tests ran" in third.split(seeded, 1)[1]
+    assert third.index(lead) < third.index(seeded) < third.index("Fix the work")
+
+    module = _loaded_module()
+    key = (str(project), "T0002")
+    assert module._LAST_CHECK_FAILURE[key][1] == 5
+    assert module._last_failure_note(key, "python3 -m pytest -q tests/other.py") == ""
+    module._forget_task(project, "T0002")
+    assert key not in module._LAST_CHECK_FAILURE
+    assert module._last_failure_note(key, check) == ""
+
+
+def test_runner_note_skips_test_the_check_does_not_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # R25: the runner note named tests/test_cases.py's `def main` though the
+    # bound check ran only the data test, and the driver passed it to workers.
+    project = _git_project(tmp_path, monkeypatch)
+    tests = project / "tests"
+    tests.mkdir()
+    (tests / "test_cases.py").write_text(R16_RUN_CASE_TEST)
+    (tests / "test_cases_data.py").write_text("def test_cases_load():\n    assert True\n")
+    lead_of = _module()._implementation_in_tests_lead
+
+    runner = "tests/test_cases.py: def run_case"
+    assert lead_of(project, ["tests/"], "python3 -m pytest -q tests/test_cases_data.py") == ""
+    assert runner in lead_of(project, ["tests/"], "python3 -m pytest -q tests/test_cases.py")
+    assert runner in lead_of(project, ["tests/"], "python3 -m pytest -q tests/")
+    assert runner in lead_of(project, ["tests/"])
+
+
 def test_cases_first_note_says_to_open_the_data_beside_the_test() -> None:
     module = _module()
     assert "Path(__file__).with_name('cases.json')" in module.CASES_FIRST_NOTE

@@ -6061,16 +6061,45 @@ def _implementation_in_tests(root: Path, changed: list[str]) -> list[str]:
     return found
 
 
-def _implementation_in_tests_lead(root: Path, scope: list[str]) -> str:
+def _check_test_reach(check: str, root: Path) -> set[str] | None:
+    """The test files `check` runs (looking one level into a shell script it runs) and
+    the project files those tests import; None when it names no test file to go by."""
+    commands = [check]
+    for script in re.findall(r"[\w./-]+\.sh\b", check):
+        with contextlib.suppress(OSError, ValueError):
+            commands += (root / script).read_text(encoding="utf-8").splitlines()
+    tests: list[str] = []
+    for command in commands:
+        tests += [t for t in _check_test_files(command, root) if t not in tests]
+    if not tests:
+        return None
+    files = set(tests)
+    for test in tests:
+        beside = Path(test).parent.as_posix()
+        for names in _test_imports(root / test):
+            for name in names:
+                path = name.replace(".", "/")
+                for base in ("", "src/", f"{beside}/" if beside != "." else ""):
+                    files.update(f"{base}{path}{end}" for end in (".py", "/__init__.py"))
+    return files
+
+
+def _implementation_in_tests_lead(root: Path, scope: list[str], check: str = "") -> str:
     """The line a not-done result leads with when its worker wrote code into tests/.
 
     Run R09: W4 wrote the library to tests/itc/ once src/ was refused, and the
-    not-done results only listed tests/itc/clock.py among the changed files.
+    not-done results only listed tests/itc/clock.py among the changed files. Run
+    R25 named tests/test_cases.py's `def main`, which the bound check no longer
+    ran, and the driver passed it on to the workers: with a `check` that names its
+    tests, only files it runs or they import are listed.
     """
+    runs = _check_test_reach(check, root) if check else None
     changed = [
         rel
         for rel in _changed_files(root)
-        if _in_scope(rel, scope, root) and (root / rel).is_file()
+        if _in_scope(rel, scope, root)
+        and (root / rel).is_file()
+        and (runs is None or rel in runs)
     ]
     by_file: dict[str, list[str]] = {}
     for where in _implementation_in_tests(root, changed):
@@ -7259,6 +7288,35 @@ _UNPROVEN: set[tuple[str, str]] = set()
 #: The exit status of each open task's check at its last run in a step, by
 #: (project root, task): a split commits the task's work when it was 0.
 _LAST_CHECK_EXIT: dict[tuple[str, str], int] = {}
+
+#: The last failing run of each open task's check, by (project root, task): the
+#: check, its exit status and the tail of its output. Run R25: only a step's
+#: second worker heard why the first one's check failed, so W4, W6, W8 and W10
+#: each started blind on a test pytest collected nothing from.
+_LAST_CHECK_FAILURE: dict[tuple[str, str], tuple[str, int, str]] = {}
+
+
+def _note_check_run(key: tuple[str, str], check: str, verdict: tuple[int, str]) -> None:
+    """Remember a check run of the task at `key`: its exit, and its tail if it failed."""
+    _LAST_CHECK_EXIT[key] = verdict[0]
+    if verdict[0] == 0:
+        _LAST_CHECK_FAILURE.pop(key, None)
+    else:
+        _LAST_CHECK_FAILURE[key] = (check, verdict[0], verdict[1][-CHECK_TAIL_CHARS:])
+
+
+def _last_failure_note(key: tuple[str, str], check: str) -> str:
+    """The brief note for a step's first worker when the task's check last failed."""
+    last = _LAST_CHECK_FAILURE.get(key)
+    if last is None or not check or last[0] != check:
+        return ""
+    _, rc, tail = last
+    no_tests = _pytest_collected_none(rc, check)
+    return (
+        (f"\n\n{no_tests}" if no_tests else "")
+        + f"\n\nThe check failed last step (exit {rc}). Its output ends:\n{tail}\n"
+        + "Fix the work, not the check."
+    )
 SPLIT_WIP_TITLE = "work in progress before split"
 
 #: Step results that left a task not done (stays open or blocked, not run,
@@ -8026,6 +8084,7 @@ def _forget_task(root: Path, task: str) -> None:
     key = (str(root), task)
     _UNPROVEN.discard(key)
     _LAST_CHECK_EXIT.pop(key, None)
+    _LAST_CHECK_FAILURE.pop(key, None)
     _NOT_DONE.pop(key, None)
     _NOT_DONE_SCOPE.pop(key, None)
 
@@ -8717,6 +8776,7 @@ def make_step_tool() -> Any:
             # record keeps its scope and this step runs on the call's.
             _UNPROVEN.discard((str(root), task))
             _LAST_CHECK_EXIT.pop((str(root), task), None)
+            _LAST_CHECK_FAILURE.pop((str(root), task), None)
             kept = _strings(record.get("scope"))
             route += f"{task}'s check is now `{done_when}`, run on scope {json.dumps(own_scope)}"
             route += (
@@ -8831,7 +8891,7 @@ def make_step_tool() -> Any:
         verdict: tuple[int, str] = (1, "")
         model = _worker_model(None)
         provider = _worker_provider(None)
-        retry_note = ""
+        retry_note = _last_failure_note((str(root), task), check) if status == "open" else ""
         restored: set[str] = set()
         attempt = 0
         proof: _Proof | None = None
@@ -8910,14 +8970,14 @@ def make_step_tool() -> Any:
         if retrying:
             # The work may have been done since, under another task.
             verdict = await _run_check(check, root, check_timeout)
-            _LAST_CHECK_EXIT[unproven_key] = verdict[0]
+            _note_check_run(unproven_key, check, verdict)
             if verdict[0] == 0:
                 proof = await _prove(task, "", scope, root, check_timeout, locks)
         elif passed_on_disk is not None and check == done_when:
             # Run R20: T0007's check passed at open on T0003's leftovers, and W11
             # passed at turn 2 and spent 29 more: the work was done; prove and close.
             verdict = passed_on_disk
-            _LAST_CHECK_EXIT[unproven_key] = verdict[0]
+            _note_check_run(unproven_key, check, verdict)
             proof = await _prove(task, "", scope, root, check_timeout, locks)
             if proof is not None and (not proof.proven or proof.by_absent_source):
                 if proof.proven:
@@ -8948,7 +9008,7 @@ def make_step_tool() -> Any:
                     root,
                     task,
                     scope,
-                    _implementation_in_tests_lead(root, scope)
+                    _implementation_in_tests_lead(root, scope, check)
                     + f"pursuit_step: {task} stays open — {run.problem}\n\n"
                     + _killed_attempt_context(run, shown, verdict, check, root, scope)
                     + f'Call pursuit_step with task="{task}" to send it again.',
@@ -8962,7 +9022,7 @@ def make_step_tool() -> Any:
                 verdict = (0, "")
                 break
             verdict = await _run_check(check, root, check_timeout)
-            _LAST_CHECK_EXIT[unproven_key] = verdict[0]
+            _note_check_run(unproven_key, check, verdict)
             if verdict[0] == 0:
                 if _absent_locks(locks, root):
                     break
@@ -9111,7 +9171,7 @@ def make_step_tool() -> Any:
                 + f"{route}{undid}{task} — {title}: the check still fails after {attempt} "
                 f"sub-agent run(s), so the task {state}.\n\n`{check}` exit {verdict[0]}:\n"
                 f"{verdict[1][-CHECK_TAIL_CHARS:]}\n\n"
-                + _implementation_in_tests_lead(root, scope)
+                + _implementation_in_tests_lead(root, scope, check)
                 + f"Last report:\n{shown}\n\n"
                 f'Next: pursuit_step with task="{task}" and notes saying what to fix. '
                 f"{if_line}If this route is wrong, pursuit_step with "
@@ -9134,7 +9194,7 @@ def make_step_tool() -> Any:
                 f"{route}{undid}{task} — {title}: the check passes, but {why}; the task "
                 f"{state}, since a done close needs a check shown to refuse.\n\n"
                 f"`prove` said:\n{proof.text}\n\n"
-                + _implementation_in_tests_lead(root, scope)
+                + _implementation_in_tests_lead(root, scope, check)
                 + f"Last report:\n{shown}\n\n"
                 + (
                     f'Next: pursuit_step with task="{task}" and notes saying what to '
