@@ -1472,7 +1472,14 @@ class CodingSession:
         key = _call_key(call)
         self._recent_calls.append((key, digest))
         first = next((line.strip() for line in text.splitlines() if line.strip()), "")
-        self._recent_heads[key] = first[:REPEATED_CALL_QUOTE]
+        head = first[:REPEATED_CALL_QUOTE]
+        if len(first) > REPEATED_CALL_QUOTE:
+            # Run R32's refusal was cut before the call it asked for, and the
+            # cut text read as done: quote the sentence that holds the call.
+            tools = {tool.name for tool in self._harness.config.tools}
+            if _named_call(head, tools) is None:
+                head = _call_sentence(text, tools) or head
+        self._recent_heads[key] = head
         live = {seen for seen, _ in self._recent_calls}
         for stale in [seen for seen in self._recent_heads if seen not in live]:
             del self._recent_heads[stale]
@@ -5607,6 +5614,30 @@ def _dedupe_lists(value: object) -> object:
                 unique.append(item)
         return unique
     return value
+
+
+def _named_call(text: str, tools: set[str]) -> re.Match[str] | None:
+    """The first call in `text` to one of `tools`: its name, then arguments."""
+    if not tools:
+        return None
+    names = "|".join(re.escape(name) for name in sorted(tools, key=len, reverse=True))
+    return re.search(rf"(?<![\w`])`?(?:{names})`?(?:\(|\s+[A-Za-z_]\w*=)", text)
+
+
+def _call_sentence(text: str, tools: set[str]) -> str | None:
+    """The first sentence of `text` holding a call to one of `tools`, bounded.
+
+    A sentence longer than `REPEATED_CALL_QUOTE` is quoted from the call on.
+    """
+    for line in text.splitlines():
+        for sentence in re.split(r"(?<=[.!?])\s+", line.strip()):
+            found = _named_call(sentence, tools)
+            if found is None:
+                continue
+            if len(sentence) > REPEATED_CALL_QUOTE:
+                sentence = sentence[found.start() :]
+            return sentence[:REPEATED_CALL_QUOTE]
+    return None
 
 
 def _call_key(call: ToolCall) -> str:

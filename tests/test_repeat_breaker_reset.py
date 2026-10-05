@@ -147,3 +147,54 @@ def test_call_key_ignores_duplicate_list_entries() -> None:
     assert _call_key(
         ToolCall(id="c", name="pursuit_found", arguments={"task": "T1", "locks": ["a.py", "b.py"]})
     ) != base
+
+
+@pytest.mark.anyio
+async def test_repeated_call_quotes_sentence_holding_the_call(tmp_path: Path) -> None:
+    # Run R32: the quoted head was cut before the call the refusal asked for,
+    # and "It said: … closes on th" read as done.
+    why = "step: T2 not changed — its data test already passes on the work on disk. " * 5
+    ask = 'Send step task="T2" check="pytest -q" to close it.'
+    texts = {
+        "step": f"{why}{ask}\nThen go on.",
+        "look": "look: " + 'the call that holds it is `step` task="T9" here. ' * 8,
+    }
+    ran: list[str] = []
+
+    def tool(name: str) -> AgentTool:
+        async def execute(
+            tool_call_id: object, arguments: object, signal: object = None, on_update: object = None
+        ) -> AgentToolResult:
+            ran.append(name)
+            return AgentToolResult(content=[TextContent(text=texts[name])])
+
+        return AgentTool(
+            name=name,
+            label=name,
+            description=f"{name} something.",
+            parameters={"type": "object"},
+            execute_fn=execute,
+        )
+
+    args: dict[str, JSONValue] = {"task": "T2"}
+    session = await CodingSession.load(
+        CodingSessionConfig(
+            provider=FakeProvider(_turns([("step", args)] * 3 + [("look", args)] * 3)),
+            model="fake",
+            system="You are Tau.",
+            storage=JsonlSessionStorage(tmp_path / "session.jsonl"),
+            cwd=tmp_path,
+            tools=[tool("step"), tool("look")],
+        )
+    )
+
+    async for _ in session.prompt("Go."):
+        pass
+
+    assert ran == ["step", "step", "look", "look"]
+    results = [m.text for m in session.messages if m.role == "toolResult"]
+    # Cut before the call: the sentence holding it is quoted instead.
+    assert f"It said: {ask} Do what that result asks" in results[2]
+    assert why.strip()[:300] not in results[2]
+    # A head that already holds the call is quoted as before.
+    assert f"It said: {texts['look'].strip()[:300]} Do what" in results[5]
