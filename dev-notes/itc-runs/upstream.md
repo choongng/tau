@@ -226,3 +226,16 @@ Nothing else for beagle: the event-tree loss is tau's ordering and checks
 - R23/T0216: beagle pursuit amend has no --scope; a task's scope cannot be
   changed after open, so tau reports the mismatch to the driver instead
   (T0223).
+
+## R26
+
+- **No attempt count in a task's record.** R26's T0011 reached beagle's
+  spawn attempt limit (E112: the spawn was refused), but `beagle pursuit
+  show T0011` gives tau no count of the retry chain, so tau kept offering
+  `new_route` (E200), a call beagle then refused. tau can count the chain
+  itself from `sibling_of` links (R26.md, fourth tau class), but the limit
+  and the count are beagle's; `show` could report both. Priority: low.
+- Not upstream: beagle's `close --outcome infeasible|abandoned` exists. R26's
+  driver had no pursuit_step argument to reach it for an open task, and
+  beagle's refusal advice (`--draft-on`, "mark it infeasible") named verbs
+  tau does not expose. That is tau's class, not beagle's.
