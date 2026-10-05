@@ -12564,6 +12564,73 @@ async def test_cases_first_names_the_live_task_holding_the_data_file(
     assert _pursuit_calls(fake_beagle, "open") == [] and _runs(fake_tau) == []
 
 
+async def _cases_first_holder_result(
+    tmp_path: Path, fake_beagle: Path, monkeypatch: pytest.MonkeyPatch, holder: dict[str, Any]
+) -> Any:
+    """T0006's Cases first refusal with no known answers on disk and T0002 as `holder`."""
+    project = _git_project(tmp_path, monkeypatch)
+    (project / "references").mkdir()
+    (project / "references" / "itc2008.txt").write_text("Interval Tree Clocks\n")
+    _r16_t0006_ready(fake_beagle)
+    (fake_beagle / "show-T0002.out").write_text(json.dumps({"id": "T0002", **holder}))
+    tree = [
+        {"id": "T0001", "parent": "", "status": "open", "container": True},
+        {"id": "T0002", "parent": "T0001", "status": "pending", "title": "Fixtures"},
+        {"id": "T0006", "parent": "T0001", "status": "pending", "title": "Create"},
+    ]
+    (fake_beagle / "tree.out").write_text(json.dumps({"nodes": tree}))
+    runtime, _ = _bound(tmp_path)
+    return await _tool(runtime, "pursuit_step").execute("c1", R16_T0006_STEP), project
+
+
+@pytest.mark.anyio
+async def test_cases_first_names_a_holder_when_the_data_file_is_not_on_disk(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Audit 11: this branch hard-coded tests/cases.json; the data path is the one
+    # the known-answers work Cases first gives names.
+    module = _module()
+    data = [rel for rel in module._CASES_FIRST_SCOPE if module._is_cases_data(rel)]
+    result, project = await _cases_first_holder_result(
+        tmp_path, fake_beagle, monkeypatch, {"scope": data}
+    )
+
+    assert not (project / "tests").exists()
+    assert "T0006 not opened" in result.text and "Cases first" in result.text
+    assert f"T0002 holds {', '.join(data)} already: do not split T0006" in result.text
+    assert 'pursuit_step task="T0002"' in result.text
+    assert "pursuit_plan" not in result.text and "on disk already" not in result.text
+    assert _pursuit_calls(fake_beagle, "open") == [] and _runs(fake_tau) == []
+
+
+@pytest.mark.anyio
+async def test_cases_first_holder_found_by_pending_locks(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # T0002's scope names only the data test; the data file is in its pending locks.
+    project = tmp_path / "project"
+    (project / ".beagle").mkdir(parents=True)
+    (project / ".beagle" / "locks-pending.json").write_text(
+        json.dumps({"T0002": ["tests/cases.json"]})
+    )
+    result, _ = await _cases_first_holder_result(
+        tmp_path, fake_beagle, monkeypatch, {"scope": ["tests/test_case_data.py"]}
+    )
+
+    assert "T0002 holds tests/cases.json already: do not split T0006" in result.text
+    assert 'pursuit_step task="T0002"' in result.text
+    assert "pursuit_plan" not in result.text
+    assert _pursuit_calls(fake_beagle, "open") == [] and _runs(fake_tau) == []
+
+
 #: R21: T0005 writes the data, T0006 (waiting on it) writes the data test.
 R21_SPLIT_TREE = [
     {"id": "T0001", "status": "open", "title": "Goal", "container": True},
@@ -12977,6 +13044,64 @@ async def test_no_worker_when_the_check_passes_and_was_unproven(
     assert "T0002 not run — call instead: " in result.text
     assert "This check already passes" in result.text
     assert 'pursuit_step task="T0002", new_route=true' in result.text
+    assert _runs(fake_tau) == []
+
+
+@pytest.mark.anyio
+async def test_unproven_refusal_first_line_is_a_complete_call_within_the_quote(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Audit 11: three branches put prose ("a done_when running the data file's
+    # test") where the values go, and the first line was not bounded to the quote.
+    project = _pursuit_project(tmp_path)
+    monkeypatch.chdir(project)
+    _open_on_done_txt(project, fake_beagle, ["done.txt"])
+    _r21_tree(project)
+    (project / "clock.py").write_text("def tick(n):\n    return n + 1\n")
+    (project / "tests" / "test_clock.py").write_text(
+        "from clock import tick\n\n\ndef test_tick():\n    assert tick(1) == 2\n"
+    )
+    runtime, _ = _bound(tmp_path)
+    module = _loaded_module()
+    pytest_clock = "python3 -m pytest -q tests/test_clock.py"
+    branches = [
+        # The check's test reads a data file outside the scope.
+        (["tests/test_case_data.py"], R21_CHECK, R21_CHECK, ["tests/cases.json"]),
+        # The scope holds the data file and its test.
+        (
+            ["tests/cases.json", "tests/test_case_data.py"],
+            "grep -q in tests/cases.json",
+            R21_CHECK,
+            [],
+        ),
+        # Tests only: the module the test imports joins the scope.
+        (["tests/test_clock.py"], pytest_clock, pytest_clock, ["clock.py"]),
+        # Code: the test that imports it is run.
+        (["clock.py"], "grep -q tick clock.py", pytest_clock, ["tests/test_clock.py"]),
+    ]
+    for scope, check, done_when, added in branches:
+        record = {"id": "T0002", "title": "Parser", "status": "open"}
+        (fake_beagle / "show.out").write_text(
+            json.dumps(record | {"done_when": check, "scope": scope})
+        )
+        module._NOT_DONE.clear()
+        module._UNPROVEN.add((str(Path.cwd()), "T0002"))
+
+        result = await _tool(runtime, "pursuit_step").execute("c1", {"task": "T0002"})
+
+        first = result.text.splitlines()[0]
+        assert first.startswith(
+            'pursuit_step: T0002 not run — call instead: pursuit_step task="T0002", '
+            f"new_route=true, done_when={json.dumps(done_when)}, "
+            f"scope={json.dumps([*scope, *added])}, notes="
+        ), first
+        assert len(first) <= module.ESCALATION_HEAD_CHARS, first
+        for prose in ("a done_when", "running", "naming", "<"):
+            assert prose not in first, first
     assert _runs(fake_tau) == []
 
 

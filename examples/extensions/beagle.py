@@ -4777,11 +4777,14 @@ def _locked_test_problem(command: str, scope: list[str], goal: Path) -> str | No
     )
 
 
+#: The known-answers task's scope and locks, as the cases-first hint gives them.
+_CASES_FIRST_SCOPE = ("tests/cases.json", "tests/test_cases.py", "tests/test_case_data.py")
+
 #: The known-answers task's scope, check and locks, as the cases-first hint gives them.
 _CASES_FIRST_WORK = (
-    "with scope tests/cases.json, tests/test_cases.py, tests/test_case_data.py; "
+    f"with scope {', '.join(_CASES_FIRST_SCOPE)}; "
     'done_when="python3 -m pytest -q tests/test_case_data.py"; and '
-    "locks=[tests/cases.json, tests/test_cases.py, tests/test_case_data.py]"
+    f"locks=[{', '.join(_CASES_FIRST_SCOPE)}]"
 )
 
 
@@ -5097,10 +5100,12 @@ def _cases_first_problem(
             "",
         )
         return _cases_on_disk_route(task, title, named, unjudged_text, on_disk, existing, "")
-    holder = _live_data_holder(task, nodes or [], ["tests/cases.json"], goal)
+    # Not on disk: the data file is the one the known-answers work below writes.
+    data = [rel for rel in _CASES_FIRST_SCOPE if _is_cases_data(rel)]
+    holder = _live_data_holder(task, nodes or [], data, goal)
     if holder:
         return (
-            f"Cases first: {unjudged_text} {holder} holds tests/cases.json already: do not "
+            f"Cases first: {unjudged_text} {holder} holds {', '.join(data)} already: do not "
             f"split {task}. Work {holder} first, {_CASES_FIRST_WORK}: "
             f'pursuit_step task="{holder}". {task} opens once its cases are locked, its '
             f"test importing {named} by name."
@@ -6365,6 +6370,88 @@ def _imported_modules(root: Path, scope: list[str]) -> list[str]:
                         modules.append(rel)
                     break
     return modules
+
+
+def _unproven_call(
+    task: str, check: str, scope: list[str], root: Path, missing_data: list[str]
+) -> str:
+    """The pursuit_step call that gives an unproven task a check a defect can fail,
+    with its values taken from the tree, or a split when none can be.
+
+    Audit 11: three branches of that refusal put prose ("a done_when running the
+    data file's test") where the values go, so the call could not be sent as given.
+    """
+    tests_only = _only_data_and_tests(scope)
+    tests = [rel.rstrip("/") for rel in scope if _is_test_path(rel) and rel.endswith(".py")]
+    tests += [rel for rel in _check_test_files(check, root) if rel not in tests]
+    done_when = ""
+    added: list[str] = []
+    notes = ""
+    if tests_only and missing_data:
+        done_when, added = check, missing_data
+        notes = f"New route: {', '.join(missing_data)}, which the check reads, is in scope"
+    elif tests_only and _scope_has_data(scope):
+        data = next(r.rstrip("/") for r in scope if Path(r.rstrip("/")).suffix not in {"", ".py"})
+        test = next(
+            (t for t in tests if _cases_test_reads(root / t, Path(data).name)),
+            _data_test("", scope, root),
+        )
+        done_when, added = f"python3 -m pytest -q {test}", [test]
+        notes = f"New route: {test} fails once {data} is taken away"
+    elif tests_only:
+        base = "src/" if (root / "src").is_dir() else ""
+        for test in tests:
+            found = _imported_modules(root, [test]) or [
+                f"{base}{name.replace('.', '/')}.py"
+                for name in _test_project_imports(root / test)
+            ]
+            if found:
+                done_when, added = f"python3 -m pytest -q {test}", found[:1]
+                notes = f"New route: a defect put into {found[0]} fails {test}"
+                break
+    else:
+        code = [
+            rel.rstrip("/")
+            for rel in scope
+            if rel.rstrip("/").endswith(".py") and not _is_test_path(rel)
+        ]
+        modules = {_module_of(rel): rel for rel in code}
+        on_disk = sorted(
+            p.relative_to(root).as_posix()
+            for p in (root / "tests").rglob("test_*.py")
+            if not _CACHE_DIRS & set(p.relative_to(root).parts)
+        )
+        importing = next(
+            (
+                (t, modules[name])
+                for t in on_disk
+                for name in _test_project_imports(root / t)
+                if name in modules
+            ),
+            None,
+        )
+        if importing is None:
+            stem = Path(code[0]).stem if code else task.lower()
+            importing = (f"tests/test_{stem}.py", code[0] if code else ", ".join(scope) or task)
+        test, module = importing
+        done_when, added = f"python3 -m pytest -q {test}", [test]
+        notes = f"New route: {test} runs {module}, so a defect there fails it"
+    if not done_when:
+        return (
+            f'pursuit_plan task="{task}", parts=["Code::the module {task}\'s tests import", '
+            f'"Tests::{task}\'s tests, run against that module"]'
+        )
+    routed = [*scope, *[rel for rel in added if rel not in scope]]
+    call = (
+        f'pursuit_step task="{task}", new_route=true, done_when={json.dumps(done_when)}, '
+        f"scope={json.dumps(routed)}, notes="
+    )
+    lead = f"pursuit_step: {task} not run — call instead: "
+    tail = "; or split it with pursuit_plan."
+    full = json.dumps(notes, ensure_ascii=False)
+    if len(lead) + len(call) + len(full) + len(tail) > ESCALATION_HEAD_CHARS:
+        full = '"…"'
+    return call + full
 
 
 @dataclass(frozen=True)
@@ -8703,12 +8790,8 @@ def make_step_tool() -> Any:
             return _step_result(f"pursuit_step: {task} not run — {mixed}")
         if unproven_key in _UNPROVEN:
             # Run R23: the breaker quotes only a result's first line; the call goes there.
-            call = f'pursuit_step task="{task}", new_route=true'
+            call = _unproven_call(task, check, scope, root, missing_data)
             if tests_only and missing_data:
-                call += (
-                    f", done_when={json.dumps(check)}, "
-                    f'scope={json.dumps([*scope, *missing_data])}, notes="…"'
-                )
                 how = (
                     TESTS_ONLY_PROOF_NOTE
                     + f" The test it runs reads {', '.join(missing_data)}, outside this "
@@ -8716,20 +8799,17 @@ def make_step_tool() -> Any:
                     "and adds that file to its scope"
                 )
             elif tests_only and _scope_has_data(scope):
-                call += ", a done_when running the data file's test, scope naming that file, notes"
                 how = (
                     TESTS_ONLY_PROOF_NOTE
                     + " The new route's done_when runs that file's test and its scope "
                     "names the data file"
                 )
             elif tests_only:
-                call += ", a done_when running the test that imports the module, notes"
                 how = (
                     TESTS_ONLY_MUTATE_NOTE
                     + " The new route's done_when runs the test that imports it"
                 )
             else:
-                call += ", a done_when running a test that imports this task's code, notes"
                 how = (
                     "The new route's done_when imports the code this task tests and runs "
                     "it (e.g. `python3 -m pytest -q tests/test_<this task>.py`, a test "
