@@ -10443,6 +10443,94 @@ async def test_known_answers_open_binds_data_test_when_the_cases_test_is_not_on_
     assert _module()._absent_test_route(both, [*scope, "clocks.py"], project) is None
 
 
+async def _open_then_resend(
+    tmp_path: Path, fake_beagle: Path, first: str, resend: str, scope: list[str], between: Any
+) -> tuple[str, str]:
+    """Open T0002 on `first`, run `between`, and resend `resend` to the open task:
+    the bound check and the resend's text."""
+    _ready_task(fake_beagle)
+    runtime, _ = _bound(tmp_path)
+    args = {"task": "T0002", "criteria": "cases", "done_when": first, "scope": scope}
+    await _tool(runtime, "pursuit_step").execute("c1", args)
+    opened = _pursuit_calls(fake_beagle, "open")[-1]
+    bound = opened[opened.index("--done-when") + 1]
+    _open_task(fake_beagle, check=bound)
+    record = json.loads((fake_beagle / "show.out").read_text())
+    (fake_beagle / "show.out").write_text(json.dumps({**record, "status": "open", "scope": scope}))
+    between()
+    args = {"task": "T0002", "criteria": "cases", "done_when": resend, "scope": scope}
+    result = await _tool(runtime, "pursuit_step").execute("c2", args)
+    return bound, result.text
+
+
+@pytest.mark.anyio
+async def test_amend_binds_data_test_when_cases_test_not_on_disk(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # R25 #5 resent the open's check, cases test and all, while tests/test_cases.py
+    # was still absent; the amend bound it, and no worker could pass it.
+    project = _pursuit_project(tmp_path)
+    monkeypatch.chdir(project)
+    data_check = _case_data_test(project)
+    scope = ["tests/cases.json", "tests/test_cases.py", "tests/test_case_data.py"]
+    both = "python3 -m pytest -q tests/test_case_data.py tests/test_cases.py"
+
+    bound, text = await _open_then_resend(tmp_path, fake_beagle, both, both, scope, lambda: None)
+
+    assert bound == data_check
+    assert _pursuit_calls(fake_beagle, "amend") == []
+    assert text.startswith(f"Bound the data test only: `{data_check}`")
+    assert "tests/test_cases.py is in scope but not on disk yet" in text
+    assert f"check is now `{both}`" not in text
+    assert "not changed" not in text and "not run" not in text
+
+    # A resend that names a check the open path keeps is amended as before.
+    other = "python3 -m pytest -q tests/test_case_data.py -x"
+    _, text = await _open_then_resend(tmp_path, fake_beagle, both, other, scope, lambda: None)
+    [*_, amend] = _pursuit_calls(fake_beagle, "amend")
+    assert amend[:3] == ["T0002", "--done-when", other]
+    assert "Bound the data test only" not in text.split("check is now")[-1]
+
+
+@pytest.mark.anyio
+async def test_amend_rebinds_data_test_when_cases_test_imports_unwritten_module(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # R25: by the resend, a worker had written tests/test_cases.py, which imports
+    # itc_clocks.itc; no path in the known-answers scope creates it.
+    project = _pursuit_project(tmp_path)
+    monkeypatch.chdir(project)
+    data_check = _case_data_test(project)
+    scope = ["tests/cases.json", "tests/test_cases.py", "tests/test_case_data.py"]
+    first = "pytest -q tests/test_case_data.py"
+    both = "pytest -q tests/test_case_data.py tests/test_cases.py"
+
+    def write_cases_test() -> None:
+        (project / "tests" / "test_cases.py").write_text(
+            "from itc_clocks.itc import Stamp\n\n\ndef test_cases():\n    assert Stamp\n"
+        )
+
+    bound, text = await _open_then_resend(
+        tmp_path, fake_beagle, first, both, scope, write_cases_test
+    )
+
+    assert bound == first
+    [amend] = _pursuit_calls(fake_beagle, "amend")
+    assert amend[:3] == ["T0002", "--done-when", data_check]
+    assert text.startswith(f"Bound the data test only: `{data_check}`")
+    assert "tests/test_cases.py imports itc_clocks.itc" in text
+    assert f"T0002's check is now `{data_check}`" in text
+    assert f"check is now `{both}`" not in text
+
+
 @pytest.mark.anyio
 async def test_non_test_py_under_tests_is_refused_as_scope_with_a_root_module_call(
     tmp_path: Path,

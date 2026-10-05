@@ -5380,6 +5380,42 @@ def _scope_note(needs: list[str], scope: list[str]) -> str:
     return f" Its scope must hold that test too: scope={json.dumps(needs)}."
 
 
+def _data_only_bind(
+    command: str, scope: list[str], root: Path, *, unwritten: bool = False
+) -> tuple[str, list[str], str] | None:
+    """For a known-answers check that runs, beside a data test, a test that cannot pass
+    on this scope: the data-test command to bind instead, its scope, and the lead that
+    says so; or None.
+
+    A named test absent from disk is the open's case (`_absent_test_route`, run R24 #4).
+    With `unwritten`, a test on disk that imports a module no scope path creates is
+    one too (`_data_test_route`): run R25 #5 resent the open's check naming the cases
+    test, and the amend bound it.
+    """
+    absent_route = _absent_test_route(command, scope, root) if scope else None
+    if absent_route is not None:
+        absent, data_check, needs = absent_route
+        return (
+            data_check,
+            needs,
+            f"Bound the data test only: `{data_check}`. {', '.join(absent)} "
+            f"{'is' if len(absent) == 1 else 'are'} in scope but not on disk yet, so "
+            "nothing shows whether the code it will import is one this scope can "
+            "write; a later task whose scope holds that code runs it.\n\n",
+        )
+    route = _data_test_route(command, scope, root) if unwritten and scope else None
+    if route is None or not (_scope_has_data(scope) and _only_data_and_tests(scope)):
+        return None
+    test, module, data_check, needs = route
+    return (
+        data_check,
+        needs,
+        f"Bound the data test only: `{data_check}`. {test} imports {module}, which no "
+        "path in this scope creates, so it fails with ImportError until a later task "
+        "whose scope holds that code runs it.\n\n",
+    )
+
+
 def _check_data_reads(command: str, root: Path) -> list[str]:
     """The data files that tests run by `command`, importing no project module, open.
 
@@ -8346,6 +8382,19 @@ def make_step_tool() -> Any:
         if amends_open:
             if data_route is not None and " ".join(done_when.split()) == data_route[2]:
                 done_when, scope = data_route[2], data_route[3]
+            # Run R25 #5: the open bound the data test only, and resending its check,
+            # cases test and all, amended to the cases test, which could not pass. A
+            # resend whose unwritten import leaves the bound data test as it is keeps
+            # the amend's refusal, which names that test.
+            own = scope or _strings(record.get("scope"))
+            data_only = _data_only_bind(done_when, own, root)
+            if data_only is None:
+                data_only = _data_only_bind(done_when, own, root, unwritten=True)
+                if data_only is not None and data_only[0] == " ".join(bound_check.split()):
+                    data_only = None
+            if data_only is not None:
+                done_when, scope, data_note = data_only
+                route += data_note
         elif (
             not new_route
             and data_route is not None
@@ -8500,17 +8549,12 @@ def make_step_tool() -> Any:
                 return _step_result(f"pursuit_step: {task} not opened — {prose}")
             route += _bound_note(done_when, chained)
             done_when = chained
-            absent_route = _absent_test_route(done_when, scope, root) if scope else None
-            if absent_route is not None:
+            data_only = _data_only_bind(done_when, scope, root)
+            if data_only is not None:
                 # Run R24 #4: the cases test, not yet written, later imported a
                 # module no path in this scope could hold.
-                absent, done_when, scope = absent_route
-                route += (
-                    f"Bound the data test only: `{done_when}`. {', '.join(absent)} "
-                    f"{'is' if len(absent) == 1 else 'are'} in scope but not on disk yet, so "
-                    "nothing shows whether the code it will import is one this scope can "
-                    "write; a later task whose scope holds that code runs it.\n\n"
-                )
+                done_when, scope, data_note = data_only
+                route += data_note
             if not scope and record.get("sibling_of"):
                 # Run R18 #56: T0008, spawned with no scope, was refused "no scope given".
                 scope = _predecessor_scope(record, root)
