@@ -6901,7 +6901,7 @@ async def test_root_plan_refuses_a_part_titled_like_a_live_task(
         "c1", {"task": "T0001", "parts": ["Docs::write them", "  FORK   and join ::again"]}
     )
     under_a_milestone = await plan.execute(
-        "c2", {"task": "T0002", "parts": ["Encode::again", "Tests::write"]}
+        "c2", {"task": "T0002", "parts": ["Decode::again", "Tests::write"]}
     )
 
     assert refused.text.startswith("pursuit_plan: nothing added")
@@ -6909,6 +6909,83 @@ async def test_root_plan_refuses_a_part_titled_like_a_live_task(
     assert "nothing added" not in under_a_milestone.text
     added = _pursuit_calls(fake_beagle, "add") + _pursuit_calls(fake_beagle, "split")
     assert added and all("T0001" not in call for call in added)
+
+
+def _r25_nodes() -> list[dict[str, Any]]:
+    """Run R25's tree: pending milestones beside T0006, the open leaf the driver split."""
+    core = {"id": "T0003", "parent": "T0001", "title": "Implement the clock core"}
+    return [
+        {"id": "T0001", "parent": "", "title": "Goal", "status": "open", "container": True},
+        {**core, "status": "pending"},
+        {"id": "T0004", "parent": "T0001", "title": "Add tests", "status": "pending"},
+        {"id": "T0006", "parent": "T0001", "title": "Known answers", "status": "open"},
+    ]
+
+
+@pytest.mark.anyio
+async def test_plan_split_repairs_bare_label_titles(
+    tmp_path: Path, beagle: Path, fake_beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # R25 #16: 'T0007::…' parts went to `split` raw, and beagle titled them T0007-T0010.
+    monkeypatch.chdir(_pursuit_project(tmp_path))
+    (fake_beagle / "tree.out").write_text(json.dumps({"nodes": _r25_nodes()}))
+    runtime, _ = _bound(tmp_path)
+    plan = _tool(runtime, "pursuit_plan")
+
+    split = await plan.execute(
+        "c1",
+        {"task": "T0006", "parts": ["T0007::Rewrite the cases from the paper", "T0008::Docs"]},
+    )
+    alone = await plan.execute("c2", {"task": "T0006", "parts": ["T0009", "Docs::write"]})
+    beside = await plan.execute(
+        "c3", {"task": "T0006", "parts": ["T0009::", "Docs::write", "Notes::add"]}
+    )
+
+    assert _pursuit_calls(fake_beagle, "split") == [
+        [
+            "T0006",
+            "Rewrite the cases from the paper::Rewrite the cases from the paper",
+            "Docs::Docs",
+            "--ordered",
+        ]
+    ]
+    assert "Part 'T0007' was only a label" in split.text
+    assert alone.text.startswith("pursuit_plan: nothing added")
+    assert "'T0009' is only a label" in alone.text
+    assert alone.text.endswith('call instead: pursuit_step task="T0006"')
+    assert beside.text.endswith(
+        'call instead: pursuit_plan task="T0006", parts=["Docs::write", "Notes::add"]'
+    )
+
+
+@pytest.mark.anyio
+async def test_plan_under_nonroot_refuses_part_duplicating_pending_task(
+    tmp_path: Path, beagle: Path, fake_beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # R25: T0008-T0010, split from T0006, repeated pending T0003-T0005 word for word.
+    monkeypatch.chdir(_pursuit_project(tmp_path))
+    nodes = [
+        *_r25_nodes(),
+        {"id": "T0011", "parent": "T0006", "title": "Sources", "status": "open"},
+        {"id": "T0012", "parent": "T0011", "title": "Read the paper", "status": "pending"},
+    ]
+    (fake_beagle / "tree.out").write_text(json.dumps({"nodes": nodes}))
+    runtime, _ = _bound(tmp_path)
+    plan = _tool(runtime, "pursuit_plan")
+
+    refused = await plan.execute(
+        "c1",
+        {"task": "T0006", "parts": ["Cases::write", "T0008::Implement the clock core"]},
+    )
+    own_subtree = await plan.execute(
+        "c2", {"task": "T0006", "parts": ["Read the paper::again", "Docs::write"]}
+    )
+
+    assert refused.text.startswith("pursuit_plan: nothing added")
+    assert "'Implement the clock core' has the title of T0003" in refused.text
+    assert 'pursuit_step task="T0003"' in refused.text
+    assert "nothing added" not in own_subtree.text
+    assert [call[1] for call in _pursuit_calls(fake_beagle, "split")] == ["Read the paper::again"]
 
 
 @pytest.mark.anyio

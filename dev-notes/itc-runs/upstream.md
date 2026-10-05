@@ -223,3 +223,6 @@ Nothing else for beagle: the event-tree loss is tau's ordering and checks
   add 129 to `_USAGE_EXITS` and accept a line-initial `error: `; for git,
   whose unknown option is never what the work adds, refuse rather than
   warn. Priority: low (tau's first class is the fix on the host side).
+- R23/T0216: beagle pursuit amend has no --scope; a task's scope cannot be
+  changed after open, so tau reports the mismatch to the driver instead
+  (T0223).

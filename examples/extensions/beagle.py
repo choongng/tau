@@ -3462,19 +3462,32 @@ def _plan_order_problem(parts: list[str], task: str, goal: Path) -> str | None:
 
 
 def _live_title_clash(task: str, parts: list[str], nodes: list[dict[str, Any]]) -> str | None:
-    """Why a plan on the root may not add `parts`, one titled as a live task is, or None.
+    """Why a plan may not add `parts`, one titled as a live task off `task`'s subtree is, or None.
 
     Run R22's driver planned five parts on the root that repeated pending
-    tasks, and they then ranked against the tasks they repeated. Titles are
-    compared case-folded with whitespace normalized.
+    tasks, and they then ranked against the tasks they repeated. Run R25's
+    split of T0006 repeated pending T0003-T0005 the same way, off the root.
+    Titles are compared case-folded with whitespace normalized.
     """
     node = next((n for n in nodes if str(n.get("id")) == task), None)
-    if node is None or node.get("parent"):
+    if node is None:
         return None
+    # The root's subtree is the whole tree: there only the root is left out.
+    subtree = {task}
+    grew = bool(node.get("parent"))
+    while grew:
+        grew = False
+        for n in nodes:
+            nid = str(n.get("id"))
+            if n.get("parent") in subtree and nid not in subtree:
+                subtree.add(nid)
+                grew = True
     live = {
         _fold(str(n.get("title") or "")): n
         for n in nodes
-        if n.get("status") in ("pending", "open") and n.get("id")
+        if n.get("status") in ("pending", "open")
+        and n.get("id")
+        and str(n.get("id")) not in subtree
     }
     for part in parts:
         title = _part_title(part)
@@ -3487,6 +3500,26 @@ def _live_title_clash(task: str, parts: list[str], nodes: list[dict[str, Any]]) 
                 "the plan again without that part."
             )
     return None
+
+
+def _bare_label_refusal(
+    task: str, parts: list[str], unlabeled: list[str], nodes: list[dict[str, Any]]
+) -> str:
+    """Why parts that are only a label, with no intent for a title, are refused, and the call.
+
+    The call leaves those parts out; where too few parts would be left to
+    split `task`, it works `task` instead.
+    """
+    rest = [part for part in parts if part not in unlabeled]
+    named = ", ".join(repr(part.strip()) for part in unlabeled)
+    if len(rest) >= 2 or (rest and not _is_leaf(task, nodes)):
+        call = f'pursuit_plan task="{task}", parts={json.dumps(rest, ensure_ascii=False)}'
+    else:
+        call = f'pursuit_step task="{task}"'
+    return (
+        f"{named} is only a label, with no intent to take a title from. Give each part "
+        f"as 'Title::what it does', or call instead: {call}"
+    )
 
 
 #: beagle's note on a task it added that reads like another, with the bash it
@@ -3556,6 +3589,26 @@ def make_plan_tool() -> Any:
         backwards = _plan_order_problem(parts, task, goal) if ordered else None
         if backwards is not None:
             return _step_result(f"pursuit_plan: nothing added — {backwards}")
+        # Run R25 sent 'T0007::…' to `split` raw, and beagle titled the task
+        # 'T0007': every part goes on as the title `_split_part` repairs.
+        unlabeled = [
+            part
+            for part in parts
+            if not _split_part(part)[1] and _BARE_LABEL.fullmatch(_split_part(part)[0])
+        ]
+        if unlabeled:
+            why = _bare_label_refusal(task, parts, unlabeled, _tree_nodes(root))
+            return _step_result(f"pursuit_plan: nothing added — {why}")
+        for part in parts:
+            label = part.partition("::")[0].strip()
+            if _BARE_LABEL.fullmatch(label):
+                split_notes.append(
+                    f"Part {label!r} was only a label, so it is titled "
+                    f"{_part_title(part)!r} from its intent."
+                )
+        parts = [
+            f"{title}::{intent}" if intent else title for title, intent in map(_split_part, parts)
+        ]
         # A small model re-sends the plan it already made; beagle adds every
         # part again, and the copies are then worked twice.
         existing = _children(task, root)
