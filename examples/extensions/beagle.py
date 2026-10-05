@@ -6258,6 +6258,74 @@ def _pytest_node_import_only_problem(command: str, scope: list[str], root: Path)
     return None
 
 
+def _pytest_node_missing_problem(command: str, scope: list[str], root: Path) -> str | None:
+    """Why a check names a pytest node its task cannot make exist, or None.
+
+    Run R34 #19: `pytest -q tests/test_cases.py::test_encode_decode_roundtrip` named
+    a test the locked file did not hold, and every worker's check exited 4. A node
+    in a test file the task may write is left alone: the worker may add it.
+    """
+    try:
+        words = shlex.split(command)
+    except ValueError:
+        return None
+    parts: list[str] = []
+    for word in words:
+        parts.append(word)
+        if " " in word:
+            with contextlib.suppress(ValueError):
+                parts += shlex.split(word)
+    locked = set(_locked(root / ".beagle" / GOAL_BASENAME))
+    named = {os.path.normpath(e.strip()) for e in scope}
+    for part in parts:
+        rel, _, node_id = part.partition("::")
+        rel = rel.rstrip("/")
+        if (
+            not node_id
+            or not rel.endswith(".py")
+            or Path(rel).is_absolute()
+            or ".." in Path(rel).parts
+            or not (root / rel).is_file()
+            or not _runs_test_file(command, rel)
+        ):
+            continue
+        rel = os.path.normpath(rel)
+        if _in_scope(rel, scope, root) and (rel not in locked or rel in named):
+            continue
+        try:
+            tree = ast.parse((root / rel).read_text(encoding="utf-8"))
+        except (OSError, SyntaxError, ValueError):
+            continue
+        found: list[ast.AST] = [tree]
+        for name in (n.split("[", 1)[0] for n in node_id.split("::")):
+            found = [
+                child
+                for parent in found
+                for child in getattr(parent, "body", [])
+                if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+                and child.name == name
+            ]
+        if found:
+            continue
+        tests = [
+            n.name
+            for n in tree.body
+            if (
+                isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+                and n.name.startswith("test")
+            )
+            or (isinstance(n, ast.ClassDef) and n.name.startswith("Test"))
+        ]
+        why = "it is locked" if rel in locked else "it is outside the task's scope"
+        held = f"its tests are: {', '.join(tests[:5])}" if tests else "it holds no tests"
+        return (
+            f"done_when `{command}` names `{node_id}`, which is not in {rel}; {held}. "
+            f"No worker can add it, since {why}. Name a test that exists, or a test file "
+            "in the task's scope, and call pursuit_step again with that."
+        )
+    return None
+
+
 def _test_imports(test_path: Path) -> list[tuple[str, ...]]:
     """Each absolute import of a test file: (module,) or (module, module.name, ...)."""
     try:
@@ -8373,15 +8441,14 @@ def _put_back_drift(
     spare: list[str] = []
     for node in _tree_nodes(root) if nodes is None else nodes:
         task = str(node.get("id") or "")
-        if (
-            task == but
-            or node.get("status") != "open"
-            or not _fixes_known_answers(str(node.get("title") or ""))
-        ):
+        if task == but or node.get("status") != "open":
             continue
+        title = str(node.get("title") or "")
         rc, out = _pursuit(["show", task], root)
         shown = _json_reply(out) if rc == 0 else None
         scope = _strings(shown.get("scope")) if isinstance(shown, dict) else []
+        if not _fixes_known_answers_in(title, scope, goal):
+            continue
         if not scope:
             return ""  # a fix whose scope is unknown may hold any of them
         spare += _locked_in_scope(scope, goal)
@@ -8461,6 +8528,19 @@ def _fixes_known_answers(title: str) -> bool:
     return bool(re.search(r"\bfix", head)) and "known answer" in head
 
 
+def _fixes_known_answers_in(title: str, scope: list[str], goal: Path) -> bool:
+    """Whether a task titled `title` on `scope` fixes the known answers.
+
+    Run R34 #27: T0007, made as the fix and scoped to the locked file alone, was
+    refused as locked for lacking the title's words. A scope of nothing but
+    locked files has no other work to do, whatever the title says.
+    """
+    if _fixes_known_answers(title):
+        return True
+    named = {os.path.normpath(entry.strip()) for entry in scope if entry.strip()}
+    return bool(named) and named <= set(_locked(goal))
+
+
 def _locked_in_scope(scope: list[str], goal: Path) -> list[str]:
     """The locked files `scope` names, itself or by a directory holding them."""
     held = []
@@ -8474,19 +8554,35 @@ def _locked_in_scope(scope: list[str], goal: Path) -> list[str]:
 
 
 def _known_answers_fix_route(
-    rel: str, goal: Path, task: str, title: str, nodes: list[dict[str, Any]] | None = None
+    rel: str,
+    goal: Path,
+    task: str,
+    title: str,
+    nodes: list[dict[str, Any]] | None = None,
+    rest: list[str] | None = None,
+    done_when: str = "",
 ) -> str:
     """Who locked `rel`, that its changes are put back, and how a wrong one is fixed.
 
     Run R28 offered a fix part titled as pending container T0010, which the
     plan refused as a clash; a live fix leaf is offered instead, and a title
-    already in the tree is made distinct.
+    already in the tree is made distinct. Run R34: with only that route offered,
+    seven steps were refused on a scope whose one file to write was not locked;
+    `rest`, the scope without its locked files, is offered first as the same call.
     """
     owner = _lock_manifest(goal).get(rel, {}).get("task")
     head = (
         f"{rel} is locked as the known answers{f' ({owner})' if owner else ''}: a "
         "worker's change to it is put back before every check. "
     )
+    if rest:
+        call = f'pursuit_step task="{task}", scope={json.dumps(rest)}'
+        if done_when:
+            call += f", done_when={json.dumps(done_when)}"
+        head += (
+            f"Send the same call without the locked files: {call}, the rest as it was. "
+            "The locked files stay readable to the worker and judge its work. "
+        )
     if nodes is None:
         nodes = _tree_nodes(goal.parent.parent)
     fix = f"Known answers: fix {rel}"
@@ -8515,7 +8611,7 @@ def _known_answers_fix_route(
 
 
 def _locked_scope_problem(
-    scope: list[str], root: Path, task_title: str, task: str
+    scope: list[str], root: Path, task_title: str, task: str, done_when: str = ""
 ) -> str | None:
     """Why `scope` may not name a locked file, or None.
 
@@ -8524,12 +8620,17 @@ def _locked_scope_problem(
     holding a locked file is allowed: put-back still guards the file, and later
     tasks add their own tests beside it.
     """
-    if _fixes_known_answers(task_title):
-        return None
     goal = root / ".beagle" / GOAL_BASENAME
+    if _fixes_known_answers_in(task_title, scope, goal):
+        return None
     named = {os.path.normpath(entry.strip()) for entry in scope}
     held = [rel for rel in _locked(goal) if rel in named]
-    return _known_answers_fix_route(held[0], goal, task, task_title) if held else None
+    if not held:
+        return None
+    rest = [entry for entry in scope if os.path.normpath(entry.strip()) not in held]
+    return _known_answers_fix_route(
+        held[0], goal, task, task_title, rest=rest, done_when=done_when
+    )
 
 
 #: Retries beagle allows a task its own check blocked.
@@ -10561,13 +10662,16 @@ def make_step_tool() -> Any:
                     done_when = ""
                 scoped = (
                     _scope_problem(route_scope, task, nodes, root)
-                    or _locked_scope_problem(route_scope, root, title, task)
+                    or _locked_scope_problem(
+                        route_scope, root, title, task, done_when or old_check
+                    )
                     or _sibling_owned_check_problem(
                         done_when or old_check, route_scope, task, nodes, root
                     )
                     or _oracle_with_code_problem(route_scope, goal, task, done_when or old_check)
                     or _locked_test_problem(done_when or old_check, route_scope, goal)
                     or _import_scope_problem(done_when or old_check, route_scope, root)
+                    or _pytest_node_missing_problem(done_when or old_check, route_scope, root)
                     or _pytest_node_import_only_problem(done_when or old_check, route_scope, root)
                 ) or await _unwritten_check_problem(
                     done_when or old_check,
@@ -10704,7 +10808,7 @@ def make_step_tool() -> Any:
                         done_when,
                     )
                     or _scope_problem(scope, task, nodes, root)
-                    or _locked_scope_problem(scope, root, title, task)
+                    or _locked_scope_problem(scope, root, title, task, done_when)
                     or _sibling_owned_check_problem(done_when, scope, task, nodes, root)
                     or _oracle_with_code_problem(scope, goal, task, done_when)
                     or _doc_only_check_problem(done_when, scope, task, root)
@@ -10713,6 +10817,7 @@ def make_step_tool() -> Any:
                     )
                     or _locked_test_problem(done_when, scope, goal)
                     or _import_scope_problem(done_when, scope, root)
+                    or _pytest_node_missing_problem(done_when, scope, root)
                     or _pytest_node_import_only_problem(done_when, scope, root)
                 ) or await _unwritten_check_problem(
                     done_when,
@@ -10846,8 +10951,9 @@ def make_step_tool() -> Any:
                 return _step_result(f"pursuit_step: {task}'s check not changed — {amend_problem}")
             own_scope = scope or _strings(record.get("scope"))
             unwritten = (
-                _locked_scope_problem(own_scope, root, title, task)
+                _locked_scope_problem(own_scope, root, title, task, done_when)
                 or _sibling_owned_check_problem(done_when, own_scope, task, nodes, root)
+                or _pytest_node_missing_problem(done_when, own_scope, root)
                 or _pytest_node_import_only_problem(done_when, own_scope, root)
             ) or (
                 await _unwritten_check_problem(
@@ -10964,6 +11070,12 @@ def make_step_tool() -> Any:
                 + ".",
                 ran=False,
             )
+        if status == "open" and not new_route and not amends_open and scope:
+            # Run R34 #22: an open task's call scope held the locked files, passed
+            # unchecked, and W6 and W7 spent 11 min on edits that were put back.
+            locked_scope = _locked_scope_problem(scope, root, title, task)
+            if locked_scope is not None:
+                return _step_result(f"pursuit_step: {task} not run — {locked_scope}")
 
         if retrying:
             # beagle briefs only an open task; a blocked one is briefed from its record.
@@ -11006,7 +11118,7 @@ def make_step_tool() -> Any:
         # close locks them again from what it wrote.
         fixing = (
             _locked_in_scope(scope or _strings(record.get("scope")), goal)
-            if _fixes_known_answers(title)
+            if _fixes_known_answers_in(title, scope or _strings(record.get("scope")), goal)
             else []
         )
         locked = [rel for rel in _locked(goal) if rel not in fixing]
@@ -11117,7 +11229,10 @@ def make_step_tool() -> Any:
             )
         if not (tests_only and _scope_has_data(scope)):
             brief += "\n\n" + WITNESS_NOTE
-        elif not (_fixes_known_answers(title) and _check_imports_code(check, root)):
+        elif not (
+            _fixes_known_answers_in(title, scope or _strings(record.get("scope")), goal)
+            and _check_imports_code(check, root)
+        ):
             # Run R28: a fix task's check ran a test importing code, and the note
             # told W3 it imported none.
             brief += "\n\n" + _known_answers_note(check, scope, root)

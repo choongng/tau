@@ -4324,7 +4324,9 @@ async def test_step_refuses_a_scope_that_names_a_locked_file(
     assert _runs(fake_tau) == []
 
     module = _module()
-    assert module._locked_scope_problem(["./tests/test_cases.py"], project, "Parser", "T0002")
+    assert module._locked_scope_problem(
+        ["parser.py", "./tests/test_cases.py"], project, "Parser", "T0002"
+    )
     fix = "Known answers: fix tests/test_cases.py"
     assert module._locked_scope_problem(["tests/test_cases.py"], project, fix, "T0002") is None
 
@@ -9875,7 +9877,12 @@ async def test_part_scoping_the_cases_module_must_run_the_locked_cases_test(
     # locked cases test that imports it.
     project = _r12_project(tmp_path)
     _git(project, "init", "-q")
-    _lock_cases_test(project, "import interval_tree_clocks")
+    # The node the check selects exists in the locked file (R34: a missing one is refused).
+    _lock_cases_test(
+        project,
+        "import interval_tree_clocks\n\n\n"
+        "def test_fork():\n    assert interval_tree_clocks.fork(1)",
+    )
     monkeypatch.chdir(project)
     _ready_task(fake_beagle)
     runtime, _ = _bound(tmp_path)
@@ -16306,3 +16313,126 @@ def test_repeated_escalation_refusal_names_notes_only_call(
     assert _quoted_head(elided) == elided.splitlines()[0]
     assert _quoted_head(elided).endswith('notes="…"')
     assert json.dumps(long) in elided
+
+
+@pytest.mark.anyio
+async def test_locked_scope_refusal_offers_scope_without_locked(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # R34 #6: the refusal offered only the split; the scope's one file to write was free.
+    project = _pursuit_project(tmp_path)
+    monkeypatch.chdir(project)
+    _locked_cases_test(project)
+    _ready_task(fake_beagle)
+    runtime, _ = _bound(tmp_path)
+
+    result = await _tool(runtime, "pursuit_step").execute(
+        "c1",
+        {
+            "task": "T0002",
+            "criteria": "the parser passes the cases",
+            "done_when": "grep -q done done.txt",
+            "scope": ["parser.py", "tests/test_cases.py"],
+        },
+    )
+
+    text = result.text
+    lead = (
+        'Send the same call without the locked files: pursuit_step task="T0002", '
+        'scope=["parser.py"], done_when="grep -q done done.txt"'
+    )
+    assert lead in text, text
+    assert "stay readable to the worker" in text
+    assert text.index(lead) < text.index("If the locked test is wrong, split T0002")
+    assert _pursuit_calls(fake_beagle, "open") == [] and _runs(fake_tau) == []
+
+    # A scope of locked files alone is taken as their fix, so no empty call is offered.
+    module = _module()
+    assert module._locked_scope_problem(["tests/test_cases.py"], project, "Parser", "T0002") is None
+
+
+@pytest.mark.anyio
+async def test_call_scope_rerun_applies_lock_check(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # R34 #22: an open task's call scope held the locked file and a worker ran on it.
+    project = _pursuit_project(tmp_path)
+    monkeypatch.chdir(project)
+    _locked_cases_test(project)
+    (fake_beagle / "next.out").write_text(json.dumps({"open": ["T0002"], "ready": []}))
+    record = {"id": "T0002", "title": "Parser", "intent": "reads input", "status": "open"}
+    record |= {"scope": ["parser.py"], "done_when": "grep -q done done.txt"}
+    (fake_beagle / "show.out").write_text(json.dumps(record))
+    (fake_beagle / "brief.out").write_text("# T0002: Parser\nDo the parser.\n")
+    runtime, _ = _bound(tmp_path)
+
+    result = await _tool(runtime, "pursuit_step").execute(
+        "c1", {"task": "T0002", "scope": ["parser.py", "tests/test_cases.py"]}
+    )
+
+    assert result.text.startswith("pursuit_step: T0002 not run — tests/test_cases.py is locked"), (
+        result.text
+    )
+    assert 'pursuit_step task="T0002", scope=["parser.py"]' in result.text
+    assert _runs(fake_tau) == []
+
+
+def test_known_answers_fix_recognised_by_scope(tmp_path: Path) -> None:
+    # R34 #27: T0007, made as the fix, was refused as locked for its title's words.
+    project = _pursuit_project(tmp_path)
+    goal = _locked_cases_test(project)
+    module = _module()
+    title = "Fix test cases in the data file"
+    assert module._fixes_known_answers(title) is False
+
+    assert module._fixes_known_answers_in(title, ["tests/test_cases.py"], goal) is True
+    assert module._fixes_known_answers_in(title, ["./tests/test_cases.py"], goal) is True
+    assert module._locked_scope_problem(["tests/test_cases.py"], project, title, "T0007") is None
+    # Other work beside the locked file is no fix, and an empty scope is none either.
+    mixed = ["parser.py", "tests/test_cases.py"]
+    assert module._fixes_known_answers_in(title, mixed, goal) is False
+    assert module._fixes_known_answers_in(title, ["tests/"], goal) is False
+    assert module._fixes_known_answers_in(title, [], goal) is False
+    assert module._locked_scope_problem(
+        ["parser.py", "tests/test_cases.py"], project, title, "T0007"
+    )
+
+
+def test_missing_pytest_node_in_unwritable_file_refused(tmp_path: Path) -> None:
+    # R34 #19: the check named a test the locked file did not hold; it exited 4.
+    project = _pursuit_project(tmp_path)
+    _locked_cases_test(project)
+    (project / "tests" / "test_other.py").write_text(
+        "def test_one():\n    pass\n\n\nclass TestTwo:\n    def test_it(self):\n        pass\n"
+    )
+    guard = _module()._pytest_node_missing_problem
+    missing = "tests/test_cases.py::test_encode_decode_roundtrip"
+
+    said = guard(f"python3 -m pytest -q {missing}", ["parser.py"], project)
+    assert said is not None
+    assert "`test_encode_decode_roundtrip`, which is not in tests/test_cases.py" in said
+    assert "its tests are: test_cases" in said and "it is locked" in said
+    outside = guard("pytest -q tests/test_other.py::test_three", ["parser.py"], project)
+    assert outside is not None and "its tests are: test_one, TestTwo" in outside
+    assert "outside the task's scope" in outside
+    # Locked even under a directory scope.
+    assert guard(f"pytest -q {missing}", ["parser.py", "tests/"], project) is not None
+
+    for check, scope in (
+        ("pytest -q tests/test_other.py::test_three", ["parser.py", "tests/test_other.py"]),
+        ("pytest -q tests/test_other.py::test_three", ["tests/"]),
+        ("pytest -q tests/test_other.py::TestTwo::test_it", ["parser.py"]),
+        ("pytest -q tests/test_other.py::test_one[1]", ["parser.py"]),
+        ("pytest -q tests/test_cases.py::test_cases", ["parser.py"]),
+        ("pytest -q tests/test_cases.py", ["parser.py"]),
+        ("pytest -q tests/test_new.py::test_x", ["parser.py"]),
+    ):
+        assert guard(check, scope, project) is None, check
