@@ -2118,6 +2118,19 @@ class _HtmlText(html.parser.HTMLParser):
         return re.sub(r"\n{3,}", "\n\n", "\n".join(lines)).strip() + "\n"
 
 
+_NON_NEWLINE_BREAKS = str.maketrans(dict.fromkeys("\r\x0b\x0c\x1c\x1d\x1e\x85\u2028\u2029", " "))
+
+
+def _newline_only(text: str) -> str:
+    """`text` with no line break `splitlines()` sees but newline: CRLF to LF, the rest to spaces.
+
+    R25: a PDF's form feeds and \\x1c/\\x1d made `splitlines()` count 718 lines
+    where the read tool, splitting on newlines, counted 671, so workers checking
+    a citation in Python "fixed" correct line numbers into wrong ones.
+    """
+    return text.replace("\r\n", "\n").translate(_NON_NEWLINE_BREAKS)
+
+
 def _pdf_text(body: bytes) -> str:
     if shutil.which("pdftotext") is None:
         raise OSError("it is a PDF and pdftotext is not installed")
@@ -2133,7 +2146,7 @@ def _pdf_text(body: bytes) -> str:
     if proc.returncode != 0:
         why = proc.stderr.decode("utf-8", "replace").strip().splitlines()
         raise OSError(f"pdftotext failed (exit {proc.returncode}): {why[-1] if why else ''}")
-    return proc.stdout.decode("utf-8", "replace")
+    return _newline_only(proc.stdout.decode("utf-8", "replace"))
 
 
 def _is_timeout(exc: BaseException) -> bool:
@@ -2171,7 +2184,7 @@ def _fetch_reference(url: str, timeout: float = REFERENCE_FETCH_TIMEOUT) -> str:
             text = parser.text()
     if not text.strip():
         raise ValueError("it held no text")
-    return text
+    return _newline_only(text)
 
 
 def _failure_reason(exc: BaseException) -> str:

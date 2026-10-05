@@ -2094,6 +2094,62 @@ async def test_found_reference_fetch_failure_is_noted(
     assert missed in brief and "references/interval-tree-clocks.txt" in brief
 
 
+_STRAY_BREAKS = "a\x0cb\x1cc\x1dd\x1ee\x0bf\x85g\u2028h\u2029i\rj\r\nk\nl\n"
+
+
+def _lines_agree(text: str) -> None:
+    by_newline = text.split("\n")
+    if text.endswith("\n"):
+        by_newline = by_newline[:-1]
+    assert len(by_newline) == len(text.splitlines())
+
+
+def test_pdf_text_has_no_line_breaks_besides_newline(monkeypatch: pytest.MonkeyPatch) -> None:
+    # R25: itc2008.txt held form feeds and \x1c/\x1d, 671 lines by "\n", 718 by splitlines().
+    module = _module()
+    monkeypatch.setattr(module.shutil, "which", lambda name: f"/usr/bin/{name}")
+
+    def run(argv: list[str], **kwargs: Any) -> subprocess.CompletedProcess[bytes]:
+        assert argv[0] == "pdftotext"
+        return subprocess.CompletedProcess(argv, 0, _STRAY_BREAKS.encode(), b"")
+
+    monkeypatch.setattr(module.subprocess, "run", run)
+    text = module._pdf_text(b"%PDF-1.4")
+
+    assert len(_STRAY_BREAKS.splitlines()) > _STRAY_BREAKS.count("\n")
+    _lines_agree(text)
+    assert text.split("\n") == ["a b c d e f g h i j", "k", "l", ""]
+
+
+def test_fetched_reference_line_numbers_agree_for_split_and_splitlines(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = _module()
+    html = f"<html><body><p>{_STRAY_BREAKS}</p></body></html>".encode()
+    _fake_web(
+        monkeypatch,
+        {
+            "https://example.org/notes.txt": (_STRAY_BREAKS.encode(), "text/plain"),
+            "https://example.org/page.html": (html, "text/html"),
+        },
+    )
+    index = module._fetch_references(
+        tmp_path, "See https://example.org/notes.txt and https://example.org/page.html"
+    )
+
+    assert set(index["fetched"].values()) == {
+        "https://example.org/notes.txt",
+        "https://example.org/page.html",
+    }
+    for name in index["fetched"]:
+        written = (tmp_path / "references" / name).read_bytes().decode("utf-8")
+        _lines_agree(written)
+    notes = next(n for n, u in index["fetched"].items() if u.endswith("notes.txt"))
+    assert (tmp_path / "references" / notes).read_bytes().decode("utf-8") == (
+        "a b c d e f g h i j\nk\nl\n"
+    )
+
+
 def _loaded_module() -> Any:
     """The extension module the last-bound runtime loaded (not a fresh `_module()`)."""
     loaded = [
