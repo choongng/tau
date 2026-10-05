@@ -1301,6 +1301,10 @@ class _WorkerRun:
     #: How its last assistant message ended, and that message's text or an earlier one's.
     stop_reason: str | None = None
     last_words: str = ""
+    #: The memory cap the run was killed at, when SIGKILL ended it under one.
+    killed_at: str | None = None
+    #: The command of the tool call its last assistant message made, if any.
+    pending_command: str = ""
 
     @property
     def unreported(self) -> bool:
@@ -1417,6 +1421,8 @@ class _WorkerEvents:
     #: How the last assistant message ended, and its thinking.
     stop_reason: str | None = None
     thinking: str = ""
+    #: The command (or tool name) of the last assistant message's last tool call.
+    pending_command: str = ""
     error: str | None = None
     #: The problem in the last tool result tau refused a call with, if any.
     refusal: str | None = None
@@ -1464,6 +1470,12 @@ class _WorkerEvents:
         ).strip()
         if text:
             self.report = text
+        calls = [block for block in blocks if block.get("type") == "toolCall"]
+        arguments = calls[-1].get("arguments") if calls else None
+        command = arguments.get("command") if isinstance(arguments, dict) else None
+        self.pending_command = (
+            command if isinstance(command, str) else str(calls[-1].get("name", "")) if calls else ""
+        )
         self.thinking = "\n".join(
             str(block.get("thinking", "")) for block in blocks if block.get("type") == "thinking"
         ).strip()
@@ -1716,6 +1728,8 @@ async def _run_worker(
 
     stderr = talk.result()
     note = _killed_note(proc.returncode, limit)
+    if note and events.stop_reason == "toolUse" and events.pending_command:
+        note += f" It was killed while its own command `{events.pending_command}` was running."
     if _TOOL_CALL_MARKUP.search(events.report):
         report = _report_before_markup(events.report, cwd, scope or [])
     else:
@@ -1729,6 +1743,8 @@ async def _run_worker(
         transcript=transcript,
         stop_reason=events.stop_reason,
         last_words=events.report,
+        killed_at=limit if note else None,
+        pending_command=events.pending_command,
     )
 
 
@@ -1741,7 +1757,9 @@ def _unreported_runs(runs: list[tuple[int, _WorkerRun, list[str]]], total: int) 
 
     Run R27: W7 ended on a bash call with no report, having changed both test
     files and found, in text, a contradiction in the criteria; the step result
-    after W8 showed only W8's report.
+    after W8 showed only W8's report. Run R30: W4-W7 were killed at the memory
+    cap while their own test command ran, and the result said only
+    "stopReason=toolUse"; such a run names the kill and the command.
     """
     lines = []
     for number, run, changes in runs:
@@ -1753,8 +1771,14 @@ def _unreported_runs(runs: list[tuple[int, _WorkerRun, list[str]]], total: int) 
         changed = "; ".join(changes) or "nothing git sees"
         words = " ".join(run.last_words.split())
         cut = words[:UNREPORTED_WORDS_CHARS] + ("…" if len(words) > UNREPORTED_WORDS_CHARS else "")
+        ended = (
+            f"was killed at its {run.killed_at} memory cap while its own command "
+            f"`{run.pending_command}` was running"
+            if run.killed_at and run.stop_reason == "toolUse" and run.pending_command
+            else f"ended without a report ({why})"
+        )
         lines.append(
-            f"Run {number} of {total} ended without a report ({why}); it changed: {changed}; "
+            f"Run {number} of {total} {ended}; it changed: {changed}; "
             f"its last words: {cut or '(none)'}\n\n"
         )
     return "".join(lines)
@@ -2548,6 +2572,43 @@ def _capped(argv: list[str], limit: str | None) -> list[str]:
         "--",
         *argv,
     ]
+
+
+#: The longest a worker's own command runs, and its share of the worker's wall clock.
+COMMAND_TIMEOUT = 540
+COMMAND_TIMEOUT_SHARE = 0.6
+_MEMORY_SIZE = re.compile(r"(\d+(?:\.\d+)?)\s*([KMGT]?)B?", re.IGNORECASE)
+
+
+def _half_memory(limit: str | None) -> str | None:
+    """Half of a systemd MemoryMax value, or None when it is unset or unreadable."""
+    if limit is None:
+        return None
+    text = limit.strip()
+    if text.endswith("%"):
+        try:
+            return f"{float(text[:-1]) / 2:g}%"
+        except ValueError:
+            return None
+    match = _MEMORY_SIZE.fullmatch(text)
+    if match is None:
+        return None
+    power = "KMGT".find(match.group(2).upper()) + 1 if match.group(2) else 0
+    mebibytes = int(float(match.group(1)) * 1024**power / 2 / 1024**2)
+    return f"{mebibytes}M" if mebibytes > 0 else None
+
+
+def _command_bound(limit: str | None, timeout: float) -> str:
+    """The prefix a worker's own command runs under: half its memory cap, under its wall.
+
+    Run R30: W4-W7 ran `timeout 540 python3 -m pytest …` inside their own capped
+    scope; the runaway test took the worker down with it, and no report came
+    back. A `systemd-run --user --scope` started by the worker is a scope of its
+    own, so the command's memory is not the worker's and an over-cap command
+    dies alone, exit 137, with the worker left to report it.
+    """
+    seconds = max(1, int(min(COMMAND_TIMEOUT, timeout * COMMAND_TIMEOUT_SHARE)))
+    return " ".join(_capped(["timeout", str(seconds)], _half_memory(limit)))
 
 
 def _killed_note(returncode: int | None, limit: str | None) -> str:
@@ -4763,6 +4824,69 @@ def _method_and_value(tree: ast.AST) -> str | None:
     return None
 
 
+def _answers_compared(tree: ast.AST, answers: Collection[str]) -> bool:
+    """Whether a value read under one of the `answers` keys reaches an assert or comparison.
+
+    Run R30: the locked test loaded each case's answer and asserted only a
+    roundtrip. A read is a subscript, `.get()` or attribute by an answer key; a
+    name assigned or looped from one, or a function returning one, carries it.
+    """
+
+    def reads(node: ast.AST) -> bool:
+        for sub in ast.walk(node):
+            if isinstance(sub, ast.Subscript) and _str_const(sub.slice) in answers:
+                return True
+            if isinstance(sub, ast.Attribute) and sub.attr in answers:
+                return True
+            if (
+                isinstance(sub, ast.Call)
+                and isinstance(sub.func, ast.Attribute)
+                and sub.func.attr == "get"
+                and sub.args
+                and _str_const(sub.args[0]) in answers
+            ):
+                return True
+            if isinstance(sub, ast.Name) and sub.id in carriers:
+                return True
+        return False
+
+    def names(target: ast.AST) -> set[str]:
+        return {sub.id for sub in ast.walk(target) if isinstance(sub, ast.Name)}
+
+    carriers: set[str] = set()
+    grew = True
+    while grew:
+        before = len(carriers)
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Assign) and reads(node.value):
+                carriers.update(n for target in node.targets for n in names(target))
+            elif (
+                isinstance(node, ast.AnnAssign | ast.AugAssign | ast.NamedExpr)
+                and node.value is not None
+                and reads(node.value)
+            ) or (
+                isinstance(node, ast.For | ast.AsyncFor | ast.comprehension) and reads(node.iter)
+            ):
+                carriers.update(names(node.target))
+            elif isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef) and any(
+                isinstance(sub, ast.Return) and sub.value is not None and reads(sub.value)
+                for sub in ast.walk(node)
+            ):
+                carriers.add(node.name)
+        grew = len(carriers) > before
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assert | ast.Compare) and reads(node):
+            return True
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr.startswith("assert")
+            and reads(node)
+        ):
+            return True
+    return False
+
+
 def _cases_test_problem(root: Path, entries: list[str]) -> tuple[str, str] | None:
     """(test, what is wrong) when a locked test reading cases data could never judge it.
 
@@ -4806,6 +4930,17 @@ def _cases_test_problem(root: Path, entries: list[str]) -> tuple[str, str] | Non
             if answers and _test_project_imports(root / test) and not answers & mentioned:
                 keys = ", ".join(f'"{key}"' for key in sorted(answers))
                 return test, f"never reads the cases' answers ({keys} in {data})"
+            if (
+                answers
+                and _test_project_imports(root / test)
+                and not _answers_compared(tree, answers)
+            ):
+                keys = ", ".join(f'"{key}"' for key in sorted(answers))
+                return test, (
+                    f"reads the cases' answers ({keys} in {data}) but never compares them: no "
+                    "assert or comparison uses them, so a wrong result the test never checks "
+                    "against an answer passes"
+                )
             both = _method_and_value(tree)
             if both is not None:
                 return test, (
@@ -8200,14 +8335,15 @@ _HABIT_LOG = re.compile(r">\s*(\S+\.log)\b")
 _SHOW_ASIDE = re.compile(r"[;,]?\s*`beagle pursuit show[^`]*` has the whole record")
 
 
-def _without_beagle_habits(brief: str) -> str:
+def _without_beagle_habits(brief: str, bound: str = f"timeout {COMMAND_TIMEOUT}") -> str:
     """beagle's brief without the lines that tell a worker to run `beagle`.
 
     The worker guard refuses every `beagle` command. Run R06: W2 and W4 ran the
     "Working habits" line's `RUN_CONTAINED_FOREGROUND=1 beagle contain run heavy
     -- …` and were refused. That line is said again with a plain capped,
     redirected command; the standing-checks line (`beagle pursuit recheck`) is
-    dropped, and the `beagle pursuit show` aside is cut.
+    dropped, and the `beagle pursuit show` aside is cut. `bound` is the
+    command's prefix, from `_command_bound`.
     """
     lines: list[str] = []
     for line in brief.splitlines(keepends=True):
@@ -8216,11 +8352,17 @@ def _without_beagle_habits(brief: str) -> str:
             log = match.group(1) if match else _DEFAULT_TEST_LOG
             bullet = "- " if line.lstrip().startswith("- ") else ""
             ending = "\n" if line.endswith("\n") else ""
+            alone = (
+                " The command gets a memory cap of its own, below yours: exit 137 means it "
+                "was killed for going over it, which is a finding to report."
+                if bound.startswith("systemd-run")
+                else ""
+            )
             lines.append(
                 f"{bullet}Run every test, build and check capped and redirected, as a plain "
-                f'command: `timeout 540 <cmd> > {log} 2>&1; echo "exit $?"` (e.g. '
-                f"`timeout 540 python3 -m pytest -q tests/ > {log} 2>&1; "
-                f'echo "exit $?"`), then read the tail of {log}.{ending}'
+                f'command: `{bound} <cmd> > {log} 2>&1; echo "exit $?"` (e.g. '
+                f"`{bound} python3 -m pytest -q tests/ > {log} 2>&1; "
+                f'echo "exit $?"`), then read the tail of {log}.{alone}{ending}'
             )
         elif "beagle pursuit recheck" in line:
             continue
@@ -10237,7 +10379,10 @@ def make_step_tool() -> Any:
             rc, brief = _pursuit(["brief", task], root)
             if rc != 0:
                 return _step_result(f"pursuit_step: `beagle pursuit brief {task}` failed:\n{brief}")
-            brief = _without_beagle_habits(_without_commit_steps(brief))
+            brief = _without_beagle_habits(
+                _without_commit_steps(brief),
+                _command_bound(_memory_max(), _worker_timeout(arguments.get("timeout"))[0]),
+            )
         references = _references_brief(
             root,
             _data_task(

@@ -3372,6 +3372,51 @@ def test_cases_test_indexing_the_top_level_key_is_not_an_absent_case(tmp_path: P
     )
 
 
+def test_cases_test_refused_when_answers_never_compared(tmp_path: Path) -> None:
+    # R30: tests/test_cases.py loaded each case's answer and asserted only a roundtrip.
+    module = _module()
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "tests" / "cases.json").write_text(R22_CASES)
+    test = tmp_path / "tests" / "test_cases.py"
+    entries = ["tests/cases.json", "tests/test_cases.py"]
+    head = R22_CASES_TEST.split("def test_cases(cases):")[0] + "from cobs import decode\n\n\n"
+
+    test.write_text(
+        head + "def test_cases(cases):\n"
+        '    for case in cases["cases"]:\n'
+        '        data = bytes.fromhex(case["input"])\n'
+        '        want = bytes.fromhex(case["expected"])\n'
+        "        assert decode(encode(data)) == data\n"
+        "        assert 0 not in encode(data)\n"
+    )
+    found = module._cases_test_problem(tmp_path, entries)
+    assert found is not None and found[0] == "tests/test_cases.py"
+    assert "never compares them" in found[1] and '"expected"' in found[1]
+
+    # Carried through a name, a loop and a helper's return, the answer reaches a compare.
+    test.write_text(
+        head + "def _want(case):\n"
+        '    raw = case.get("expected")\n    return bytes.fromhex(raw)\n\n\n'
+        "def test_cases(cases):\n"
+        '    for case in cases["cases"]:\n'
+        '        out = encode(bytes.fromhex(case["input"]))\n'
+        "        assert out == _want(case)\n"
+    )
+    assert module._cases_test_problem(tmp_path, entries) is None
+
+    test.write_text(
+        head + "def test_cases(cases):\n"
+        '    answers = [c["expected"] for c in cases["cases"]]\n'
+        "    for want in answers:\n"
+        "        got = want\n"
+        "        assert encode(b'') != got\n"
+    )
+    assert module._cases_test_problem(tmp_path, entries) is None
+
+    test.write_text(R22_CASES_TEST)
+    assert module._cases_test_problem(tmp_path, entries) is None
+
+
 @pytest.mark.anyio
 async def test_known_answers_close_locks_the_cases_test_beside_explicit_locks(
     tmp_path: Path,
@@ -9960,7 +10005,7 @@ async def test_worker_brief_drops_beagle_contain_run(
     assert "beagle contain" not in told and "RUN_CONTAINED" not in told
     assert "beagle pursuit" not in told
     assert "- Run every test, build and check capped and redirected, as a plain command: " in told
-    assert f"`timeout 540 <cmd> > {log} 2>&1" in told
+    assert re.search(rf"`(systemd-run [^`]*-- )?timeout 540 <cmd> > {re.escape(log)} 2>&1", told)
     assert "- Read files by the range you need." in told
     assert "(context, not a contract):" in told
     assert re.search(r"\bbeagle\s+\w", told) is None
@@ -15460,3 +15505,72 @@ async def test_killed_note_names_non_finishing_code_when_earlier_run_was_fast(
     assert "killed at the 4G memory cap after" in note
     assert re.search(r"earlier run \d+\.\d\ds\)", note)
     assert "Find the loop or growth in src/hog.py" in note
+
+
+def test_worker_habit_bounds_command_memory_below_worker_cap() -> None:
+    # R30: W4-W7's `timeout 540 python3 -m pytest` shared the worker's 4G scope and
+    # was OOM-killed with it; the habit bounded time but not memory.
+    ext = _module()
+    brief = (
+        "Working habits:\n- Run every test contained: `RUN_CONTAINED_FOREGROUND=1 beagle "
+        "contain run heavy -- timeout 540 <cmd> > /r/.git/beagle/logs/T1.log 2>&1; "
+        'echo "exit $?"`\n'
+    )
+
+    bound = ext._command_bound("4G", 900.0)
+    assert bound.split() == [
+        "systemd-run", "--user", "--scope", "-q", "-p", "MemoryMax=2048M",
+        "-p", "MemorySwapMax=0", "--", "timeout", "540",
+    ]  # fmt: skip
+    told = ext._without_beagle_habits(brief, bound)
+    assert f"`{bound} <cmd> > /r/.git/beagle/logs/T1.log 2>&1" in told
+    assert "exit 137" in told and "beagle" not in told.replace("/beagle/logs", "")
+
+    assert ext._command_bound("4G", 300.0).endswith("-- timeout 180")
+    assert ext._half_memory("1.5G") == "768M"
+    assert ext._half_memory("50%") == "25%"
+    assert ext._half_memory("lots") is None
+    assert ext._command_bound(None, 900.0) == "timeout 540"
+    unbounded = ext._without_beagle_habits(brief, ext._command_bound(None, 900.0))
+    assert "`timeout 540 <cmd> > /r/.git/beagle/logs/T1.log" in unbounded
+    assert "exit 137" not in unbounded
+
+
+def test_unreported_run_names_kill_during_own_command() -> None:
+    # R30 E30/E44: a worker killed at its cap mid-pytest showed only "stopReason=toolUse".
+    ext = _module()
+    events = ext._WorkerEvents()
+    call = {
+        "role": "assistant",
+        "content": [
+            {"type": "text", "text": "Running the tests."},
+            {
+                "type": "toolCall",
+                "id": "t1",
+                "name": "bash",
+                "arguments": {"command": "timeout 540 python3 -m pytest -q tests/"},
+            },
+        ],
+        "stopReason": "toolUse",
+    }
+    events.feed(json.dumps({"type": "message_end", "message": call}).encode())
+    assert events.pending_command == "timeout 540 python3 -m pytest -q tests/"
+
+    killed = ext._WorkerRun(
+        returncode=-9,
+        stop_reason="toolUse",
+        last_words="Running the tests.",
+        killed_at="4G",
+        pending_command=events.pending_command,
+    )
+    text = ext._unreported_runs([(1, killed, ["src/x.py"])], 2)
+    assert (
+        "Run 1 of 2 was killed at its 4G memory cap while its own command "
+        "`timeout 540 python3 -m pytest -q tests/` was running" in text
+    )
+    assert "ended without a report" not in text
+
+    quiet = ext._WorkerRun(stop_reason="toolUse", pending_command="ls")
+    assert "ended without a report (stopReason=toolUse)" in ext._unreported_runs(
+        [(1, quiet, [])], 2
+    )
