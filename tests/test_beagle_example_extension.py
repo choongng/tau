@@ -13010,3 +13010,80 @@ async def test_new_route_binds_a_bare_and_chain_like_open(
         result.text
     )
     assert len(_pursuit_calls(fake_beagle, "spawn")) == 1
+
+
+def _open_on_notes_txt(project: Path, fake: Path, scope: list[str]) -> None:
+    (project / "notes.txt").write_text("draft\n")
+    record = {"id": "T0002", "title": "Parser", "status": "open"}
+    record |= {"done_when": "grep -q ready notes.txt", "scope": scope}
+    (fake / "show.out").write_text(json.dumps(record))
+    (fake / "next.out").write_text(json.dumps({"open": [{"id": "T0002"}], "ready": []}))
+    (fake / "brief.out").write_text("# T0002: Parser\nDo the parser.\n")
+
+
+@pytest.mark.anyio
+async def test_step_with_same_done_when_names_the_scope_it_kept(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # R24 #14: T0013 was resent with its bound done_when and a wider scope; the
+    # scope was dropped from the record and nothing said so.
+    project = _pursuit_project(tmp_path)
+    monkeypatch.chdir(project)
+    monkeypatch.setenv("FAKE_TAU_SUCCEEDS_ON", "99")
+    _open_on_notes_txt(project, fake_beagle, ["notes.txt"])
+    runtime, _ = _bound(tmp_path)
+    wider = ["notes.txt", "extra.txt"]
+
+    result = await _tool(runtime, "pursuit_step").execute(
+        "c1",
+        {"task": "T0002", "done_when": "grep -q ready notes.txt", "scope": wider, "attempts": 1},
+    )
+
+    assert not _pursuit_calls(fake_beagle, "amend") and len(_runs(fake_tau)) == 1
+    first = result.text.split("\n\n", 1)[0]
+    assert first.startswith(
+        f"T0002 is worked on this call's scope {json.dumps(wider)}; "
+        'its record keeps scope ["notes.txt"]'
+    )
+    assert (
+        f'pursuit_step task="T0002", new_route=true, scope={json.dumps(wider)}, '
+        'done_when="grep -q ready notes.txt"'
+    ) in first
+
+    same = await _tool(runtime, "pursuit_step").execute(
+        "c2", {"task": "T0002", "scope": ["notes.txt"], "attempts": 1}
+    )
+    assert "is worked on this call's scope" not in same.text
+
+
+@pytest.mark.anyio
+async def test_pending_locks_hold_only_tests_and_data(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # R24 #14 filed tests/interval_tree_clocks.py, the module, as a pending
+    # lock, and the workers after it were refused the file they were to write.
+    project = _pursuit_project(tmp_path)
+    monkeypatch.chdir(project)
+    monkeypatch.setenv("FAKE_TAU_SUCCEEDS_ON", "99")
+    _open_on_notes_txt(project, fake_beagle, ["notes.txt"])
+    runtime, _ = _bound(tmp_path)
+    data = ["tests/cases.json", "tests/test_cases.py", "data/cases.yaml"]
+    code = ["tests/interval_tree_clocks.py", "itc/core.py"]
+
+    result = await _tool(runtime, "pursuit_step").execute(
+        "c1", {"task": "T0002", "locks": [*data, *code], "attempts": 1}
+    )
+
+    pending = json.loads((project / ".beagle" / "locks-pending.json").read_text())
+    assert pending == {"T0002": data}
+    assert f"Not filed as locks: {', '.join(code)}" in result.text
+    module = _loaded_module()
+    assert [module._lockable(e) for e in [*data, *code]] == [True] * 3 + [False] * 2

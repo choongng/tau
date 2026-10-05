@@ -6666,6 +6666,15 @@ def _pending_locks(goal: Path, task: str, add: list[str] | None = None) -> list[
     return entries
 
 
+def _lockable(rel: str) -> bool:
+    """Whether `rel` may be filed as a pending lock: a test or a data file.
+
+    Run R24 #14 filed tests/interval_tree_clocks.py, the module, as a lock, and
+    the workers after it were refused the file their task was to write.
+    """
+    return _is_test_path(rel) or Path(rel).suffix.lower() in CASES_DATA_SUFFIXES
+
+
 def _drop_pending_locks(goal: Path, task: str) -> None:
     path = goal.parent / PENDING_LOCKS
     with contextlib.suppress(OSError, ValueError, AttributeError):
@@ -7990,6 +7999,8 @@ def make_step_tool() -> Any:
 
     #: The lead for this call's refusals, set once the task is a setup milestone.
     lead: list[str] = []
+    #: Leads for every result of this call: the scope and locks it did not keep.
+    kept_lead: list[str] = []
 
     async def _execute(
         tool_call_id: str,
@@ -8525,11 +8536,14 @@ def make_step_tool() -> Any:
             brief = f"{brief}\n\nFrom the driver (who has not read the reference):\n{notes}"
         brief += "\n\n" + NO_BEAGLE_NOTE
         held = set(_locked(goal))
-        locks = _pending_locks(
-            goal,
-            task,
-            [e for e in _strings(arguments.get("locks")) if os.path.normpath(e) not in held],
-        )
+        asked = [e for e in _strings(arguments.get("locks")) if os.path.normpath(e) not in held]
+        locks = _pending_locks(goal, task, [e for e in asked if _lockable(e)])
+        unlocked = [e for e in asked if not _lockable(e)]
+        if unlocked:
+            kept_lead.append(
+                f"Not filed as locks: {', '.join(unlocked)} (only tests and data files "
+                "are locked; code stays open to the task that writes it).\n\n"
+            )
         # A known-answers fix may change the locked files in its scope; its
         # close locks them again from what it wrote.
         fixing = (
@@ -8620,6 +8634,26 @@ def make_step_tool() -> Any:
                 ran=False,
             )
         brief += "\n\n" + WITNESS_NOTE
+        asked_scope = _strings(arguments.get("scope"))
+        kept = _strings(record.get("scope"))
+        if (
+            status == "open"
+            and not new_route
+            and not amends_open
+            and asked_scope
+            and kept
+            and {os.path.normpath(e) for e in asked_scope} != {os.path.normpath(e) for e in kept}
+        ):
+            # Run R24 #14: an unchanged done_when is not amended, and `beagle
+            # pursuit amend` takes no --scope, so the call's scope went unsaid.
+            kept_lead.insert(
+                0,
+                f"{task} is worked on this call's scope {json.dumps(scope)}; its record keeps "
+                f"scope {json.dumps(kept)}, since the done_when is unchanged. To make the "
+                f"call's scope {task}'s own: pursuit_step task=\"{task}\", new_route=true, "
+                f"scope={json.dumps(asked_scope)}, done_when={json.dumps(check)}, "
+                'notes="…".\n\n',
+            )
         if retrying:
             # The work may have been done since, under another task.
             verdict = await _run_check(check, root, check_timeout)
@@ -9020,12 +9054,16 @@ def make_step_tool() -> Any:
         stepped.clear()
         spawns.clear()
         lead.clear()
+        kept_lead.clear()
         result = await _execute(tool_call_id, arguments, signal, on_update)
         refusal = "".join(getattr(c, "text", "") for c in result.content)
         if lead and refusal.startswith("pursuit_step:"):
             # Run R19: the .beagle/ refusal came five times for setup T0002
             # and never said that founding was its work.
             result = _step_result(lead[0] + refusal)
+        if kept_lead:
+            text = "".join(getattr(c, "text", "") for c in result.content)
+            result = _step_result("".join(kept_lead) + text)
         if spawns:
             result = _with_spawn_notice(result, *spawns[0])
         result = _with_note(result, _worker_timeout(arguments.get("timeout"))[1])
