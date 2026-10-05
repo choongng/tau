@@ -14567,3 +14567,206 @@ async def test_check_still_fails_at_spawn_limit_offers_infeasible(
     assert "beagle's limit of 3 attempts" in result.text
     assert 'pursuit_step task="T0002", abandon="infeasible: ' in result.text
     assert 'pursuit_plan task="T0010", parts=["Parser::' in result.text
+
+
+#: R28's stripped tests/test_cases.py: W3 removed the import and the code test.
+R28_STRIPPED_TEST = b"def test_one():\n    pass\n"
+R28_PUT_BACK = "1 locked file(s) were put back, since they differed from their lock: "
+
+
+@pytest.mark.anyio
+async def test_split_commit_restores_locked_file(
+    tmp_path: Path, beagle: Path, fake_beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # R28: #55's split committed W3's stripped locked test as 64e0ba2, and nothing
+    # put it back.
+    project = _split_open_task_with_cases(tmp_path, fake_beagle, commit=True)
+    goal = project / ".beagle" / "pursuit.toml"
+    cases = project / "tests" / "test_cases.py"
+    cases.write_bytes(R14_LOCKED_TEST)
+    _git(project, "add", "tests/test_cases.py")
+    _git(project, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "lock")
+    assert _module()._lock(goal, project, ["tests/test_cases.py"])[0] == ["tests/test_cases.py"]
+    cases.write_bytes(R28_STRIPPED_TEST)
+    (project / "tests" / "test_x.py").write_text("def test_x():\n    assert True\n")
+    script = fake_beagle / "beagle"
+    script.write_text(
+        f"#!{sys.executable}\n{FAKE_BEAGLE_GIT_COMMIT}{FAKE_BEAGLE}", encoding="utf-8"
+    )
+    for var in ("GIT_AUTHOR", "GIT_COMMITTER"):
+        monkeypatch.setenv(f"{var}_NAME", "t")
+        monkeypatch.setenv(f"{var}_EMAIL", "t@t")
+    monkeypatch.chdir(project)
+    runtime, _ = _bound(tmp_path)
+    _loaded_module()._LAST_CHECK_EXIT[(str(project), "T0007")] = 0
+
+    plan = await _tool(runtime, "pursuit_plan").execute(
+        "c1", {"task": "T0007", "parts": ["Data::write the cases", "Code::the clock"]}
+    )
+
+    assert f"{R28_PUT_BACK}tests/test_cases.py." in plan.text
+    assert cases.read_bytes() == R14_LOCKED_TEST
+    assert _git(project, "log", "-1", "--format=%s") == "T0007: work in progress before split\n"
+    assert _git(project, "show", "HEAD:tests/test_cases.py").encode() == R14_LOCKED_TEST
+    assert _git(project, "status", "--porcelain", "--", "tests") == ""
+
+
+def test_split_commit_puts_back_before_committing(tmp_path: Path, beagle: Path) -> None:
+    module = _module()
+    project, goal = _locked_repo(tmp_path)
+    module._lock(goal, project, ["tests/test_cases.py"])
+    (project / "tests" / "test_cases.py").write_bytes(R28_STRIPPED_TEST)
+    module._LAST_CHECK_EXIT[(str(project), "T0007")] = 0
+
+    said = module._commit_before_split(
+        project, "T0007", ["tests/"], ["tests/test_cases.py"], goal
+    )
+
+    assert said == f"{R28_PUT_BACK}tests/test_cases.py."
+    assert (project / "tests" / "test_cases.py").read_bytes() == R14_LOCKED_TEST
+
+
+def _lock_done_by_cases(project: Path) -> Path:
+    """tests/test_cases.py, as T0003 committed it, locked; then changed on disk."""
+    goal = project / ".beagle" / "pursuit.toml"
+    assert _module()._lock(goal, project, ["tests/test_cases.py"])[0] == ["tests/test_cases.py"]
+    (project / "tests" / "test_cases.py").write_text("def test_cases():\n    DRIFT = 1\n")
+    return goal
+
+
+@pytest.mark.anyio
+async def test_done_by_check_runs_on_locked_content(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # R28: T0026 closed done on `pytest -q tests/test_cases.py`, which passed only
+    # on the stripped file; on the locked one it failed.
+    project, _ = _done_by_project(tmp_path, fake_beagle, monkeypatch, "T0003: Cases")
+    _lock_done_by_cases(project)
+    nodes = json.loads((fake_beagle / "tree.out").read_text())["nodes"]
+    check = "grep -q DRIFT tests/test_cases.py"
+
+    said = await _module()._done_by("T0004", "T0003", {"done_when": check}, nodes, project)
+
+    assert said.startswith(f"{R28_PUT_BACK}tests/test_cases.py.")
+    assert "does not pass now" in said
+    assert "DRIFT" not in (project / "tests" / "test_cases.py").read_text()
+    assert _pursuit_calls(fake_beagle, "close") == []
+
+
+@pytest.mark.anyio
+async def test_step_restores_drifted_lock(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project, _ = _done_by_project(tmp_path, fake_beagle, monkeypatch, "T0003: Cases")
+    _lock_done_by_cases(project)
+    cases = project / "tests" / "test_cases.py"
+    runtime, _ = _bound(tmp_path)
+    step = _tool(runtime, "pursuit_step")
+
+    result = await step.execute("c1", {"abandon": "not needed"})
+
+    assert result.text.startswith(f"{R28_PUT_BACK}tests/test_cases.py.\n\n")
+    assert "DRIFT" not in cases.read_text()
+
+    # An open known-answers fix may change the locked file in its scope.
+    tree = json.loads((fake_beagle / "tree.out").read_text())
+    title = "Known answers: fix tests/test_cases.py"
+    tree["nodes"].append({"id": "T0005", "parent": "T0002", "title": title, "status": "open"})
+    (fake_beagle / "tree.out").write_text(json.dumps(tree))
+    fix = {"id": "T0005", "title": title, "status": "open", "scope": ["tests/test_cases.py"]}
+    (fake_beagle / "show-T0005.out").write_text(json.dumps(fix))
+    cases.write_text("def test_cases():\n    DRIFT = 1\n")
+
+    kept = await step.execute("c2", {"abandon": "not needed"})
+
+    assert "were put back" not in kept.text
+    assert "DRIFT" in cases.read_text()
+
+
+def _known_answers_project(tmp_path: Path, imports: str) -> Path:
+    """tests/test_cases.py reading tests/cases.json under `imports`; src/itc.py on disk."""
+    project = _pursuit_project(tmp_path)
+    (project / "src").mkdir()
+    (project / "src" / "itc.py").write_text("class Clock:\n    pass\n")
+    tests = project / "tests"
+    tests.mkdir()
+    (tests / "cases.json").write_text('[{"name": "seed"}]\n')
+    (tests / "test_cases.py").write_text(
+        f"import json\nfrom pathlib import Path\n{imports}\n\n"
+        "def test_cases():\n"
+        "    assert json.loads(Path(__file__).with_name('cases.json').read_text())\n"
+    )
+    return project
+
+
+R28_FIX_SCOPE = ["tests/test_cases.py", "tests/cases.json"]
+R28_FIX_CHECK = "python3 -m pytest -q tests/test_cases.py"
+
+
+def test_known_answers_note_not_said_when_test_imports_code(tmp_path: Path) -> None:
+    # R28 W3's brief said test_cases.py, which has `from src.interval_tree_clock
+    # import IntervalTreeClock`, imports none of the code; W3 deleted the import.
+    project = _known_answers_project(tmp_path, "from src.itc import Clock")
+
+    note = _module()._known_answers_note(R28_FIX_CHECK, R28_FIX_SCOPE, project)
+
+    assert "imports none of the code" not in note
+    assert "no task has written it yet" not in note
+
+
+def test_known_answers_note_keeps_existing_import(tmp_path: Path) -> None:
+    project = _known_answers_project(tmp_path, "from src.itc import Clock")
+    module = _module()
+
+    note = module._known_answers_note(R28_FIX_CHECK, R28_FIX_SCOPE, project)
+
+    assert (
+        "tests/test_cases.py imports src.itc, which exists: keep that import; this task "
+        "changes only tests/test_cases.py, tests/cases.json."
+    ) in note
+
+    # A test importing no code is told so; the code on disk is no longer unwritten.
+    plain = _known_answers_project(tmp_path / "plain", "")
+    (plain / "tests" / "test_data.py").write_text("from src.itc import Clock\n")
+    said = module._known_answers_note(R28_FIX_CHECK, R28_FIX_SCOPE, plain)
+    assert (
+        "tests/test_cases.py is the check: it reads tests/cases.json and imports none of "
+        "the code;"
+    ) in said
+
+
+@pytest.mark.anyio
+async def test_fix_task_brief_has_no_imports_none_note(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # R28 W3 (T0010 "Known answers: fix tests/test_cases.py") quoted the note and
+    # made it true by deleting the import.
+    project = _known_answers_project(tmp_path, "from src.itc import Missing")
+    monkeypatch.chdir(project)
+    monkeypatch.setenv("FAKE_TAU_SUCCEEDS_ON", "99")
+    title = "Known answers: fix tests/test_cases.py"
+    record = {"id": "T0010", "title": title, "status": "open", "criteria": "cases"}
+    record |= {"scope": R28_FIX_SCOPE, "done_when": R28_FIX_CHECK}
+    (fake_beagle / "show.out").write_text(json.dumps(record))
+    (fake_beagle / "next.out").write_text(json.dumps({"open": ["T0010"], "ready": []}))
+    (fake_beagle / "brief.out").write_text(f"# T0010: {title}\n")
+    runtime, _ = _bound(tmp_path)
+
+    await _tool(runtime, "pursuit_step").execute("c1", {"task": "T0010", "attempts": 1})
+
+    [run] = _runs(fake_tau)
+    assert "imports none of the code" not in run["stdin"]
+    assert "no task has written it yet" not in run["stdin"]
+    assert "tests/test_cases.py is the check: it reads" not in run["stdin"]

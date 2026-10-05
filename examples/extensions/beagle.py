@@ -3420,20 +3420,30 @@ def _uncommitted_note(task: str, paths: list[str]) -> str:
     )
 
 
-def _commit_before_split(root: Path, task: str, scope: list[str], paths: list[str]) -> str:
+def _commit_before_split(
+    root: Path, task: str, scope: list[str], paths: list[str], goal: Path | None = None
+) -> str:
     """Commit a split task's uncommitted work when its check last passed; the note to give.
 
     R12: test_comprehensive.py passed under T0007 and was left to the last
     part, so the workspace-clean gate stayed red for every part before it.
     Work whose check failed, or was never run, stays a note for the parts.
+    R28: the commit kept a stripped locked test, so locked files are put back
+    first; the task being split no longer fixes them.
     """
+    put_back = _put_back_drift(goal, root, but=task) if goal is not None else ""
+    if put_back:
+        paths = [rel for rel in _changed_files(root) if _in_scope(rel, scope, root)]
+        if not paths:
+            return put_back
+        put_back += "\n\n"
     if _LAST_CHECK_EXIT.get((str(root), task)) != 0:
-        return _uncommitted_note(task, paths)
+        return put_back + _uncommitted_note(task, paths)
     said = _commit(task, SPLIT_WIP_TITLE, scope, root)
     left = [rel for rel in _changed_files(root) if _in_scope(rel, scope, root)]
     if left:
-        return f"{said}\n\n{_uncommitted_note(task, left)}"
-    return (
+        return f"{put_back}{said}\n\n{_uncommitted_note(task, left)}"
+    return put_back + (
         f"{task}'s check passed at its last run, so its uncommitted work "
         f"({', '.join(paths[:8])}{', …' if len(paths) > 8 else ''}) was committed as "
         f"'{task}: {SPLIT_WIP_TITLE}' before the split: {said}"
@@ -3749,6 +3759,9 @@ def make_plan_tool() -> Any:
         # step. Run R15's beagle refused the part's title before it got there.
         if len(parts) == 1 and _is_leaf(task, _tree_nodes(root)):
             return _step_result(one_step)
+        drift = _put_back_drift(goal, root, but=task)
+        if drift:
+            split_notes.append(drift)
         # Read before the split, which leaves the task a container.
         scope, uncommitted = _uncommitted_in_scope(root, task)
         uncommitted_note = _uncommitted_note(task, uncommitted) if uncommitted else ""
@@ -3761,7 +3774,7 @@ def make_plan_tool() -> Any:
                 return _step_result(one_step)
         else:
             if uncommitted:
-                uncommitted_note = _commit_before_split(root, task, scope, uncommitted)
+                uncommitted_note = _commit_before_split(root, task, scope, uncommitted, goal)
             rc, out = _pursuit(["split", task, *parts, *(["--ordered"] if ordered else [])], root)
             if rc != 0 and "already has children" in out:
                 rc, out = _add_children(task, parts, root)
@@ -5634,11 +5647,56 @@ def _drop_self_import_restore(notes: str, command: str, scope: list[str], root: 
     return notes
 
 
+def _module_on_disk(name: str, root: Path) -> bool:
+    """Whether module `name` is a project file, a.py or a/__init__.py, outside tests."""
+    rel = name.replace(".", "/")
+    return any(
+        (root / path).is_file() and not _in_tests_dir(path)
+        for base in ("", "src/")
+        for path in (f"{base}{rel}.py", f"{base}{rel}/__init__.py")
+    )
+
+
+def _project_imports(test_path: Path, root: Path) -> list[tuple[str, bool]]:
+    """Each project module the test's AST imports, with whether it is on disk now.
+
+    Stdlib, test libraries, sibling tests and installed packages are not project
+    modules; a name that resolves to nothing installed is one not yet written.
+    """
+    found: list[tuple[str, bool]] = []
+    for names in _test_imports(test_path):
+        top = names[0].split(".")[0]
+        if top in sys.stdlib_module_names or top in _TEST_LIBRARIES or top.startswith("test_"):
+            continue
+        if any(_module_on_disk(n, root) for n in names):
+            found.append((names[0], True))
+            continue
+        ours = any(
+            (root / f"{b}{top}").exists() or (root / f"{b}{top}.py").exists() for b in ("", "src/")
+        )
+        if not ours:
+            try:
+                if importlib.util.find_spec(top) is not None:
+                    continue
+            except (ImportError, ValueError):
+                pass
+        found.append((names[0], False))
+    return found
+
+
+def _check_imports_code(command: str, root: Path) -> bool:
+    """Whether a test the check runs imports a project module."""
+    return any(_project_imports(root / rel, root) for rel in _check_test_files(command, root))
+
+
 def _known_answers_note(command: str, scope: list[str], root: Path) -> str:
-    """The brief's proof note for a scope of data and tests: the data test imports no code.
+    """The brief's proof note for a scope of data and tests: what the data test imports.
 
     Run R27 W3's brief held only `WITNESS_NOTE`, pointing at "the code they test", and
-    W3 wrote `from cobs import …` into tests/test_case_data.py.
+    W3 wrote `from cobs import …` into tests/test_case_data.py. Run R28 W3's brief said
+    a test with `from src.interval_tree_clock import …`, a module on disk, imported
+    none, and W3 deleted the import; so that is said only of a test whose AST imports
+    no project module.
     """
     data = next(r.rstrip("/") for r in scope if Path(r.rstrip("/")).suffix not in {"", ".py"})
     runs = [rel for rel in _check_test_files(command, root) if rel.endswith(".py")]
@@ -5646,10 +5704,30 @@ def _known_answers_note(command: str, scope: list[str], root: Path) -> str:
         (t for t in runs if _cases_test_reads(root / t, Path(data).name)),
         next((t for t in runs if _in_scope(t, scope, root)), _data_test("", scope, root)),
     )
+    proof = _tests_only_proof_note(command, scope, root)
+    imports = _project_imports(root / test, root)
+    present = [module for module, here in imports if here]
+    if present:
+        return (
+            f"{test} is the check: it reads {data}. {test} imports {present[0]}, which "
+            f"exists: keep that import; this task changes only {', '.join(scope)}. " + proof
+        )
+    if imports:
+        said = _self_import_note(command, scope, root).strip() or (
+            f"{test} imports {imports[0][0]}, which is not on disk yet; this task "
+            f"changes only {', '.join(scope)}."
+        )
+        return f"{test} is the check: it reads {data}. {said} " + proof
+    beside = (root / test).parent
+    written = any(
+        here
+        for other in (beside.glob("test_*.py") if beside.is_dir() else [])
+        for _, here in _project_imports(other, root)
+    )
+    unwritten = "" if written else " (no task has written it yet)"
     return (
-        f"{test} is the check: it reads {data} and imports none of the code (no task has "
-        "written it yet); a test that imports the code is not run by this check. "
-        + _tests_only_proof_note(command, scope, root)
+        f"{test} is the check: it reads {data} and imports none of the code{unwritten}; "
+        "a test that imports the code is not run by this check. " + proof
     )
 
 
@@ -7333,6 +7411,42 @@ def _restore_locked(goal: Path, root: Path, spare: Collection[str] = ()) -> list
     return restored
 
 
+def _put_back_drift(
+    goal: Path, root: Path, nodes: list[dict[str, Any]] | None = None, but: str = ""
+) -> str:
+    """Put back each locked file that differs from its lock; one line saying so, or "".
+
+    Run R28: W3 stripped the locked tests/test_cases.py after the last put-back, the
+    split's WIP commit kept it, and T0026 closed done on a check that passed only on
+    the stripped file. An open known-answers fix task other than `but` keeps the
+    locked files in its scope as it wrote them; its close locks them again.
+    """
+    if not _locked(goal):
+        return ""
+    spare: list[str] = []
+    for node in _tree_nodes(root) if nodes is None else nodes:
+        task = str(node.get("id") or "")
+        if (
+            task == but
+            or node.get("status") != "open"
+            or not _fixes_known_answers(str(node.get("title") or ""))
+        ):
+            continue
+        rc, out = _pursuit(["show", task], root)
+        shown = _json_reply(out) if rc == 0 else None
+        scope = _strings(shown.get("scope")) if isinstance(shown, dict) else []
+        if not scope:
+            return ""  # a fix whose scope is unknown may hold any of them
+        spare += _locked_in_scope(scope, goal)
+    restored = _restore_locked(goal, root, spare)
+    if not restored:
+        return ""
+    return (
+        f"{len(restored)} locked file(s) were put back, since they differed from their "
+        f"lock: {', '.join(restored)}."
+    )
+
+
 def _pending_locks(goal: Path, task: str, add: list[str] | None = None) -> list[str]:
     """The locks `task` asked for, adding `add`; kept until the task closes done."""
     path = goal.parent / PENDING_LOCKS
@@ -8192,10 +8306,13 @@ async def _done_by(
             f"{refused}{done}'s commit ({shas[0][:12]}) touches none of "
             f"{', '.join(paths)}, so it did not do this task's work."
         )
+    # Run R28: T0026 closed done on a check that passed only on a stripped locked test.
+    put_back = _put_back_drift(root / ".beagle" / GOAL_BASENAME, root, nodes)
     check_rc, check_out = await _run_check(check, root, DEFAULT_CHECK_TIMEOUT)
     if check_rc != 0:
         return (
-            f"{refused}its check `{check}` does not pass now (exit {check_rc}), so the "
+            (f"{put_back}\n\n" if put_back else "")
+            + f"{refused}its check `{check}` does not pass now (exit {check_rc}), so the "
             f"work is not there yet: work it with pursuit_step.\n"
             f"{check_out[-CHECK_TAIL_CHARS:]}"
         )
@@ -8870,6 +8987,9 @@ def make_step_tool() -> Any:
         ready_ids = _ids(ready.get("ready"))
         blocked = _blocked_tasks(root)
         nodes = _tree_nodes(root)
+        drift = _put_back_drift(goal, root, nodes)
+        if drift:
+            kept_lead.append(f"{drift}\n\n")
         open_ids = _steppable(open_ids, nodes)
         ready_ids = _steppable(ready_ids, nodes)
         left = _unfinished(nodes)
@@ -9528,11 +9648,12 @@ def make_step_tool() -> Any:
                 + ". Its notes say what the new route does differently.",
                 ran=False,
             )
-        brief += "\n\n" + (
-            _known_answers_note(check, scope, root)
-            if tests_only and _scope_has_data(scope)
-            else WITNESS_NOTE
-        )
+        if not (tests_only and _scope_has_data(scope)):
+            brief += "\n\n" + WITNESS_NOTE
+        elif not (_fixes_known_answers(title) and _check_imports_code(check, root)):
+            # Run R28: a fix task's check ran a test importing code, and the note
+            # told W3 it imported none.
+            brief += "\n\n" + _known_answers_note(check, scope, root)
         asked_scope = _strings(arguments.get("scope"))
         kept = _strings(record.get("scope"))
         if (
