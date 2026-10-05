@@ -159,6 +159,7 @@ from tau_coding.extensions import (
 from tau_coding.paths import TauPaths
 from tau_coding.resources import parse_markdown_resource
 from tau_coding.skills import Skill, format_skill_invocation
+from tau_coding.tool_buffers import WINDOW_LINES
 
 #: The beagle checkout. `BEAGLE_ROOT` overrides the default `~/beagle`.
 BEAGLE = Path(os.environ.get("BEAGLE_ROOT") or Path.home() / "beagle").expanduser()
@@ -2348,7 +2349,10 @@ def _references_brief(root: Path, context_only: bool = False) -> str:
     fetched = index.get("fetched") or {}
     failed = index.get("failed") or {}
     if fetched or failed:
-        lines = [f"- {REFERENCES_DIR}/{name} (from {url})" for name, url in fetched.items()]
+        lines = [
+            f"- {REFERENCES_DIR}/{name} (from {url}){_reference_size(root / REFERENCES_DIR / name)}"
+            for name, url in fetched.items()
+        ]
         lines += [f"- could not fetch {url}: {why}" for url, why in failed.items()]
         parts.append(
             "References: read first; outranks the driver's notes. Where the driver's "
@@ -2366,7 +2370,31 @@ def _references_brief(root: Path, context_only: bool = False) -> str:
         parts.append(f"{lead}:\n<<<\n{request}\n>>>")
     if context_only and fetched:
         parts.append(QUOTED_SOURCE_NOTE)
+        parts.append(
+            "A case needs only the lines it cites: read those by line range "
+            "(offset and limit), not the whole file."
+        )
     return "\n\n".join(parts)
+
+
+def _reference_size(path: Path) -> str:
+    """` — N lines, R reads`: a whole read shows WINDOW_LINES lines at a time (R25)."""
+    try:
+        count = len(path.read_text(encoding="utf-8", errors="replace").splitlines())
+    except OSError:
+        return ""
+    reads = max(1, -(-count // WINDOW_LINES))
+    noun = "read" if reads == 1 else "reads"
+    return f" — {count} lines, {reads} {noun} at {WINDOW_LINES} lines per read"
+
+
+def _turn_cap_note() -> str:
+    """The worker's tool-call cap, as pursuit_step's brief states it (R21-R25)."""
+    cap = _worker_max_turns()
+    return (
+        f"You have {cap} tool calls in all. Write the files by about call {cap // 2}, "
+        "then use the rest to run the check and fix them."
+    )
 
 
 def _git_identity(root: Path) -> bool:
@@ -8854,7 +8882,7 @@ def make_step_tool() -> Any:
             brief = f"{brief}\n\n{references}"
         if notes:
             brief = f"{brief}\n\nFrom the driver (who has not read the reference):\n{notes}"
-        brief += "\n\n" + NO_BEAGLE_NOTE
+        brief += "\n\n" + NO_BEAGLE_NOTE + "\n\n" + _turn_cap_note()
         held = set(_locked(goal))
         asked = [e for e in _strings(arguments.get("locks")) if os.path.normpath(e) not in held]
         locks = _pending_locks(goal, task, [e for e in asked if _lockable(e)])

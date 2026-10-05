@@ -3870,6 +3870,30 @@ def test_known_answers_guidance_asks_for_a_quoted_source(tmp_path: Path) -> None
     assert module.QUOTED_SOURCE_NOTE not in module._references_brief(tmp_path)
 
 
+def test_references_brief_states_line_counts_and_read_cost(tmp_path: Path) -> None:
+    module = _module()
+    window = module.WINDOW_LINES
+    refs = tmp_path / "references"
+    refs.mkdir()
+    (refs / "long.txt").write_text("".join(f"line {i}\n" for i in range(2 * window + 1)))
+    (refs / "short.txt").write_text("one\ntwo\nthree")
+    (refs / "index.json").write_text(
+        json.dumps(
+            {
+                "request": "x",
+                "fetched": {"long.txt": "https://e.org/a", "short.txt": "https://e.org/b"},
+            }
+        )
+    )
+    brief = module._references_brief(tmp_path)
+    per = f"at {window} lines per read"
+    long_line = f"(from https://e.org/a) — {2 * window + 1} lines, 3 reads {per}"
+    assert f"references/long.txt {long_line}" in brief
+    assert f"references/short.txt (from https://e.org/b) — 3 lines, 1 read {per}" in brief
+    assert "by line range" not in brief
+    assert "by line range" in module._references_brief(tmp_path, context_only=True)
+
+
 def test_a_witness_block_is_read_from_the_end_of_a_report() -> None:
     witness = _module()._witness
     assert witness(WITNESSED_REPORT) == ("src/clock.py", "    return a + b", "    return a - b")
@@ -9985,6 +10009,37 @@ async def test_task_worker_brief_carries_the_no_beagle_note(
     sent = _runs(fake_tau)[0]["stdin"]
     assert "Do the parser." in sent
     assert _module().NO_BEAGLE_NOTE in sent
+
+
+@pytest.mark.anyio
+async def test_brief_states_worker_turn_cap(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.chdir(_pursuit_project(tmp_path))
+    monkeypatch.setenv("BEAGLE_TAU_WORKER_MAX_TURNS", "24")
+    _ready_task(fake_beagle)
+    runtime, _ = _bound(tmp_path)
+
+    await _tool(runtime, "pursuit_step").execute(
+        "c1",
+        {
+            "task": "T0002",
+            "criteria": "done.txt exists",
+            "done_when": "grep -q done done.txt",
+            "scope": ["done.txt"],
+        },
+    )
+
+    run = _runs(fake_tau)[0]
+    argv = run["argv"]
+    cap = int(argv[argv.index("--max-turns") + 1])
+    assert cap == 24 == _module()._worker_max_turns()
+    assert f"You have {cap} tool calls in all." in run["stdin"]
+    assert f"Write the files by about call {cap // 2}," in run["stdin"]
 
 
 def _stop_gate_sends(monkeypatch: pytest.MonkeyPatch, cwd: Path, *, has_ui: bool) -> list[str]:
