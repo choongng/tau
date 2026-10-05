@@ -3057,6 +3057,171 @@ async def test_known_answers_close_locks_a_well_formed_r20_cases_test(
         result.text
     ), result.text
 
+
+#: Run R22's tests/cases.json shape: the cases under a top-level "cases" key.
+R22_CASES = json.dumps(
+    {
+        "cases": [
+            {"name": "empty", "input": "", "expected": "01"},
+            {"name": "one_zero", "input": "00", "expected": "0101"},
+        ]
+    }
+)
+R22_CASES_TEST = (
+    "import json\n\nimport pytest\n\nfrom cobs import encode\n\n\n"
+    "@pytest.fixture\ndef cases():\n"
+    '    with open("tests/cases.json") as f:\n        return json.load(f)\n\n\n'
+    "def test_cases(cases):\n"
+    '    for case in cases["cases"]:\n'
+    '        assert encode(bytes.fromhex(case["input"])).hex() == case["expected"]\n'
+)
+
+
+def test_cases_test_indexing_the_top_level_key_is_not_an_absent_case(tmp_path: Path) -> None:
+    # R22 E12/E22: `cases["cases"]` was refused as looking up case "cases".
+    module = _module()
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "tests" / "cases.json").write_text(R22_CASES)
+    test = tmp_path / "tests" / "test_cases.py"
+    entries = ["tests/cases.json", "tests/test_cases.py"]
+
+    test.write_text(R22_CASES_TEST)
+    assert module._cases_test_problem(tmp_path, entries) is None
+
+    test.write_text(
+        R22_CASES_TEST.replace('cases["cases"]', 'json.load(open("tests/cases.json"))["cases"]')
+        + "\n\ndef test_raw():\n"
+        '    raw = json.load(open("tests/cases.json"))\n'
+        '    assert raw["cases"]\n'
+    )
+    assert module._cases_test_problem(tmp_path, entries) is None
+
+    test.write_text(
+        R22_CASES_TEST + "\n\ndef test_named(cases):\n"
+        '    by_name = {c["name"]: c for c in cases["cases"]}\n'
+        '    named_cases = by_name\n    assert named_cases["two_zeros"]["expected"]\n'
+    )
+    found = module._cases_test_problem(tmp_path, entries)
+    assert found == (
+        "tests/test_cases.py",
+        'looks up case "two_zeros", which tests/cases.json does not hold',
+    )
+
+
+@pytest.mark.anyio
+async def test_known_answers_close_locks_the_cases_test_beside_explicit_locks(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # R22 E26: locks=[tests/cases.json] left the committed tests/test_cases.py,
+    # which read it and imported cobs, unlocked.
+    project = _cases_task(tmp_path, fake_beagle, monkeypatch, CASES_DATA_TEST)
+    writes = json.loads(os.environ["FAKE_TAU_WRITES"])
+    writes["tests/cases.json"] = R22_CASES.replace("expected", "out")
+    writes["tests/test_cases.py"] = R22_CASES_TEST.replace("expected", "out")
+    monkeypatch.setenv("FAKE_TAU_WRITES", json.dumps(writes))
+    scope = [*CASES_SCOPE, "tests/test_cases.py"]
+
+    result = await _step_cases(tmp_path, scope=scope, locks=["tests/cases.json"])
+
+    assert "Locked: tests/cases.json, tests/test_cases.py." in result.text, result.text
+    store = project / ".beagle" / "locked" / "tests"
+    assert (store / "test_cases.py").is_file()
+    # The data test imports nothing of the project: it is no cases test.
+    assert not (store / "test_case_data.py").exists()
+
+
+def _r22_committed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, test: bool) -> Path:
+    """R22 after T0002: cases.json locked, test_cases.py committed (if `test`) unlocked."""
+    project = _git_project(tmp_path, monkeypatch)
+    (project / "references").mkdir()
+    (project / "references" / "cobs.txt").write_text("COBS\n")
+    (project / "tests").mkdir()
+    (project / "tests" / "cases.json").write_text(R22_CASES)
+    if test:
+        (project / "tests" / "test_cases.py").write_text(R22_CASES_TEST)
+    _git(project, "add", "tests", "references")
+    _git(project, "commit", "-q", "-m", "T0002: Known answers")
+    store = project / ".beagle" / "locked" / "tests"
+    store.mkdir(parents=True)
+    (store / "cases.json").write_text(R22_CASES)
+    return project
+
+
+#: R22's tree at #118: T0002 wrote the known answers, T0003 writes the code.
+R22_NODES = [
+    {"id": "T0001", "status": "open", "title": "Goal", "container": True},
+    {"id": "T0002", "parent": "T0001", "status": "done", "title": "Known answers"},
+    {"id": "T0003", "parent": "T0001", "status": "pending", "title": "Codec"},
+]
+
+
+def test_cases_first_offers_to_lock_a_committed_cases_test_instead_of_a_new_split(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # R22: Cases first refused 11 code steps and planned known answers again.
+    project = _r22_committed(tmp_path, monkeypatch, test=True)
+    module = _module()
+    goal = project / ".beagle" / "pursuit.toml"
+
+    found = module._cases_first_problem(["cobs.py"], "T0003", "Codec", goal, R22_NODES)
+
+    assert found is not None
+    assert "tests/test_cases.py is T0002's committed work" in found
+    assert (
+        'pursuit_step task="T0003" scope=["cobs.py"] '
+        'done_when="python3 -m pytest -q tests/test_cases.py" locks=["tests/test_cases.py"]'
+    ) in found
+    assert "pursuit_plan" not in found and "Known answers::" not in found
+    assert not (project / ".beagle" / "locked" / "tests" / "test_cases.py").exists()
+
+    locks = ["tests/test_cases.py"]
+    assert (
+        module._cases_first_problem(["cobs.py"], "T0003", "Codec", goal, R22_NODES, locks) is None
+    )
+    assert (project / ".beagle" / "locked" / "tests" / "test_cases.py").read_text() == (
+        R22_CASES_TEST
+    )
+    entry = module._lock_manifest(goal)["tests/test_cases.py"]
+    head = _git(project, "rev-parse", "HEAD").strip()
+    assert entry["task"] == "T0002" and entry["commit"] == head
+
+    # A test changed since its commit is not the done task's work: no lock route.
+    (project / ".beagle" / "locked" / "tests" / "test_cases.py").unlink()
+    (project / "tests" / "test_cases.py").write_text(R22_CASES_TEST + "\n# edited\n")
+    edited = module._cases_first_problem(["cobs.py"], "T0003", "Codec", goal, R22_NODES, locks)
+    assert edited is not None and "committed work" not in edited
+
+
+def test_cases_first_never_plans_known_answers_over_locked_data(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project = _r22_committed(tmp_path, monkeypatch, test=False)
+    module = _module()
+    goal = project / ".beagle" / "pursuit.toml"
+    planned = {"id": "T0004", "parent": "T0001", "status": "pending", "title": "Known answers"}
+
+    for nodes in (R22_NODES, [*R22_NODES, planned]):
+        found = module._cases_first_problem(["cobs.py"], "T0003", "Codec", goal, nodes)
+        assert found is not None
+        assert "(tests/cases.json) are locked already: do not plan them again" in found
+        assert module._CASES_FIRST_WORK not in found
+        assert "pursuit_plan" not in found and "Known answers::" not in found
+        assert (
+            'scope=["cobs.py", "tests/test_cases.py"] '
+            'done_when="python3 -m pytest -q tests/test_cases.py" locks=["tests/test_cases.py"]'
+        ) in found
+
+    carried = ["cobs.py", "tests/test_cases.py"]
+    locks = ["tests/test_cases.py"]
+    assert module._cases_first_problem(carried, "T0003", "Codec", goal, R22_NODES, locks) is None
+    # Asking to lock a test the scope does not hold is no route past it.
+    assert module._cases_first_problem(["cobs.py"], "T0003", "Codec", goal, R22_NODES, locks)
+
+
 @pytest.mark.anyio
 async def test_cases_test_naming_the_file_only_in_a_docstring_stays_open(
     tmp_path: Path,

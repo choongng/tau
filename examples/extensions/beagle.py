@@ -4208,7 +4208,34 @@ def _str_const(node: ast.AST) -> str | None:
     return None
 
 
-def _absent_case_lookup(tree: ast.AST, labels: set[str]) -> str | None:
+def _json_loaded_names(tree: ast.AST) -> set[str]:
+    """Names assigned straight from a `json.load` or `json.loads` call."""
+    names: set[str] = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Assign | ast.AnnAssign) or node.value is None:
+            continue
+        call = node.value
+        if not (
+            isinstance(call, ast.Call)
+            and isinstance(call.func, ast.Attribute)
+            and call.func.attr in {"load", "loads"}
+            and isinstance(call.func.value, ast.Name)
+            and call.func.value.id == "json"
+        ):
+            continue
+        targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+        names.update(t.id for t in targets if isinstance(t, ast.Name))
+    return names
+
+
+def _absent_case_lookup(tree: ast.AST, labels: set[str], keys: Collection[str] = ()) -> str | None:
+    """The first case label the test looks up that the data does not hold, or None.
+
+    Run R22: `cases["cases"]` took the list from {"cases": [...]}. A subscript
+    by one of the data file's own top-level `keys`, or of a value straight
+    from `json.load`, reads the file's container, not a case.
+    """
+    loaded = _json_loaded_names(tree)
     for node in ast.walk(tree):
         if isinstance(node, ast.Compare):
             sides = [node.left, *node.comparators]
@@ -4225,9 +4252,10 @@ def _absent_case_lookup(tree: ast.AST, labels: set[str]) -> str | None:
             isinstance(node, ast.Subscript)
             and isinstance(node.value, ast.Name)
             and "cases" in node.value.id.lower()
+            and node.value.id not in loaded
         ):
             named = _str_const(node.slice)
-            if named is not None and named not in labels:
+            if named is not None and named not in labels and named not in keys:
                 return named
     return None
 
@@ -4270,9 +4298,11 @@ def _cases_test_problem(root: Path, entries: list[str]) -> tuple[str, str] | Non
     tests = [rel for rel in files if rel.endswith(".py") and _is_test_path(rel)]
     for data in (rel for rel in files if _is_cases_data(rel) and rel.endswith(".json")):
         try:
-            cases = _cases_list(json.loads((root / data).read_text(encoding="utf-8")))
+            raw = json.loads((root / data).read_text(encoding="utf-8"))
         except (OSError, ValueError):
             continue
+        cases = _cases_list(raw)
+        keys = {str(key) for key in raw} if isinstance(raw, dict) else set()
         labels = _case_labels(cases)
         answers = _answer_keys(cases)
         for test in tests:
@@ -4282,7 +4312,7 @@ def _cases_test_problem(root: Path, entries: list[str]) -> tuple[str, str] | Non
                 tree = ast.parse((root / test).read_text(encoding="utf-8"))
             except (OSError, SyntaxError, ValueError):
                 continue
-            absent = _absent_case_lookup(tree, labels) if labels else None
+            absent = _absent_case_lookup(tree, labels, keys) if labels else None
             if absent is not None:
                 return test, f'looks up case "{absent}", which {data} does not hold'
             mentioned = {
@@ -4423,6 +4453,43 @@ def _unquoted_cases(
         if cases and 2 * len(unfound) > len(cases):
             return rel, len(unfound), len(cases), unfound[:3]
     return None
+
+
+def _reads_locked_data(root: Path, test: str, data: list[str]) -> bool:
+    """Whether `test` reads one of the `data` files and imports a project module.
+
+    The same AST reads as `_unread_cases`: the test opens the file by name, and
+    imports a module that is neither stdlib, a test library nor a test.
+    """
+    names = {Path(rel).name for rel in data}
+    path = root / test
+    return (
+        test.endswith(".py")
+        and _is_test_path(test)
+        and any(_cases_test_reads(path, name) for name in names)
+        and bool(_test_project_imports(path))
+    )
+
+
+def _cases_tests_beside_locks(
+    root: Path, goal: Path, changed: list[str], locks: list[str]
+) -> list[str]:
+    """The changed tests, not in `locks`, that read locked data and import the code.
+
+    Run R22: T0002 locked tests/cases.json alone, and its committed
+    tests/test_cases.py, which read it and imported cobs, stayed unlocked, so
+    Cases first refused every code task after it.
+    """
+    named = set()
+    for entry in locks:
+        target = _project_file(root, entry)
+        if target is not None:
+            named.add(str(target.relative_to(root.resolve())))
+    data = [rel for rel in [*named, *_locked(goal)] if _is_cases_data(rel)]
+    if not data:
+        return []
+    held = named | set(_locked(goal))
+    return [rel for rel in changed if rel not in held and _reads_locked_data(root, rel, data)]
 
 
 def _locked_test_imports(goal: Path) -> dict[str, str]:
@@ -4587,12 +4654,88 @@ def _cases_on_disk_route(
     )
 
 
+def _locked_data_route(
+    task: str,
+    scope: list[str],
+    named: str,
+    unjudged_text: str,
+    data: list[str],
+    committed: list[tuple[str, str]],
+    module: str,
+    root: Path,
+) -> str:
+    """The Cases first refusal when the known answers are locked but no test of them is.
+
+    Run R22: the hint planned a known-answers part over the locked
+    tests/cases.json, and that part's work was refused as locked. With a done
+    task's cases test committed, the route locks it on this step; else this
+    task writes the test and its close locks it.
+    """
+    listed = ", ".join(data)
+    head = (
+        f"Cases first: {unjudged_text} The known answers ({listed}) are locked already: "
+        "do not plan them again."
+    )
+    if committed:
+        test, owner = committed[0]
+        check = f"python3 -m pytest -q {test}"
+        scoped = ", ".join(f'"{e}"' for e in scope)
+        return (
+            f"{head} {test} is {owner}'s committed work: it reads them and imports the "
+            f"code, but it was never locked. Lock it on this step, scope kept: "
+            f'pursuit_step task="{task}" scope=[{scoped}] done_when="{check}" '
+            f'locks=["{test}"]. {test} is locked at once, as {owner} committed it, and '
+            "then judges this task's code."
+        )
+    stem = module.split(".")[-1] if module else "cases"
+    candidates = [
+        "tests/test_cases.py",
+        f"tests/test_{stem}_cases.py",
+        f"tests/test_{stem}_known_answers.py",
+    ]
+    test = next((rel for rel in candidates if not (root / rel).exists()), candidates[-1])
+    scoped = ", ".join(f'"{e}"' for e in [*scope, test])
+    return (
+        f"{head} No test that reads them imports {named} yet. Write that test in this "
+        f'task and lock it at its close: pursuit_step task="{task}" scope=[{scoped}] '
+        f'done_when="python3 -m pytest -q {test}" locks=["{test}"]. The test must load '
+        f"{listed} and run every case against {named}, with no asserts of its own."
+    )
+
+
+def _committed_cases_tests(
+    root: Path, goal: Path, task: str, nodes: list[dict[str, Any]]
+) -> list[tuple[str, str]]:
+    """(test, done task) for each unlocked test a done task committed that reads
+    locked data and imports the code, unchanged since HEAD.
+
+    Run R22: T0002 committed tests/test_cases.py beside the locked
+    tests/cases.json but never locked it.
+    """
+    locked = _locked(goal)
+    data = [rel for rel in locked if _is_cases_data(rel)]
+    head = _head_files(root) if data else None
+    found: list[tuple[str, str]] = []
+    for rel in sorted(head or ()):
+        if rel in locked or not _reads_locked_data(root, rel, data):
+            continue
+        try:
+            unchanged = (root / rel).read_bytes() == _committed_bytes(root, "HEAD", rel)
+        except OSError:
+            continue
+        owner = _done_task_in_log([rel], task, nodes, root) if unchanged else ""
+        if owner:
+            found.append((rel, owner))
+    return found
+
+
 def _cases_first_problem(
     scope: list[str],
     task: str,
     title: str,
     goal: Path,
     nodes: list[dict[str, Any]] | None = None,
+    locks: list[str] | None = None,
 ) -> str | None:
     """Why a task would write new source before known answers judge it, or None.
 
@@ -4610,6 +4753,23 @@ def _cases_first_problem(
         return None
     new = _new_modules(scope, root)
     if not new:
+        return None
+    locked_data = [rel for rel in _locked(goal) if _is_cases_data(rel)]
+    committed = _committed_cases_tests(root, goal, task, nodes or []) if locked_data else []
+    asked = {os.path.normpath(entry.strip()) for entry in locks or []}
+    for rel, owner in committed:
+        if rel in asked:
+            # The route below asks for this: a done task's committed test,
+            # locked as that task left it.
+            _lock(goal, root, [rel], owner)
+    named_scope = {os.path.normpath(entry.strip()) for entry in scope}
+    carried = [
+        rel
+        for rel in asked & named_scope
+        if rel.endswith(".py") and _is_test_path(rel) and rel not in _locked(goal)
+    ]
+    if locked_data and carried:
+        # Its close locks the cases test beside the locked data, or stays open.
         return None
     imported = _locked_test_imports(goal)
 
@@ -4640,6 +4800,10 @@ def _cases_first_problem(
         f"Scope names new source {entry}, and no locked test imports it yet, so nothing "
         "from the reference would judge the code."
     )
+    if locked_data:
+        return _locked_data_route(
+            task, scope, named, unjudged_text, locked_data, committed, module, root
+        )
     on_disk = _known_answers_on_disk(root)
     siblings = _known_answers_siblings(task, nodes or [])
     if siblings:
@@ -7617,7 +7781,9 @@ def make_step_tool() -> Any:
                 or _locked_scope_problem(scope, root, title, task)
                 or _sibling_owned_check_problem(done_when, scope, task, nodes, root)
                 or _oracle_with_code_problem(scope, goal)
-                or _cases_first_problem(scope, task, title, goal, nodes)
+                or _cases_first_problem(
+                    scope, task, title, goal, nodes, _strings(arguments.get("locks"))
+                )
                 or _locked_test_problem(done_when, scope, goal)
                 or _import_scope_problem(done_when, scope, root)
             ) or await _unwritten_check_problem(
@@ -7797,7 +7963,12 @@ def make_step_tool() -> Any:
         if notes:
             brief = f"{brief}\n\nFrom the driver (who has not read the reference):\n{notes}"
         brief += "\n\n" + NO_BEAGLE_NOTE
-        locks = _pending_locks(goal, task, _strings(arguments.get("locks")))
+        held = set(_locked(goal))
+        locks = _pending_locks(
+            goal,
+            task,
+            [e for e in _strings(arguments.get("locks")) if os.path.normpath(e) not in held],
+        )
         # A known-answers fix may change the locked files in its scope; its
         # close locks them again from what it wrote.
         fixing = (
@@ -8147,7 +8318,12 @@ def make_step_tool() -> Any:
         if not locks and _only_data_and_tests(changed):
             # Run R04: the driver passed no locks for its known-answers task.
             locks = changed
-        unread = _unread_cases(root, locks) if locks else None
+        if locks:
+            locks = [*locks, *_cases_tests_beside_locks(root, goal, changed, locks)]
+        # The data locked earlier counts: a cases test locked now must read it.
+        judged = [*locks, *(rel for rel in _locked(goal) if _is_cases_data(rel))]
+        judged = list(dict.fromkeys(judged))
+        unread = _unread_cases(root, judged) if locks else None
         if unread:
             state = "stays blocked" if retrying else "stays open"
             test, data = unread
@@ -8163,7 +8339,7 @@ def make_step_tool() -> Any:
                 f'Next: pursuit_step with task="{task}" and notes saying {test} must load '
                 f"{data} and run every case against the code.",
             )
-        flawed = _cases_test_problem(root, locks) if locks else None
+        flawed = _cases_test_problem(root, judged) if locks else None
         if flawed:
             state = "stays blocked" if retrying else "stays open"
             test, problem = flawed
