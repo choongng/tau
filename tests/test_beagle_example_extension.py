@@ -13748,3 +13748,75 @@ async def test_pending_locks_hold_only_tests_and_data(
     assert f"Not filed as locks: {', '.join(code)}" in result.text
     module = _loaded_module()
     assert [module._lockable(e) for e in [*data, *code]] == [True] * 3 + [False] * 2
+
+
+R26_DATA_SCOPE = ["tests/cases.json", "tests/test_case_data.py"]
+
+
+@pytest.mark.anyio
+async def test_data_test_route_does_not_propose_the_importing_test_itself(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # R26 W5 put `import cobs` into the data test; the rebind proposed that same
+    # check and no worker ran to drop the one line.
+    project = _pursuit_project(tmp_path)
+    monkeypatch.chdir(project)
+    check = _case_data_test(project)
+    data_test = project / "tests" / "test_case_data.py"
+    data_test.write_text("import cobs\n" + data_test.read_text())
+    (project / "tests" / "cases.json").write_text('[{"name": "seed"}]\n')
+    module = _module()
+    assert module._data_test_route(check, R26_DATA_SCOPE, project) is None
+    assert module._imports_unwritten_problem(check, R26_DATA_SCOPE, project) is None
+    monkeypatch.setenv("FAKE_TAU_SUCCEEDS_ON", "99")
+    record = {"id": "T0006", "title": "Known answers", "status": "open"}
+    record |= {"scope": R26_DATA_SCOPE, "criteria": "cases", "done_when": check}
+    (fake_beagle / "show.out").write_text(json.dumps(record))
+    (fake_beagle / "next.out").write_text(json.dumps({"open": ["T0006"], "ready": []}))
+    (fake_beagle / "brief.out").write_text("# T0006: Known answers\n")
+    runtime, _ = _bound(tmp_path)
+
+    result = await _tool(runtime, "pursuit_step").execute("c1", {"task": "T0006", "attempts": 1})
+
+    assert "not run" not in result.text
+    assert "amend done_when to" not in result.text
+    [run] = _runs(fake_tau)
+    assert (
+        "tests/test_case_data.py imports cobs, which no path in this scope creates; a data "
+        "test reads only the data file and imports none of the code: remove that import."
+    ) in run["stdin"]
+
+
+def test_runs_test_file_sees_python_script_run(tmp_path: Path) -> None:
+    # R26 bound T0007-T0011 to `python3 tests/test_case_data.py`; no helper saw the
+    # test run, so the proof note said to mutate a module it did not import.
+    module = _module()
+    rel = "tests/test_case_data.py"
+    for command in (
+        f"python3 {rel}",
+        f"python {rel}",
+        f"python3.12 -u {rel}",
+        f"/usr/bin/python3 -W error ./{rel}",
+        f"cd . && python3 {rel}",
+        f"python3 -m pytest -q {rel}",
+    ):
+        assert module._runs_test_file(command, rel), command
+    for command in (
+        "python3 -c 'import tests.test_case_data'",
+        "python3 -m json.tool tests/cases.json",
+        "python3 tools/gen.py tests/test_case_data.py",
+        f"cat {rel}",
+        "python3 tests/test_other.py",
+    ):
+        assert not module._runs_test_file(command, rel), command
+
+    check = f"python3 {_case_data_test(tmp_path).split()[-1]}"
+    assert module._check_test_files(check, tmp_path) == [rel]
+    assert module._check_data_reads(check, tmp_path) == ["tests/cases.json"]
+    note = module._tests_only_proof_note(check, [rel], tmp_path)
+    assert note != module.TESTS_ONLY_MUTATE_NOTE
+    assert 'scope=["tests/test_case_data.py", "tests/cases.json"]' in note

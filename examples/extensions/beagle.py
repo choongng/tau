@@ -4811,7 +4811,7 @@ def _locked_test_imports(goal: Path) -> dict[str, str]:
 
 def _runs_test_file(command: str, rel: str) -> bool:
     """Whether `command` runs pytest over `rel`: the file, a node id or `-k` in it, a
-    directory holding it, or the whole suite."""
+    directory holding it, or the whole suite; or runs `rel` as a python script."""
     try:
         words = shlex.split(command)
     except ValueError:
@@ -4832,7 +4832,37 @@ def _runs_test_file(command: str, rel: str) -> bool:
                 paths.append(token.split("::")[0].rstrip("/"))
         if not paths or any(p in {"", "."} or p == rel or rel.startswith(f"{p}/") for p in paths):
             return True
-    return False
+    return any(
+        _python_script(tokens[at + 1 :]) == rel
+        for at, t in enumerate(tokens)
+        if _PYTHON_NAME.fullmatch(Path(t).name)
+    )
+
+
+#: An interpreter name a check runs a test script with: python, python3, python3.N.
+_PYTHON_NAME = re.compile(r"python(?:3(?:\.\d+)?)?")
+
+
+def _python_script(args: list[str]) -> str | None:
+    """The script an interpreter's arguments run, or None for `-c`, `-m` or none.
+
+    Run R26 bound T0007-T0011 to `python3 tests/test_case_data.py`; pytest-only
+    matching saw no test run and called the scope's proof a module mutation.
+    """
+    skip = False
+    for token in args:
+        if skip:
+            skip = False
+            continue
+        if token in {"-c", "-m"} or token in {"&&", "||", ";", "|"}:
+            return None
+        if token in {"-W", "-X"}:
+            skip = True
+            continue
+        if token.startswith("-"):
+            continue
+        return token.rstrip(";").removeprefix("./")
+    return None
 
 
 def _locked_test_problem(command: str, scope: list[str], goal: Path) -> str | None:
@@ -5337,8 +5367,8 @@ def _module_written(name: str, root: Path, beside: Path, scope: list[str]) -> bo
 
 
 def _check_test_files(command: str, root: Path) -> list[str]:
-    """The test .py files a check runs under pytest, named directly or as a directory
-    holding them; a file the check only reads (grep, cat) is not run."""
+    """The test .py files a check runs under pytest or as a script, named directly or
+    as a directory holding them; a file the check only reads (grep, cat) is not run."""
     found: list[str] = []
     for rel in _check_targets(command, root):
         target = root / rel
@@ -5404,8 +5434,26 @@ def _data_test_route(
         return None
     test, module = found
     data_test = _data_test(test, scope, root)
+    if data_test == test:
+        return None
     needs = scope if _in_scope(data_test, scope, root) else [*scope, data_test]
     return test, module, f"python3 -m pytest -q {data_test}", needs
+
+
+def _self_import_note(command: str, scope: list[str], root: Path) -> str:
+    """The worker note for a check whose data test itself imports unwritten code, or "".
+
+    Run R26 W5 put `import cobs` into tests/test_case_data.py; `_data_test_route`
+    then proposed binding that same test, and no worker ran to drop the import.
+    """
+    found = _imports_unwritten(command, scope, root) if scope else None
+    if found is None or _data_test(found[0], scope, root) != found[0]:
+        return ""
+    test, module = found
+    return (
+        f"\n\n{test} imports {module}, which no path in this scope creates; a data test "
+        "reads only the data file and imports none of the code: remove that import."
+    )
 
 
 def _absent_test_route(
@@ -8981,6 +9029,8 @@ def make_step_tool() -> Any:
         unproven_key = (str(root), task)
         tests_only = _only_data_and_tests(scope)
         proof_note = _tests_only_proof_note(check, scope, root)
+        self_import = _self_import_note(check, scope, root) if check else ""
+        retry_note = self_import + retry_note
         missing_data = _missing_data(check, scope, root) if check else []
         mixed = _oracle_with_code_problem(scope, goal)
         if mixed is not None:
@@ -9141,6 +9191,7 @@ def make_step_tool() -> Any:
             if cannot_pass is not None:
                 # Run R16 sent W4, W6, W8, W10 and W12 after this was already known.
                 break
+            retry_note = _self_import_note(check, scope, root) + retry_note
             no_tests = _pytest_collected_none(verdict[0], check)
             if no_tests is not None:
                 retry_note = f"\n\n{no_tests}" + retry_note
