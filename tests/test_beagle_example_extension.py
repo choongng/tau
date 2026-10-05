@@ -2326,6 +2326,50 @@ async def test_step_brief_carries_references_and_prompt(
 
 
 @pytest.mark.anyio
+async def test_absolute_scope_under_root_is_matched_root_relative(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # R23: the driver scoped /home/choong/cobs/docs/reference-notes.md; stored
+    # as given, it never matched git's root-relative paths, so nothing committed.
+    project = _pursuit_project(tmp_path)
+    monkeypatch.chdir(project)
+    _ready_task(fake_beagle)
+    runtime, _ = _bound(tmp_path)
+    step = _tool(runtime, "pursuit_step")
+    outside = tmp_path / "elsewhere" / "notes.md"
+
+    refused = await step.execute(
+        "c1", {"task": "T0002", "done_when": "grep -q done done.txt", "scope": [str(outside)]}
+    )
+    assert f"outside the project root {project}" in refused.text
+    assert _pursuit_calls(fake_beagle, "open") == []
+
+    await step.execute(
+        "c2",
+        {
+            "task": "T0002",
+            "criteria": "done.txt exists",
+            "done_when": "grep -q done done.txt",
+            "scope": [str(project / "docs" / "notes.md"), "done.txt"],
+        },
+    )
+    [opened] = _pursuit_calls(fake_beagle, "open")
+    assert opened[opened.index("--scope") + 1 :][:2] == ["docs/notes.md", "done.txt"]
+
+    module = _module()
+    stored = [str(project / "docs") + "/", "done.txt"]
+    assert module._in_scope("docs/notes.md", stored, project)
+    assert module._in_scope("done.txt", stored, project)
+    assert not module._in_scope("src/x.py", stored, project)
+    assert not module._in_scope("notes.md", [str(outside)], project)
+    assert module._in_scope("docs/notes.md", ["docs/"], project)
+
+
+@pytest.mark.anyio
 async def test_pursuit_plan_adds_one_part_to_a_container(
     tmp_path: Path, beagle: Path, fake_beagle: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

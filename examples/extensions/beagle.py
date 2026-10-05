@@ -1578,7 +1578,7 @@ def _report_before_markup(report: str, cwd: Path, scope: list[str]) -> str:
 def _scope_changes(cwd: Path, scope: list[str]) -> list[str]:
     """What git sees changed in `scope`: the diff stat and the changed or new files."""
     rc, stat = _run(["git", "diff", "--stat", "--", *scope], cwd, timeout=30.0)
-    changed = [rel for rel in _changed_files(cwd) if _in_scope(rel, scope)]
+    changed = [rel for rel in _changed_files(cwd) if _in_scope(rel, scope, cwd)]
     lines: list[str] = []
     if rc == 0 and stat.strip():
         lines.append(f"git diff --stat:\n{stat.strip()}")
@@ -3270,7 +3270,7 @@ def _uncommitted_in_scope(root: Path, task: str) -> tuple[list[str], list[str]]:
     scope = _strings(record.get("scope"))
     if not scope:
         return [], []
-    return scope, [rel for rel in _changed_files(root) if _in_scope(rel, scope)]
+    return scope, [rel for rel in _changed_files(root) if _in_scope(rel, scope, root)]
 
 
 def _uncommitted_note(task: str, paths: list[str]) -> str:
@@ -3293,7 +3293,7 @@ def _commit_before_split(root: Path, task: str, scope: list[str], paths: list[st
     if _LAST_CHECK_EXIT.get((str(root), task)) != 0:
         return _uncommitted_note(task, paths)
     said = _commit(task, SPLIT_WIP_TITLE, scope, root)
-    left = [rel for rel in _changed_files(root) if _in_scope(rel, scope)]
+    left = [rel for rel in _changed_files(root) if _in_scope(rel, scope, root)]
     if left:
         return f"{said}\n\n{_uncommitted_note(task, left)}"
     return (
@@ -5203,7 +5203,7 @@ def _data_test_route(
         return None
     test, module = found
     data_test = _data_test(test, scope, root)
-    needs = scope if _in_scope(data_test, scope) else [*scope, data_test]
+    needs = scope if _in_scope(data_test, scope, root) else [*scope, data_test]
     return test, module, f"python3 -m pytest -q {data_test}", needs
 
 
@@ -5253,7 +5253,7 @@ def _check_data_reads(command: str, root: Path) -> list[str]:
 
 def _missing_data(command: str, scope: list[str], root: Path) -> list[str]:
     """The data files the check's tests read that `scope` does not hold."""
-    return [rel for rel in _check_data_reads(command, root) if not _in_scope(rel, scope)]
+    return [rel for rel in _check_data_reads(command, root) if not _in_scope(rel, scope, root)]
 
 
 def _tests_only_proof_note(command: str, scope: list[str], root: Path | None) -> str:
@@ -5266,7 +5266,7 @@ def _tests_only_proof_note(command: str, scope: list[str], root: Path | None) ->
     reads = _check_data_reads(command, root) if root is not None and command else []
     if not _scope_has_data(scope) and not reads:
         return TESTS_ONLY_MUTATE_NOTE
-    missing = [rel for rel in reads if not _in_scope(rel, scope)]
+    missing = [rel for rel in reads if not _in_scope(rel, scope, root)]
     if not missing:
         return TESTS_ONLY_PROOF_NOTE
     return (
@@ -5845,7 +5845,9 @@ def _implementation_in_tests_lead(root: Path, scope: list[str]) -> str:
     not-done results only listed tests/itc/clock.py among the changed files.
     """
     changed = [
-        rel for rel in _changed_files(root) if _in_scope(rel, scope) and (root / rel).is_file()
+        rel
+        for rel in _changed_files(root)
+        if _in_scope(rel, scope, root) and (root / rel).is_file()
     ]
     by_file: dict[str, list[str]] = {}
     for where in _implementation_in_tests(root, changed):
@@ -5888,7 +5890,7 @@ def _missing_scoped_test(rc: int, output: str, scope: list[str], root: Path) -> 
         return None
     for match in re.finditer(r"file or directory not found:\s*(\S+)", output):
         rel = match.group(1).split("::")[0].rstrip("/")
-        if _in_scope(rel, scope) and not (root / rel).exists():
+        if _in_scope(rel, scope, root) and not (root / rel).exists():
             return rel
     return None
 
@@ -6060,9 +6062,47 @@ def _changed_files(root: Path) -> list[str]:
     return paths
 
 
-def _in_scope(rel: str, scope: list[str]) -> bool:
+def _root_relative(entry: str, root: Path) -> str | None:
+    """`entry` relative to `root`: as given when relative, None when absolute outside it.
+
+    Run R23: the driver scoped /home/choong/cobs/docs/reference-notes.md, and git's
+    root-relative paths never matched it, so prove took nothing away and the
+    passing task was never committed.
+    """
+    text = entry.strip()
+    if not text or not Path(text).expanduser().is_absolute():
+        return entry
+    path = Path(text).expanduser()
+    for base in (root, _resolved(root)):
+        for candidate in (path, _resolved(path)):
+            try:
+                rel = candidate.relative_to(base).as_posix()
+            except ValueError:
+                continue
+            return (rel or ".") + ("/" if text.endswith("/") and rel else "")
+    return None
+
+
+def _root_relative_scope(scope: list[str], root: Path) -> tuple[list[str], str | None]:
+    """`scope` with absolute entries under `root` made root-relative, or why one is refused."""
+    entries: list[str] = []
+    for entry in scope:
+        rel = _root_relative(entry, root)
+        if rel is None:
+            return scope, (
+                f"pursuit_step: scope entry {entry} is outside the project root {root}. "
+                f"Scope names paths in the project, relative to {root} "
+                '(e.g. "src/module.py"); call pursuit_step again with those.'
+            )
+        entries.append(rel)
+    return entries, None
+
+
+def _in_scope(rel: str, scope: list[str], root: Path | None = None) -> bool:
     if not scope:
         return True
+    if root is not None:
+        scope = [e for e in (_root_relative(s, root) for s in scope) if e is not None]
     return any(rel == s.rstrip("/") or rel.startswith(s.rstrip("/") + "/") for s in scope)
 
 
@@ -6201,7 +6241,7 @@ async def _prove(
         sources = [
             rel
             for rel in changed
-            if _in_scope(rel, scope) and not _is_test_path(rel) and (root / rel).is_file()
+            if _in_scope(rel, scope, root) and not _is_test_path(rel) and (root / rel).is_file()
         ]
     if not sources:
         # A known-answers task changes only data and tests: taking its data
@@ -6209,7 +6249,7 @@ async def _prove(
         sources = [
             rel
             for rel in changed
-            if _in_scope(rel, scope) and not rel.endswith(".py") and (root / rel).is_file()
+            if _in_scope(rel, scope, root) and not rel.endswith(".py") and (root / rel).is_file()
         ]
     if sources:
         # Run R14: both witnesses took away interval_tree_clocks.py, which T0003
@@ -6272,7 +6312,7 @@ def _commit(task: str, title: str, scope: list[str], root: Path) -> str:
     Run 11d left six of seven tasks' work uncommitted. Claims are the worker's
     to record; with none, the commit says so rather than not landing at all.
     """
-    paths = [rel for rel in _changed_files(root) if _in_scope(rel, scope)]
+    paths = [rel for rel in _changed_files(root) if _in_scope(rel, scope, root)]
     if not paths:
         return "Nothing to commit: the task changed no file in its scope."
     if not _git_identity(root):
@@ -6935,7 +6975,7 @@ async def _passes_without_own_work(check: str, scope: list[str], root: Path) -> 
     Run R12: T0008's new route was refused as already passing, five times, when
     only its own uncommitted test made the check pass.
     """
-    own = [rel for rel in _changed_files(root) if scope and _in_scope(rel, scope)]
+    own = [rel for rel in _changed_files(root) if scope and _in_scope(rel, scope, root)]
     if not own:
         return True
     saved: dict[str, bytes | None] = {}
@@ -7047,7 +7087,11 @@ def _own_files(task: str, rel: str, root: Path) -> bool:
     Run R22: T0019, with no scope, was titled "Known answers: run
     tests/test_case_data.py", and the title made T0002's committed test its own.
     """
-    named = {os.path.normpath(s) for s in _strings(_shown(task, root).get("scope")) if s.strip()}
+    named = {
+        os.path.normpath(rel)
+        for s in _strings(_shown(task, root).get("scope"))
+        if s.strip() and (rel := _root_relative(s, root)) is not None
+    }
     return os.path.normpath(rel) in named
 
 
@@ -7063,7 +7107,7 @@ def _sibling_owned_check_problem(
     """
     if not check or not scope:
         return None
-    runs = [rel for rel in _check_test_files(check, root) if not _in_scope(rel, scope)]
+    runs = [rel for rel in _check_test_files(check, root) if not _in_scope(rel, scope, root)]
     if not runs:
         return None
     for waiter, waits in _hard_waits(nodes).items():
@@ -7198,7 +7242,7 @@ async def _done_by(
             f'`git log --grep "{done}:"` finds none.'
         )
     sha = next(
-        (s for s in shas if any(_in_scope(rel, paths) for rel in _commit_paths(s, root))), ""
+        (s for s in shas if any(_in_scope(rel, paths, root) for rel in _commit_paths(s, root))), ""
     )
     if not sha:
         return (
@@ -7226,7 +7270,7 @@ async def _done_by(
         witness = [
             rel
             for rel in committed
-            if _in_scope(rel, paths) and _can_witness(rel) and (root / rel).is_file()
+            if _in_scope(rel, paths, root) and _can_witness(rel) and (root / rel).is_file()
         ]
         if not witness:
             return _done_by_unwitnessed(task, done, check, paths, committed, root)
@@ -7281,7 +7325,7 @@ def _done_by_unwitnessed(
     outside = [
         rel
         for rel in committed
-        if not _in_scope(rel, paths) and _can_witness(rel) and (root / rel).is_file()
+        if not _in_scope(rel, paths, root) and _can_witness(rel) and (root / rel).is_file()
     ]
     said = (
         f"pursuit_step: {task} not closed done by {done} — this pursuit closes done only on "
@@ -7500,7 +7544,7 @@ def _unproven_data_route(
     reads = _check_data_reads(bound_check, root)
     if not reads:
         return None
-    return [rel for rel in reads if not _in_scope(rel, scope)]
+    return [rel for rel in reads if not _in_scope(rel, scope, root)]
 
 
 async def _offered_data_test_passes(
@@ -7660,7 +7704,7 @@ def _check_runs_own_file(
     check = str(shown.get("done_when") or "")
     scope = _strings(shown.get("scope"))
     for rel in _check_test_files(check, root) if check else []:
-        if scope and not _in_scope(rel, scope) and _own_files(task, rel, root):
+        if scope and not _in_scope(rel, scope, root) and _own_files(task, rel, root):
             return (
                 f"{predecessor}'s check runs {rel}, {task}'s own file, which {predecessor}'s "
                 f"scope cannot change: put {rel} in {predecessor}'s scope with its own files, "
@@ -7745,6 +7789,11 @@ def make_step_tool() -> Any:
         root, goal = _project_root()
         if goal is None:
             return _step_result("pursuit_step: no pursuit here yet; call pursuit_found first.")
+        if _strings(arguments.get("scope")):
+            scope, outside = _root_relative_scope(_strings(arguments.get("scope")), root)
+            if outside is not None:
+                return _step_result(outside)
+            arguments = {**arguments, "scope": scope}
         rc, ready, raw = _next_ready(root)
         if rc == 4 or rc not in (0, 3) or not isinstance(ready, dict):
             return _step_result(
@@ -8564,7 +8613,9 @@ def make_step_tool() -> Any:
                 ),
             )
         changed = [
-            rel for rel in _changed_files(root) if _in_scope(rel, scope) and (root / rel).is_file()
+            rel
+            for rel in _changed_files(root)
+            if _in_scope(rel, scope, root) and (root / rel).is_file()
         ]
         misplaced = _implementation_in_tests(root, changed)
         if misplaced:
