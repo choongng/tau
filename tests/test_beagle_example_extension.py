@@ -6314,6 +6314,47 @@ async def test_unfounded_dispatch_runs(
 
 
 @pytest.mark.anyio
+async def test_dispatch_text_in_a_founded_session_names_no_guard_refused_bash_command(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # T0209: the dispatch footer and guideline sent a founded driver to a bash
+    # `beagle pursuit close`, which the driver guard then refused.
+    monkeypatch.chdir(_pursuit_project(tmp_path))
+    (fake_beagle / "next.out").write_text(json.dumps({"open": [], "ready": ["T0003"]}))
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    runtime, _ = _bound(tmp_path)
+    await runtime.emit_session_start("startup")
+    dispatch = _tool(runtime, "pursuit_dispatch")
+
+    refused = await dispatch.execute("c1", {"brief": "Implement it"})
+    # A worker sent to an unfounded cwd from a founded session still reports.
+    reported = await dispatch.execute("c2", {"brief": "Implement it", "cwd": str(elsewhere)})
+    assert "refused, nothing was spawned" in refused.text
+    assert "[pursuit_dispatch] step-executor" in reported.text
+
+    texts = [refused.text, reported.text]
+    for tool in runtime.compose_tools([]):
+        texts += [tool.description, *tool.prompt_guidelines]
+    commands = [
+        re.sub(r"<[^>]*>", "X", span)
+        for text in texts
+        for span in re.findall(r"`(beagle [^`]*)`", text)
+    ]
+    assert any(c.startswith("beagle pursuit") for c in commands)
+
+    bash = _tool_with_hooks(runtime, "bash")
+    for command in commands:
+        result = await bash.execute("c3", {"command": command})
+        assert result.text == "ran", (command, result.text)
+    assert "pursuit_step" in reported.text
+
+
+@pytest.mark.anyio
 async def test_founded_driver_reference_read_refused(
     tmp_path: Path, beagle: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

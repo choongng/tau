@@ -39,7 +39,8 @@ because a specific part of that model has no Tau equivalent:
   target dir set with `--cwd`, and the model inherited from the session unless
   the caller names a Tau model/provider. Because the worker is Tau too, the
   ground-truth guard stays live inside it — a sub-agent is not a way around it.
-  The driver still runs `pursuit close`; this tool only does the work and
+  Before a pursuit is founded the driver still runs `pursuit close`; once it
+  is, the tool is refused and pursuit_step closes. It only does the work and
   returns the report.
 - **steering** — `pursuit_found`, `pursuit_plan` and `pursuit_step` carry a
   session through the pursuit without the driver text, which runs to tens of
@@ -1732,6 +1733,25 @@ def _founded_dispatch_refusal(cwd: Path) -> str | None:
     )
 
 
+def _dispatch_footer(session_cwd: Path) -> str:
+    """The line after a worker's report: who closes the task, and with what.
+
+    Once the session's pursuit is founded the driver guard refuses a bash
+    `beagle pursuit close`, so the line names pursuit_step instead (T0209's
+    report: the footer still sent the driver to the refused bash verb).
+    """
+    if _find_goal(session_cwd) is not None:
+        return (
+            "\n\n— The worker closes nothing, and this dispatch recorded nothing. In a "
+            "founded pursuit pursuit_step does the task: it has a sub-agent do it, runs its "
+            "check and closes it."
+        )
+    return (
+        "\n\n— YOU run the close, not the worker: `beagle pursuit close <task> "
+        "--outcome done --spent <n>`, after running its --done-when yourself."
+    )
+
+
 def make_dispatch() -> Any:
     """Build the `pursuit_dispatch` tool executor."""
 
@@ -1771,10 +1791,7 @@ def make_dispatch() -> Any:
             f"(model={model or 'inherit'} provider={provider or 'inherit'}) "
             f"cwd={cwd} rc={run.returncode}\n\n"
         )
-        footer = (
-            "\n\n— YOU run the close, not the worker: `beagle pursuit close <task> "
-            "--outcome done --spent <n>`, after running its --done-when yourself."
-        )
+        footer = _dispatch_footer(_SEEN_CWD or Path.cwd())
         return _with_note(_make_dispatch_result(header + run.shown_report + footer), clamped)
 
     return execute
@@ -11551,9 +11568,10 @@ def setup(tau: ExtensionAPI) -> None:
                     "Delegate one well-specified pursuit task to a headless step-executor (a "
                     "nested `tau -p`, inheriting this session's model unless a Tau model id is "
                     "given). Pass the brief ('run `beagle pursuit brief <task>` and do what it "
-                    "says'). Returns the executor's report; the caller still runs `beagle "
-                    "pursuit close`. Use for roughly ten tool calls or more of mechanical work, "
-                    "not one-line edits or open-ended exploration."
+                    "says'). Returns the executor's report; the worker closes nothing. Once "
+                    "a pursuit is founded this tool is refused: pursuit_step has the task done, "
+                    "runs its check and closes it. Use for roughly ten tool calls or more of "
+                    "mechanical work, not one-line edits or open-ended exploration."
                 ),
                 parameters=DISPATCH_PARAMETERS,
                 execute_fn=make_dispatch(),
@@ -11561,8 +11579,8 @@ def setup(tau: ExtensionAPI) -> None:
                 prompt_guidelines=(
                     "Hand pursuit_dispatch a self-contained brief; the worker sees no "
                     "conversation.",
-                    "The worker does the work; YOU run `beagle pursuit close` after its "
-                    "--done-when.",
+                    "The worker does the work and closes nothing; in a founded pursuit, "
+                    "pursuit_step runs the task's check and closes it.",
                 ),
             )
         )
