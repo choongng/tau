@@ -6650,13 +6650,41 @@ def _at_spawn_limit(task: str, nodes: list[dict[str, Any]] | None) -> bool:
     return bool(nodes) and len(_retry_chain(task, nodes or [])) > SPAWN_LIMIT
 
 
-def _infeasible_call(task: str, check: str, scope: list[str]) -> str:
+def _infeasible_call(task: str, check: str, scope: list[str], why: str = "") -> str:
     """The pursuit_step call that closes an open, unprovable `task` infeasible."""
-    why = (
+    why = why or (
         f"`{check or 'its check'}` passes, and no defect put back into "
         f"{', '.join(scope[:4]) or 'its scope'} fails it"
     )
     return f"pursuit_step task={json.dumps(task)}, abandon={json.dumps('infeasible: ' + why)}"
+
+
+def _replan_parent_call(task: str, nodes: list[dict[str, Any]]) -> str:
+    """The pursuit_plan call that re-plans `task`'s parent once `task` closes infeasible."""
+    node = next((n for n in nodes if str(n.get("id")) == task), {})
+    parent = str(node.get("parent") or "")
+    if not parent:
+        return ""
+    title = str(node.get("title") or task).replace("::", ":").replace('"', "'").strip()
+    return (
+        f'pursuit_plan task="{parent}", parts=["{title}::by a route other than '
+        f"{task}'s, which was found infeasible\"]"
+    )
+
+
+def _spawn_limit_offer(
+    task: str, check: str, scope: list[str], nodes: list[dict[str, Any]], why: str = ""
+) -> str:
+    """What a result says for `task` at beagle's spawn limit: no new route, and the
+    infeasible close with the parent's re-plan to make instead."""
+    chain = ", ".join(sorted(_retry_chain(task, nodes)))
+    replan = _replan_parent_call(task, nodes)
+    return (
+        f"Its retry chain ({chain}) is at beagle's limit of {SPAWN_LIMIT} attempts, so "
+        f"beagle refuses a new route. Close it infeasible instead: "
+        f"{_infeasible_call(task, check, scope, why)}"
+        + (f"; then re-plan its parent: {replan}." if replan else ".")
+    )
 
 
 def _unproven_call(
@@ -7538,11 +7566,25 @@ def _close_infeasible(
             f"pursuit_step: {task} not closed infeasible — it is the root, the goal "
             "itself, and the goal is the user's."
         )
-    if node.get("status") not in ("open", "pending"):
+    if node.get("status") != "open":
         return (
             f"pursuit_step: {task} not closed infeasible — it is "
-            f"{node.get('status') or 'not in the tree'}; only an open or pending task "
-            "closes this way."
+            f"{node.get('status') or 'not in the tree'}; only an open task closes this "
+            "way, as beagle refuses an infeasible close on a task not yet worked."
+            + (
+                f' Work it first: pursuit_step task="{task}".'
+                if node.get("status") == "pending"
+                else ""
+            )
+        )
+    if not _at_spawn_limit(task, nodes):
+        chain = ", ".join(sorted(_retry_chain(task, nodes)))
+        return (
+            f"pursuit_step: {task} not closed infeasible — its retry chain ({chain}) "
+            f"holds {len(_retry_chain(task, nodes))} attempt(s), below beagle's limit of "
+            f"{SPAWN_LIMIT}, so a hard task is not yet shown infeasible. Call instead: "
+            f'pursuit_step task="{task}", new_route=true and notes saying how the new '
+            f'route differs, or pursuit_step task="{task}" with notes saying what to fix.'
         )
     argv = [
         "close", task, "--outcome", "infeasible",
@@ -7558,11 +7600,9 @@ def _close_infeasible(
     _drop_pending_locks(goal, task)
     _forget_task(root, task)
     parent = str(node.get("parent") or "")
-    title = str(node.get("title") or task).replace("::", ":").replace('"', "'").strip()
     replan = (
         f"Re-plan its parent {parent} with a route the finding does not rule out: "
-        f'pursuit_plan task="{parent}", parts=["{title}::by a route other than '
-        f"{task}'s, which was found infeasible\"]."
+        f"{_replan_parent_call(task, nodes)}."
         if parent
         else "Next: call pursuit_step with no arguments for the next task."
     )
@@ -8834,7 +8874,18 @@ def make_step_tool() -> Any:
                 if successor is None:
                     return _step_result(
                         f"pursuit_step: `beagle pursuit spawn {task}` refused:\n{spawned}\n\n"
-                        "Say more specifically in notes how this route differs."
+                        + (
+                            _spawn_limit_offer(
+                                task,
+                                old_check,
+                                _strings(record.get("scope")),
+                                nodes,
+                                f"{len(_retry_chain(task, nodes))} routes were tried and "
+                                "beagle refuses another",
+                            )
+                            if _at_spawn_limit(task, nodes)
+                            else "Say more specifically in notes how this route differs."
+                        )
                     )
                 route = f"{taken}{spawned}\n\n"
                 spawns[:] = [(task, successor, spawned)]
@@ -9209,13 +9260,12 @@ def make_step_tool() -> Any:
             # Run R23: the breaker quotes only a result's first line; the call goes there.
             call = _unproven_call(task, check, scope, root, missing_data, nodes)
             if _at_spawn_limit(task, nodes):
-                chain = ", ".join(sorted(_retry_chain(task, nodes)))
-                closes = (
+                rebinds = (
                     "That call rebinds this task to the data file's test, so taking the "
                     "data file away proves the check and the task closes done; if it "
-                    f"cannot, {_infeasible_call(task, check, scope)}"
+                    "cannot: "
                     if "abandon=" not in call
-                    else "That closes it infeasible in beagle, and its parent is then re-planned"
+                    else ""
                 )
                 return _not_done(
                     root,
@@ -9224,9 +9274,8 @@ def make_step_tool() -> Any:
                     f"pursuit_step: {task} not run — call instead: {call}.\n"
                     "This check already passes and cannot be shown to refuse, since no "
                     f"defect could be put back into a file in its scope "
-                    f"({', '.join(scope) or 'none'}). Its retry chain ({chain}) is at "
-                    f"beagle's limit of {SPAWN_LIMIT} attempts, so beagle refuses a new "
-                    f"route. {closes}.",
+                    f"({', '.join(scope) or 'none'}). {rebinds}"
+                    + _spawn_limit_offer(task, check, scope, nodes),
                     ran=False,
                 )
             if tests_only and missing_data:
@@ -9530,6 +9579,8 @@ def make_step_tool() -> Any:
                     "tests/test_<this task>.py`, with notes saying what that test must "
                     "check. A bare import or file-exists check cannot be shown to refuse."
                     if proof.weak
+                    else f"Next: {_spawn_limit_offer(task, check, scope, fresh)}"
+                    if _at_spawn_limit(task, fresh := _tree_nodes(root))
                     else f'Next: a new route, pursuit_step with task="{task}", '
                     "new_route=true, notes and "
                     + (

@@ -14010,3 +14010,118 @@ async def test_abandon_infeasible_closes_open_task_at_attempt_limit(
     assert 'pursuit_plan task="T0002", parts=["Known answers::' in closed.text
     assert "T0001 not closed infeasible" in root.text
     assert "say why after the colon" in bare.text
+
+
+# --------------------------------------------------------------------------- #
+# audit 12: every unproven result at the spawn limit offers the infeasible close
+# --------------------------------------------------------------------------- #
+
+
+def _t0002_at_limit(fake: Path, status: str = "pending") -> None:
+    """T0002 the fourth attempt of its retry chain, under milestone T0010."""
+    tree = [
+        {"id": "T0001", "parent": "", "status": "open", "container": True},
+        {"id": "T0010", "parent": "T0001", "status": "open", "container": True},
+        {"id": "T0007", "parent": "T0010", "status": "superseded", "title": "Parser"},
+        {"id": "T0008", "parent": "T0010", "status": "superseded", "sibling_of": "T0007"},
+        {"id": "T0009", "parent": "T0010", "status": "superseded", "sibling_of": "T0008"},
+        {
+            "id": "T0002",
+            "parent": "T0010",
+            "status": status,
+            "title": "Parser",
+            "sibling_of": "T0009",
+        },
+    ]
+    (fake / "tree.out").write_text(json.dumps({"nodes": tree}))
+
+
+@pytest.mark.anyio
+async def test_unproven_step_at_spawn_limit_offers_infeasible_not_new_route(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # R26 T0011: the fourth attempt ended unproven and was offered new_route=true.
+    monkeypatch.chdir(_git_project(tmp_path, monkeypatch))
+    monkeypatch.setenv("FAKE_TAU_REPORT", WITNESSED_REPORT)
+    _ready_task(fake_beagle)
+    _t0002_at_limit(fake_beagle)
+    (fake_beagle / "prove.out").write_text("T0002: NOT PROVEN — src/clock.py is not there\n")
+    (fake_beagle / "prove.rc").write_text("9")
+    runtime, _ = _bound(tmp_path)
+
+    result = await _tool(runtime, "pursuit_step").execute(
+        "c1",
+        {
+            "task": "T0002",
+            "criteria": "c",
+            "done_when": "grep -q done done.txt",
+            "scope": ["done.txt"],
+        },
+    )
+
+    assert len(_runs(fake_tau)) == 1
+    assert _pursuit_calls(fake_beagle, "close") == []
+    assert "no defect could be put back" in result.text
+    assert "new_route" not in result.text
+    assert "beagle's limit of 3 attempts" in result.text
+    assert "Next: Its retry chain (T0002, T0007, T0008, T0009)" in result.text
+    assert 'pursuit_step task="T0002", abandon="infeasible: ' in result.text
+    assert 'pursuit_plan task="T0010", parts=["Parser::' in result.text
+
+
+@pytest.mark.anyio
+async def test_spawn_refusal_relay_offers_infeasible_close(
+    tmp_path: Path, beagle: Path, fake_beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Audit 12: beagle refused the spawn for thrash, and tau's relay asked for
+    # notes saying how the route differs, which no notes can get past.
+    monkeypatch.chdir(_pursuit_project(tmp_path))
+    _blocked_task(fake_beagle)
+    _t0002_at_limit(fake_beagle, "blocked")
+    (fake_beagle / "spawn.out").write_text("refused: T0002's retry chain holds 4 attempts\n")
+    (fake_beagle / "spawn.rc").write_text("4")
+    runtime, _ = _bound(tmp_path)
+    step = _tool(runtime, "pursuit_step")
+    route = {"task": "T0002", "new_route": True, "notes": "check the file it writes"}
+
+    result = await step.execute("c1", route)
+
+    assert len(_pursuit_calls(fake_beagle, "spawn")) == 1
+    assert "refused:\nrefused: T0002's retry chain holds 4 attempts" in result.text
+    assert "how this route differs" not in result.text
+    assert "new_route" not in result.text
+    assert "beagle's limit of 3 attempts" in result.text
+    assert 'pursuit_step task="T0002", abandon="infeasible: 4 routes were tried' in result.text
+    assert 'pursuit_plan task="T0010", parts=["Parser::' in result.text
+
+
+@pytest.mark.anyio
+async def test_infeasible_abandon_refused_below_the_limit(
+    tmp_path: Path, beagle: Path, fake_beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Audit 12: abandon="infeasible: …" closed any task, pending included, so a
+    # hard task had an easy way out before its routes were tried.
+    monkeypatch.chdir(_pursuit_project(tmp_path))
+    (fake_beagle / "next.out").write_text(json.dumps({"open": [{"id": "T0011"}], "ready": []}))
+    (fake_beagle / "close.out").write_text("T0011 infeasible\n")
+    runtime, _ = _bound(tmp_path)
+    step = _tool(runtime, "pursuit_step")
+    why = {"task": "T0011", "abandon": "infeasible: the check cannot be shown to refuse"}
+
+    (fake_beagle / "tree.out").write_text(json.dumps({"nodes": _r26_chain("pending")}))
+    pending = await step.execute("c1", why)
+    below = [n for n in _r26_chain() if n["id"] != "T0009"]
+    (fake_beagle / "tree.out").write_text(json.dumps({"nodes": below}))
+    short = await step.execute("c2", why)
+
+    assert _pursuit_calls(fake_beagle, "close") == []
+    assert "T0011 not closed infeasible — it is pending" in pending.text
+    assert 'Work it first: pursuit_step task="T0011".' in pending.text
+    assert "not closed infeasible — its retry chain (T0009, T0010, T0011) holds 3" in short.text
+    assert "below beagle's limit of 3" in short.text
+    assert 'pursuit_step task="T0011", new_route=true' in short.text
+    assert 'pursuit_step task="T0011" with notes' in short.text
