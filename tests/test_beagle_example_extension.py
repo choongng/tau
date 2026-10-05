@@ -2973,7 +2973,8 @@ async def test_cases_task_with_implementation_in_test_file_stays_open(
         result.text
     )
     assert "tests/test_case_data.py: class IntervalTreeClock" in result.text
-    assert "tests/test_case_data.py: def join" in result.text
+    # R24: it imports no project module, so a long helper has nowhere to move.
+    assert "def join" not in result.text
     assert "def cases" not in result.text and "def _load" not in result.text
     assert _pursuit_calls(fake_beagle, "close") == []
     assert _pursuit_calls(fake_beagle, "commit") == []
@@ -9617,8 +9618,21 @@ async def test_implementation_in_tests_lets_small_helpers_through(
     assert _pursuit_calls(fake_beagle, "close") != []
     found = _module()._implementation_in_tests
     large = "def fork(s):\n" + "    s = s\n" * 15 + "    return s\n"
-    (tmp_path / "test_big.py").write_text(f"class Stamp:\n    pass\n\n\n{large}")
+    (tmp_path / "test_big.py").write_text(f"import itc\n\n\nclass Stamp:\n    pass\n\n\n{large}")
     assert found(tmp_path, ["test_big.py"]) == ["test_big.py: class Stamp", "test_big.py: def fork"]
+
+
+def test_long_helper_in_data_test_is_not_misplaced(tmp_path: Path) -> None:
+    # R24 class 2: a long helper in a data test that imports no project module
+    # held a passing, proven known-answers task open.
+    found = _module()._implementation_in_tests
+    large = "def check_case(case):\n" + "    case = case\n" * 15 + "    return case\n"
+    (tmp_path / "test_data.py").write_text(f"import json\nimport pytest\n\n\n{large}")
+    assert found(tmp_path, ["test_data.py"]) == []
+    (tmp_path / "test_cls.py").write_text(f"import json\n\n\nclass Stamp:\n    pass\n\n\n{large}")
+    assert found(tmp_path, ["test_cls.py"]) == ["test_cls.py: class Stamp"]
+    (tmp_path / "test_mod.py").write_text(f"from itc import Stamp\n\n\n{large}")
+    assert found(tmp_path, ["test_mod.py"]) == ["test_mod.py: def check_case"]
 
 
 @pytest.mark.anyio
@@ -12103,6 +12117,42 @@ async def test_open_closes_without_a_worker_when_uncommitted_work_already_passes
     assert prove[:3] == ["T0002", "--absent", "done.txt"]
     assert _pursuit_calls(fake_beagle, "close")[0][:3] == ["T0002", "--outcome", "done"]
     assert "closed done" in result.text
+
+
+@pytest.mark.anyio
+async def test_misplaced_on_disk_close_does_not_count_a_step(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # R24 class 2: the check passed on disk and no worker ran, yet the misplaced
+    # hold counted toward escalation.
+    project = _git_project(tmp_path, monkeypatch)
+    monkeypatch.chdir(project)
+    (project / "done.txt").write_text("done")
+    (project / "tests").mkdir(exist_ok=True)
+    (project / "tests" / "test_done.py").write_text("class Stamp:\n    pass\n")
+    _ready_task(fake_beagle)
+    (fake_beagle / "prove.out").write_text("T0002: PROVEN — refuses with done.txt gone\n")
+    runtime, _ = _bound(tmp_path)
+
+    result = await _tool(runtime, "pursuit_step").execute(
+        "c1",
+        {
+            "task": "T0002",
+            "criteria": "c",
+            "done_when": "grep -q done done.txt",
+            "scope": ["done.txt", "tests/test_done.py"],
+        },
+    )
+
+    assert _runs(fake_tau) == []
+    assert "implementation belongs in the module" in result.text
+    assert "tests/test_done.py: class Stamp" in result.text
+    assert _pursuit_calls(fake_beagle, "close") == []
+    assert _loaded_module()._NOT_DONE.get((str(project), "T0002"), 0) == 0
 
 
 @pytest.mark.anyio

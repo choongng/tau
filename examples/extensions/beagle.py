@@ -5871,7 +5871,9 @@ def _implementation_in_tests(root: Path, changed: list[str]) -> list[str]:
     Run R04: a cases-first worker wrote an `IntervalTreeClock` class into
     tests/test_cases.py, and twenty more workers debugged it there. Run R06: a
     passing cases-first task stayed open over a three-line `load_cases()`, so a
-    small function is let through as a helper.
+    small function is let through as a helper. Run R24: a long helper in a data
+    test that imports no project module held a passing, proven known-answers
+    task open; there is no module to move it to, so only its classes count.
     """
     found: list[str] = []
     for rel in changed:
@@ -5882,11 +5884,14 @@ def _implementation_in_tests(root: Path, changed: list[str]) -> list[str]:
             tree = ast.parse((root / rel).read_text(encoding="utf-8"), filename=rel)
         except (OSError, SyntaxError, ValueError):
             continue
+        imports_project = bool(_test_project_imports(root / rel))
         for node in tree.body:
             if isinstance(node, ast.ClassDef):
                 if not node.name.startswith("Test"):  # pytest's test grouping
                     found.append(f"{rel}: class {node.name}")
             elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                if not imports_project:
+                    continue
                 if node.name.startswith(("test_", "_", "pytest_")):
                     continue
                 if any(_is_fixture(d) for d in node.decorator_list):
@@ -8632,6 +8637,7 @@ def make_step_tool() -> Any:
                     proof = _Proof(proven=False, text=proof.text)
                 attempts = 1
                 retry_note = "\n\n" + ON_DISK_WITNESS_NOTE
+        worker_ran = False
         for attempt in range(1, attempts + 1):
             if (
                 verdict[0] == 0
@@ -8645,6 +8651,7 @@ def make_step_tool() -> Any:
             run = await _run_worker(
                 brief + retry_note, root, model, provider, timeout, signal, task, scope
             )
+            worker_ran = True
             undone = _restore_locked(goal, root, fixing)
             restored.update(undone)
             if run.spent is not None:
@@ -8890,6 +8897,7 @@ def make_step_tool() -> Any:
                 f'Next: pursuit_step with task="{task}" and notes saying to move these '
                 "out of the test file (into the module the test imports, under a task "
                 "whose scope holds it) or delete them.",
+                ran=worker_ran,
             )
         if not locks and _only_data_and_tests(changed):
             # Run R04: the driver passed no locks for its known-answers task.
