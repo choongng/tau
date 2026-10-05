@@ -12001,16 +12001,8 @@ async def test_check_running_a_waiting_siblings_file_is_refused_at_open(
     assert (
         module._sibling_owned_check_problem(R21_DATA_CHECK, scope, "T0005", nodes, project) is None
     )
-    # Named only by its title, the file is still the sibling's.
-    (fake_beagle / "show-T0006.out").write_text(json.dumps({"id": "T0006", "scope": []}))
-    titled = [
-        {**n, "title": "Write tests/test_case_data.py"} if n["id"] == "T0006" else n for n in nodes
-    ]
-    assert "T0006 writes after T0005" in module._sibling_owned_check_problem(
-        R21_DATA_CHECK, ["tests/cases.json"], "T0005", titled, project
-    )
     # A task that does not wait on T0005 owns nothing T0005 must leave alone.
-    unwaited = [{k: v for k, v in n.items() if k != "waiting_on"} for n in titled]
+    unwaited = [{k: v for k, v in n.items() if k != "waiting_on"} for n in nodes]
     assert (
         module._sibling_owned_check_problem(
             R21_DATA_CHECK, ["tests/cases.json"], "T0005", unwaited, project
@@ -12225,3 +12217,175 @@ async def test_worker_killed_by_cap_says_so_after_a_nonempty_report(
 
     assert "Now let me test the encoder:" in result.text
     assert "most likely for going over its 4G memory cap" in result.text
+
+
+def _require_witness(project: Path) -> None:
+    toml = project / ".beagle" / "pursuit.toml"
+    toml.write_text(toml.read_text() + '\n[close]\nrequire = "witness"\n')
+
+
+@pytest.mark.anyio
+async def test_done_by_does_not_leave_the_task_open_when_close_fails(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # R22 #191: T0018 opened by done-by, its close exited 4 for want of a
+    # witness, and it stayed open for six workers.
+    project, _ = _done_by_project(tmp_path, fake_beagle, monkeypatch, "T0003: Cases")
+    runtime, _ = _bound(tmp_path)
+    step = _tool(runtime, "pursuit_step")
+    args = {"task": "T0004", "abandon": "done by T0003", "done_when": CASES_CHECK}
+    module = _loaded_module()
+    real = module._pursuit
+
+    def close_refused(argv: list[str], root: Path, timeout: float = 60.0) -> tuple[int, str]:
+        if argv[:4] == ["close", "T0004", "--outcome", "done"]:
+            return 4, "T0004's check has not been WITNESSED"
+        return real(argv, root, timeout)
+
+    monkeypatch.setattr(module, "_pursuit", close_refused)
+    refused_close = await step.execute("c1", args)
+
+    assert [c[0] for c in _pursuit_calls(fake_beagle, "open")] == ["T0004"]
+    [released] = _pursuit_calls(fake_beagle, "close")
+    assert released[:3] == ["T0004", "--outcome", "blocked"]
+    assert "T0004 not closed done" in refused_close.text
+    assert "closed blocked rather than left open" in refused_close.text
+    assert 'pursuit_step task="T0004", new_route=true' in refused_close.text
+    monkeypatch.setattr(module, "_pursuit", real)
+
+    # Under [close] require = "witness", a commit of tests alone gives nothing to
+    # take away, so nothing is opened.
+    _require_witness(project)
+    (fake_beagle / "calls.jsonl").unlink()
+    unwitnessed = await step.execute("c2", args)
+
+    assert "T0004 not closed done by T0003" in unwitnessed.text
+    assert "Nothing was opened" in unwitnessed.text
+    assert 'pursuit_step task="T0004"' in unwitnessed.text
+    assert _pursuit_calls(fake_beagle, "open") == [] == _pursuit_calls(fake_beagle, "close")
+
+    # A source file the done task committed is the witness; a prove it does not
+    # pass releases the task rather than closing it done.
+    (project / "tests" / "cases.json").write_text("[]\n")
+    _git(project, "add", "tests/cases.json")
+    _git(project, "commit", "-q", "-m", "T0003: Cases data")
+    (fake_beagle / "prove.out").write_text("T0004: NOT PROVEN — STILL PASSES\n")
+    (fake_beagle / "prove.rc").write_text("1")
+    unproven = await step.execute("c3", args)
+
+    [opened] = _pursuit_calls(fake_beagle, "open")
+    assert opened[opened.index("--confirms") + 1] == "T0003"
+    [proved] = _pursuit_calls(fake_beagle, "prove")
+    assert proved[:3] == ["T0004", "--absent", "tests/cases.json"]
+    [released] = _pursuit_calls(fake_beagle, "close")
+    assert released[:3] == ["T0004", "--outcome", "blocked"]
+    assert "closed blocked rather than left open" in unproven.text
+
+    (fake_beagle / "calls.jsonl").unlink()
+    (fake_beagle / "prove.out").write_text("T0004: PROVEN — refuses with tests/cases.json gone\n")
+    (fake_beagle / "prove.rc").unlink()
+    proven = await step.execute("c4", args)
+
+    assert [c[2] for c in _pursuit_calls(fake_beagle, "close")] == ["done"]
+    assert "T0004 — Cases test: closed done" in proven.text
+    assert _runs(fake_tau) == []
+
+
+def _open_on_done_txt(project: Path, fake: Path, scope: list[str]) -> None:
+    (project / "done.txt").write_text("done\n")
+    record = {"id": "T0002", "title": "Parser", "status": "open"}
+    record |= {"done_when": "grep -q done done.txt", "scope": scope}
+    (fake / "show.out").write_text(json.dumps(record))
+    (fake / "next.out").write_text(json.dumps({"open": [{"id": "T0002"}], "ready": []}))
+    (fake / "brief.out").write_text("# T0002: Parser\nDo the parser.\n")
+
+
+@pytest.mark.anyio
+async def test_no_worker_for_an_open_task_with_empty_scope(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # R22 #194, #195, #214: W5-W10 ran on T0018, scope [], and rewrote cobs/cobs.py.
+    project = _pursuit_project(tmp_path)
+    monkeypatch.chdir(project)
+    _open_on_done_txt(project, fake_beagle, [])
+    runtime, _ = _bound(tmp_path)
+
+    result = await _tool(runtime, "pursuit_step").execute("c1", {"task": "T0002"})
+
+    assert "T0002 not run — it is open with no scope" in result.text
+    assert 'pursuit_step task="T0002", new_route=true, scope=["done.txt"]' in result.text
+    assert "Add to it: notes" in result.text and "<" not in result.text
+    assert _runs(fake_tau) == []
+
+
+@pytest.mark.anyio
+async def test_no_worker_when_the_check_passes_and_was_unproven(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project = _pursuit_project(tmp_path)
+    monkeypatch.chdir(project)
+    _open_on_done_txt(project, fake_beagle, ["done.txt"])
+    runtime, _ = _bound(tmp_path)
+    _loaded_module()._UNPROVEN.add((str(Path.cwd()), "T0002"))
+
+    result = await _tool(runtime, "pursuit_step").execute("c1", {"task": "T0002"})
+
+    assert "T0002 not run: this check already passes" in result.text
+    assert 'pursuit_step task="T0002", new_route=true' in result.text
+    assert _runs(fake_tau) == []
+
+
+def test_sibling_check_ignores_a_path_named_only_in_a_title(
+    tmp_path: Path, beagle: Path, fake_beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # R22 #225 E467: T0019, no scope, titled "Known answers: run tests/test_case_data.py".
+    project = _pursuit_project(tmp_path)
+    monkeypatch.chdir(project)
+    _r21_split(project, fake_beagle)
+    title = "Known answers: run tests/test_case_data.py"
+    (fake_beagle / "show-T0006.out").write_text(
+        json.dumps({"id": "T0006", "title": title, "scope": []})
+    )
+    nodes = [{**n, "title": title} if n["id"] == "T0006" else n for n in R21_SPLIT_TREE]
+
+    assert (
+        _module()._sibling_owned_check_problem(
+            R21_DATA_CHECK, ["tests/cases.json"], "T0005", nodes, project
+        )
+        is None
+    )
+
+
+def test_sibling_check_ignores_files_committed_by_a_done_task(
+    tmp_path: Path, beagle: Path, fake_beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # R22 E465: tests/test_case_data.py was T0002's committed work, and passed.
+    project = _pursuit_project(tmp_path)
+    monkeypatch.chdir(project)
+    _r21_split(project, fake_beagle)
+    for var in ("GIT_AUTHOR", "GIT_COMMITTER"):
+        monkeypatch.setenv(f"{var}_NAME", "t")
+        monkeypatch.setenv(f"{var}_EMAIL", "t@t")
+    _git(project, "init", "-q")
+    nodes = [*R21_SPLIT_TREE, {"id": "T0002", "parent": "T0001", "status": "done"}]
+    module = _module()
+    check = (R21_DATA_CHECK, ["tests/cases.json"], "T0005", nodes, project)
+
+    assert "T0006 writes after T0005" in module._sibling_owned_check_problem(*check)
+
+    _git(project, "add", "tests/test_case_data.py")
+    _git(project, "commit", "-q", "-m", "T0002: Data test")
+
+    assert module._sibling_owned_check_problem(*check) is None

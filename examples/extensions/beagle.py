@@ -6902,17 +6902,14 @@ def _shown(task: str, root: Path) -> dict[str, Any]:
     return shown if isinstance(shown, dict) else {}
 
 
-def _text_names_path(text: str, rel: str) -> bool:
-    """Whether `text` names the project path `rel` as a whole path."""
-    return re.search(rf"(?<![\w./-]){re.escape(rel)}(?![\w/-])", text) is not None
+def _own_files(task: str, rel: str, root: Path) -> bool:
+    """Whether `task`'s declared scope names `rel`.
 
-
-def _own_files(task: str, rel: str, nodes: list[dict[str, Any]], root: Path) -> bool:
-    """Whether `task` names `rel` as its own, by path, in its title or its scope."""
-    title = next((str(n.get("title") or "") for n in nodes if str(n.get("id")) == task), "")
-    shown = _shown(task, root)
-    named = {os.path.normpath(s) for s in _strings(shown.get("scope")) if s.strip()}
-    return rel in named or _text_names_path(title or str(shown.get("title") or ""), rel)
+    Run R22: T0019, with no scope, was titled "Known answers: run
+    tests/test_case_data.py", and the title made T0002's committed test its own.
+    """
+    named = {os.path.normpath(s) for s in _strings(_shown(task, root).get("scope")) if s.strip()}
+    return os.path.normpath(rel) in named
 
 
 def _sibling_owned_check_problem(
@@ -6922,7 +6919,8 @@ def _sibling_owned_check_problem(
 
     Run R21 bound T0005, scope tests/cases.json, to T0006's tests/test_case_data.py;
     T0006 waited on T0005, so only T0005's worker could touch the failing test, and
-    its scope forbade it.
+    its scope forbade it. A file a done task committed is that task's work, not the
+    waiter's to write.
     """
     if not check or not scope:
         return None
@@ -6933,7 +6931,7 @@ def _sibling_owned_check_problem(
         if waiter == task or not any(task in (w[1], w[2]) for w in waits):
             continue
         for rel in runs:
-            if _own_files(waiter, rel, nodes, root):
+            if _own_files(waiter, rel, root) and not _done_task_in_log([rel], task, nodes, root):
                 return (
                     f"{task}'s check runs {rel}, which {waiter} writes after {task}, so "
                     f"nothing can fix {rel} before {task} closes. Put {rel} in {task}'s "
@@ -7080,6 +7078,19 @@ async def _done_by(
             f"{refused}its check passes only with uncommitted changes in its scope, not "
             f"on {done}'s commit: work it with pursuit_step."
         )
+    # Run R22: the close refused T0018 for want of a witness and left it open, and
+    # six workers then ran on its empty scope. A witness here takes away a file
+    # `done` committed in this task's paths; with none, the close cannot be met.
+    witness: list[str] = []
+    if _requires_witness(root):
+        committed = list(dict.fromkeys(rel for s in shas for rel in _commit_paths(s, root)))
+        witness = [
+            rel
+            for rel in committed
+            if _in_scope(rel, paths) and _can_witness(rel) and (root / rel).is_file()
+        ]
+        if not witness:
+            return _done_by_unwitnessed(task, done, check, paths, committed, root)
     title = str(record.get("title") or "")
     criteria = (
         str(arguments.get("criteria") or "").strip()
@@ -7089,19 +7100,94 @@ async def _done_by(
     argv = ["open", task, "--criteria", criteria, "--done-when", check]
     if scope:
         argv += ["--scope", *scope]
+    if witness:
+        argv += ["--confirms", done]
     rc, opened = _pursuit(argv, root, timeout=DEFAULT_CHECK_TIMEOUT + 60)
     if rc != 0:
         return f"pursuit_step: `beagle pursuit open` refused (exit {rc}):\n{opened}"
+    if witness:
+        argv = ["prove", task, *(a for rel in witness for a in ("--absent", rel))]
+        argv += ["--check-timeout", f"{DEFAULT_CHECK_TIMEOUT:.0f}"]
+        rc, proved = _pursuit(argv, root, timeout=2 * DEFAULT_CHECK_TIMEOUT + 120)
+        verdicts = {m.group(1): m.group(2) for m in _PROVE_VERDICT.finditer(proved)}
+        if rc != 0 or verdicts.get(task) != "PROVEN":
+            why = (
+                f"its check passes on {done}'s commit but was not shown to refuse with "
+                f"{', '.join(witness)} taken away (prove exit {rc})"
+            )
+            return _done_by_released(task, why, proved, root)
     because = f"satisfied by {done}'s commit {sha[:12]}; no sub-agent ran"
     argv = ["close", task, "--outcome", "done", "--body", because]
     argv += ["--spent", "0", "--spent-because", because]
     rc, closed = _pursuit(argv, root, timeout=DEFAULT_CHECK_TIMEOUT + 60)
     if rc != 0:
-        return f"pursuit_step: {task} opened, but `beagle pursuit close` exited {rc}:\n{closed}"
+        why = f"`beagle pursuit close` refused the done close (exit {rc})"
+        return _done_by_released(task, why, closed, root)
     _forget_task(root, task)
     return (
         f"{task} — {title}: closed done, {because}.\n\n{closed}\n\n{_tree(root)}\n\n"
         "Next: call pursuit_step with no arguments for the next task."
+    )
+
+
+def _can_witness(rel: str) -> bool:
+    """Whether taking `rel` away can witness a check: a source or data file, not a test."""
+    return not (_is_test_path(rel) and rel.endswith(".py"))
+
+
+def _done_by_unwitnessed(
+    task: str, done: str, check: str, paths: list[str], committed: list[str], root: Path
+) -> str:
+    """The up-front refusal of a done-by close the witness rule would refuse."""
+    outside = [
+        rel
+        for rel in committed
+        if not _in_scope(rel, paths) and _can_witness(rel) and (root / rel).is_file()
+    ]
+    said = (
+        f"pursuit_step: {task} not closed done by {done} — this pursuit closes done only on "
+        f"a witnessed check, and no file {done} committed in {', '.join(paths)} is a source "
+        "or data file whose absence could show the check refuses, so the close would "
+        f"refuse and leave {task} open. Nothing was opened."
+    )
+    if outside:
+        return (
+            f"{said} {done} committed {', '.join(outside)}, outside those paths: call "
+            f'pursuit_step task="{task}", abandon="done by {done}", '
+            f"done_when={json.dumps(check)}, scope={json.dumps([*paths, *outside])}."
+        )
+    return (
+        f"{said} Its check does not depend on any file {done} wrote, so {done}'s commit "
+        f'is not shown to have done this work: call pursuit_step task="{task}" with a '
+        "done_when that fails now and a scope naming the files the work changes."
+    )
+
+
+def _done_by_released(task: str, why: str, out: str, root: Path) -> str:
+    """Close `task`, opened for a done-by close that did not go through, as blocked.
+
+    beagle has no verb that returns an open task to pending, and an abandoned part
+    stalls its container; a blocked task stays accountable and is reworked by its
+    own check or a new route.
+    """
+    reason = f"done-by close not taken: {why}"[:500]
+    argv = ["close", task, "--outcome", "blocked", "--reason", reason]
+    if out.strip():
+        argv += ["--body", out]
+    argv += ["--spent", "0", "--spent-because", "no sub-agent ran: a done-by close"]
+    rc, closed = _pursuit(argv, root, timeout=DEFAULT_CHECK_TIMEOUT + 60)
+    _forget_task(root, task)
+    if rc != 0:
+        return (
+            f"pursuit_step: {task} not closed done — {why}:\n{out[-CHECK_TAIL_CHARS:]}\n\n"
+            f"It is still open: closing it blocked exited {rc}:\n{closed}"
+        )
+    return (
+        f"pursuit_step: {task} not closed done — {why}. It was closed blocked rather than "
+        f"left open:\n{out[-CHECK_TAIL_CHARS:]}\n\n{closed}\n\n{_tree(root)}\n\n"
+        f'Next: give it a new route, pursuit_step task="{task}", new_route=true, with a '
+        "done_when that fails until the work is done and notes saying what that work is; "
+        "or call pursuit_step with no arguments for the next task."
     )
 
 
@@ -7435,7 +7521,7 @@ def _check_runs_own_file(
     check = str(shown.get("done_when") or "")
     scope = _strings(shown.get("scope"))
     for rel in _check_test_files(check, root) if check else []:
-        if scope and not _in_scope(rel, scope) and _own_files(task, rel, nodes, root):
+        if scope and not _in_scope(rel, scope) and _own_files(task, rel, root):
             return (
                 f"{predecessor}'s check runs {rel}, {task}'s own file, which {predecessor}'s "
                 f"scope cannot change: put {rel} in {predecessor}'s scope with its own files, "
@@ -7962,6 +8048,26 @@ def make_step_tool() -> Any:
                 f"pursuit_step: {task} is open, but its bound check `{check}` cannot pass "
                 f"whatever the work does — {prose} Pass the corrected done_when with "
                 f'task="{task}"; it is amended.'
+            )
+        if status == "open" and not new_route and not _strings(record.get("scope")):
+            # Run R22: six workers ran on T0018, opened with scope [], and
+            # rewrote files no task of theirs held.
+            targets = _check_targets(check, root) if check else []
+            call = f"pursuit_step task={json.dumps(task)}, new_route=true"
+            supply = ["notes, saying what the new route does differently"]
+            if targets:
+                call += f", scope={json.dumps(targets)}"
+            else:
+                supply.insert(0, "scope, the paths the work changes")
+            return _not_done(
+                root,
+                task,
+                [],
+                f"pursuit_step: {task} not run — it is open with no scope, so a sub-agent "
+                "could change any file and nothing would hold the change to this task. Give "
+                f"it a new route that names its files: {call}. Add to it: "
+                + "; ".join(supply)
+                + ".",
             )
 
         if retrying:
