@@ -4948,13 +4948,42 @@ def _cases_on_disk_route(
     on_disk: list[str],
     existing: str,
     unwait: str,
+    nodes: list[dict[str, Any]] | None = None,
+    root: Path | None = None,
 ) -> str:
     """The Cases first refusal when the known answers are on disk, uncommitted.
 
     Run R18 #51: the hint ordered a fresh known-answers split whose data test
     had passed since t3.7 on W1's uncommitted files, and that open was then
     refused as "already passes". The route named here opens on those files.
+    Run R26 E196: it told the driver to open T0011, already open and unprovable;
+    an open holder gets the call that settles it instead.
     """
+    holder = next((n for n in nodes or [] if str(n.get("id")) == existing), None)
+    if existing and holder is not None and holder.get("status") == "open":
+        check = str(holder.get("done_when") or "").strip()
+        own = _strings(holder.get("scope"))
+        stuck = root is not None and (
+            (str(root), existing) in _UNPROVEN or _at_spawn_limit(existing, nodes)
+        )
+        settle = (
+            _unproven_call(
+                existing,
+                check,
+                own,
+                root,
+                _missing_data(check, own, root) if check else [],
+                nodes,
+            )
+            if stuck and root is not None
+            else f'pursuit_step task="{existing}"'
+        )
+        return (
+            f"Cases first: {unjudged_text} The known answers are on disk already, "
+            f"uncommitted, and {existing}, open already, holds them: do not split {task}. "
+            f"{unwait}Settle {existing} first: {settle}. {task} opens once its cases are "
+            f"locked, its test importing {named} by name."
+        )
     data = next((rel for rel in on_disk if re.search(r"test_\w*data\w*\.py$", rel)), "")
     check = f"python3 -m pytest -q {data or 'tests/test_case_data.py'}"
     scope = sorted({*on_disk, data or "tests/test_case_data.py"})
@@ -5203,7 +5232,9 @@ def _cases_first_problem(
             else ""
         )
         if on_disk:
-            return _cases_on_disk_route(task, title, named, unjudged_text, on_disk, first, unwait)
+            return _cases_on_disk_route(
+                task, title, named, unjudged_text, on_disk, first, unwait, nodes, root
+            )
         return (
             f"Cases first: {unjudged_text} The known answers are already planned beside "
             f"{task}: {listed}. Do not split {task}. {unwait}Then work {first} first, "
@@ -5223,7 +5254,9 @@ def _cases_first_problem(
             ),
             "",
         )
-        return _cases_on_disk_route(task, title, named, unjudged_text, on_disk, existing, "")
+        return _cases_on_disk_route(
+            task, title, named, unjudged_text, on_disk, existing, "", nodes, root
+        )
     # Not on disk: the data file is the one the known-answers work below writes.
     data = [rel for rel in _CASES_FIRST_SCOPE if _is_cases_data(rel)]
     holder = _live_data_holder(task, nodes or [], data, goal)
@@ -6579,15 +6612,61 @@ def _imported_modules(root: Path, scope: list[str]) -> list[str]:
     return modules
 
 
+#: beagle's THRASH_LIMIT (beagle/pursuit.py), a constant there and not configurable:
+#: `pursuit spawn` refuses a task whose retry chain holds more attempts than this.
+SPAWN_LIMIT = 3
+
+
+def _retry_chain(task: str, nodes: list[dict[str, Any]]) -> set[str]:
+    """Every attempt at `task`'s intent: `sibling_of` back to the first route, then
+    everything descended from it, as beagle's `_sibling_family` counts them."""
+    by_id = {str(n.get("id")): n for n in nodes}
+    origin, seen = task, {task}
+    while (up := str((by_id.get(origin) or {}).get("sibling_of") or "")) and up not in seen:
+        origin = up
+        seen.add(up)
+    chain = {origin}
+    growing = True
+    while growing:
+        growing = False
+        for n in nodes:
+            if str(n.get("sibling_of") or "") in chain and str(n.get("id")) not in chain:
+                chain.add(str(n.get("id")))
+                growing = True
+    return chain
+
+
+def _at_spawn_limit(task: str, nodes: list[dict[str, Any]] | None) -> bool:
+    """Whether beagle refuses another route for `task`: its retry chain is at the limit."""
+    return bool(nodes) and len(_retry_chain(task, nodes or [])) > SPAWN_LIMIT
+
+
+def _infeasible_call(task: str, check: str, scope: list[str]) -> str:
+    """The pursuit_step call that closes an open, unprovable `task` infeasible."""
+    why = (
+        f"`{check or 'its check'}` passes, and no defect put back into "
+        f"{', '.join(scope[:4]) or 'its scope'} fails it"
+    )
+    return f"pursuit_step task={json.dumps(task)}, abandon={json.dumps('infeasible: ' + why)}"
+
+
 def _unproven_call(
-    task: str, check: str, scope: list[str], root: Path, missing_data: list[str]
+    task: str,
+    check: str,
+    scope: list[str],
+    root: Path,
+    missing_data: list[str],
+    nodes: list[dict[str, Any]] | None = None,
 ) -> str:
     """The pursuit_step call that gives an unproven task a check a defect can fail,
     with its values taken from the tree, or a split when none can be.
 
     Audit 11: three branches of that refusal put prose ("a done_when running the
     data file's test") where the values go, so the call could not be sent as given.
+    Run R26: at beagle's spawn limit a new route is refused, so the call is a close
+    the tree allows: the known-answers amend for a data scope, else infeasible.
     """
+    limited = _at_spawn_limit(task, nodes)
     tests_only = _only_data_and_tests(scope)
     tests = [rel.rstrip("/") for rel in scope if _is_test_path(rel) and rel.endswith(".py")]
     tests += [rel for rel in _check_test_files(check, root) if rel not in tests]
@@ -6643,6 +6722,19 @@ def _unproven_call(
         test, module = importing
         done_when, added = f"python3 -m pytest -q {test}", [test]
         notes = f"New route: {test} runs {module}, so a defect there fails it"
+    if limited:
+        if (
+            tests_only
+            and _scope_has_data(scope)
+            and done_when
+            and " ".join(done_when.split()) != " ".join(check.split())
+        ):
+            routed = [*scope, *[rel for rel in added if rel not in scope]]
+            return (
+                f"pursuit_step task={json.dumps(task)}, done_when={json.dumps(done_when)}, "
+                f"scope={json.dumps(routed)}"
+            )
+        return _infeasible_call(task, check, scope)
     if not done_when:
         return (
             f'pursuit_plan task="{task}", parts=["Code::the module {task}\'s tests import", '
@@ -7405,6 +7497,69 @@ def _abandon(task: str, why: str, root: Path, goal: Path) -> str:
     return (
         f"{out.splitlines()[0] if out else task + ' abandoned'}{freed}\n\n"
         f"{_tree(root)}\n\nNext: call pursuit_step with no arguments for the next task."
+    )
+
+
+#: An abandon that closes a task infeasible, with the evidence after the colon.
+_INFEASIBLE = re.compile(r"(?is)^\s*infeasible\s*:\s*(.*)$")
+
+
+def _close_infeasible(
+    task: str,
+    evidence: str,
+    nodes: list[dict[str, Any]],
+    roots: list[str],
+    root: Path,
+    goal: Path,
+) -> str:
+    """Close `task` infeasible in beagle, and name the parent to re-plan.
+
+    Run R26: T0011 was open, its check passing and unprovable, its retry chain at
+    beagle's spawn limit; no pursuit_step argument closed it, so the driver
+    hand-edited .beagle/.
+    """
+    node = next((n for n in nodes if str(n.get("id")) == task), {})
+    if not evidence:
+        return (
+            f"pursuit_step: {task} not closed infeasible — say why after the colon: "
+            f'abandon="infeasible: <what makes it so>".'
+        )
+    if task in roots:
+        return (
+            f"pursuit_step: {task} not closed infeasible — it is the root, the goal "
+            "itself, and the goal is the user's."
+        )
+    if node.get("status") not in ("open", "pending"):
+        return (
+            f"pursuit_step: {task} not closed infeasible — it is "
+            f"{node.get('status') or 'not in the tree'}; only an open or pending task "
+            "closes this way."
+        )
+    argv = [
+        "close", task, "--outcome", "infeasible",
+        "--reason", f"infeasible: {evidence}"[:500],
+        "--evidence", evidence[:1000],
+    ]  # fmt: skip
+    rc, out = _pursuit(argv, root)
+    if rc != 0:
+        return (
+            f"pursuit_step: `beagle pursuit close {task} --outcome infeasible` refused "
+            f"(exit {rc}):\n{out}"
+        )
+    _drop_pending_locks(goal, task)
+    _forget_task(root, task)
+    parent = str(node.get("parent") or "")
+    title = str(node.get("title") or task).replace("::", ":").replace('"', "'").strip()
+    replan = (
+        f"Re-plan its parent {parent} with a route the finding does not rule out: "
+        f'pursuit_plan task="{parent}", parts=["{title}::by a route other than '
+        f"{task}'s, which was found infeasible\"]."
+        if parent
+        else "Next: call pursuit_step with no arguments for the next task."
+    )
+    return (
+        f"{out.splitlines()[0] if out else task + ' closed infeasible'}\n\n"
+        f"{_tree(root)}\n\n{replan}"
     )
 
 
@@ -8489,6 +8644,11 @@ def make_step_tool() -> Any:
                 return _step_result("pursuit_step: abandon names the task to drop; pass task too.")
             done_by = _DONE_BY.match(abandon)
             roots = [str(n.get("id")) for n in nodes if not n.get("parent")]
+            infeasible = _INFEASIBLE.match(abandon)
+            if infeasible is not None:
+                return _step_result(
+                    _close_infeasible(task, infeasible.group(1).strip(), nodes, roots, root, goal)
+                )
             if done_by is not None and task not in roots:
                 return _step_result(
                     await _done_by(task, done_by.group(1).upper(), arguments, nodes, root)
@@ -9038,7 +9198,28 @@ def make_step_tool() -> Any:
             return _step_result(f"pursuit_step: {task} not run — {mixed}")
         if unproven_key in _UNPROVEN:
             # Run R23: the breaker quotes only a result's first line; the call goes there.
-            call = _unproven_call(task, check, scope, root, missing_data)
+            call = _unproven_call(task, check, scope, root, missing_data, nodes)
+            if _at_spawn_limit(task, nodes):
+                chain = ", ".join(sorted(_retry_chain(task, nodes)))
+                closes = (
+                    "That call rebinds this task to the data file's test, so taking the "
+                    "data file away proves the check and the task closes done; if it "
+                    f"cannot, {_infeasible_call(task, check, scope)}"
+                    if "abandon=" not in call
+                    else "That closes it infeasible in beagle, and its parent is then re-planned"
+                )
+                return _not_done(
+                    root,
+                    task,
+                    scope,
+                    f"pursuit_step: {task} not run — call instead: {call}.\n"
+                    "This check already passes and cannot be shown to refuse, since no "
+                    f"defect could be put back into a file in its scope "
+                    f"({', '.join(scope) or 'none'}). Its retry chain ({chain}) is at "
+                    f"beagle's limit of {SPAWN_LIMIT} attempts, so beagle refuses a new "
+                    f"route. {closes}.",
+                    ran=False,
+                )
             if tests_only and missing_data:
                 how = (
                     TESTS_ONLY_PROOF_NOTE

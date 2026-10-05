@@ -13820,3 +13820,134 @@ def test_runs_test_file_sees_python_script_run(tmp_path: Path) -> None:
     note = module._tests_only_proof_note(check, [rel], tmp_path)
     assert note != module.TESTS_ONLY_MUTATE_NOTE
     assert 'scope=["tests/test_case_data.py", "tests/cases.json"]' in note
+
+
+# --------------------------------------------------------------------------- #
+# run R26: an open, unprovable task at beagle's spawn limit had no call to close it
+# --------------------------------------------------------------------------- #
+
+
+def _r26_chain(status: str = "open") -> list[dict[str, Any]]:
+    """T0011 at the end of a four-attempt retry chain under milestone T0002."""
+    return [
+        {"id": "T0001", "parent": "", "status": "open", "container": True},
+        {"id": "T0002", "parent": "T0001", "status": "open", "container": True},
+        {"id": "T0007", "parent": "T0002", "status": "superseded", "title": "Known answers"},
+        {"id": "T0009", "parent": "T0002", "status": "superseded", "sibling_of": "T0007"},
+        {"id": "T0010", "parent": "T0002", "status": "superseded", "sibling_of": "T0009"},
+        {
+            "id": "T0011",
+            "parent": "T0002",
+            "status": status,
+            "title": "Known answers",
+            "sibling_of": "T0010",
+            "done_when": "grep -q done done.txt",
+            "scope": ["done.txt"],
+        },
+    ]
+
+
+@pytest.mark.anyio
+async def test_unproven_call_at_spawn_limit_offers_no_new_route(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # R26 E112, E200: beagle refused `spawn T0011` at four attempts, and tau still
+    # offered new_route=true for it.
+    module = _module()
+    _r21_tree(tmp_path)
+    chain = _r26_chain()
+    assert module._retry_chain("T0009", chain) == {"T0007", "T0009", "T0010", "T0011"}
+    assert module._at_spawn_limit("T0011", chain)
+    assert not module._at_spawn_limit("T0011", chain[:3] + chain[4:])
+
+    call, done = module._unproven_call, "grep -q done done.txt"
+    data_scope = ["tests/cases.json", "tests/test_case_data.py"]
+    code = call("T0011", done, ["done.txt"], tmp_path, [], chain)
+    data = call("T0011", "grep -q x tests/cases.json", data_scope, tmp_path, [], chain)
+    below = call("T0011", done, ["done.txt"], tmp_path, [], [])
+
+    assert "new_route" in below
+    for call in (code, data):
+        assert "new_route" not in call and "<" not in call
+    assert code.startswith('pursuit_step task="T0011", abandon="infeasible: ')
+    # A tests-and-data scope rebinds to the data test, the known-answers close.
+    assert data == (
+        'pursuit_step task="T0011", done_when="python3 -m pytest -q tests/test_case_data.py", '
+        f"scope={json.dumps(data_scope)}"
+    )
+
+    project = _pursuit_project(tmp_path)
+    monkeypatch.chdir(project)
+    _open_on_done_txt(project, fake_beagle, ["done.txt"])
+    record = json.loads((fake_beagle / "show.out").read_text()) | {"id": "T0011"}
+    (fake_beagle / "show.out").write_text(json.dumps(record))
+    (fake_beagle / "next.out").write_text(json.dumps({"open": [{"id": "T0011"}], "ready": []}))
+    (fake_beagle / "tree.out").write_text(json.dumps({"nodes": chain}))
+    runtime, _ = _bound(tmp_path)
+    _loaded_module()._UNPROVEN.add((str(Path.cwd()), "T0011"))
+
+    result = await _tool(runtime, "pursuit_step").execute("c1", {"task": "T0011"})
+
+    first = result.text.splitlines()[0]
+    assert first.startswith('pursuit_step: T0011 not run — call instead: pursuit_step task="T0011"')
+    assert 'abandon="infeasible: ' in first
+    assert "new_route" not in result.text
+    assert "beagle's limit of 3 attempts" in result.text
+    assert _runs(fake_tau) == []
+
+
+def test_cases_first_does_not_send_to_open_unprovable_holder(tmp_path: Path) -> None:
+    # R26 E196: "Open T0011 first … pursuit_step task="T0011"" for a task already open,
+    # unprovable, and at the spawn limit.
+    module = _module()
+    _r21_tree(tmp_path)
+    on_disk = ["tests/cases.json", "tests/test_case_data.py"]
+    args = ("T0012", "Clock", "`clock`", "Scope names new source clock.py.", on_disk)
+
+    held = module._cases_on_disk_route(*args, "T0011", "", _r26_chain(), tmp_path)
+    pending = module._cases_on_disk_route(*args, "T0011", "", _r26_chain("pending"), tmp_path)
+
+    assert "Open T0011 first" not in held and "open already" in held
+    assert 'Settle T0011 first: pursuit_step task="T0011", abandon="infeasible: ' in held
+    assert "new_route" not in held
+    assert "Open T0011 first" in pending
+
+
+@pytest.mark.anyio
+async def test_abandon_infeasible_closes_open_task_at_attempt_limit(
+    tmp_path: Path, beagle: Path, fake_beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # R26 E158, E162: every abandon but "duplicate of" was refused, so T0011 was
+    # hand-edited in .beagle/ instead.
+    monkeypatch.chdir(_pursuit_project(tmp_path))
+    (fake_beagle / "next.out").write_text(json.dumps({"open": [{"id": "T0011"}], "ready": []}))
+    (fake_beagle / "tree.out").write_text(json.dumps({"nodes": _r26_chain()}))
+    (fake_beagle / "close.out").write_text("T0011 infeasible\n")
+    runtime, _ = _bound(tmp_path)
+    step = _tool(runtime, "pursuit_step")
+    evidence = "`grep -q done done.txt` passes, and no defect put back into done.txt fails it"
+
+    closed = await step.execute("c1", {"task": "T0011", "abandon": f"infeasible: {evidence}"})
+    root = await step.execute("c2", {"task": "T0001", "abandon": "infeasible: no"})
+    bare = await step.execute("c3", {"task": "T0011", "abandon": "infeasible:"})
+
+    assert _pursuit_calls(fake_beagle, "close") == [
+        [
+            "T0011",
+            "--outcome",
+            "infeasible",
+            "--reason",
+            f"infeasible: {evidence}",
+            "--evidence",
+            evidence,
+        ]
+    ]
+    assert "T0011 infeasible" in closed.text
+    assert "Re-plan its parent T0002 with a route the finding does not rule out: " in closed.text
+    assert 'pursuit_plan task="T0002", parts=["Known answers::' in closed.text
+    assert "T0001 not closed infeasible" in root.text
+    assert "say why after the colon" in bare.text
