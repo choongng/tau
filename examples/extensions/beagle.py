@@ -126,6 +126,7 @@ import os
 import re
 import shlex
 import shutil
+import signal
 import socket
 import subprocess
 import sys
@@ -529,27 +530,79 @@ def _strip_frontmatter(text: str) -> str:
     return text
 
 
-def _run(cmd: list[str], cwd: Path | None, timeout: float, stdin: str = "") -> tuple[int, str]:
+def _run(
+    cmd: list[str], cwd: Path | None, timeout: float, stdin: str = "", limit: str | None = None
+) -> tuple[int, str]:
     """Run a short capture command, failing soft (rc!=0 with the reason inline).
 
     stdin is always fed, never inherited: under the TUI it is the terminal, and
-    a beagle hook reads its payload from it.
+    a beagle hook reads its payload from it. The command leads its own process
+    group, under `limit` when one is given, and a timeout kills the group.
     """
+    if limit is not None and shutil.which(cmd[0]) is None:
+        return 127, f"{cmd[0]}: not found on PATH"
     try:
-        proc = subprocess.run(
-            cmd,
+        proc = subprocess.Popen(
+            _capped(cmd, limit),
             cwd=str(cwd) if cwd else None,
-            input=stdin,
-            capture_output=True,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
-            timeout=timeout,
+            start_new_session=True,
         )
     except FileNotFoundError:
         return 127, f"{cmd[0]}: not found on PATH"
+    try:
+        stdout, stderr = proc.communicate(stdin, timeout=timeout)
     except subprocess.TimeoutExpired:
+        _kill_group(proc, limit)
         return 124, f"{cmd[0]}: timed out after {timeout:.0f}s"
-    out = (proc.stdout or "") + (("\n" + proc.stderr) if proc.stderr else "")
+    out = (stdout or "") + (("\n" + stderr) if stderr else "")
+    note = _killed_note(proc.returncode, limit)
+    out = f"{out.strip()}\n{note}" if note else out
     return proc.returncode, out.strip()
+
+
+def _kill_group(proc: subprocess.Popen[str], limit: str | None) -> None:
+    """Kill `proc`'s process group, and its memory scope's leftovers, then reap it.
+
+    A check beagle rehearses runs in a session of its own, outside the group;
+    under a cap it is still in the scope's cgroup, which `cgroup.kill` empties.
+    """
+    scope = _own_scope(proc.pid) if limit is not None else None
+    with contextlib.suppress(ProcessLookupError, PermissionError):
+        os.killpg(proc.pid, signal.SIGKILL)
+    if scope is not None:
+        with contextlib.suppress(OSError):
+            (scope / "cgroup.kill").write_text("1")
+    with contextlib.suppress(subprocess.TimeoutExpired):
+        proc.wait(timeout=10)
+    for stream in (proc.stdin, proc.stdout, proc.stderr):
+        if stream is not None:
+            with contextlib.suppress(OSError):
+                stream.close()
+
+
+def _own_scope(pid: int) -> Path | None:
+    """The cgroup directory of the transient scope `pid` runs in, or None.
+
+    Only a `run-*.scope` that is not this process's own cgroup qualifies, so
+    the kill can never reach tau itself.
+    """
+
+    def cgroup(of: str) -> str:
+        try:
+            text = Path(f"/proc/{of}/cgroup").read_text()
+        except OSError:
+            return ""
+        return next((line[3:] for line in text.splitlines() if line.startswith("0::")), "")
+
+    path = cgroup(str(pid))
+    name = path.rsplit("/", 1)[-1]
+    if not (name.startswith("run-") and name.endswith(".scope")) or path == cgroup("self"):
+        return None
+    return Path("/sys/fs/cgroup") / path.lstrip("/")
 
 
 # --------------------------------------------------------------------------- #
@@ -1616,6 +1669,8 @@ async def _run_worker(
         report = _report_before_markup(events.report, cwd, scope or [])
     else:
         report = events.final_report(f"{stderr}\n{note}".strip() if note else stderr)
+    if note and note not in report:
+        report = f"{report}\n\n{note}".strip()
     return _WorkerRun(
         returncode=proc.returncode,
         report=report,
@@ -2328,7 +2383,8 @@ def _killed_note(returncode: int | None, limit: str | None) -> str:
 
 
 def _pursuit(args: list[str], root: Path, timeout: float = 60.0) -> tuple[int, str]:
-    return _run([BEAGLE_BIN, "pursuit", *args], root, timeout=timeout)
+    """`beagle pursuit <args>`, under the worker memory cap with every check it runs."""
+    return _run([BEAGLE_BIN, "pursuit", *args], root, timeout=timeout, limit=_memory_max())
 
 
 def _json_reply(out: str) -> Any:
@@ -6290,7 +6346,7 @@ def _spawn(
         argv += ["--title", str(record["title"])[:200]]
     if done_when and done_when != bound:
         argv.append("--check-defect")
-    rc, out = _pursuit(argv, root)
+    rc, out = _pursuit(argv, root, timeout=DEFAULT_CHECK_TIMEOUT + 60)
     found = re.search(rf"{re.escape(task)} superseded by ({_TASK_ID.pattern})", out)
     if rc != 0 or found is None:
         return None, out
@@ -6846,7 +6902,7 @@ async def _done_by(
     argv = ["open", task, "--criteria", criteria, "--done-when", check]
     if scope:
         argv += ["--scope", *scope]
-    rc, opened = _pursuit(argv, root)
+    rc, opened = _pursuit(argv, root, timeout=DEFAULT_CHECK_TIMEOUT + 60)
     if rc != 0:
         return f"pursuit_step: `beagle pursuit open` refused (exit {rc}):\n{opened}"
     because = f"satisfied by {done}'s commit {sha[:12]}; no sub-agent ran"
@@ -7594,13 +7650,23 @@ def make_step_tool() -> Any:
                     f"pursuit_step: {task} not opened — the check could not run: `{broke}` "
                     f"(exit {pre_rc}). Correct the command and call pursuit_step again."
                 )
+            killed = _killed_note(-9 if pre_rc in (-9, 137) else pre_rc, _memory_max())
+            if killed:
+                # R22: beagle's open rehearses the check again, and a second
+                # run past the cap outlived the open's timeout.
+                return _step_result(
+                    f"pursuit_step: {task} not opened — the check was killed before it "
+                    f"finished (exit {pre_rc}). {killed} Opening would run it again. Find "
+                    "what the check runs that keeps growing, and make it stop, before you "
+                    "call pursuit_step again."
+                )
             argv = ["open", task, "--criteria", criteria, "--done-when", done_when]
             if scope:
                 argv += ["--scope", *scope]
             budget = str(arguments.get("budget") or "").strip()
             if budget:
                 argv += ["--budget", budget]
-            rc, opened = _pursuit(argv, root)
+            rc, opened = _pursuit(argv, root, timeout=DEFAULT_CHECK_TIMEOUT + 60)
             if rc != 0:
                 return _step_result(
                     f"pursuit_step: `beagle pursuit open` refused (exit {rc}):\n{opened}"

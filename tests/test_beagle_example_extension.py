@@ -17,6 +17,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import time
 import tomllib
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -1410,6 +1411,10 @@ if attempt >= int(os.environ.get("FAKE_TAU_HANGS_ON") or 99):
     import time
     time.sleep(60)
 print(json.dumps({"type": "message_end", "message": message}))
+if os.environ.get("FAKE_TAU_KILLED"):  # as its memory cap kills it, after its report
+    import signal
+    sys.stdout.flush()
+    os.kill(os.getpid(), signal.SIGKILL)
 """
 
 
@@ -11849,3 +11854,134 @@ async def test_not_workable_names_the_escalated_workable_tasks_working_call(
         assert call.startswith('pursuit_step task="T0005", new_route=true')
         assert "<" not in call and ">" not in call
     assert _pursuit_calls(fake_beagle, "open") == [] and _runs(fake_tau) == []
+
+
+FAKE_SYSTEMD_RUN = """\
+import json, os, sys
+args = sys.argv[1:]
+with open(os.environ["FAKE_SYSTEMD_RUN_LOG"], "a") as log:
+    log.write(json.dumps(args) + "\\n")
+cmd = args[args.index("--") + 1 :] if "--" in args else [a for a in args if a[0] != "-"]
+os.execvp(cmd[0], cmd)
+"""
+
+
+def _fake_systemd_run(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """A `systemd-run` on PATH that logs its argv and runs the command in place."""
+    bin_dir = tmp_path / "fake-systemd"
+    bin_dir.mkdir()
+    script = bin_dir / "systemd-run"
+    script.write_text(f"#!{sys.executable}\n{FAKE_SYSTEMD_RUN}", encoding="utf-8")
+    script.chmod(0o755)
+    log = bin_dir / "argv.jsonl"
+    monkeypatch.setenv("FAKE_SYSTEMD_RUN_LOG", str(log))
+    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}")
+    monkeypatch.setenv("BEAGLE_TAU_MEMORY_MAX", "4G")
+    return log
+
+
+def _scoped(log: Path) -> list[list[str]]:
+    lines = log.read_text().splitlines() if log.exists() else []
+    return [args for args in map(json.loads, lines) if "--" in args]
+
+
+def test_pursuit_runs_beagle_under_the_memory_cap(
+    tmp_path: Path, beagle: Path, fake_beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # R22 E461: `beagle pursuit open` rehearsed the check uncapped, and the
+    # check grew past every limit tau sets for its own runs.
+    ext = _module()
+    log = _fake_systemd_run(tmp_path, monkeypatch)
+    monkeypatch.setattr(ext, "_scopes_work", lambda: True)
+    monkeypatch.setattr(ext, "BEAGLE_BIN", str(fake_beagle / "beagle"))
+    (fake_beagle / "status.out").write_text("ok\n")
+
+    rc, out = ext._pursuit(["status"], tmp_path)
+
+    [scoped] = _scoped(log)
+    assert (rc, out) == (0, "ok")
+    assert "MemoryMax=4G" in scoped
+    assert scoped[scoped.index("--") + 1 :] == [str(fake_beagle / "beagle"), "pursuit", "status"]
+    assert [c["cwd"] for c in _calls(fake_beagle)] == [str(tmp_path)]
+
+
+def test_pursuit_timeout_kills_the_whole_process_group(
+    tmp_path: Path, beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # R22: the rehearsed pytest outlived beagle's 60 s timeout by an hour.
+    ext = _module()
+    pidfile = tmp_path / "child.pid"
+    slow = tmp_path / "slow-beagle"
+    slow.write_text(f"#!/bin/sh\nsleep 30 &\necho $! > {pidfile}\nwait\n", encoding="utf-8")
+    slow.chmod(0o755)
+    monkeypatch.setattr(ext, "BEAGLE_BIN", str(slow))
+
+    started = time.monotonic()
+    rc, out = ext._pursuit(["open", "T0002"], tmp_path, timeout=1.0)
+    elapsed = time.monotonic() - started
+
+    child = int(pidfile.read_text())
+    for _ in range(50):
+        try:
+            state = Path(f"/proc/{child}/stat").read_text().rsplit(")", 1)[1].split()[0]
+        except OSError:
+            state = "gone"
+        if state in ("gone", "Z"):
+            break
+        time.sleep(0.05)
+    assert (rc, elapsed < 10) == (124, True) and "timed out after 1s" in out
+    assert state in ("gone", "Z")
+
+
+@pytest.mark.anyio
+async def test_open_refuses_when_the_pre_run_was_killed_for_memory(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # R22 E460: the pre-run was killed at the cap (-9), and the open ran the
+    # check again, uncapped, in beagle's rehearsal.
+    project = _pursuit_project(tmp_path)
+    monkeypatch.chdir(project)
+    log = _fake_systemd_run(tmp_path, monkeypatch)
+    (project / "hog.py").write_text("import os, signal\nos.kill(os.getpid(), signal.SIGKILL)\n")
+    _ready_task(fake_beagle)
+    runtime, _ = _bound(tmp_path)
+
+    result = await _tool(runtime, "pursuit_step").execute(
+        "c1", {"task": "T0002", "criteria": "hog stops", "done_when": "python3 hog.py"}
+    )
+
+    assert "not opened" in result.text and "(exit -9)" in result.text
+    assert "most likely for going over its 4G memory cap" in result.text
+    assert any(s[-2:] == ["python3", "hog.py"] for s in _scoped(log))
+    assert _pursuit_calls(fake_beagle, "open") == [] and _runs(fake_tau) == []
+
+
+@pytest.mark.anyio
+async def test_worker_killed_by_cap_says_so_after_a_nonempty_report(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # R22 E459: the driver read "Last report: Now let me test the encoder:"
+    # and nothing about the cap that killed the worker mid-test.
+    project = _pursuit_project(tmp_path)
+    monkeypatch.chdir(project)
+    _fake_systemd_run(tmp_path, monkeypatch)
+    monkeypatch.setenv("FAKE_TAU_REPORT", "Now let me test the encoder:")
+    monkeypatch.setenv("FAKE_TAU_KILLED", "1")
+    _ready_task(fake_beagle)
+    runtime, _ = _bound(tmp_path)
+
+    result = await _tool(runtime, "pursuit_step").execute(
+        "c1",
+        {"task": "T0002", "criteria": "c", "done_when": "grep -q done done.txt"},
+    )
+
+    assert "Now let me test the encoder:" in result.text
+    assert "most likely for going over its 4G memory cap" in result.text
