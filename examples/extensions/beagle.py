@@ -8976,45 +8976,133 @@ def _on_disk_note(check: str, task: str) -> str:
     )
 
 
+def _cases_close_problem(root: Path, entries: list[str]) -> tuple[str, str] | None:
+    """(what keeps the task open, the notes that fix it) when the close's cases
+    judgements, `_unread_cases` then `_cases_test_problem`, refuse the files on disk."""
+    unread = _unread_cases(root, entries)
+    if unread is not None:
+        test, data = unread
+        return (
+            f"{test} does not read {data}, so the known answers judge nothing",
+            f"{test} must load {data} and run every case in it against the code, with no "
+            "hand-written asserts of its own.",
+        )
+    flawed = _cases_test_problem(root, entries)
+    if flawed is not None:
+        test, problem = flawed
+        return (
+            f"{test} {problem}, so the known answers could never judge the code",
+            f"{test} {problem}: make it look up only cases the data holds, compare the "
+            "code's results with each case's expected value, and use each attribute one way.",
+        )
+    return None
+
+
+def _bound_is_data_check(bound: str, data_check: str, root: Path) -> bool:
+    """Whether the bound check already is `data_check`, the data test it would propose."""
+    if not bound:
+        return False
+    if _same_check(bound, data_check):
+        return True
+    data_test = data_check.split()[-1]
+    return _check_targets(bound, root) == [data_test]
+
+
 async def _data_route_on_disk(
-    task: str, route: tuple[str, str, str, list[str]], root: Path, extra: list[str] | None = None
+    task: str,
+    route: tuple[str, str, str, list[str]],
+    root: Path,
+    extra: list[str] | None = None,
+    *,
+    bound: str = "",
+    locks: list[str] | None = None,
+    is_open: bool = False,
 ) -> str | None:
     """What to say in place of "bind the data test" when that test already passes; or None.
 
     Run R18: told to bind `pytest tests/test_case_data.py`, which W1's uncommitted
     files made pass, the driver was refused as "already passes" for 14 minutes.
+    Run R32: told an open task "closes on that work" that the close's cases
+    judgements still refused, and to bind the check it was already bound to.
     """
     test, module, data_check, needs = route
     if (await _run_check(data_check, root, DEFAULT_CHECK_TIMEOUT))[0] != 0:
         return None
-    scope_arg = f", scope={json.dumps(needs)}" if needs else ""
+    same = _bound_is_data_check(bound, data_check, root)
+    rebind = "" if same else f", done_when={json.dumps(data_check)}"
+    if needs and not same:
+        rebind += f", scope={json.dumps(needs)}"
+    leave = " The bound check already is that data test; leave done_when out." if same else ""
     if await _passes_only_by_uncommitted(data_check, [needs, extra or []], root):
-        return (
+        why = (
             f"{test} imports {module}, which a later task writes, so {task} closes on its "
             f"data test `{data_check}`. That already passes, on the known-answers work on "
-            f"disk, uncommitted in this scope: {task} closes on that work. Send "
-            f'pursuit_step task="{task}", done_when="{data_check}"{scope_arg}: it opens, '
-            "and the close judges the files on disk."
+            "disk, uncommitted in this scope"
+        )
+        kept = _cases_close_problem(root, list(dict.fromkeys([*needs, *(locks or [])])))
+        if kept is not None:
+            problem, notes = kept
+            return (
+                f"Send pursuit_step task={json.dumps(task)}{rebind}, notes={json.dumps(notes)}: "
+                f"the close keeps {task} open while {problem}. {why}, but the close also "
+                f"judges the cases test.{leave}"
+            )
+        opens = "its check is amended" if is_open and not same else "it opens"
+        if is_open and same:
+            opens = "it runs"
+        opens += ", and the close judges the files on disk"
+        return (
+            f"Send pursuit_step task={json.dumps(task)}{rebind}: {opens}. {why}: {task} "
+            f"closes on that work.{leave}"
         )
     return (
-        f"{test} imports {module}, which a later task writes, and the data test "
-        f"`{data_check}` already passes on the committed tree, so neither check can tell "
-        f"{task}'s work from none. If a done task already did this work, call pursuit_step "
-        f'task="{task}" abandon="done by <that task>" done_when="{data_check}"; if work is '
-        "left, name a new data test file for it that fails now, put it in scope, and say "
-        "in the notes what it should test."
+        f"If a done task already did this work, call pursuit_step task={json.dumps(task)} "
+        f'abandon="done by <that task>" done_when="{data_check}"; if work is left, name a '
+        "new data test file for it that fails now, put it in scope, and say in the notes "
+        f"what it should test. {test} imports {module}, which a later task writes, and the "
+        f"data test `{data_check}` already passes on the committed tree, so neither check "
+        f"can tell {task}'s work from none."
     )
 
 
 async def _unwritten_check_problem(
-    command: str, scope: list[str], task: str, root: Path, extra: list[str] | None = None
+    command: str,
+    scope: list[str],
+    task: str,
+    root: Path,
+    extra: list[str] | None = None,
+    *,
+    bound: str = "",
+    locks: list[str] | None = None,
+    is_open: bool = False,
 ) -> str | None:
     """`_imports_unwritten_problem`, unless the data test it prescribes already passes."""
     route = _data_test_route(command, scope, root)
     if route is None:
         return None
-    on_disk = await _data_route_on_disk(task, route, root, extra)
+    on_disk = await _data_route_on_disk(
+        task, route, root, extra, bound=bound, locks=locks, is_open=is_open
+    )
     return on_disk or _imports_unwritten_problem(command, scope, root)
+
+
+def _kept_data_check(done_when: str, scope: list[str], bound: str, root: Path) -> str | None:
+    """The note for keeping the bound check when `done_when` runs a test importing
+    unwritten code and the data test tau would propose instead is the bound check; or None.
+
+    Run R32 #12: the notes that would have fixed the task were refused together
+    with such a done_when.
+    """
+    if not bound or _check_problem(bound) is not None:
+        return None
+    route = _data_test_route(done_when, scope, root)
+    if route is None or not _bound_is_data_check(bound, route[2], root):
+        return None
+    test, module = route[0], route[1]
+    return (
+        f'Kept done_when="{bound}" (the data test); {test} imports {module}, which a '
+        f"later task writes, so `{done_when}` is not bound.\n\n"
+    )
 
 
 def _shown(task: str, root: Path) -> dict[str, Any]:
@@ -10169,6 +10257,16 @@ def make_step_tool() -> Any:
                 # run R06 spawned T0008, then refused to open it on a check that
                 # already passed, and left a successor with no criteria.
                 route_scope = scope or _strings(record.get("scope"))
+                kept_check = (
+                    _kept_data_check(done_when, route_scope, old_check, root)
+                    if done_when and status == "open"
+                    else None
+                )
+                if kept_check is not None:
+                    # Run R32 #12: the notes went down with a done_when whose data
+                    # test was the bound check already.
+                    taken += kept_check
+                    done_when = ""
                 scoped = (
                     _scope_problem(route_scope, task, nodes, root)
                     or _locked_scope_problem(route_scope, root, title, task)
@@ -10180,7 +10278,14 @@ def make_step_tool() -> Any:
                     or _import_scope_problem(done_when or old_check, route_scope, root)
                     or _pytest_node_import_only_problem(done_when or old_check, route_scope, root)
                 ) or await _unwritten_check_problem(
-                    done_when or old_check, route_scope, task, root, _strings(record.get("scope"))
+                    done_when or old_check,
+                    route_scope,
+                    task,
+                    root,
+                    _strings(record.get("scope")),
+                    bound=old_check,
+                    locks=_pending_locks(goal, task) + _strings(arguments.get("locks")),
+                    is_open=status == "open",
                 )
                 if scoped is not None:
                     return _step_result(f"pursuit_step: no new route for {task} — {scoped}")
@@ -10314,7 +10419,12 @@ def make_step_tool() -> Any:
                     or _import_scope_problem(done_when, scope, root)
                     or _pytest_node_import_only_problem(done_when, scope, root)
                 ) or await _unwritten_check_problem(
-                    done_when, scope, task, root, _predecessor_scope(record, root)
+                    done_when,
+                    scope,
+                    task,
+                    root,
+                    _predecessor_scope(record, root),
+                    locks=_pending_locks(goal, task) + _strings(arguments.get("locks")),
                 )
 
             rehomed = _rehomed_scope(scope, root)
@@ -10391,6 +10501,24 @@ def make_step_tool() -> Any:
                 del _KILLED_NOT_OPENED[str(_resolved(root))]
             rc, out = _pursuit(["show", task], root)
             record = _json_reply(out) if rc == 0 else record
+        elif (
+            done_when
+            and notes
+            and done_when != bound_check
+            and (
+                kept_check := _kept_data_check(
+                    done_when, scope or _strings(record.get("scope")), bound_check, root
+                )
+            )
+            is not None
+            and _locked_scope_problem(scope or _strings(record.get("scope")), root, title, task)
+            is None
+        ):
+            # Run R32 #12: an open task's notes were refused with a done_when whose
+            # data test was the bound check already; the bound check stays and the
+            # notes run. Without notes, the refusal below says to leave done_when out.
+            route += kept_check
+            done_when = bound_check
         elif done_when and done_when != str(record.get("done_when") or "").strip():
             # Open already, with a check the model now writes differently: the
             # bound one could not judge the work (prose, a usage error), and
@@ -10427,7 +10555,14 @@ def make_step_tool() -> Any:
                 or _pytest_node_import_only_problem(done_when, own_scope, root)
             ) or (
                 await _unwritten_check_problem(
-                    done_when, own_scope, task, root, _predecessor_scope(record, root)
+                    done_when,
+                    own_scope,
+                    task,
+                    root,
+                    _predecessor_scope(record, root),
+                    bound=bound_check,
+                    locks=_pending_locks(goal, task) + _strings(arguments.get("locks")),
+                    is_open=True,
                 )
             )
             if unwritten is not None:
@@ -10487,7 +10622,13 @@ def make_step_tool() -> Any:
             )
             data_check = data_route[2]
             on_disk = await _data_route_on_disk(
-                task, data_route, root, _predecessor_scope(record, root)
+                task,
+                data_route,
+                root,
+                _predecessor_scope(record, root),
+                bound=bound_check,
+                locks=_pending_locks(goal, task) + _strings(arguments.get("locks")),
+                is_open=True,
             )
             if on_disk is not None:
                 return _step_result(f"pursuit_step: {task} not run — {on_disk}")
@@ -10890,7 +11031,14 @@ def make_step_tool() -> Any:
                 if_line = ""
             unpassable = ""
             on_disk = (
-                await _data_route_on_disk(task, cannot_pass, root)
+                await _data_route_on_disk(
+                    task,
+                    cannot_pass,
+                    root,
+                    bound=check,
+                    locks=_pending_locks(goal, task) + _strings(arguments.get("locks")),
+                    is_open=True,
+                )
                 if cannot_pass is not None
                 else None
             )

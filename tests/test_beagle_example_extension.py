@@ -13314,7 +13314,10 @@ async def test_data_test_route_is_not_offered_when_the_data_test_already_passes(
     else:
         assert "on the known-answers work on disk, uncommitted in this scope" in result.text
         assert f'pursuit_step task="T0002", done_when="{R16_DATA_CHECK}"' in result.text
-        assert "it opens, and the close judges the files on disk" in result.text
+        # R32: this cases test never reads the answers, so the close would keep T0002
+        # open; the call names that demand instead of "closes on that work".
+        assert "the close keeps T0002 open while tests/test_cases.py never reads" in result.text
+        assert "closes on that work" not in result.text
 
 
 @pytest.mark.anyio
@@ -15802,3 +15805,129 @@ def test_unreported_run_names_kill_during_own_command() -> None:
     assert "ended without a report (stopReason=toolUse)" in ext._unreported_runs(
         [(1, quiet, [])], 2
     )
+
+
+R32_SCOPE = ["tests/cases.json", "tests/test_cases.py", "tests/test_case_data.py"]
+#: R32: the cases test imports the code a later task writes and never reads the data.
+R32_CASES_TEST = (
+    "from interval_tree_clocks import Clock\n\n\n"
+    "def test_join():\n    assert Clock().join(Clock()) == Clock()\n"
+)
+
+
+def _r32_tree(project: Path, cases_test: str = R32_CASES_TEST) -> str:
+    """R32's T0002 files, uncommitted; returns the data test's check."""
+    data_check = _case_data_test(project)
+    (project / "tests" / "cases.json").write_text('[{"name": "seed", "expected": 1}]\n')
+    (project / "tests" / "test_cases.py").write_text(cases_test)
+    return data_check
+
+
+@pytest.mark.anyio
+async def test_data_route_open_task_names_unread_cases_instead_of_closing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # R32 E16-E34: "T0002 closes on that work", while the close kept refusing it
+    # because tests/test_cases.py did not read tests/cases.json.
+    project = _git_project(tmp_path, monkeypatch)
+    data_check = _r32_tree(project)
+    module = _module()
+    route = module._data_test_route(R16_CHECK, R32_SCOPE, project)
+
+    text = await module._data_route_on_disk("T0002", route, project, bound=data_check, is_open=True)
+
+    assert "closes on that work" not in text
+    assert "tests/test_cases.py does not read tests/cases.json" in text
+    notes = "tests/test_cases.py must load tests/cases.json and run every case in it"
+    assert text.startswith(f'Send pursuit_step task="T0002", notes="{notes}')
+
+
+@pytest.mark.anyio
+async def test_data_route_says_leave_done_when_out_when_equal_to_bound_check(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # R32 E16: the proposed done_when was T0002's bound check, named as a change.
+    project = _git_project(tmp_path, monkeypatch)
+    data_check = _r32_tree(project)
+    module = _module()
+    route = module._data_test_route(R16_CHECK, R32_SCOPE, project)
+
+    bound = await module._data_route_on_disk(
+        "T0002", route, project, bound=data_check, is_open=True
+    )
+    call = bound.split(":")[0]
+    assert "done_when" not in call
+    assert "already is that data test; leave done_when out" in bound
+    assert "it opens" not in bound
+
+    pending = await module._data_route_on_disk("T0002", route, project)
+    assert f'done_when="{data_check}"' in pending.split(":")[0]
+    assert "leave done_when out" not in pending
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("new_route", [False, True])
+async def test_open_task_rejected_done_when_still_runs_notes(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    new_route: bool,
+) -> None:
+    # R32 #12: the notes that would have fixed T0002 were refused with its done_when.
+    project = _git_project(tmp_path, monkeypatch)
+    monkeypatch.chdir(project)
+    data_check = _r32_tree(project)
+    monkeypatch.setenv("FAKE_TAU_SUCCEEDS_ON", "99")
+    _open_task(fake_beagle, check=data_check)
+    record = json.loads((fake_beagle / "show.out").read_text())
+    (fake_beagle / "show.out").write_text(
+        json.dumps({**record, "status": "open", "scope": R32_SCOPE})
+    )
+    (fake_beagle / "spawn.out").write_text("T0002 superseded by T0003\n")
+    runtime, _ = _bound(tmp_path)
+    notes = "The test_cases.py must load tests/cases.json and run every case against the code"
+    args = {"task": "T0002", "done_when": R16_CHECK, "scope": R32_SCOPE, "notes": notes}
+    if new_route:
+        args["new_route"] = True
+
+    result = await _tool(runtime, "pursuit_step").execute("c1", args)
+
+    assert "not changed" not in result.text and "no new route" not in result.text
+    assert f'Kept done_when="{data_check}" (the data test)' in result.text
+    assert "tests/test_cases.py imports interval_tree_clocks" in result.text
+    assert _pursuit_calls(fake_beagle, "amend") == []
+    [run, *_] = _runs(fake_tau)
+    assert notes in run["stdin"]
+    if new_route:
+        [spawn] = _pursuit_calls(fake_beagle, "spawn")
+        assert R16_CHECK not in spawn
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("committed", [False, True])
+async def test_data_route_refusal_leads_with_its_call(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, committed: bool
+) -> None:
+    # R32 E22, E36: the quoted head of the refusal ended before the call it named.
+    project = _git_project(tmp_path, monkeypatch)
+    cases_test = (
+        "import json\nfrom pathlib import Path\n\nfrom interval_tree_clocks import Clock\n\n"
+        "CASES = json.loads(Path(__file__).with_name('cases.json').read_text())\n\n\n"
+        "def test_cases():\n    for case in CASES:\n"
+        "        assert Clock(case['name']).value() == case['expected']\n"
+    )
+    data_check = _r32_tree(project, cases_test)
+    if committed:
+        _commit(project, *R32_SCOPE)
+    module = _module()
+    route = module._data_test_route(R16_CHECK, R32_SCOPE, project)
+
+    text = await module._data_route_on_disk("T0002", route, project)
+
+    if committed:
+        assert text.startswith("If a done task already did this work, call pursuit_step task=")
+    else:
+        assert text.startswith(f'Send pursuit_step task="T0002", done_when="{data_check}"')
+        assert "closes on that work" in text
