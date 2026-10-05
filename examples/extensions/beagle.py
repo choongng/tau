@@ -6773,10 +6773,11 @@ def _unproven_call(
             )
         return _infeasible_call(task, check, scope)
     if not done_when:
-        return (
-            f'pursuit_plan task="{task}", parts=["Code::the module {task}\'s tests import", '
-            f'"Tests::{task}\'s tests, run against that module"]'
-        )
+        # Run R26: the test imports no module, so no defect outside it can fail it;
+        # the new route keeps the check and has the test import what it tests.
+        test = tests[0] if tests else "the test"
+        done_when = check or (f"python3 -m pytest -q {tests[0]}" if tests else "")
+        notes = f"Make {test} import the module it tests, from a file added to scope"
     routed = [*scope, *[rel for rel in added if rel not in scope]]
     call = (
         f'pursuit_step task="{task}", new_route=true, done_when={json.dumps(done_when)}, '
@@ -9545,8 +9546,13 @@ def make_step_tool() -> Any:
                 + _implementation_in_tests_lead(root, scope, check)
                 + f"Last report:\n{shown}\n\n"
                 f'Next: pursuit_step with task="{task}" and notes saying what to fix. '
-                f"{if_line}If this route is wrong, pursuit_step with "
-                f'task="{task}", new_route=true and notes saying what to do instead.',
+                + (
+                    f"{if_line}If this route is wrong: "
+                    + _spawn_limit_offer(task, check, scope, fresh)
+                    if _at_spawn_limit(task, fresh := _tree_nodes(root))
+                    else f"{if_line}If this route is wrong, pursuit_step with "
+                    f'task="{task}", new_route=true and notes saying what to do instead.'
+                ),
             )
         if proof is not None and not proof.proven:
             state = "stays blocked" if retrying else "stays open"

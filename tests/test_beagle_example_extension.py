@@ -14125,3 +14125,67 @@ async def test_infeasible_abandon_refused_below_the_limit(
     assert "below beagle's limit of 3" in short.text
     assert 'pursuit_step task="T0011", new_route=true' in short.text
     assert 'pursuit_step task="T0011" with notes' in short.text
+
+
+# --------------------------------------------------------------------------- #
+# audit 12 follow-ups: the import-nothing fallback, and "check still fails"
+# --------------------------------------------------------------------------- #
+
+
+def test_unproven_call_tests_only_scope_importing_nothing_gives_step(tmp_path: Path) -> None:
+    # R26 E94, E106: a test importing nothing got `pursuit_plan … "Code::the module
+    # T0011's tests import"`, naming a module that was not there.
+    module = _module()
+    (tmp_path / "tests").mkdir()
+    test = "tests/test_case_data.py"
+    (tmp_path / test).write_text("import json\n\nassert json.loads('[1]') == [1]\n")
+    check = f"python3 {test}"
+
+    call = module._unproven_call("T0011", check, [test], tmp_path, [], [])
+
+    assert call.startswith(
+        f'pursuit_step task="T0011", new_route=true, done_when={json.dumps(check)}, '
+        f"scope={json.dumps([test])}, notes="
+    )
+    assert "pursuit_plan" not in call and "Code::" not in call and "<" not in call
+    notes = f"Make {test} import the module it tests, from a file added to scope"
+    assert call.endswith(f"notes={json.dumps(notes)}")
+    lead = "pursuit_step: T0011 not run — call instead: "
+    tail = "; or split it with pursuit_plan."
+    assert len(lead) + len(call) + len(tail) <= module.ESCALATION_HEAD_CHARS
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("limited", [True, False])
+async def test_check_still_fails_at_spawn_limit_offers_infeasible(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    limited: bool,
+) -> None:
+    # Audit 12 (T0242): "the check still fails" offered new_route=true to a task
+    # whose retry chain beagle would refuse another route.
+    monkeypatch.chdir(_git_project(tmp_path, monkeypatch))
+    _ready_task(fake_beagle, "false")
+    _t0002_at_limit(fake_beagle)
+    if not limited:
+        tree = json.loads((fake_beagle / "tree.out").read_text())["nodes"]
+        below = [n for n in tree if n["id"] != "T0009"]
+        (fake_beagle / "tree.out").write_text(json.dumps({"nodes": below}))
+    runtime, _ = _bound(tmp_path)
+    args = {"task": "T0002", "criteria": "c", "done_when": "false", "scope": ["done.txt"]}
+
+    result = await _tool(runtime, "pursuit_step").execute("c1", args)
+
+    assert _runs(fake_tau)
+    assert "the check still fails after" in result.text
+    offer = 'task="T0002", new_route=true and notes saying what to do instead'
+    if not limited:
+        assert offer in result.text and "beagle's limit" not in result.text
+        return
+    assert "new_route" not in result.text
+    assert "beagle's limit of 3 attempts" in result.text
+    assert 'pursuit_step task="T0002", abandon="infeasible: ' in result.text
+    assert 'pursuit_plan task="T0010", parts=["Parser::' in result.text
