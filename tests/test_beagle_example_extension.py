@@ -1390,6 +1390,17 @@ message = {
     "usage": {"totalTokens": 1000},
     "stopReason": "stop",
 }
+if str(attempt) == os.environ.get("FAKE_TAU_SILENT_ON"):
+    # R27 W7: the session ends on a tool call, with no result and no report.
+    message = {
+        "role": "assistant",
+        "content": [
+            {"type": "text", "text": "The criteria say ceil/10, but the reference uses 254."},
+            {"type": "toolCall", "id": "t1", "name": "bash", "arguments": {"command": "ls"}},
+        ],
+        "usage": {"totalTokens": 1000},
+        "stopReason": "toolUse",
+    }
 if os.environ.get("FAKE_TAU_RAMBLES"):
     # A worker that spends its whole output on reasoning: the update events
     # repeat the growing message, one of them past the reader's line limit.
@@ -1409,6 +1420,13 @@ if attempt >= int(os.environ.get("FAKE_TAU_HANGS_ON") or 99):
     for _ in range(int(os.environ.get("FAKE_TAU_LENGTH_STOPS", "0"))):
         cut = {"role": "assistant", "content": [], "stopReason": "length"}
         print(json.dumps({"type": "message_end", "message": cut}), flush=True)
+    for _ in range(int(os.environ.get("FAKE_TAU_CUT_OFFS", "0"))):
+        # R27: the provider reports a call cut off at the output limit as "toolUse".
+        call = {"role": "assistant", "content": [], "stopReason": "toolUse"}
+        print(json.dumps({"type": "message_end", "message": call}), flush=True)
+        refused = "Tool call blocked: This call's arguments were cut off after 10053 characters"
+        result = {"role": "toolResult", "content": [{"type": "text", "text": refused}]}
+        print(json.dumps({"type": "message_end", "message": result}), flush=True)
     import time
     time.sleep(60)
 print(json.dumps({"type": "message_end", "message": message}))
@@ -8371,13 +8389,18 @@ async def test_worker_raw_tool_call_report_falls_back(
 
 
 async def _hung_second_worker(
-    tmp_path: Path, fake_beagle: Path, monkeypatch: pytest.MonkeyPatch, length_stops: int
+    tmp_path: Path,
+    fake_beagle: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    length_stops: int,
+    cut_offs: int = 0,
 ) -> str:
     project = _git_project(tmp_path, monkeypatch)
     monkeypatch.chdir(project)
     monkeypatch.setenv("FAKE_TAU_SUCCEEDS_ON", "99")
     monkeypatch.setenv("FAKE_TAU_HANGS_ON", "2")
     monkeypatch.setenv("FAKE_TAU_LENGTH_STOPS", str(length_stops))
+    monkeypatch.setenv("FAKE_TAU_CUT_OFFS", str(cut_offs))
     monkeypatch.setenv("FAKE_TAU_WRITES", json.dumps({"tests/test_x.py": "def test_x(): ...\n"}))
     monkeypatch.setenv("FAKE_TAU_REPORT", "attempt 1: wrote tests/test_x.py; the check fails")
     _ready_task(fake_beagle)
@@ -8428,6 +8451,85 @@ async def test_worker_timeout_names_output_limit_turns_not_the_env_var(
 
     assert "its last 4 turn(s) ended at the output limit" in text
     assert _module().WORKER_MAX_TURNS_ENV not in text and "turn cap" not in text
+
+
+@pytest.mark.anyio
+async def test_timeout_after_cutoffs_names_output_limit(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Run R27: W2's four cut-off calls came back as stopReason "toolUse", and the
+    # timeout blamed the turn cap.
+    text = await _hung_second_worker(tmp_path, fake_beagle, monkeypatch, 0, cut_offs=4)
+
+    assert "its last 4 turn(s) ended at the output limit" in text
+    assert _module().WORKER_MAX_TURNS_ENV not in text and "turn cap" not in text
+
+
+@pytest.mark.anyio
+async def test_step_result_names_earlier_worker_without_report(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Run R27: W7 ended on a bash call with no report; the step result showed only W8's.
+    monkeypatch.chdir(_git_project(tmp_path, monkeypatch))
+    monkeypatch.setenv("FAKE_TAU_SUCCEEDS_ON", "99")
+    monkeypatch.setenv("FAKE_TAU_SILENT_ON", "1")
+    monkeypatch.setenv("FAKE_TAU_WRITES", json.dumps({"tests/test_x.py": "def test_x(): ...\n"}))
+    monkeypatch.setenv("FAKE_TAU_REPORT", "attempt 2: the check fails")
+    _ready_task(fake_beagle)
+    runtime, _ = _bound(tmp_path)
+    args = {
+        "task": "T0002",
+        "criteria": "c",
+        "done_when": "grep -q done done.txt",
+        "scope": ["done.txt", "tests/test_x.py"],
+    }
+
+    text = (await _tool(runtime, "pursuit_step").execute("c1", args)).text
+
+    assert len(_runs(fake_tau)) == 2
+    assert "the check still fails after 2 sub-agent run(s)" in text
+    assert (
+        "Run 1 of 2 ended without a report (stopReason=toolUse); it changed: "
+        "Changed or new in its scope: tests/test_x.py; its last words: "
+        "The criteria say ceil/10, but the reference uses 254."
+    ) in text
+    assert "Run 2 of 2" not in text
+    assert text.index("Run 1 of 2") < text.index("Last report:\nattempt 2: the check fails")
+
+
+def _cut_off_events() -> tuple[bytes, bytes, bytes]:
+    def end(message: dict[str, Any]) -> bytes:
+        return json.dumps({"type": "message_end", "message": message}).encode()
+
+    call = end({"role": "assistant", "content": [], "stopReason": "toolUse"})
+    refused = "Tool call blocked: This call's arguments were cut off after 10053 characters"
+    cut = end({"role": "toolResult", "content": [{"type": "text", "text": refused}]})
+    ran = end({"role": "toolResult", "content": [{"type": "text", "text": "ok"}]})
+    return call, cut, ran
+
+
+def test_worker_events_counts_truncated_refusal_as_length_stop() -> None:
+    call, cut, ran = _cut_off_events()
+    events = _module()._WorkerEvents()
+
+    for line in (call, cut, call, cut):
+        events.feed(line)
+    assert events.length_stops == 2
+    events.feed(call)
+    assert events.length_stops == 0
+    events.feed(ran)
+    assert events.length_stops == 0
+    for line in (call, cut, call, cut, call, cut):
+        events.feed(line)
+    assert events.length_stops == 3
 
 
 def test_timeout_blames_output_limit_only_when_last_turns_hit_it() -> None:
@@ -10100,9 +10202,42 @@ async def test_worker_guard_explains_a_truncated_tool_call_instead_of_a_missing_
     assert f"cut off after {len(raw)} characters" in result.text
     assert "not valid JSON (Unterminated string" in result.text
     assert "nothing was written" in result.text
-    assert "`write` the first part, then add the rest with `edit`" in result.text
+    assert "`write` the first part, then append the rest with `edit`" in result.text
     whole = {"path": "tests/itc_clocks.py", "content": "x = 1\n"}
     assert (await _tool_with_hooks(runtime, "write").execute("c2", whole)).text == "ran"
+
+
+def test_truncated_call_names_char_budget() -> None:
+    # R27: "parts of a few hundred lines" let W2 resend 10k characters of hex four times.
+    raw = '{"path":"tests/cases.json","content":"' + "0a1b" * 2500
+
+    refusal = _module()._truncated_call({"_raw_arguments": raw})
+
+    assert refusal is not None
+    assert f"cut off after {len(raw)} characters" in refusal
+    assert f"parts of at most {len(raw) // 2} characters" in refusal
+    assert "lines" not in refusal
+    assert "short script run by bash" in refusal
+    assert "cut off again" not in refusal
+
+
+@pytest.mark.anyio
+async def test_second_truncated_call_says_it_repeats(
+    tmp_path: Path, beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runtime = _scoped_worker(tmp_path, monkeypatch, scope="tests/")
+    raw = '{"path":"tests/cases.json","content":"0a1b'
+    write = _tool_with_hooks(runtime, "write")
+
+    first = await write.execute("c1", {"_raw_arguments": raw})
+    second = await write.execute("c2", {"_raw_arguments": raw})
+    third = await write.execute("c3", {"_raw_arguments": raw})
+
+    assert "cut off after" in first.text and "cut off again" not in first.text
+    assert (
+        "This is the 2nd call cut off at the output limit; the same size will be cut off again."
+    ) in second.text
+    assert "This is the 3rd call cut off" in third.text
 
 
 @pytest.mark.anyio

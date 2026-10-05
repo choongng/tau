@@ -1297,6 +1297,18 @@ class _WorkerRun:
     problem: str | None = None
     #: The worker's session file, for reading what it did beyond its report.
     transcript: Path | None = None
+    #: How its last assistant message ended, and that message's text or an earlier one's.
+    stop_reason: str | None = None
+    last_words: str = ""
+
+    @property
+    def unreported(self) -> bool:
+        """Whether it ended without a report: a problem, a stub, or mid-call (R27 W7)."""
+        return (
+            self.problem is not None
+            or self.report.startswith(NO_REPORT)
+            or self.stop_reason == "toolUse"
+        )
 
     @property
     def shown_report(self) -> str:
@@ -1385,6 +1397,10 @@ _WORKER_TAIL_CHARS = 2000
 #: How tau's repeat breaker words a refused call's tool result, and the stop.
 _REFUSED = "Not run: "
 _BREAKER_STOP = "Not run, and the run is stopped"
+#: How the refusal of a call cut off at the output limit begins (`_truncated_call`).
+CUT_OFF_REFUSAL = "This call's arguments were cut off"
+#: How tau words the tool result of a call an extension blocked.
+_BLOCKED = "Tool call blocked: "
 #: The countdown sentence tau appends to each refusal's problem.
 _REFUSAL_COUNTDOWN = re.compile(r"\s*\d+ more refused calls? in a row stop the run\.\s*$")
 
@@ -1407,8 +1423,12 @@ class _WorkerEvents:
     stopped: bool = False
     #: How many assistant turns in a row, up to the last, ended at the output-token
     #: limit. Audit 7: a count over the whole run blamed the limit for a wall a
-    #: worker hit long after its last cut-off turn.
+    #: worker hit long after its last cut-off turn. Run R27: a turn whose call was
+    #: refused as cut off counts too, since the provider reported it as "toolUse".
     length_stops: int = 0
+    #: The count before the last turn, and whether that turn was counted as cut off.
+    _before_turn: int = 0
+    _turn_cut: bool = False
 
     def feed(self, line: bytes) -> None:
         if b'"message_end"' not in line[:64]:
@@ -1448,12 +1468,14 @@ class _WorkerEvents:
         ).strip()
         stop = message.get("stopReason")
         self.stop_reason = stop if isinstance(stop, str) else None
-        self.length_stops = self.length_stops + 1 if stop == "length" else 0
+        self._before_turn = self.length_stops
+        self._turn_cut = stop == "length"
+        self.length_stops = self._before_turn + 1 if self._turn_cut else 0
         error = message.get("errorMessage")
         self.error = str(error) if stop == "error" and error else None
 
     def _note_refusal(self, content: object) -> None:
-        """Track tau's refusals: the last one's problem, and the breaker's stop."""
+        """Track tau's refusals: the last one's problem, the breaker's stop, cut-off calls."""
         if isinstance(content, str):
             text = content
         elif isinstance(content, list):
@@ -1465,6 +1487,9 @@ class _WorkerEvents:
         else:
             return
         text = text.strip()
+        if text.removeprefix(_BLOCKED).startswith(CUT_OFF_REFUSAL) and not self._turn_cut:
+            self._turn_cut = True
+            self.length_stops = self._before_turn + 1
         if text.startswith(_BREAKER_STOP):
             self.stopped = True
         elif text.startswith(_REFUSED):
@@ -1701,7 +1726,37 @@ async def _run_worker(
         report=report,
         spent=events.spent,
         transcript=transcript,
+        stop_reason=events.stop_reason,
+        last_words=events.report,
     )
+
+
+#: How much of an unreported worker's last text a step result quotes.
+UNREPORTED_WORDS_CHARS = 300
+
+
+def _unreported_runs(runs: list[tuple[int, _WorkerRun, list[str]]], total: int) -> str:
+    """One paragraph per run before the last that ended without a report.
+
+    Run R27: W7 ended on a bash call with no report, having changed both test
+    files and found, in text, a contradiction in the criteria; the step result
+    after W8 showed only W8's report.
+    """
+    lines = []
+    for number, run, changes in runs:
+        if number >= total:
+            continue
+        why = run.problem or (
+            f"stopReason={run.stop_reason}" if run.stop_reason else "no assistant message"
+        )
+        changed = "; ".join(changes) or "nothing git sees"
+        words = " ".join(run.last_words.split())
+        cut = words[:UNREPORTED_WORDS_CHARS] + ("…" if len(words) > UNREPORTED_WORDS_CHARS else "")
+        lines.append(
+            f"Run {number} of {total} ended without a report ({why}); it changed: {changed}; "
+            f"its last words: {cut or '(none)'}\n\n"
+        )
+    return "".join(lines)
 
 
 def _founded_dispatch_refusal(cwd: Path) -> str | None:
@@ -9356,6 +9411,7 @@ def make_step_tool() -> Any:
                 attempts = 1
                 retry_note = "\n\n" + ON_DISK_WITNESS_NOTE
         worker_ran = False
+        unreported: list[tuple[int, _WorkerRun, list[str]]] = []
         for attempt in range(1, attempts + 1):
             if (
                 verdict[0] == 0
@@ -9384,6 +9440,8 @@ def make_step_tool() -> Any:
                     + _killed_attempt_context(run, shown, verdict, check, root, scope)
                     + f'Call pursuit_step with task="{task}" to send it again.',
                 )
+            if run.unreported:
+                unreported.append((attempt, run, _scope_changes(root, scope)))
             report, shown = run.report, _capped_report(run)
             # Run R17: W4, W9 and W11 claimed files they never wrote.
             missing = _report_missing_paths(report, root)
@@ -9544,6 +9602,7 @@ def make_step_tool() -> Any:
                 f"sub-agent run(s), so the task {state}.\n\n`{check}` exit {verdict[0]}:\n"
                 f"{verdict[1][-CHECK_TAIL_CHARS:]}\n\n"
                 + _implementation_in_tests_lead(root, scope, check)
+                + _unreported_runs(unreported, attempt)
                 + f"Last report:\n{shown}\n\n"
                 f'Next: pursuit_step with task="{task}" and notes saying what to fix. '
                 + (
@@ -10522,12 +10581,21 @@ def _link_out(links: list[tuple[Path, Path]], root: Path) -> ToolCallHookResult 
     return None
 
 
-def _truncated_call(arguments: Mapping[str, Any]) -> str | None:
+def _ordinal(n: int) -> str:
+    """`n` as "1st", "2nd", "3rd", "4th", "11th", "22nd"."""
+    suffix = "th" if 10 <= n % 100 <= 20 else {1: "st", 2: "nd", 3: "rd"}.get(n % 10, "th")
+    return f"{n}{suffix}"
+
+
+def _truncated_call(arguments: Mapping[str, Any], earlier: int = 0) -> str | None:
     """Why a call whose arguments are only unparsed text is refused, or None.
 
     Run R21: W3's `write` calls were cut off mid-JSON and reached the tool as
     `{"_raw_arguments": ...}`; told "path must be a string", W3 rewrote the
-    same 30k-character file four times.
+    same 30k-character file four times. Run R27: told to write "a few hundred
+    lines", W2 resent the same 10k characters four times; the budget is now
+    in characters, and `earlier` (this worker's cut-off calls before this
+    one) says from the second on that the same size is cut off again.
     """
     if set(arguments) != {"_raw_arguments"}:
         return None
@@ -10538,11 +10606,18 @@ def _truncated_call(arguments: Mapping[str, Any]) -> str | None:
         error = str(exc)
     else:
         error = "not an object of named arguments"
-    return (
-        f"This call's arguments were cut off after {len(text)} characters and are not "
-        f"valid JSON ({error}), so nothing was written. Write the file in parts of a few "
-        "hundred lines: `write` the first part, then add the rest with `edit`."
+    refusal = (
+        f"{CUT_OFF_REFUSAL} after {len(text)} characters and are not valid JSON ({error}), "
+        f"so nothing was written. Write it in parts of at most {len(text) // 2} characters: "
+        "`write` the first part, then append the rest with `edit`; data with a pattern is "
+        "shorter to generate with a short script run by bash."
     )
+    if earlier:
+        refusal += (
+            f" This is the {_ordinal(earlier + 1)} call cut off at the output limit; "
+            "the same size will be cut off again."
+        )
+    return refusal
 
 
 def make_worker_scope_guard() -> Any:
@@ -10558,12 +10633,16 @@ def make_worker_scope_guard() -> Any:
     task is kept from reading the trees beside its project. Fails open.
     """
 
+    cut_offs = 0
+
     async def guard(event: Any, context: ExtensionContext) -> ToolCallHookResult | None:
+        nonlocal cut_offs
         try:
             cwd = Path(context.cwd)
             arguments = event.arguments or {}
-            cut_off = _truncated_call(arguments)
+            cut_off = _truncated_call(arguments, cut_offs)
             if cut_off is not None:
+                cut_offs += 1
                 return ToolCallHookResult(block=True, reason=cut_off)
             sent_on_task = bool(os.environ.get(WORKER_TASK_ENV, "").strip())
             orientation = (
