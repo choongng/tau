@@ -8,7 +8,7 @@ import re
 import shutil
 import string
 from collections import deque
-from collections.abc import AsyncIterator, Callable, Mapping, Sequence
+from collections.abc import AsyncIterator, Callable, Hashable, Mapping, Sequence
 from contextlib import suppress
 from dataclasses import dataclass, field, replace
 from os import environ
@@ -5590,6 +5590,29 @@ def _append_session_entry_sync(storage: SessionStorage, entry: SessionEntry) -> 
     raise RuntimeError("Session storage does not support synchronous initialization")
 
 
+def _dedupe_lists(value: object) -> object:
+    """Drop repeated entries from lists of hashable items, keeping first-seen order."""
+    if isinstance(value, dict):
+        return {key: _dedupe_lists(item) for key, item in value.items()}
+    if isinstance(value, list):
+        items = [_dedupe_lists(item) for item in value]
+        if not all(isinstance(item, Hashable) for item in items):
+            return items
+        seen: set[tuple[type, object]] = set()
+        unique: list[object] = []
+        for item in items:
+            marker = (type(item), item)
+            if marker not in seen:
+                seen.add(marker)
+                unique.append(item)
+        return unique
+    return value
+
+
 def _call_key(call: ToolCall) -> str:
-    """What makes two tool calls the same call: the tool and its arguments."""
-    return f"{call.name}\0{json.dumps(call.arguments, sort_keys=True, default=str)}"
+    """What makes two tool calls the same call: the tool and its arguments.
+
+    A list argument that differs only by repeated entries is the same argument.
+    """
+    arguments = _dedupe_lists(call.arguments)
+    return f"{call.name}\0{json.dumps(arguments, sort_keys=True, default=str)}"

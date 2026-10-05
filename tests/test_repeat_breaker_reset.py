@@ -125,3 +125,25 @@ async def test_repeat_refusal_quotes_earlier_result(tmp_path: Path) -> None:
     assert refusal.startswith("Not run: this `pursuit_found` call ran 2 times")
     assert f"It said: {head.strip()[:300]}" in refusal
     assert head.strip()[:301] not in refusal and "Leave it out." not in refusal
+
+
+def test_call_key_ignores_duplicate_list_entries() -> None:
+    from tau_coding.session import _call_key
+
+    def key(arguments: dict[str, JSONValue]) -> str:
+        return _call_key(ToolCall(id="c", name="pursuit_step", arguments=arguments))
+
+    base = key({"task": "T1", "locks": ["a.py", "b.py"]})
+    assert key({"task": "T1", "locks": ["a.py", "b.py", "a.py", "a.py"]}) == base
+    assert key({"task": "T1", "locks": ["a.py", "a.py", "b.py", "b.py"]}) == base
+    nested = key({"opts": {"locks": ["x", "y"]}})
+    assert key({"opts": {"locks": ["x", "x", "y", "x"]}}) == nested
+
+    assert key({"task": "T1", "locks": ["b.py", "a.py"]}) != base
+    assert key({"task": "T1", "locks": ["a.py"]}) != base
+    assert key({"task": "T2", "locks": ["a.py", "b.py"]}) != base
+    assert key({"task": "T1", "locks": ["a.py", "b.py", "c.py"]}) != base
+    assert key({"flags": [1, True]}) != key({"flags": [1]})
+    assert _call_key(
+        ToolCall(id="c", name="pursuit_found", arguments={"task": "T1", "locks": ["a.py", "b.py"]})
+    ) != base
