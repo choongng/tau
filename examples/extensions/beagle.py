@@ -3731,6 +3731,9 @@ def make_plan_tool() -> Any:
         parts = [
             f"{title}::{intent}" if intent else title for title, intent in map(_split_part, parts)
         ]
+        reading = _reading_only_part(parts)
+        if reading is not None:
+            return _step_result(f"pursuit_plan: nothing added — {reading}")
         # A small model re-sends the plan it already made; beagle adds every
         # part again, and the copies are then worked twice.
         existing = _children(task, root)
@@ -4343,6 +4346,62 @@ def _oracle_with_code_problem(scope: list[str], goal: Path) -> str | None:
         f"scope holds known-answer data ({', '.join(data)}) and the code it judges "
         f"({', '.join(source)}). Split it: first a task with only the data and its cases "
         f"test in scope, passing locks=[{', '.join(data)}]; then the code in a later task."
+    )
+
+
+def _check_path_words(check: str) -> list[str]:
+    """The relative paths a check's words name, inside one `sh -c` level, written or not."""
+    try:
+        words = shlex.split(check)
+    except ValueError:
+        return []
+    found: list[str] = []
+    for word in words:
+        inner = shlex.split(word) if " " in word and not word.startswith("-") else [word]
+        for part in inner:
+            rel = part.split("::")[0].rstrip("/")
+            if "/" not in rel or rel.startswith("-") or Path(rel).is_absolute():
+                continue
+            if ".." in Path(rel).parts or Path(rel).parts[0] == ".beagle":
+                continue
+            if rel not in found:
+                found.append(rel)
+    return found
+
+
+def _scope_holds_code_or_cases(
+    scope: list[str], root: Path, also: list[str] | None = None, tests_count: bool = True
+) -> bool:
+    """Whether `scope` (its directories walked) or `also` holds a .py file or cases data.
+
+    With `tests_count` false, a test .py is not code: only source counts.
+    """
+    entries = [rel.rstrip("/") for rel in [*scope, *(also or [])]]
+    for rel in list(entries):
+        if (root / rel).is_dir():
+            entries.extend(_scope_dir_files(root, rel))
+    return any(
+        _is_cases_data(rel) or (rel.endswith(".py") and (tests_count or not _is_test_path(rel)))
+        for rel in entries
+    )
+
+
+def _doc_only_check_problem(check: str, scope: list[str], task: str, root: Path) -> str | None:
+    """Why a task whose check reads only non-.py files under tests/ may not open, or None.
+
+    Run R29 opened T0006 on a grep over a digest it wrote under tests/, with
+    no code or cases data in scope: no defect could be put back to prove the
+    check, so the task could never close done.
+    """
+    reads = _check_path_words(check)
+    if not reads or not all(_in_tests_dir(rel) and not rel.endswith(".py") for rel in reads):
+        return None
+    if _scope_holds_code_or_cases(scope, root, reads, tests_count=False):
+        return None
+    return (
+        f"{reads[0]} is under tests/, so nothing can witness it; fold reading the "
+        f"reference into the known-answers task, or abandon {task}: "
+        f'pursuit_step task="{task}", abandon="folded into the known-answers task".'
     )
 
 
@@ -6414,6 +6473,28 @@ def _design_only_milestone(part: str) -> bool:
     head = re.split(r":| - | — ", part, maxsplit=1)[0]
     bare = re.sub(r"\([^)]*\)", "", part)
     return _read_or_design_only(head) and _read_or_design_only(bare)
+
+
+def _reading_only_part(parts: list[str]) -> str | None:
+    """Why one of `parts` only reads the reference or chooses a design, or None.
+
+    Run R29 planned 'Read both references: extract … into a short digest': its
+    head only reads, and the task it became could never be proved. The head,
+    before ':' or ' — ', decides, as for a founding milestone.
+    """
+    for part in parts:
+        if _names_known_answers(part):
+            continue
+        head = re.split(r":| - | — ", part, maxsplit=1)[0].strip()
+        if _read_or_design_only(head):
+            return (
+                f"{head!r} only reads the reference or chooses a design: a sub-agent "
+                f"reads the reference and writes the cases file and its test in the "
+                f"known-answers task ({KNOWN_ANSWERS_TITLE!r}), and the design is part "
+                "of the implementation, not a part of its own. Fold it into the part "
+                "that uses it, and plan the parts that do the work."
+            )
+    return None
 
 
 def _fold_design_milestones(kept: list[str]) -> tuple[list[str], list[str]]:
@@ -9787,6 +9868,7 @@ def make_step_tool() -> Any:
                     or _locked_scope_problem(scope, root, title, task)
                     or _sibling_owned_check_problem(done_when, scope, task, nodes, root)
                     or _oracle_with_code_problem(scope, goal)
+                    or _doc_only_check_problem(done_when, scope, task, root)
                     or _cases_first_problem(
                         scope, task, title, goal, nodes, _strings(arguments.get("locks"))
                     )
@@ -10392,7 +10474,15 @@ def make_step_tool() -> Any:
                 + _implementation_in_tests_lead(root, scope, check)
                 + f"Last report:\n{shown}\n\n"
                 + (
-                    f'Next: pursuit_step with task="{task}" and notes saying what to '
+                    f"Next: nothing in this scope ({', '.join(scope)}) is a module or "
+                    "cases data, so no defect can be put back into it and no "
+                    "route on it can close done. Fold its work into the task that writes "
+                    f'the code or the known answers, then pursuit_step task="{task}", '
+                    'abandon="folded into <that task>".'
+                    if tests_only
+                    and all(Path(rel.rstrip("/")).suffix not in {"", ".py"} for rel in scope)
+                    and not _scope_holds_code_or_cases(scope, root)
+                    else f'Next: pursuit_step with task="{task}" and notes saying what to '
                     f"fix. {proof_note}"
                     if tests_only and proof.weak
                     else f'Next: pursuit_step with task="{task}" and notes asking for a '

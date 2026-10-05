@@ -7104,7 +7104,7 @@ async def test_plan_under_nonroot_refuses_part_duplicating_pending_task(
     nodes = [
         *_r25_nodes(),
         {"id": "T0011", "parent": "T0006", "title": "Sources", "status": "open"},
-        {"id": "T0012", "parent": "T0011", "title": "Read the paper", "status": "pending"},
+        {"id": "T0012", "parent": "T0011", "title": "Port the paper", "status": "pending"},
     ]
     (fake_beagle / "tree.out").write_text(json.dumps({"nodes": nodes}))
     runtime, _ = _bound(tmp_path)
@@ -7115,14 +7115,14 @@ async def test_plan_under_nonroot_refuses_part_duplicating_pending_task(
         {"task": "T0006", "parts": ["Cases::write", "T0008::Implement the clock core"]},
     )
     own_subtree = await plan.execute(
-        "c2", {"task": "T0006", "parts": ["Read the paper::again", "Docs::write"]}
+        "c2", {"task": "T0006", "parts": ["Port the paper::again", "Docs::write"]}
     )
 
     assert refused.text.startswith("pursuit_plan: nothing added")
     assert "'Implement the clock core' has the title of T0003" in refused.text
     assert 'pursuit_step task="T0003"' in refused.text
     assert "nothing added" not in own_subtree.text
-    assert [call[1] for call in _pursuit_calls(fake_beagle, "split")] == ["Read the paper::again"]
+    assert [call[1] for call in _pursuit_calls(fake_beagle, "split")] == ["Port the paper::again"]
 
 
 @pytest.mark.anyio
@@ -7134,7 +7134,7 @@ async def test_plan_refuses_part_titled_as_the_split_task(
     nodes = [
         *_r25_nodes(),
         {"id": "T0011", "parent": "T0006", "title": "Sources", "status": "open"},
-        {"id": "T0012", "parent": "T0011", "title": "Read the paper", "status": "pending"},
+        {"id": "T0012", "parent": "T0011", "title": "Port the paper", "status": "pending"},
     ]
     (fake_beagle / "tree.out").write_text(json.dumps({"nodes": nodes}))
     runtime, _ = _bound(tmp_path)
@@ -7143,14 +7143,14 @@ async def test_plan_refuses_part_titled_as_the_split_task(
     own = await plan.execute("c1", {"task": "T0006", "parts": ["known  ANSWERS::x", "Docs::y"]})
     on_root = await plan.execute("c2", {"task": "T0001", "parts": ["goal::x", "Docs::y"]})
     descendant = await plan.execute(
-        "c3", {"task": "T0006", "parts": ["Read the paper::z", "Docs::y"]}
+        "c3", {"task": "T0006", "parts": ["Port the paper::z", "Docs::y"]}
     )
 
     assert own.text.startswith("pursuit_plan: nothing added")
     assert "has the title of T0006, the task being split" in own.text
     assert "has the title of T0001, the task being split" in on_root.text
     assert "nothing added" not in descendant.text
-    assert [call[1] for call in _pursuit_calls(fake_beagle, "split")] == ["Read the paper::z"]
+    assert [call[1] for call in _pursuit_calls(fake_beagle, "split")] == ["Port the paper::z"]
 
 
 def _r28_nodes() -> list[dict[str, Any]]:
@@ -15145,3 +15145,95 @@ def test_cases_on_disk_route_plan_never_repeats_task_title(tmp_path: Path) -> No
     parts = _offered_parts(text)
     assert module._live_title_clash("T0002", parts, nodes) is None
     assert parts[1].startswith("Clock, judged by the cases::")
+
+
+@pytest.mark.anyio
+async def test_open_refuses_doc_only_check_under_tests(
+    tmp_path: Path, beagle: Path, fake_beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # R29 class 2: T0006 opened on a grep over a digest under tests/, with no code in scope.
+    monkeypatch.chdir(_pursuit_project(tmp_path))
+    _ready_task(fake_beagle)
+    runtime, _ = _bound(tmp_path)
+    step = _tool(runtime, "pursuit_step")
+    call = {"task": "T0002", "criteria": "the digest is written"}
+
+    refused = await step.execute(
+        "c1", {**call, "done_when": "grep -q join tests/notes.md", "scope": ["tests/notes.md"]}
+    )
+
+    assert refused.text.startswith(
+        "pursuit_step: T0002 not opened — tests/notes.md is under tests/, so nothing can "
+        "witness it; fold reading the reference into the known-answers task, or abandon T0002"
+    )
+    assert 'abandon="' in refused.text
+    assert _pursuit_calls(fake_beagle, "open") == []
+    module = _module()
+    for check, scope in (
+        ("grep -q join tests/notes.md", ["tests/notes.md", "src/clock.py"]),
+        ("grep -q join tests/cases.json", ["tests/cases.json"]),
+        ("python3 -m pytest -q tests/test_notes.py", ["tests/notes.md"]),
+        ("grep -q join docs/notes.md", ["docs/notes.md"]),
+    ):
+        assert module._doc_only_check_problem(check, scope, "T0002", tmp_path) is None, check
+
+
+@pytest.mark.anyio
+async def test_plan_refuses_reading_only_part(
+    tmp_path: Path, beagle: Path, fake_beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # R29 class 2: 'Read both references: extract … into a short digest' became a task.
+    monkeypatch.chdir(_pursuit_project(tmp_path))
+    _ready_task(fake_beagle)
+    runtime, _ = _bound(tmp_path)
+    parts = [
+        "Read both references: extract the rules into a short digest for the worker",
+        "Join::implement join of two stamps",
+    ]
+
+    plan = await _tool(runtime, "pursuit_plan").execute("c1", {"task": "T0001", "parts": parts})
+
+    assert plan.text.startswith(
+        "pursuit_plan: nothing added — 'Read both references' only reads the reference"
+    )
+    assert "known-answers task" in plan.text
+    assert _pursuit_calls(fake_beagle, "split") == []
+    assert _pursuit_calls(fake_beagle, "add") == []
+    module = _module()
+    assert module._reading_only_part(["Join::implement join, after reading the paper"]) is None
+    assert module._reading_only_part(["Known answers::read the reference"]) is None
+
+
+@pytest.mark.anyio
+async def test_not_proven_without_module_offers_abandon(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # R29 class 2: E48 sent a scope of only a digest under tests/ to mutate a module.
+    monkeypatch.chdir(_git_project(tmp_path, monkeypatch))
+    monkeypatch.setenv("FAKE_TAU_REPORT", WITNESSED_REPORT)
+    _ready_task(fake_beagle)
+    (fake_beagle / "prove.out").write_text("T0002: NOT PROVEN — src/clock.py is not there\n")
+    (fake_beagle / "prove.rc").write_text("9")
+    runtime, _ = _bound(tmp_path)
+
+    result = await _tool(runtime, "pursuit_step").execute(
+        "c1",
+        {
+            "task": "T0002",
+            "criteria": "c",
+            "done_when": "grep -q done done.txt",
+            "scope": ["tests/notes.md"],
+        },
+    )
+
+    assert "no defect could be put back" in result.text, result.text
+    lead = "Next: nothing in this scope (tests/notes.md) is a module or cases data"
+    assert lead in result.text
+    assert 'pursuit_step task="T0002", abandon="' in result.text
+    assert "mutate the module" not in result.text
+    assert "new_route=true" not in result.text
+    assert _pursuit_calls(fake_beagle, "close") == []
