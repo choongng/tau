@@ -3134,6 +3134,17 @@ async def test_known_answers_close_locks_the_cases_test_beside_explicit_locks(
     assert not (store / "test_case_data.py").exists()
 
 
+def _store_lock(beagle: Path, rel: str, text: str) -> None:
+    """Lock `rel` as beagle does: its copy under `locked/` and a manifest entry."""
+    copy = beagle / "locked" / rel
+    copy.parent.mkdir(parents=True, exist_ok=True)
+    copy.write_text(text)
+    manifest_path = beagle / "locks.json"
+    manifest = json.loads(manifest_path.read_text()) if manifest_path.is_file() else {}
+    manifest[rel] = {"sha256": hashlib.sha256(text.encode()).hexdigest(), "commit": None}
+    manifest_path.write_text(json.dumps(manifest))
+
+
 def _r22_committed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, test: bool) -> Path:
     """R22 after T0002: cases.json locked, test_cases.py committed (if `test`) unlocked."""
     project = _git_project(tmp_path, monkeypatch)
@@ -3145,9 +3156,7 @@ def _r22_committed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, test: boo
         (project / "tests" / "test_cases.py").write_text(R22_CASES_TEST)
     _git(project, "add", "tests", "references")
     _git(project, "commit", "-q", "-m", "T0002: Known answers")
-    store = project / ".beagle" / "locked" / "tests"
-    store.mkdir(parents=True)
-    (store / "cases.json").write_text(R22_CASES)
+    _store_lock(project / ".beagle", "tests/cases.json", R22_CASES)
     return project
 
 
@@ -3279,15 +3288,18 @@ def test_locked_test_imports_skips_a_test_that_reads_no_locked_data(tmp_path: Pa
     # The store holds a cases file, so a locked test that never reads it is
     # judged by its own asserts and must not decide which module is tested.
     goal = tmp_path / ".beagle" / "pursuit.toml"
-    store = tmp_path / ".beagle" / "locked" / "tests"
-    store.mkdir(parents=True)
-    (store / "cases.json").write_text('[{"in": 1, "out": 2}]')
-    (store / "test_case_data.py").write_text(
+    beagle = tmp_path / ".beagle"
+    _store_lock(beagle, "tests/cases.json", '[{"in": 1, "out": 2}]')
+    _store_lock(
+        beagle,
+        "tests/test_case_data.py",
         "import json\n\nimport clocks\n\n\n"
-        "def test_cases():\n    assert json.load(open('tests/cases.json'))\n"
+        "def test_cases():\n    assert json.load(open('tests/cases.json'))\n",
     )
-    (store / "test_stamps.py").write_text(
-        "import stamps\n\n\ndef test_stamps():\n    assert stamps.ok()\n"
+    _store_lock(
+        beagle,
+        "tests/test_stamps.py",
+        "import stamps\n\n\ndef test_stamps():\n    assert stamps.ok()\n",
     )
 
     assert _module()._locked_test_imports(goal) == {"clocks": "tests/test_case_data.py"}
@@ -5270,9 +5282,7 @@ async def test_step_refuses_a_scope_mixing_known_answer_data_with_source(
     assert _runs(fake_tau) == []
 
     # Locked by an earlier task, the data is restored before every check.
-    store = project / ".beagle" / "locked" / "itc" / "tests"
-    store.mkdir(parents=True)
-    (store / "cases.json").write_text("[]")
+    _store_lock(project / ".beagle", "itc/tests/cases.json", "[]")
     passed = await _tool(runtime, "pursuit_step").execute("c2", arguments)
 
     # R20: a scope naming the locked data itself is refused for that instead.
@@ -5371,9 +5381,7 @@ async def test_step_refuses_directory_scopes_holding_unlocked_data_and_source(
     assert _pursuit_calls(fake_beagle, "open") == []
     assert _runs(fake_tau) == []
 
-    store = project / ".beagle" / "locked" / "tests"
-    store.mkdir(parents=True)
-    (store / "cases.json").write_text("[]")
+    _store_lock(project / ".beagle", "tests/cases.json", "[]")
     passed = await _tool(runtime, "pursuit_step").execute("c2", arguments)
 
     assert "known-answer data" not in passed.text
@@ -5389,12 +5397,12 @@ def _r12_project(tmp_path: Path, *, references: bool = True) -> Path:
 
 
 def _lock_cases_test(project: Path, imports: str) -> None:
-    store = project / ".beagle" / "locked" / "tests"
-    store.mkdir(parents=True)
-    (store / "cases.json").write_text("[]")
-    (store / "test_cases.py").write_text(
+    _store_lock(project / ".beagle", "tests/cases.json", "[]")
+    _store_lock(
+        project / ".beagle",
+        "tests/test_cases.py",
         f"import json\n\nimport pytest\n\n{imports}\n\n"
-        "CASES = json.load(open('tests/cases.json'))\n"
+        "CASES = json.load(open('tests/cases.json'))\n",
     )
 
 
@@ -9793,19 +9801,86 @@ def test_restore_locked_undoes_a_change_made_to_the_store_as_well(tmp_path: Path
     assert module._restore_locked(goal, project) == []
 
 
-def test_restore_locked_without_a_manifest_entry_compares_with_the_store(
-    tmp_path: Path,
-) -> None:
-    # A pursuit locked before the manifest existed keeps working.
+def test_locked_ignores_files_not_in_the_manifest(tmp_path: Path) -> None:
+    # R22: `cp tests/test_cases.py .beagle/locked/tests/` locked a file by hand,
+    # and the forged copy then put back a worker's change to it.
     module = _module()
     project, goal = _locked_repo(tmp_path)
     module._lock(goal, project, ["tests/test_cases.py"])
+    forged = project / ".beagle" / "locked" / "tests" / "forged.py"
+    forged.write_text("x = 1\n")
+    (project / "tests" / "forged.py").write_text("x = 2\n")
+
+    assert module._locked(goal) == ["tests/test_cases.py"]
+    assert module._restore_locked(goal, project) == []
+    assert (project / "tests" / "forged.py").read_text() == "x = 2\n"
+
+    # Without the manifest, a copy in the store locks nothing.
     (project / ".beagle" / module.LOCK_MANIFEST).unlink()
-
     (project / "tests" / "test_cases.py").write_bytes(R14_FORMATTED_TEST)
+    assert module._locked(goal) == []
+    assert module._restore_locked(goal, project) == []
+    assert (project / "tests" / "test_cases.py").read_bytes() == R14_FORMATTED_TEST
 
-    assert module._restore_locked(goal, project) == ["tests/test_cases.py"]
-    assert (project / "tests" / "test_cases.py").read_bytes() == R14_LOCKED_TEST
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "BEAGLE_TAU_DRIVER_EDITS=1 bash -c 'echo x > src/app.py'",
+        "X=1 Y=2 sh -c 'cp /tmp/a src/app.py'",
+        "env X=1 bash -c 'echo x > src/app.py'",
+        "nohup bash -c 'echo x > src/app.py'",
+        "timeout 60 bash -c 'echo x > src/app.py'",
+        "env -u HOME timeout -s KILL 5 bash -c 'echo x > src/app.py'",
+        "nice -n 5 bash -c 'echo x > src/app.py'",
+    ],
+)
+@pytest.mark.anyio
+async def test_driver_guard_reads_bash_c_behind_env_assignments(
+    tmp_path: Path, beagle: Path, monkeypatch: pytest.MonkeyPatch, command: str
+) -> None:
+    # R22: `BEAGLE_TAU_DRIVER_EDITS=1 bash -c '...'` wrote cobs.py 8 times:
+    # the guard took the assignment for the command and never read the script.
+    project = _pursuit_project(tmp_path)
+    monkeypatch.chdir(project)
+    assert _module()._bash_write_targets(command, project) == [project / "src" / "app.py"]
+    runtime, _ = _bound(tmp_path)
+    bash = _tool_with_hooks(runtime, "bash")
+    await runtime.emit_session_start("startup")
+
+    refused = await bash.execute("c1", {"command": command})
+    allowed = await bash.execute("c2", {"command": "X=1 timeout 60 bash -c 'uv run pytest -q'"})
+
+    assert "refusing to change src/app.py from the driving session" in refused.text
+    assert allowed.text == "ran"
+
+
+@pytest.mark.anyio
+async def test_driver_refusals_do_not_name_the_override_env(
+    tmp_path: Path, beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # R22: every driver refusal ended "they set BEAGLE_TAU_DRIVER_EDITS=1",
+    # and the driver put that in front of its next command.
+    project = _pursuit_project(tmp_path)
+    monkeypatch.chdir(project)
+    runtime, _ = _bound(tmp_path)
+    bash, read = _tool_with_hooks(runtime, "bash"), _tool_with_hooks(runtime, "read")
+    write = _tool_with_hooks(runtime, "write")
+    await runtime.emit_session_start("startup")
+
+    refused = [
+        await write.execute("c1", {"path": "src/app.py", "content": "x"}),
+        await bash.execute("c2", {"command": "echo x > src/app.py"}),
+        await bash.execute("c3", {"command": "beagle pursuit next"}),
+        await read.execute("c4", {"path": str(tmp_path / "refs" / "itc.pdf")}),
+    ]
+
+    for result in refused:
+        assert "refusing" in result.text, result.text
+        assert "BEAGLE_TAU_DRIVER_EDITS" not in result.text
+        assert "DRIVER_EDITS" not in result.text
+    monkeypatch.setenv("BEAGLE_TAU_DRIVER_EDITS", "1")
+    assert (await write.execute("c5", {"path": "src/app.py", "content": "x"})).text == "ran"
 
 
 def test_lock_before_a_commit_fills_in_the_commit_once_one_holds_it(tmp_path: Path) -> None:

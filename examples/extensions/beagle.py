@@ -612,7 +612,14 @@ def _own_scope(pid: int) -> Path | None:
 _WRITE_TOKEN = re.compile(r"(>>|>|tee\b|\bsed\b|\btruncate\b|\bdd\b|\binstall\b)")
 _HEREDOC = re.compile(r"(?<!<)<<(-?)\s*(['\"]?)([A-Za-z_][\w.-]*)\2")
 #: Words that run the command after them: skipped to find the real one.
-_WRAPPERS = frozenset({"sudo", "env", "command", "nice", "nohup", "time", "exec", "builtin"})
+_WRAPPERS = frozenset(
+    {"sudo", "env", "command", "nice", "nohup", "time", "exec", "builtin", "timeout"}
+)
+#: Wrapper options that take the next word as their value.
+_WRAPPER_VALUE_OPTIONS = frozenset(
+    {"-n", "--adjustment", "-u", "--unset", "-C", "--chdir", "-s", "--signal", "-k"}
+    | {"--kill-after", "-g", "--group", "-U", "--user"}
+)
 _SHELLS = frozenset({"sh", "bash", "zsh", "dash"})
 _GLOB_CHARS = frozenset("*?[")
 
@@ -739,12 +746,26 @@ _UV_VALUE_OPTIONS = frozenset(
 )
 
 
+def _unwrapped(argv: list[str]) -> list[str]:
+    """`argv` without its leading `NAME=value` words and `_WRAPPERS`.
+
+    A wrapper's own options go with it, and `timeout` its duration, so
+    `X=1 env -u Y timeout 5 bash -c '...'` is read from `bash`.
+    """
+    while argv and ("=" in argv[0] and not argv[0].startswith("=") or argv[0] in _WRAPPERS):
+        wrapper, argv = argv[0], argv[1:]
+        while argv and argv[0].startswith("-") and argv[0] != "-":
+            option, argv = argv[0], argv[1:]
+            if option in _WRAPPER_VALUE_OPTIONS and argv:
+                argv = argv[1:]
+        if wrapper == "timeout" and argv:
+            argv = argv[1:]
+    return argv
+
+
 def _command_targets(argv: list[str], cwd: Path) -> list[str] | None:
     """The paths one simple command (argv, redirects removed) writes."""
-    while argv and ("=" in argv[0] and not argv[0].startswith("=") or argv[0] in _WRAPPERS):
-        argv = argv[1:]
-        while argv and argv[0].startswith("-"):  # a wrapper's own options
-            argv = argv[1:]
+    argv = _unwrapped(argv)
     if not argv:
         return []
     name, args = Path(argv[0]).name, argv[1:]
@@ -859,6 +880,8 @@ def _bash_write_targets(command: str, cwd: Path) -> list[Path] | None:
             i += 1
             continue
         # A separator: the simple command before it is complete.
+        # Run R22: `BEAGLE_TAU_DRIVER_EDITS=1 bash -c '...'` hid its script.
+        segment = _unwrapped(segment)
         if segment and segment[0] == "cd":
             here = _cd_into(segment, here)
         elif segment and Path(segment[0]).name in _SHELLS and "-c" in segment[1:]:
@@ -6156,11 +6179,15 @@ LOCK_MANIFEST = "locks.json"
 
 
 def _locked(goal: Path) -> list[str]:
-    """The project paths locked so far, as their known copies name them."""
+    """The project paths locked so far: in the lock manifest, with a known copy.
+
+    Run R22: a copy put into the store by hand locked a file nothing had locked;
+    only beagle writes the manifest, so a copy it does not name is not a lock.
+    """
     store = goal.parent / LOCKED_DIR
     try:
-        return sorted(str(f.relative_to(store)) for f in store.rglob("*") if f.is_file())
-    except OSError:
+        return sorted(rel for rel in _lock_manifest(goal) if (store / rel).is_file())
+    except (OSError, ValueError):
         return []
 
 
@@ -6292,8 +6319,7 @@ def _restore_locked(goal: Path, root: Path, spare: Collection[str] = ()) -> list
 
     A path in the lock manifest is held to its recorded sha256 and restored
     from its lock commit, the store copy rewritten with it: a tool run over
-    the whole tree changes the store too. A path the manifest lacks (locked
-    before it existed) is compared with its store copy, as before.
+    the whole tree changes the store too.
     """
     store = goal.parent / LOCKED_DIR
     manifest = _lock_manifest(goal)
@@ -6303,23 +6329,20 @@ def _restore_locked(goal: Path, root: Path, spare: Collection[str] = ()) -> list
         if rel in spare:
             continue
         target = root / rel
-        entry = manifest.get(rel)
+        entry = manifest[rel]
         try:
             current = target.read_bytes() if target.is_file() else None
-            if entry is None:
-                known = (store / rel).read_bytes()
-            else:
-                known = _locked_bytes(root, store, rel, entry)
-                if known is None:
-                    continue  # neither the commit nor the store holds it any more
-                if not entry.get("commit"):
-                    commit = _head_holding(root, rel, known)
-                    if commit is not None:
-                        entry["commit"] = commit
-                        changed_manifest = True
-                copy = store / rel
-                if not copy.is_file() or copy.read_bytes() != known:
-                    copy.write_bytes(known)
+            known = _locked_bytes(root, store, rel, entry)
+            if known is None:
+                continue  # neither the commit nor the store holds it any more
+            if not entry.get("commit"):
+                commit = _head_holding(root, rel, known)
+                if commit is not None:
+                    entry["commit"] = commit
+                    changed_manifest = True
+            copy = store / rel
+            if not copy.is_file() or copy.read_bytes() != known:
+                copy.write_bytes(known)
             if current == known:
                 continue
             target.parent.mkdir(parents=True, exist_ok=True)
@@ -8576,8 +8599,7 @@ def make_driver_edit_guard() -> Any:
                 "meant to change in its notes; a sub-agent does it and the task's check "
                 "decides. For work no task covers (a failing gate, a lint fix), add a task "
                 "with pursuit_plan. Reading and running (tests, `ruff check` without "
-                "`--fix`, `git status`) is fine. (If the user wants this session to edit, they set "
-                f"{DRIVER_EDITS_ENV}=1.)"
+                "`--fix`, `git status`) is fine."
             ),
         )
 
@@ -8642,10 +8664,8 @@ def _bash_find(command: str, match: Callable[[list[str]], str | None]) -> str | 
         if not _is_operator(token):
             segment.append(token)
             continue
-        argv = segment
+        argv = _unwrapped(segment)
         segment = []
-        while argv and ("=" in argv[0] and not argv[0].startswith("=") or argv[0] in _WRAPPERS):
-            argv = argv[1:]
         if not argv:
             continue
         if Path(argv[0]).name in _SHELLS and "-c" in argv[1:]:
@@ -9457,9 +9477,7 @@ def make_driver_pursuit_guard() -> Any:
             block=True,
             reason=(
                 f"refusing `beagle pursuit {verb}` from bash: use {_STEERED_VERBS[verb]}. "
-                "The tool runs it with the checks around it that the bare verb skips. "
-                f"(If the user wants this session to run it by hand, they set "
-                f"{DRIVER_EDITS_ENV}=1.)"
+                "The tool runs it with the checks around it that the bare verb skips."
             ),
         )
 
@@ -9608,8 +9626,7 @@ def make_driver_reference_guard() -> Any:
                 f"refusing to {what} from the driving session: references are read by the "
                 "worker that a pursuit_step dispatches. Call pursuit_step, naming in its "
                 "notes the reference the task needs (its URL or path); the sub-agent reads "
-                f"it. Files inside the project, {REFERENCES_DIR}/ aside, are yours to read. "
-                f"(If the user wants this session to read it, they set {DRIVER_EDITS_ENV}=1.)"
+                f"it. Files inside the project, {REFERENCES_DIR}/ aside, are yours to read."
             ),
         )
 
