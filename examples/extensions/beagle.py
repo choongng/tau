@@ -8903,9 +8903,14 @@ _NOT_DONE_SCOPE: dict[tuple[str, str], tuple[str, ...]] = {}
 #: Why the last close whose check passed kept the task open, by (project root,
 #: task). Run R32: the rerun's worker never heard what the close refused.
 _NOT_DONE_DEMAND: dict[tuple[str, str], str] = {}
+#: Tasks a not-done step left with their check failing, by (project root, task).
+_NOT_DONE_CHECK_FAILED: set[tuple[str, str]] = set()
 
 #: Not-done results after which a further step on the task dispatches no worker.
 ESCALATE_AFTER = 3
+#: Not-done results after which an escalation no longer offers a notes-only rerun
+#: of a task only the close's own judge kept open.
+JUDGE_NOTES_UNTIL = 2 * ESCALATE_AFTER
 # The breaker quotes a refused result's first line up to 300 characters
 # (REPEATED_CALL_QUOTE in tau core); an escalation's call must fit in it.
 ESCALATION_HEAD_CHARS = 290
@@ -9672,6 +9677,9 @@ def _escalation(
         return _escalation_options(
             task, count, f"pursuit_step: {task} not run: {count} steps on it have left it not done."
         )
+    demand = _judge_kept_open(task, root)
+    if demand:
+        return _judge_escalation(task, count, demand)
     lacks = _escalation_lacks(task, arguments, record, root, data_test_passes, bound_fails)
     # Run R16 E34 dropped the done_when line, and the driver resent without it.
     call = _working_call(task, arguments, record, root, data_test_passes, bound_fails)
@@ -9693,17 +9701,97 @@ def _escalation(
     return _escalation_options(task, count, head)
 
 
-def _escalation_options(task: str, count: int, head: str) -> str:
-    """An escalation's `head`, then the options a task left not done has."""
+def _escalation_options(task: str, count: int, head: str, rerun: str | None = None) -> str:
+    """An escalation's `head`, then the options a task left not done has.
+
+    `rerun`, given for a task only the close's own judge kept open, stands in for
+    the new route with a rewritten done_when; "" offers neither.
+    """
+    if rerun is None:
+        rerun = (
+            f'- pursuit_step task="{task}", new_route=true, with a rewritten done_when and '
+            "notes saying what the new route does differently (the criteria stay);\n"
+        )
+        why = (
+            "another sub-agent on it, however its scope or notes are put, would only add "
+            "one more"
+        )
+    else:
+        why = "its check passes each time, and only the close keeps it open"
     return (
-        f"{head}\n{task} has had {count} steps without a pass, and another sub-agent on "
-        "it, however its scope or notes are put, would only add one more. Choose one:\n"
+        f"{head}\n{task} has had {count} steps without a pass, and {why}. Choose one:\n"
         f'- pursuit_plan task="{task}" with two or more parts, to split it into smaller '
         "tasks (a plan of one part is refused: the task is already one step);\n"
-        f'- pursuit_step task="{task}", new_route=true, with a rewritten done_when and '
-        "notes saying what the new route does differently (the criteria stay);\n"
+        f"{rerun}"
         "- stop, and tell the user what blocks it."
     )
+
+
+def _judge_kept_open(task: str, root: Path | None) -> str:
+    """The close judge's reason, when every not-done step on `task` passed its check
+    and only that judge kept the task open; else ""."""
+    if root is None:
+        return ""
+    key = (str(root), task)
+    if key in _NOT_DONE_CHECK_FAILED or _LAST_CHECK_EXIT.get(key, 0) != 0:
+        return ""
+    return _NOT_DONE_DEMAND.get(key, "")
+
+
+def _notes_only_call(task: str, notes: str) -> str:
+    """The rerun of `task` with the bound check kept and `notes` saying what to fix."""
+    return f"pursuit_step task={json.dumps(task)}, notes={json.dumps(notes, ensure_ascii=False)}"
+
+
+def _judge_escalation(task: str, count: int, demand: str) -> str:
+    """The escalation of a task only the close's own judge kept open.
+
+    Run R33 #13-#24: every not-done step had passed its check, yet the escalation
+    asked for a new done_when, which the data-route rewrite put back to the bound
+    one; no call passed both, and the driver resent one call 12 times.
+    """
+    reason = demand.rstrip(".")
+    said = (
+        f"\n{count} steps on it have left it not done, each with its check passing: the "
+        f"close kept it open because {reason}. A new done_when would not change that, so "
+        "keep the bound one (leave done_when and new_route out)."
+    )
+    if count >= JUDGE_NOTES_UNTIL:
+        head = f"pursuit_step: {task} not run — split it or stop.{said}"
+        return _escalation_options(task, count, head, rerun="")
+    call = _notes_only_call(task, reason)
+    lead = f"pursuit_step: {task} not run — call instead: "
+    short = call
+    if len(lead) + len(short) > ESCALATION_HEAD_CHARS:
+        short = _notes_only_call(task, "…")
+    head = f"{lead}{short}{said}\nThe call that works, whole: {call}"
+    rerun = f"- {call}, a sub-agent at what the close refused, with the bound check kept;\n"
+    return _escalation_options(task, count, head, rerun=rerun)
+
+
+def _judge_notes_rerun(
+    task: str, arguments: Mapping[str, Any], record: Mapping[str, Any], root: Path
+) -> bool:
+    """Whether a step on an escalated task is the notes-only rerun `_judge_escalation`
+    offers: notes given, no new route, and the bound check kept or put back."""
+    if not _judge_kept_open(task, root) or _NOT_DONE.get((str(root), task), 0) >= JUDGE_NOTES_UNTIL:
+        return False
+    if arguments.get("new_route") is True or not str(arguments.get("notes") or "").strip():
+        return False
+    return _kept_bound(arguments, record, root)
+
+
+def _kept_bound(arguments: Mapping[str, Any], record: Mapping[str, Any], root: Path | None) -> bool:
+    """Whether the call's done_when is absent, the bound check, or one
+    `_kept_data_check` puts back to the bound check."""
+    done_when = " ".join(str(arguments.get("done_when") or "").split())
+    bound = " ".join(str(record.get("done_when") or "").split())
+    if done_when in ("", bound):
+        return True
+    if root is None:
+        return False
+    scope = _strings(arguments.get("scope")) or _strings(record.get("scope"))
+    return _kept_data_check(done_when, scope, bound, root) is not None
 
 
 def _escalation_lacks(
@@ -9729,8 +9817,11 @@ def _escalation_lacks(
             f"Its criteria differ from {task}'s: leave criteria out, since a new route "
             "keeps them."
         )
-    done_when = " ".join(str(arguments.get("done_when") or "").split())
     bound_check = " ".join(str(record.get("done_when") or "").split())
+    done_when = " ".join(str(arguments.get("done_when") or "").split())
+    if done_when and _kept_bound(arguments, record, root):
+        # Run R33 #12: `_kept_data_check` puts such a done_when back to the bound one.
+        done_when = bound_check
     scope = _strings(arguments.get("scope")) or _strings(record.get("scope"))
     unproven = _unproven_data_route(task, bound_check, scope, root)
     if unproven is not None:
@@ -9784,8 +9875,11 @@ def _working_call(
     """
     record = record or {}
     record_scope = _strings(record.get("scope"))
-    done_when = " ".join(str(arguments.get("done_when") or "").split())
     bound_check = " ".join(str(record.get("done_when") or "").split())
+    done_when = " ".join(str(arguments.get("done_when") or "").split())
+    if done_when and _kept_bound(arguments, record, root):
+        # Run R33 #12: `_kept_data_check` puts such a done_when back to the bound one.
+        done_when = bound_check
     scope = _strings(arguments.get("scope")) or _strings(record.get("scope"))
     unproven = _unproven_data_route(task, bound_check, scope, root)
     route = (
@@ -9941,6 +10035,7 @@ def _forget_task(root: Path, task: str) -> None:
     _NOT_DONE.pop(key, None)
     _NOT_DONE_SCOPE.pop(key, None)
     _NOT_DONE_DEMAND.pop(key, None)
+    _NOT_DONE_CHECK_FAILED.discard(key)
 
 
 def _killed_attempt_context(
@@ -9991,6 +10086,8 @@ def _not_done(
         _NOT_DONE_DEMAND[key] = demand
     elif ran:
         _NOT_DONE_DEMAND.pop(key, None)
+        if _LAST_CHECK_EXIT.get(key, 0) != 0:
+            _NOT_DONE_CHECK_FAILED.add(key)
     if count >= ESCALATE_AFTER:
         text += "\n\n" + _escalation(task, count).replace(
             f"pursuit_step: {task} not run: ", "The next step on it runs no sub-agent: ", 1
@@ -10486,7 +10583,11 @@ def make_step_tool() -> Any:
                 if not isinstance(record, dict):
                     return _step_result(f"pursuit_step: cannot read {task} (exit {rc}):\n{out}")
         tried = _NOT_DONE.get((str(root), task), 0)
-        if not route and tried >= ESCALATE_AFTER:
+        if (
+            not route
+            and tried >= ESCALATE_AFTER
+            and not _judge_notes_rerun(task, arguments, record, root)
+        ):
             return _step_result(
                 _escalation(
                     task,

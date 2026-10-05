@@ -16133,3 +16133,106 @@ def test_known_answers_brief_states_cases_test_must_load_data(tmp_path: Path) ->
     note = module._known_answers_note(R28_FIX_CHECK, R28_FIX_SCOPE, on_disk)
     assert note.startswith("tests/test_cases.py is the check")
     assert required in note
+
+
+def _judge_only_escalated(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, check_failed: bool = False
+) -> tuple[Any, Path, dict[str, Any], str]:
+    """R33 T0006: three not-done steps whose check passed and the close judge kept open."""
+    project = _git_project(tmp_path, monkeypatch)
+    data_check = _r32_tree(project)
+    module = _module()
+    key = (str(project), "T0006")
+    for n in range(ESCALATE_STEPS):
+        module._LAST_CHECK_EXIT[key] = 1 if check_failed and n == 0 else 0
+        text = "T0006 — Cases: the check still fails" if check_failed and n == 0 else R32_STAYS_OPEN
+        module._not_done(project, "T0006", R32_SCOPE, text)
+    record = {"id": "T0006", "status": "open", "criteria": "c", "done_when": data_check}
+    return module, project, record | {"scope": R32_SCOPE}, data_check
+
+
+ESCALATE_STEPS = 3
+
+
+def test_escalation_after_judge_only_stays_open_offers_notes_only_call(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # R33 E26, E34, E36: every not-done step passed its check, and the escalation
+    # still asked for a new done_when.
+    module, project, record, _ = _judge_only_escalated(tmp_path, monkeypatch)
+    call = {"task": "T0006", "new_route": True, "scope": R32_SCOPE, "notes": "retry"}
+
+    text = module._escalation("T0006", 3, call, record, project, False, False)
+
+    notes_call = f'pursuit_step task="T0006", notes={json.dumps(R32_DEMAND)}'
+    assert text.splitlines()[0] == f"pursuit_step: T0006 not run — call instead: {notes_call}"
+    assert f"- {notes_call}," in text
+    assert "Its done_when is the bound one" not in text
+    assert "Add to it: done_when" not in text and "rewritten done_when" not in text
+    assert "done_when=" not in text and "new_route=true" not in text
+    assert text.index("Choose one:") > text.index(notes_call)
+    # The offered call is taken, not refused by the escalation again.
+    taken = {"task": "T0006", "notes": R32_DEMAND}
+    assert module._judge_notes_rerun("T0006", taken, record, project)
+    assert not module._judge_notes_rerun("T0006", {**taken, "new_route": True}, record, project)
+    # Once its check failed, a step was not the judge's alone: the new route stays.
+    failed, f_project, f_record, _ = _judge_only_escalated(
+        tmp_path / "failed", monkeypatch, check_failed=True
+    )
+    assert failed._judge_kept_open("T0006", f_project) == ""
+    other = failed._escalation("T0006", 3, call, f_record, f_project, False, False)
+    assert "rewritten done_when" in other
+    assert not failed._judge_notes_rerun("T0006", taken, f_record, f_project)
+
+
+def test_escalation_does_not_offer_check_rewritten_to_bound(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # R33 #12 (E28): the only other check in scope, data + cases, was put back to
+    # the bound data test by `_kept_data_check`.
+    module, project, record, data_check = _judge_only_escalated(tmp_path, monkeypatch)
+    assert module._kept_data_check(R16_CHECK, R32_SCOPE, data_check, project) is not None
+    rewritten = {"task": "T0006", "done_when": R16_CHECK, "scope": R32_SCOPE, "notes": "x"}
+
+    for call in (rewritten, {**rewritten, "new_route": True}):
+        text = module._escalation("T0006", 3, call, record, project, False, False)
+        assert R16_CHECK not in text and "done_when" not in text.splitlines()[0]
+        assert "Its done_when is the bound one" not in text
+    assert module._judge_notes_rerun("T0006", rewritten, record, project)
+    # Past JUDGE_NOTES_UNTIL steps, neither a rerun nor a new done_when is offered.
+    late = module._escalation(
+        "T0006", module.JUDGE_NOTES_UNTIL, rewritten, record, project, False, False
+    )
+    assert late.startswith("pursuit_step: T0006 not run — split it or stop.")
+    assert "rewritten done_when" not in late and "Add to it" not in late
+    assert 'pursuit_step task="T0006"' not in late
+    # Without a judge-only close, such a done_when is taken as the bound one, and
+    # the working call does not offer it either.
+    module._NOT_DONE_DEMAND.clear()
+    plain = module._working_call("T0006", rewritten, record, project)
+    assert R16_CHECK not in plain
+
+
+def test_repeated_escalation_refusal_names_notes_only_call(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # R33 #13-#24: the driver resent one refused call 12 times, and the breaker
+    # quoted a head that asked for a done_when no guard would take.
+    module, project, record, _ = _judge_only_escalated(tmp_path, monkeypatch)
+    refused = {"task": "T0006", "new_route": True, "scope": R32_SCOPE, "notes": "again"}
+
+    first = module._escalation("T0006", 3, refused, record, project, False, False)
+    again = module._escalation("T0006", 4, refused, record, project, False, False)
+
+    for text in (first, again):
+        head = _quoted_head(text)
+        assert head.startswith(
+            'pursuit_step: T0006 not run — call instead: pursuit_step task="T0006", notes='
+        )
+        assert "done_when" not in head
+    long = "the sub-agent must " + "load every case and compare it " * 20
+    module._NOT_DONE_DEMAND[(str(project), "T0006")] = long
+    elided = module._escalation("T0006", 3, refused, record, project, False, False)
+    assert _quoted_head(elided) == elided.splitlines()[0]
+    assert _quoted_head(elided).endswith('notes="…"')
+    assert json.dumps(long) in elided
