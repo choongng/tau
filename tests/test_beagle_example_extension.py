@@ -12455,6 +12455,56 @@ async def test_cases_first_names_cases_already_on_disk_instead_of_a_new_split(
     assert _pursuit_calls(fake_beagle, "open") == [] and _runs(fake_tau) == []
 
 
+@pytest.mark.anyio
+async def test_cases_first_names_the_live_task_holding_the_data_file(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # R24 class 5: the lookup skipped containers, so each new_route split off a
+    # fresh "Known answers" task (T0002 -> T0013 -> T0019) over the same files.
+    project = _git_project(tmp_path, monkeypatch)
+    (project / "references").mkdir()
+    (project / "references" / "itc2008.txt").write_text("Interval Tree Clocks\n")
+    (project / "tests").mkdir()
+    (project / "tests" / "cases.json").write_text("[]")
+    (project / "tests" / "test_case_data.py").write_text("def test_data():\n    pass\n")
+    _r16_t0006_ready(fake_beagle)
+    code = {"id": "T0006", "parent": "T0001", "status": "pending", "title": "Create"}
+    holder = {"id": "T0002", "scope": ["tests/cases.json", "tests/test_case_data.py"]}
+    (fake_beagle / "show-T0002.out").write_text(json.dumps(holder))
+    runtime, _ = _bound(tmp_path)
+    step = _tool(runtime, "pursuit_step")
+
+    leaf_tree = [
+        {"id": "T0001", "parent": "", "status": "open", "container": True},
+        {"id": "T0002", "parent": "T0001", "status": "pending", "title": "Fixtures"},
+        code,
+    ]
+    (fake_beagle / "tree.out").write_text(json.dumps({"nodes": leaf_tree}))
+    leaf = await step.execute("c1", R16_T0006_STEP)
+
+    split_tree = [
+        {"id": "T0001", "parent": "", "status": "open", "container": True},
+        {"id": "T0002", "parent": "T0001", "status": "pending", "container": True},
+        {"id": "T0013", "parent": "T0002", "status": "abandoned", "title": "Fixtures"},
+        {"id": "T0015", "parent": "T0002", "status": "pending", "title": "Fixtures again"},
+        code,
+    ]
+    (fake_beagle / "tree.out").write_text(json.dumps({"nodes": split_tree}))
+    nested = await step.execute("c2", R16_T0006_STEP)
+
+    for result, named in ((leaf, "T0002"), (nested, "T0015")):
+        assert "T0006 not opened" in result.text and "Cases first" in result.text
+        assert f"{named} holds them: do not split T0006" in result.text
+        assert f'pursuit_step task="{named}"' in result.text
+        assert "pursuit_plan" not in result.text and "No task holds them" not in result.text
+    assert 'pursuit_step task="T0002"' not in nested.text
+    assert _pursuit_calls(fake_beagle, "open") == [] and _runs(fake_tau) == []
+
+
 #: R21: T0005 writes the data, T0006 (waiting on it) writes the data test.
 R21_SPLIT_TREE = [
     {"id": "T0001", "status": "open", "title": "Goal", "container": True},

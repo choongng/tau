@@ -4932,6 +4932,56 @@ def _committed_cases_tests(
     return found
 
 
+def _live_data_holder(
+    task: str, nodes: list[dict[str, Any]], data: list[str], goal: Path
+) -> str:
+    """The live leaf to work for `data`: the first open or pending task whose scope
+    or pending locks name a `data` file, or the first live leaf under it when it is
+    a container; "" when no live task holds the data.
+
+    Run R24: the lookup skipped containers, so each new_route split off a fresh
+    known-answers task (T0002, T0013, T0019) over files T0002 already held.
+    """
+    live = ("open", "pending")
+    wanted = {os.path.normpath(rel) for rel in data}
+    root = goal.parent.parent
+
+    def holds(node: dict[str, Any]) -> bool:
+        held = _strings(_shown(str(node.get("id")), root).get("scope"))
+        held += _pending_locks(goal, str(node.get("id")))
+        return any(os.path.normpath(entry.strip()) in wanted for entry in held)
+
+    containers = {str(n.get("id")) for n in nodes if n.get("container")}
+
+    def leaf(node_id: str, seen: set[str]) -> str:
+        parts = [
+            n
+            for n in nodes
+            if str(n.get("parent") or "") == node_id and n.get("status") in live
+        ]
+        if not parts:
+            return "" if node_id in containers else node_id
+        for part in parts:
+            part_id = str(part.get("id"))
+            if part_id in seen:
+                continue
+            found = leaf(part_id, seen | {part_id})
+            if found and found != task:
+                return found
+        return ""
+
+    holders = [n for n in nodes if str(n.get("id")) != task and n.get("status") in live]
+    # A leaf that names the data outranks a container whose scope is wider.
+    holders.sort(key=lambda n: bool(n.get("container")))
+    for node in holders:
+        if holds(node):
+            node_id = str(node.get("id"))
+            found = leaf(node_id, {node_id})
+            if found and found != task:
+                return found
+    return ""
+
+
 def _cases_first_problem(
     scope: list[str],
     task: str,
@@ -5034,7 +5084,8 @@ def _cases_first_problem(
             f"cases are locked, its test importing {named} by name."
         )
     if on_disk:
-        existing = next(
+        data = [rel for rel in on_disk if _is_cases_data(rel)] or on_disk
+        existing = _live_data_holder(task, nodes or [], data, goal) or next(
             (
                 str(n.get("id"))
                 for n in nodes or []
@@ -5046,6 +5097,14 @@ def _cases_first_problem(
             "",
         )
         return _cases_on_disk_route(task, title, named, unjudged_text, on_disk, existing, "")
+    holder = _live_data_holder(task, nodes or [], ["tests/cases.json"], goal)
+    if holder:
+        return (
+            f"Cases first: {unjudged_text} {holder} holds tests/cases.json already: do not "
+            f"split {task}. Work {holder} first, {_CASES_FIRST_WORK}: "
+            f'pursuit_step task="{holder}". {task} opens once its cases are locked, its '
+            f"test importing {named} by name."
+        )
     label = title.replace("::", ":").replace('"', "'").strip() or task
     return (
         "Cases first: open the known-answers milestone before the code; its test imports "
