@@ -1420,6 +1420,9 @@ if attempt >= int(os.environ.get("FAKE_TAU_HANGS_ON") or 99):
     for _ in range(int(os.environ.get("FAKE_TAU_LENGTH_STOPS", "0"))):
         cut = {"role": "assistant", "content": [], "stopReason": "length"}
         print(json.dumps({"type": "message_end", "message": cut}), flush=True)
+        if os.environ.get("FAKE_TAU_SPACED"):  # R33: a normal turn after each cut-off
+            turn = {"role": "assistant", "content": [], "stopReason": "toolUse"}
+            print(json.dumps({"type": "message_end", "message": turn}), flush=True)
     for _ in range(int(os.environ.get("FAKE_TAU_CUT_OFFS", "0"))):
         # R27: the provider reports a call cut off at the output limit as "toolUse".
         call = {"role": "assistant", "content": [], "stopReason": "toolUse"}
@@ -8810,6 +8813,7 @@ async def _hung_second_worker(
     monkeypatch: pytest.MonkeyPatch,
     length_stops: int,
     cut_offs: int = 0,
+    timeout: int = 3,
 ) -> str:
     project = _git_project(tmp_path, monkeypatch)
     monkeypatch.chdir(project)
@@ -8828,7 +8832,7 @@ async def _hung_second_worker(
             "criteria": "c",
             "done_when": "grep -q done done.txt",
             "scope": ["done.txt", "tests/test_x.py"],
-            "timeout": 3,
+            "timeout": timeout,
         },
     )
     return str(result.text)
@@ -8863,9 +8867,10 @@ async def test_worker_timeout_names_output_limit_turns_not_the_env_var(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     # Run R15: W6 spent four turns at the 8192-token output limit, not its turn cap.
-    text = await _hung_second_worker(tmp_path, fake_beagle, monkeypatch, 4)
+    # Run R33: a second cut-off now ends the worker, so the wall sees one.
+    text = await _hung_second_worker(tmp_path, fake_beagle, monkeypatch, 1)
 
-    assert "its last 4 turn(s) ended at the output limit" in text
+    assert "its last 1 turn(s) ended at the output limit" in text
     assert _module().WORKER_MAX_TURNS_ENV not in text and "turn cap" not in text
 
 
@@ -8879,10 +8884,39 @@ async def test_timeout_after_cutoffs_names_output_limit(
 ) -> None:
     # Run R27: W2's four cut-off calls came back as stopReason "toolUse", and the
     # timeout blamed the turn cap.
-    text = await _hung_second_worker(tmp_path, fake_beagle, monkeypatch, 0, cut_offs=4)
+    text = await _hung_second_worker(tmp_path, fake_beagle, monkeypatch, 0, cut_offs=1)
 
-    assert "its last 4 turn(s) ended at the output limit" in text
+    assert "its last 1 turn(s) ended at the output limit" in text
     assert _module().WORKER_MAX_TURNS_ENV not in text and "turn cap" not in text
+
+
+@pytest.mark.anyio
+async def test_worker_ended_on_second_output_cap_cutoff_over_run(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Run R33: W2 was cut off three times, each followed by a normal turn, and
+    # ran to the 900 s wall.
+    monkeypatch.setenv("FAKE_TAU_SPACED", "1")
+    text = await _hung_second_worker(tmp_path, fake_beagle, monkeypatch, 2, timeout=30)
+
+    assert "wall-clock" not in text
+    assert "the sub-agent was ended: cut off twice at the output limit" in text
+    assert "Split the task or have the notes say to write in parts." in text
+    assert "`grep -q done done.txt` exit 2" in text
+
+
+def test_worker_events_count_cut_offs_over_run() -> None:
+    call, cut, ran = _cut_off_events()
+    events = _module()._WorkerEvents()
+
+    for line in (call, cut, call, ran, call, cut, call, ran):
+        events.feed(line)
+    assert events.length_stops == 0
+    assert events.cut_offs == 2
 
 
 @pytest.mark.anyio
@@ -10702,6 +10736,42 @@ def test_truncated_call_names_char_budget() -> None:
     assert "lines" not in refusal
     assert "short script run inline by bash" in refusal
     assert "cut off again" not in refusal
+
+
+def test_cutoff_advice_sizes_parts_to_output_limit(monkeypatch: pytest.MonkeyPatch) -> None:
+    # R33: told "parts of at most 13644 characters", W2 sent ~28k characters again.
+    raw = '{"path":"tests/cases.json","content":"' + "0a1b" * 7000
+
+    refusal = _module()._truncated_call({"_raw_arguments": raw})
+    monkeypatch.setenv(_module().WORKER_OUTPUT_TOKENS_ENV, "4096")
+    smaller = _module()._truncated_call({"_raw_arguments": raw})
+
+    assert refusal is not None and smaller is not None
+    assert "parts of at most 8192 characters, one write per part, appending" in refusal
+    assert "parts of at most 4096 characters" in smaller
+
+
+@pytest.mark.anyio
+async def test_worker_guard_refuses_reads_past_half_cap_with_nothing_written(
+    tmp_path: Path, beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # R33: W3 and W7 re-read references until the cap, writing at the last call.
+    monkeypatch.setenv(_module().WORKER_MAX_TURNS_ENV, "10")
+    runtime = _scoped_worker(tmp_path, monkeypatch, scope="tests/x.py")
+    read = _tool_with_hooks(runtime, "read")
+    write = _tool_with_hooks(runtime, "write")
+
+    early = [await read.execute(f"r{i}", {"path": "ref.txt"}) for i in range(5)]
+    late = await read.execute("r5", {"path": "ref.txt"})
+    own = await read.execute("r6", {"path": "tests/x.py"})
+    wrote = await write.execute("w1", {"path": "tests/x.py", "content": "x"})
+    after = await read.execute("r7", {"path": "ref.txt"})
+
+    assert all(result.text == "ran" for result in early)
+    assert late.text != "ran"
+    assert "5 of 10 calls used and nothing written" in late.text
+    assert "Write tests/x.py now; re-read only what a write needs." in late.text
+    assert own.text == "ran" and wrote.text == "ran" and after.text == "ran"
 
 
 def test_truncated_call_advice_keeps_generator_out_of_scope() -> None:

@@ -219,6 +219,11 @@ WORKER_PROVIDER_ENV = "BEAGLE_TAU_DISPATCH_PROVIDER"
 WORKER_MAX_TURNS_ENV = "BEAGLE_TAU_WORKER_MAX_TURNS"
 DEFAULT_WORKER_MAX_TURNS = 30
 
+#: The worker's output limit in tokens, which sizes the parts a call cut off at
+#: it is told to write in. Runs R15 and R33 were cut off at 8192.
+WORKER_OUTPUT_TOKENS_ENV = "BEAGLE_TAU_WORKER_OUTPUT_TOKENS"
+DEFAULT_WORKER_OUTPUT_TOKENS = 8192
+
 #: The worker's thinking level; unset runs it with thinking off, since most of
 #: R01's worker time went to reasoning spirals.
 WORKER_THINKING_ENV = "BEAGLE_TAU_DISPATCH_THINKING"
@@ -1257,6 +1262,15 @@ def _worker_provider(explicit: str | None) -> str:
     return os.environ.get(WORKER_PROVIDER_ENV, "").strip()
 
 
+def _worker_output_tokens() -> int:
+    """The worker's output limit in tokens: env, else DEFAULT_WORKER_OUTPUT_TOKENS."""
+    raw = os.environ.get(WORKER_OUTPUT_TOKENS_ENV, "").strip()
+    try:
+        return max(1, int(raw)) if raw else DEFAULT_WORKER_OUTPUT_TOKENS
+    except ValueError:
+        return DEFAULT_WORKER_OUTPUT_TOKENS
+
+
 def _worker_max_turns() -> int:
     """The worker's turn cap: env, else DEFAULT_WORKER_MAX_TURNS."""
     raw = os.environ.get(WORKER_MAX_TURNS_ENV, "").strip()
@@ -1415,6 +1429,9 @@ _REFUSED = "Not run: "
 _BREAKER_STOP = "Not run, and the run is stopped"
 #: How the refusal of a call cut off at the output limit begins (`_truncated_call`).
 CUT_OFF_REFUSAL = "This call's arguments were cut off"
+#: The turns over a run cut off at the output limit that end the worker.
+WORKER_CUT_OFFS = 2
+CUT_OFF_TWICE = "cut off twice at the output limit"
 #: How tau words the tool result of a call an extension blocked.
 _BLOCKED = "Tool call blocked: "
 #: The countdown sentence tau appends to each refusal's problem.
@@ -1444,6 +1461,9 @@ class _WorkerEvents:
     #: worker hit long after its last cut-off turn. Run R27: a turn whose call was
     #: refused as cut off counts too, since the provider reported it as "toolUse".
     length_stops: int = 0
+    #: How many turns over the whole run ended at the output limit, in a row or
+    #: not. Run R33: W2 was cut off three times, each followed by a normal turn.
+    cut_offs: int = 0
     #: The count before the last turn, and whether that turn was counted as cut off.
     _before_turn: int = 0
     _turn_cut: bool = False
@@ -1495,6 +1515,7 @@ class _WorkerEvents:
         self._before_turn = self.length_stops
         self._turn_cut = stop == "length"
         self.length_stops = self._before_turn + 1 if self._turn_cut else 0
+        self.cut_offs += self._turn_cut
         error = message.get("errorMessage")
         self.error = str(error) if stop == "error" and error else None
 
@@ -1514,6 +1535,7 @@ class _WorkerEvents:
         if text.removeprefix(_BLOCKED).startswith(CUT_OFF_REFUSAL) and not self._turn_cut:
             self._turn_cut = True
             self.length_stops = self._before_turn + 1
+            self.cut_offs += 1
         if text.startswith(_BREAKER_STOP):
             self.stopped = True
         elif text.startswith(_REFUSED):
@@ -1743,6 +1765,24 @@ async def _run_worker(
     deadline = loop.time() + timeout
     problem: str | None = None
     while not talk.done():
+        if events.cut_offs >= WORKER_CUT_OFFS:
+            # Run R33: W2 was cut off three times, not in a row, and ran to the wall.
+            with contextlib.suppress(ProcessLookupError):
+                proc.kill()
+            with contextlib.suppress(Exception):
+                await talk
+            ended = (
+                f"(the sub-agent was ended: {CUT_OFF_TWICE}. Split the task or have the "
+                "notes say to write in parts.)"
+            )
+            return _WorkerRun(
+                returncode=proc.returncode,
+                report=f"{events.report}\n\n{ended}".strip(),
+                spent=events.spent,
+                transcript=transcript,
+                stop_reason="length",
+                last_words=events.report,
+            )
         if signal is not None and signal.is_cancelled():
             problem = "cancelled; the worker was killed and its partial work is in the tree."
             break
@@ -12352,6 +12392,9 @@ def _truncated_call(arguments: Mapping[str, Any], earlier: int = 0) -> str | Non
     in characters, and `earlier` (this worker's cut-off calls before this
     one) says from the second on that the same size is cut off again. Run R31:
     told to generate data with a script, W2 saved its generator in the scope.
+    Run R33: told "parts of at most 13644 characters", W2 sent ~28k again; a
+    part is now at most a quarter of the output limit, about one character per
+    token, so it fits well inside a turn.
     """
     if set(arguments) != {"_raw_arguments"}:
         return None
@@ -12362,10 +12405,12 @@ def _truncated_call(arguments: Mapping[str, Any], earlier: int = 0) -> str | Non
         error = str(exc)
     else:
         error = "not an object of named arguments"
+    part = min(len(text) // 2, _worker_output_tokens())
     refusal = (
         f"{CUT_OFF_REFUSAL} after {len(text)} characters and are not valid JSON ({error}), "
-        f"so nothing was written. Write it in parts of at most {len(text) // 2} characters: "
-        "`write` the first part, then append the rest with `edit`; data with a pattern is "
+        f"so nothing was written. Write it in parts of at most {part} characters, one "
+        "write per part, appending: `write` the first part, then append the rest with "
+        "`edit`, one call per part; data with a pattern is "
         "shorter to generate with a short script run inline by bash (`python3 - <<'EOF'` "
         "... `EOF`) or saved to a scratch path outside the project, never saved in scope."
     )
@@ -12375,6 +12420,32 @@ def _truncated_call(arguments: Mapping[str, Any], earlier: int = 0) -> str | Non
             "the same size will be cut off again."
         )
     return refusal
+
+
+def _reread_refusal(
+    tool: str, arguments: Mapping[str, Any], cwd: Path, scope: tuple[str, ...], calls: int
+) -> str | None:
+    """Why a worker's read is refused once half its calls went with nothing written, or None.
+
+    Run R33: W3 and W7 spent their calls re-reading references in short windows
+    and wrote their file at the last call, or never ran the check. A read of a
+    file in the scope still passes: a write may need it.
+    """
+    cap = _worker_max_turns()
+    if tool != "read" or calls <= cap // 2:
+        return None
+    path = arguments.get("path")
+    goal = _find_goal(cwd)
+    if not isinstance(path, str) or not path or goal is None:
+        return None
+    root = _resolved(goal.parent.parent)
+    target = _own_path(cwd / Path(path).expanduser(), root)
+    if (target == root or root in target.parents) and _scope_hit(target, root, scope) is not None:
+        return None
+    return (
+        f"refusing to read {path}: {calls - 1} of {cap} calls used and nothing written. "
+        f"Write {', '.join(scope)} now; re-read only what a write needs."
+    )
 
 
 def make_worker_scope_guard() -> Any:
@@ -12391,9 +12462,12 @@ def make_worker_scope_guard() -> Any:
     """
 
     cut_offs = 0
+    calls = 0
+    wrote = False
 
     async def guard(event: Any, context: ExtensionContext) -> ToolCallHookResult | None:
-        nonlocal cut_offs
+        nonlocal cut_offs, calls, wrote
+        calls += 1
         try:
             cwd = Path(context.cwd)
             arguments = event.arguments or {}
@@ -12438,6 +12512,11 @@ def make_worker_scope_guard() -> Any:
             if sent is None:
                 return None
             task, scope = sent
+            reread = (
+                None if wrote else _reread_refusal(event.tool_name, arguments, cwd, scope, calls)
+            )
+            if reread is not None:
+                return ToolCallHookResult(block=True, reason=reread)
             script = _bash_find(command, _driver_change) if command else None
             scripted = (
                 script is not None
@@ -12453,6 +12532,7 @@ def make_worker_scope_guard() -> Any:
                 return None
             root = _resolved(goal.parent.parent)
             allowed = [_resolved(goal.parent), root / ".git" / "beagle"]
+            hits = 0
             for target in targets:
                 target = _own_path(target, root)
                 if target != root and root not in target.parents:
@@ -12463,8 +12543,11 @@ def make_worker_scope_guard() -> Any:
                     continue
                 if _scope_hit(target, root, scope) is None:
                     break
+                hits += 1
             else:
-                return _link_out(links, root)
+                refused = _link_out(links, root)
+                wrote = wrote or (hits > 0 and refused is None)
+                return refused
         except Exception:  # noqa: BLE001 - fail open, never block on a guard bug
             return None
         rel = target.relative_to(root) if target != root else target
