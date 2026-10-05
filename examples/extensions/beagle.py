@@ -5129,13 +5129,28 @@ def _cases_on_disk_route(
             f'{work}: pursuit_step task="{existing}". {opens} {task} opens once its cases '
             f"are locked, its test importing {named} by name."
         )
-    label = title.replace("::", ":").replace('"', "'").strip() or task
+    parts = [
+        f"Known answers::the cases on disk ({listed}), locked",
+        f"{_judged_label(title, task)}::the code, judged by the locked cases",
+    ]
+    clash = _live_title_clash(task, parts, nodes or [])
+    if clash is not None:
+        return f"{head} No task holds them yet, and a plan cannot add one: {clash}"
     return (
         f"{head} No task holds them yet. Add it before this one in one call: "
-        f'pursuit_plan task="{task}" parts=["Known answers::the cases on disk ({listed}), '
-        f'locked", "{label}::the code, judged by the locked cases"]. Then open the '
-        f"known-answers task, {work}. {opens}"
+        f'pursuit_plan task="{task}" parts={json.dumps(parts, ensure_ascii=False)}. '
+        f"Then open the known-answers task, {work}. {opens}"
     )
+
+
+def _judged_label(title: str, task: str) -> str:
+    """The code part's title in a cases-first plan: never `task`'s own title.
+
+    Run R29: the plan's second part took the task's title, and the plan tool
+    refused it as the title of the task being split.
+    """
+    base = title.replace("::", ":").replace('"', "'").strip() or task
+    return f"{base}, judged by the cases"
 
 
 def _locked_data_route(
@@ -5290,13 +5305,13 @@ def _cases_first_problem(
         return None
     locked_data = [rel for rel in _locked(goal) if _is_cases_data(rel)]
     committed = _committed_cases_tests(root, goal, task, nodes or []) if locked_data else []
-    asked = {os.path.normpath(entry.strip()) for entry in locks or []}
+    asked = set(_lock_paths(locks or [], root))
     for rel, owner in committed:
         if rel in asked:
             # The route below asks for this: a done task's committed test,
             # locked as that task left it.
             _lock(goal, root, [rel], owner)
-    named_scope = {os.path.normpath(entry.strip()) for entry in scope}
+    named_scope = set(_lock_paths(scope, root))
     carried = [
         rel
         for rel in asked & named_scope
@@ -5319,6 +5334,14 @@ def _cases_first_problem(
     if not unjudged:
         return None
     entry, module = unjudged[0]
+    if _names_known_answers(title) or asked & set(_CASES_FIRST_SCOPE):
+        # Run R29: the known-answers task itself was told to split off known answers.
+        rest = [e for e in scope if not _new_modules([e], root)] or list(_CASES_FIRST_SCOPE)
+        return (
+            f"Cases first: {task} is the known-answers task: drop {entry} from scope (the "
+            f"code is a later task) and call pursuit_step again with scope "
+            f"{json.dumps(rest)}."
+        )
     if imported:
         name, test = next(iter(imported.items()))
         path = name.replace(".", "/")
@@ -5392,14 +5415,20 @@ def _cases_first_problem(
             f'pursuit_step task="{holder}". {task} opens once its cases are locked, its '
             f"test importing {named} by name."
         )
-    label = title.replace("::", ":").replace('"', "'").strip() or task
+    parts = [
+        "Known answers::cases from references/ in tests/cases.json, and "
+        f"tests/test_cases.py importing {named} by name",
+        f"{_judged_label(title, task)}::the code, judged by the locked cases",
+    ]
+    clash = _live_title_clash(task, parts, nodes or [])
+    if clash is not None:
+        return f"Cases first: {unjudged_text} A known-answers milestone cannot be planned: {clash}"
     return (
         "Cases first: open the known-answers milestone before the code; its test imports "
         f"this module by name. {unjudged_text} Add the milestone "
-        f'before this one in one call: pursuit_plan task="{task}" parts=["Known answers::'
-        f"cases from references/ in tests/cases.json, and tests/test_cases.py importing "
-        f'{named} by name", "{label}::the code, judged by the locked cases"]. Then work the '
-        f"known-answers task first, {_CASES_FIRST_WORK}."
+        f'before this one in one call: pursuit_plan task="{task}" '
+        f"parts={json.dumps(parts, ensure_ascii=False)}. Then work the known-answers "
+        f"task first, {_CASES_FIRST_WORK}."
     )
 
 
@@ -6951,8 +6980,16 @@ _COLLECT_ONLY = re.compile(r"(?<![\w-])--(?:collect-only|co)(?![\w-])")
 
 def _reads_a_lock(check: str, locks: list[str], root: Path) -> bool:
     """Whether `check` names a locked file, or a test (or a directory of them) that
-    reads one, as `_cases_test_reads` judges it."""
+    reads one, as `_cases_test_reads` judges it.
+
+    Run R29: a test lock the check names counts though it is not on disk yet;
+    it is the test the task will write.
+    """
+    locks = _lock_paths(locks, root)
     if any(lock.rstrip("/") in check for lock in locks):
+        return True
+    named = {os.path.normpath(word.split("::")[0]) for word in _check_words(check)}
+    if any(_is_test_path(lock) and os.path.normpath(lock) in named for lock in locks):
         return True
     names = {Path(lock.rstrip("/")).name for lock in locks}
     for rel in _check_targets(check, root):
@@ -6980,6 +7017,7 @@ def _amend_problem(check: str, bound: str, locks: list[str], root: Path) -> str 
             f"`{check}` runs pytest --collect-only, which only imports the tests and runs "
             f"none, so it passes whatever the work does.{keep}"
         )
+    locks = _lock_paths(locks, root)
     if locks and not _reads_a_lock(check, locks, root):
         return (
             f"this task has locked known answers ({', '.join(locks)}), and `{check}` "
@@ -7074,19 +7112,41 @@ def _root_relative(entry: str, root: Path) -> str | None:
     return None
 
 
-def _root_relative_scope(scope: list[str], root: Path) -> tuple[list[str], str | None]:
-    """`scope` with absolute entries under `root` made root-relative, or why one is refused."""
+def _root_relative_scope(
+    scope: list[str], root: Path, kind: str = "scope"
+) -> tuple[list[str], str | None]:
+    """`scope` with absolute entries under `root` made root-relative, or why one is refused.
+
+    `kind` names the argument in the refusal: "scope", or "locks" for the locks.
+    """
     entries: list[str] = []
     for entry in scope:
         rel = _root_relative(entry, root)
         if rel is None:
             return scope, (
-                f"pursuit_step: scope entry {entry} is outside the project root {root}. "
-                f"Scope names paths in the project, relative to {root} "
+                f"pursuit_step: {kind} entry {entry} is outside the project root {root}. "
+                f"{kind.capitalize()} names paths in the project, relative to {root} "
                 '(e.g. "src/module.py"); call pursuit_step again with those.'
             )
         entries.append(rel)
     return entries, None
+
+
+def _lock_path(entry: str, root: Path) -> str:
+    """Lock `entry` root-relative and normalized; an entry outside `root` is kept as given."""
+    rel = _root_relative(entry.strip(), root)
+    if rel is None:
+        return entry.strip()
+    return os.path.normpath(rel) + ("/" if rel.endswith("/") and rel != "/" else "")
+
+
+def _lock_paths(locks: list[str], root: Path) -> list[str]:
+    """`locks` root-relative and normalized, each once, in order.
+
+    Run R29: absolute locks never matched a relative check, and
+    reference_digest.md was listed twice.
+    """
+    return list(dict.fromkeys(_lock_path(e, root) for e in locks if e.strip()))
 
 
 def _in_scope(rel: str, scope: list[str], root: Path | None = None) -> bool:
@@ -7762,15 +7822,17 @@ def _put_back_drift(
 def _pending_locks(goal: Path, task: str, add: list[str] | None = None) -> list[str]:
     """The locks `task` asked for, adding `add`; kept until the task closes done."""
     path = goal.parent / PENDING_LOCKS
+    root = goal.parent.parent
     try:
         pending = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         pending = {}
     if not isinstance(pending, dict):
         pending = {}
-    entries = [e for e in pending.get(task) or [] if isinstance(e, str)]
+    # Run R29 filed absolute paths; they are read, and stored, root-relative.
+    entries = _lock_paths([e for e in pending.get(task) or [] if isinstance(e, str)], root)
     if add:
-        entries += [e for e in add if e not in entries]
+        entries = _lock_paths(entries + add, root)
         pending[task] = entries
         with contextlib.suppress(OSError):
             path.write_text(json.dumps(pending, indent=1), encoding="utf-8")
@@ -8496,6 +8558,21 @@ def _sibling_owned_check_problem(
 #: An abandon naming the done task whose commit did this one's work:
 #: "done by T0008", "Done by T0008's commit".
 _DONE_BY = re.compile(r"(?i)^\s*done\s+by\s+(t\d{4,})\b")
+
+
+def _check_words(check: str) -> list[str]:
+    """A check's words, inside one `sh -c` level too."""
+    try:
+        words = shlex.split(check)
+    except ValueError:
+        return []
+    found: list[str] = []
+    for word in words:
+        try:
+            found += shlex.split(word) if " " in word and not word.startswith("-") else [word]
+        except ValueError:
+            found.append(word)
+    return found
 
 
 def _check_targets(check: str, root: Path) -> list[str]:
@@ -9369,6 +9446,12 @@ def make_step_tool() -> Any:
             if outside is not None:
                 return _step_result(outside)
             arguments = {**arguments, "scope": scope}
+        if _strings(arguments.get("locks")):
+            # Run R29: absolute locks never matched the relative check.
+            locks, outside = _root_relative_scope(_strings(arguments.get("locks")), root, "locks")
+            if outside is not None:
+                return _step_result(outside)
+            arguments = {**arguments, "locks": _lock_paths(locks, root)}
         rc, ready, raw = _next_ready(root)
         if rc == 4 or rc not in (0, 3) or not isinstance(ready, dict):
             return _step_result(

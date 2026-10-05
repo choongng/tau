@@ -5722,7 +5722,7 @@ async def test_opening_a_new_source_module_before_a_locked_cases_test_is_refused
     assert "not opened" in refused.text and "Cases first" in refused.text
     assert "known-answers milestone" in refused.text
     assert 'pursuit_plan task="T0002" parts=["Known answers::' in refused.text
-    assert '"Parser::the code, judged by the locked cases"' in refused.text
+    assert '"Parser, judged by the cases::the code, judged by the locked cases"' in refused.text
     assert _pursuit_calls(fake_beagle, "open") == []
     assert _runs(fake_tau) == []
 
@@ -14992,3 +14992,156 @@ async def test_witness_import_error_only_is_not_proof(
     assert refused is not None and not refused.proven
     assert "failed only on importing it" in refused.text
     assert proven is not None and proven.proven and proven.by_absent_source
+
+
+@pytest.mark.anyio
+async def test_step_locks_made_root_relative(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # R29: locks given absolute were filed absolute and never matched the check.
+    project = _pursuit_project(tmp_path)
+    monkeypatch.chdir(project)
+    _open_on_notes_txt(project, fake_beagle, ["notes.txt"])
+    runtime, _ = _bound(tmp_path)
+
+    outside = await _tool(runtime, "pursuit_step").execute(
+        "c1", {"task": "T0002", "locks": [str(tmp_path / "elsewhere" / "test_x.py")]}
+    )
+
+    assert "locks entry" in outside.text and "is outside the project root" in outside.text
+    assert not (project / ".beagle" / "locks-pending.json").exists()
+
+    monkeypatch.setenv("FAKE_TAU_SUCCEEDS_ON", "99")
+    absolute = str(project / "tests" / "test_digest.py")
+    await _tool(runtime, "pursuit_step").execute(
+        "c2",
+        {
+            "task": "T0002",
+            "locks": [absolute, "tests/test_digest.py", "./tests/reference.md"],
+            "attempts": 1,
+        },
+    )
+
+    pending = json.loads((project / ".beagle" / "locks-pending.json").read_text())
+    assert pending == {"T0002": ["tests/test_digest.py", "tests/reference.md"]}
+
+
+def test_amend_accepts_check_naming_lock_given_absolute(tmp_path: Path) -> None:
+    # R29 E52: `python3 -m pytest -q tests/test_digest.py` "names none of" the
+    # absolute locks, one of which was tests/test_digest.py, not yet on disk.
+    module = _module()
+    locks = [
+        str(tmp_path / "tests" / "reference_digest.md"),
+        str(tmp_path / "tests" / "test_digest.py"),
+    ]
+    check = "python3 -m pytest -q tests/test_digest.py"
+
+    assert module._amend_problem(check, "", locks, tmp_path) is None
+    assert module._amend_problem(check, "", ["tests/test_digest.py"], tmp_path) is None
+    other = "python3 -m pytest -q tests/test_other.py"
+    refused = module._amend_problem(other, "", locks * 2, tmp_path)
+    assert refused is not None
+    assert "(tests/reference_digest.md, tests/test_digest.py)" in refused
+
+
+def test_pending_locks_deduplicated_and_relative(tmp_path: Path) -> None:
+    # R29: locks-pending.json held absolute paths, and reads listed one twice.
+    module = _module()
+    project = _pursuit_project(tmp_path)
+    goal = project / ".beagle" / "pursuit.toml"
+    absolute = str(project / "tests" / "reference_digest.md")
+    (project / ".beagle" / "locks-pending.json").write_text(
+        json.dumps({"T0006": [absolute, "tests/reference_digest.md"]})
+    )
+
+    assert module._pending_locks(goal, "T0006") == ["tests/reference_digest.md"]
+    added = module._pending_locks(goal, "T0006", [str(project / "tests/test_digest.py")])
+
+    assert added == ["tests/reference_digest.md", "tests/test_digest.py"]
+    stored = json.loads((project / ".beagle" / "locks-pending.json").read_text())
+    assert stored == {"T0006": added}
+
+
+def test_cases_first_carried_lock_matches_absolute_entry(tmp_path: Path) -> None:
+    # R29: `asked` held the absolute lock, `carried` compared it with the
+    # relative scope, and a code task carrying its cases test was refused.
+    module = _module()
+    project = _r12_project(tmp_path)
+    goal = project / ".beagle" / "pursuit.toml"
+    _store_lock(project / ".beagle", "tests/cases.json", "[]")
+    scope = ["src/clock.py", "tests/test_clock_cases.py"]
+    absolute = [str(project / "tests" / "test_clock_cases.py")]
+
+    assert module._cases_first_problem(scope, "T0003", "Clock", goal, [], absolute) is None
+    assert module._cases_first_problem(scope, "T0003", "Clock", goal, [], []) is not None
+
+
+def test_cases_first_on_known_answers_task_says_drop_code_from_scope(tmp_path: Path) -> None:
+    # R29 E10: T0002, "known answers: ...", scoped `itc` beside the cases files
+    # and was told to split off a known-answers milestone: itself.
+    module = _module()
+    project = _r12_project(tmp_path)
+    goal = project / ".beagle" / "pursuit.toml"
+    scope = ["itc/", "tests/cases.json", "tests/test_case_data.py"]
+    nodes = [
+        {"id": "T0001", "title": "Ship it", "status": "open", "container": True},
+        {"id": "T0002", "title": "known answers: tests", "parent": "T0001", "status": "pending"},
+    ]
+    title = "known answers: a sub-agent writes tests/test_interval_tree.py"
+
+    by_title = module._cases_first_problem(["itc/clock.py"], "T0002", title, goal, nodes)
+    by_locks = module._cases_first_problem(
+        scope, "T0002", "Clocks", goal, nodes, ["tests/cases.json"]
+    )
+
+    assert by_title is not None and by_locks is not None
+    assert "T0002 is the known-answers task: drop itc/clock.py from scope" in by_title
+    assert "pursuit_plan" not in by_title and "pursuit_plan" not in by_locks
+    assert 'scope ["tests/cases.json", "tests/test_case_data.py"]' in by_locks
+
+
+def _r29_nodes(title: str) -> list[dict[str, Any]]:
+    return [
+        {"id": "T0001", "title": "Ship it", "status": "open", "container": True},
+        {"id": "T0002", "title": title, "parent": "T0001", "status": "pending"},
+    ]
+
+
+def _offered_parts(text: str) -> list[str]:
+    match = re.search(r"parts=(\[.*?\])", text)
+    assert match is not None, text
+    return json.loads(match.group(1))
+
+
+def test_cases_first_plan_never_repeats_task_title(tmp_path: Path) -> None:
+    # R29 E10: the plan's second part was T0002's own title; the plan tool refused it.
+    module = _module()
+    project = _r12_project(tmp_path)
+    goal = project / ".beagle" / "pursuit.toml"
+    nodes = _r29_nodes("Interval tree clocks")
+
+    text = module._cases_first_problem(
+        ["itc/clock.py"], "T0002", "Interval tree clocks", goal, nodes
+    )
+
+    parts = _offered_parts(text)
+    assert module._live_title_clash("T0002", parts, nodes) is None
+    assert parts[1].startswith("Interval tree clocks, judged by the cases::")
+
+
+def test_cases_on_disk_route_plan_never_repeats_task_title(tmp_path: Path) -> None:
+    module = _module()
+    nodes = _r29_nodes("Clock")
+    on_disk = ["tests/cases.json", "tests/test_case_data.py"]
+
+    text = module._cases_on_disk_route(
+        "T0002", "Clock", "`clock`", "Scope names new source clock.py.", on_disk, "", "", nodes
+    )
+
+    parts = _offered_parts(text)
+    assert module._live_title_clash("T0002", parts, nodes) is None
+    assert parts[1].startswith("Clock, judged by the cases::")
