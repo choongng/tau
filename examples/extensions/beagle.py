@@ -233,8 +233,13 @@ WORKER_BASH_TIMEOUT_ENV = "BEAGLE_TAU_WORKER_BASH_TIMEOUT"
 DEFAULT_WORKER_BASH_TIMEOUT = 120.0
 
 #: The worker's thinking level; unset runs it with thinking off, since most of
-#: R01's worker time went to reasoning spirals.
+#: R01's worker time went to reasoning spirals. `default` sends no `--thinking`
+#: at all and leaves the level to tau: a model with no thinking modes rejects
+#: every level, `off` included, and a worker spawn that passes the flag then
+#: exits 2 before reading a token (trial T01, qwen3.8-flash-next-iq4 with no
+#: thinking metadata).
 WORKER_THINKING_ENV = "BEAGLE_TAU_DISPATCH_THINKING"
+WORKER_THINKING_OMIT = "default"
 
 #: Escape hatch: `BEAGLE_TAU_ALLOW_PURSUIT_EDIT=1` disables the ground-truth guard.
 GUARD_DISABLE_ENV = "BEAGLE_TAU_ALLOW_PURSUIT_EDIT"
@@ -1752,7 +1757,9 @@ async def _run_worker(
     if model:
         cmd += ["--model", model]
     cmd += ["--max-turns", str(_worker_max_turns())]
-    cmd += ["--thinking", os.environ.get(WORKER_THINKING_ENV, "").strip() or "off"]
+    thinking = os.environ.get(WORKER_THINKING_ENV, "").strip() or "off"
+    if thinking != WORKER_THINKING_OMIT:
+        cmd += ["--thinking", thinking]
 
     limit = _memory_max()
     env = {**os.environ, WORKER_ENV: "1", BASH_TIMEOUT_ENV_VAR: f"{_worker_bash_timeout():g}"}

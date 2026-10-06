@@ -7053,6 +7053,7 @@ async def test_unfounded_driver_may_fetch_references(
 
 
 # -- R01: workers stop by turn count, with a bounded timeout and thinking off --
+# -- T01: a model with no thinking modes rejects `--thinking off`, so `default` omits it --
 
 
 @pytest.mark.anyio
@@ -7077,7 +7078,7 @@ async def test_worker_argv_caps_turns(
 
 
 @pytest.mark.anyio
-async def test_worker_argv_thinking_off(
+async def test_worker_argv_thinking_level(
     tmp_path: Path, beagle: Path, fake_tau: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     project = tmp_path / "project"
@@ -7087,13 +7088,20 @@ async def test_worker_argv_thinking_off(
     runtime, _ = _bound(tmp_path)
     dispatch = _tool(runtime, "pursuit_dispatch")
 
+    # R01: unset means thinking off, the pursuit's own policy on reasoning
+    # spirals. T01: `default` sends no flag, because tau rejects every level --
+    # off included -- for a model with no thinking modes, and the worker then
+    # dies parsing arguments instead of doing the task.
     await dispatch.execute("c1", {"brief": "Write notes"})
     monkeypatch.setenv("BEAGLE_TAU_DISPATCH_THINKING", "low")
     await dispatch.execute("c2", {"brief": "Write notes"})
+    monkeypatch.setenv("BEAGLE_TAU_DISPATCH_THINKING", "default")
+    await dispatch.execute("c3", {"brief": "Write notes"})
 
-    default, pinned = (run["argv"] for run in _runs(fake_tau))
-    assert default[default.index("--thinking") + 1] == "off"
+    off, pinned, omitted = (run["argv"] for run in _runs(fake_tau))
+    assert off[off.index("--thinking") + 1] == "off"
     assert pinned[pinned.index("--thinking") + 1] == "low"
+    assert "--thinking" not in omitted
 
 
 @pytest.mark.anyio
