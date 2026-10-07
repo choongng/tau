@@ -3705,7 +3705,7 @@ class TauTuiApp(App[None]):
         height: 1fr;
         border: none;
         background: $tau-transcript-background;
-        padding: 0 0 0 3;
+        padding: 0 0 0 2;
         overflow-x: auto;
         scrollbar-size-vertical: 0;
         scrollbar-size-horizontal: 1;
@@ -3788,10 +3788,10 @@ class TauTuiApp(App[None]):
        flush with the transcript's left edge, and the box begins directly
        after it at x=2, two columns left of the message pipes. */
     #prompt-prefix {
-        width: 2;
+        width: 1;
         height: 3;
         padding: 0 0 0 0;
-        margin: 0 1 0 0;
+        margin: 0;
         content-align: center middle;
         color: $tau-accent;
         text-style: bold;
