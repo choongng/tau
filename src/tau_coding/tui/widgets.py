@@ -597,7 +597,7 @@ class TranscriptMessageWidget(Horizontal):
     TranscriptMessageWidget {
         width: 1fr;
         height: auto;
-        margin: 1 0 0 0;
+        margin: 1 1 0 1;
     }
 
     /* One padding column at each side, inside the highlighted box, for every
@@ -797,7 +797,7 @@ class StreamingTranscriptMessageWidget(ThemedMarkdownWidget):
     StreamingTranscriptMessageWidget {
         width: 1fr;
         height: auto;
-        margin: 1 0 0 0;
+        margin: 1 1 0 1;
         padding: 0 1;
     }
 

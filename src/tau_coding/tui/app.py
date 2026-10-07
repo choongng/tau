@@ -3688,10 +3688,6 @@ class TauTuiApp(App[None]):
         display: none;
     }
 
-    TauTuiApp.-hide-sidebar #main-pane {
-        padding-left: 1;
-    }
-
     TauTuiApp.-sidebar-right #sidebar {
         dock: right;
     }
@@ -3705,7 +3701,7 @@ class TauTuiApp(App[None]):
         height: 1fr;
         border: none;
         background: $tau-transcript-background;
-        padding: 0 0 0 2;
+        padding: 0;
         overflow-x: auto;
         scrollbar-size-vertical: 0;
         scrollbar-size-horizontal: 1;
