@@ -600,11 +600,23 @@ class TranscriptMessageWidget(Horizontal):
         margin: 1 1 0 0;
     }
 
+    /* Message text starts one column from the row's left edge for every
+       role. Bordered rows (user, tool, status) spend that column on their
+       pipe; the borderless rows (assistant, thinking) have nothing there, so
+       the same column is kept as padding instead. The padding has to live on
+       the body, not on the inner markdown blocks: those are children of the
+       markdown widget and inherit its styles, and padding on both would
+       double up. */
     TranscriptMessageWidget > .transcript-message-body {
         width: 1fr;
         height: auto;
-        padding: 0 1 0 1;
+        padding: 0 0 0 1;
     }
+
+    TranscriptMessageWidget.-bordered > .transcript-message-body {
+        padding: 0;
+    }
+
 
     TranscriptMessageWidget > .transcript-markdown-body > MarkdownParagraph {
         margin: 0 0 1 0;
@@ -657,6 +669,7 @@ class TranscriptMessageWidget(Horizontal):
         else:
             self._body_background = background
             self.styles.border_left = ("solid", self._role_style.border)
+            self.add_class("-bordered")
             if background:
                 self.styles.background = background
 
