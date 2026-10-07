@@ -600,20 +600,16 @@ class TranscriptMessageWidget(Horizontal):
         margin: 1 1 0 0;
     }
 
-    /* Message text starts two columns from the row's left edge for every
-       role: the bordered rows (user, tool, status) spend one on their pipe
-       and one inside the box; the borderless rows (assistant, thinking) use
-       two columns of body padding instead, so all text shares one column.
-       The padding lives on the body, not on the inner markdown blocks: those
-       inherit the markdown widget's styles, and padding on both would double
-       up. */
+    /* Bordered rows (user, tool, status): one padding column at each side,
+       inside the highlighted box; their pipe column is the row's own left
+       border, so their text sits two columns from the row's left edge. The
+       borderless rows (assistant, thinking) take a second left column from
+       the rule below instead, so all text shares one column. The padding
+       lives on the body, not on the inner markdown blocks: those inherit the
+       markdown widget's styles, and padding on both would double up. */
     TranscriptMessageWidget > .transcript-message-body {
         width: 1fr;
         height: auto;
-        padding: 0 1;
-    }
-
-    TranscriptMessageWidget.-bordered > .transcript-message-body {
         padding: 0 1;
     }
 
