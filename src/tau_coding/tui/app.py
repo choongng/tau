@@ -3783,15 +3783,22 @@ class TauTuiApp(App[None]):
         margin: 1 1 1 1;
     }
 
-    /* The "τ" column plus its gap stands in for the transcript rows' left
-       inset (the transcript's 2-column padding plus each row's own border
-       column), and the input's 1-column padding lands the typed text on the
-       same column as message text. */
+    /* Transcript rows begin at x=4 (main-pane padding + the transcript's
+       2-column gutter); the bordered ones (user, tool, status) draw their
+       left pipe there and their text starts one column in, at x=5. The prompt
+       box has no border of its own, so the "τ" column is widened to 3 to hold
+       the gap column as well: the box's highlighted edge lands on x=5, the
+       column the message pipes occupy. A TextArea draws its cursor at the
+       border+padding edge regardless of the border's colour, so the box keeps
+       a 1-column left inset for the caret to sit on instead of covering the
+       box edge; the cursor column is thus one short of the transcript's text
+       column. Exact text-on-text alignment would need the inset to move to
+       the transcript and its rows, so that no row's pipe shifts. */
     #prompt-prefix {
-        width: 2;
+        width: 3;
         height: 3;
         padding: 0 0 0 0;
-        margin: 0 1 0 0;
+        margin: 0;
         content-align: center middle;
         color: $tau-accent;
         text-style: bold;
@@ -3805,7 +3812,7 @@ class TauTuiApp(App[None]):
         border: none;
         border-left: solid transparent;
         margin: 0;
-        padding: 1 1 1 0;
+        padding: 1 1;
         max-height: 8;
     }
 
