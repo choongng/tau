@@ -3783,11 +3783,15 @@ class TauTuiApp(App[None]):
         margin: 1 1 1 1;
     }
 
+    /* The "τ" column plus its gap stands in for the transcript rows' left
+       inset (the transcript's 2-column padding plus each row's own border
+       column), and the input's 1-column padding lands the typed text on the
+       same column as message text. */
     #prompt-prefix {
         width: 2;
         height: 3;
         padding: 0 0 0 0;
-        margin: 0;
+        margin: 0 1 0 0;
         content-align: center middle;
         color: $tau-accent;
         text-style: bold;
@@ -3801,7 +3805,7 @@ class TauTuiApp(App[None]):
         border: none;
         border-left: solid transparent;
         margin: 0;
-        padding: 1 1;
+        padding: 1 1 1 0;
         max-height: 8;
     }
 
