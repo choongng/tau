@@ -2135,7 +2135,9 @@ async def test_transcript_message_widget_renders_full_height_role_block() -> Non
         assert widget.styles.background == background
         assert body.styles.background == background
         assert widget.styles.padding.top == 1
-        assert widget.styles.padding.bottom == 1
+        # The blank row above the block is a margin only: a bottom padding row
+        # would paint a second background row under the message.
+        assert widget.styles.padding.bottom == 0
         edge_type, edge_color = widget.styles.border_left
         assert edge_type != "none"
         assert edge_color == border

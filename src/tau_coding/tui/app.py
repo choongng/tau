@@ -3698,14 +3698,14 @@ class TauTuiApp(App[None]):
 
     #main-pane {
         width: 1fr;
-        padding: 1 1 0 1;
+        padding: 1 0 0 0;
     }
 
     #transcript {
         height: 1fr;
         border: none;
         background: $tau-transcript-background;
-        padding: 0 0 0 2;
+        padding: 0 0 0 3;
         overflow-x: auto;
         scrollbar-size-vertical: 0;
         scrollbar-size-horizontal: 1;
@@ -3780,6 +3780,7 @@ class TauTuiApp(App[None]):
 
     #prompt-row {
         height: auto;
+        width: 100%;
         margin: 1 1 1 0;
     }
 
@@ -3790,7 +3791,7 @@ class TauTuiApp(App[None]):
         width: 2;
         height: 3;
         padding: 0 0 0 0;
-        margin: 0;
+        margin: 0 1 0 0;
         content-align: center middle;
         color: $tau-accent;
         text-style: bold;
@@ -3807,7 +3808,7 @@ class TauTuiApp(App[None]):
         border: none;
         border-left: solid transparent;
         margin: 0;
-        padding: 1 1 1 0;
+        padding: 1 1 1 2;
         max-height: 8;
     }
 
@@ -3822,7 +3823,7 @@ class TauTuiApp(App[None]):
     #compact-session-info {
         height: auto;
         max-height: 3;
-        margin: 0 1 1 1;
+        margin: 0 1 0 1;
         padding: 0 1;
         color: $tau-muted-text;
     }

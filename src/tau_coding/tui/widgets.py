@@ -597,26 +597,25 @@ class TranscriptMessageWidget(Horizontal):
     TranscriptMessageWidget {
         width: 1fr;
         height: auto;
-        margin: 1 1 0 0;
+        margin: 1 0 0 0;
     }
 
-    /* Message text starts one column from the row's left edge for every
-       role. Bordered rows (user, tool, status) spend that column on their
-       pipe; the borderless rows (assistant, thinking) have nothing there, so
-       the same column is kept as padding instead. The padding has to live on
-       the body, not on the inner markdown blocks: those are children of the
-       markdown widget and inherit its styles, and padding on both would
-       double up. */
+    /* Message text starts two columns from the row's left edge for every
+       role: the bordered rows (user, tool, status) spend one on their pipe
+       and one inside the box; the borderless rows (assistant, thinking) use
+       two columns of body padding instead, so all text shares one column.
+       The padding lives on the body, not on the inner markdown blocks: those
+       inherit the markdown widget's styles, and padding on both would double
+       up. */
     TranscriptMessageWidget > .transcript-message-body {
         width: 1fr;
         height: auto;
-        padding: 0 0 0 1;
+        padding: 0 1 0 2;
     }
 
     TranscriptMessageWidget.-bordered > .transcript-message-body {
-        padding: 0;
+        padding: 0 1 0 1;
     }
-
 
     TranscriptMessageWidget > .transcript-markdown-body > MarkdownParagraph {
         margin: 0 0 1 0;
@@ -661,11 +660,12 @@ class TranscriptMessageWidget(Horizontal):
         )
         super().__init__(classes="transcript-message")
         if item.role == "user":
-            self.styles.padding = (1, 0)
+            self.styles.padding = (1, 0, 0, 0)
         foreground, background = _split_rich_style_colors(self._role_style.body)
         self._body_foreground = foreground
         if item.role in _BORDERLESS_TRANSCRIPT_ROLES or item.system_prompt_sources is not None:
             self._body_background = None
+            self.add_class("-borderless")
         else:
             self._body_background = background
             self.styles.border_left = ("solid", self._role_style.border)
@@ -800,10 +800,10 @@ class StreamingTranscriptMessageWidget(ThemedMarkdownWidget):
 
     DEFAULT_CSS = """
     StreamingTranscriptMessageWidget {
-        width: 1fr;
+        width: 100%;
         height: auto;
-        margin: 1 1 0 1;
-        padding: 0 1 0 0;
+        margin: 1 0 0 0;
+        padding: 0 1;
     }
 
     StreamingTranscriptMessageWidget > MarkdownParagraph {
