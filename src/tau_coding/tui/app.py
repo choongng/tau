@@ -3781,7 +3781,7 @@ class TauTuiApp(App[None]):
     #prompt-row {
         height: auto;
         width: 100%;
-        margin: 1 1 1 0;
+        margin: 1 0 1 0;
     }
 
     /* The prompt row keeps only the main-pane padding: the "τ" sits at x=1,
@@ -3791,7 +3791,7 @@ class TauTuiApp(App[None]):
         width: 2;
         height: 3;
         padding: 0 0 0 0;
-        margin: 0 1 0 0;
+        margin: 0;
         content-align: center middle;
         color: $tau-accent;
         text-style: bold;
@@ -3807,8 +3807,8 @@ class TauTuiApp(App[None]):
         color: $tau-prompt-text;
         border: none;
         border-left: solid transparent;
-        margin: 0;
-        padding: 1 1 1 2;
+        margin: 0 1 0 0;
+        padding: 1 1 1 1;
         max-height: 8;
     }
 
