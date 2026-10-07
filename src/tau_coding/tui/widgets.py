@@ -609,7 +609,7 @@ class TranscriptMessageWidget(Horizontal):
     TranscriptMessageWidget > .transcript-message-body {
         width: 1fr;
         height: auto;
-        padding: 0 1;
+        padding: 0 1 1 1;
     }
 
     TranscriptMessageWidget > .transcript-markdown-body > MarkdownParagraph {
@@ -665,6 +665,9 @@ class TranscriptMessageWidget(Horizontal):
             self._body_background = background
             self.styles.border_left = ("solid", self._role_style.border)
             self.add_class("-bordered")
+            # The row itself carries the role background so the highlight (and
+            # the body's bottom interior padding row) paints edge to edge;
+            # Textual does not paint a widget's background through its margins.
             if background:
                 self.styles.background = background
 
@@ -798,7 +801,7 @@ class StreamingTranscriptMessageWidget(ThemedMarkdownWidget):
         width: 1fr;
         height: auto;
         margin: 1 1 0 1;
-        padding: 0 1;
+        padding: 0 1 1 1;
     }
 
     StreamingTranscriptMessageWidget > MarkdownParagraph {
