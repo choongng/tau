@@ -3780,20 +3780,14 @@ class TauTuiApp(App[None]):
 
     #prompt-row {
         height: auto;
-        margin: 1 1 1 1;
+        margin: 1 1 1 0;
     }
 
-    /* Transcript rows begin at x=4 (main-pane padding + the transcript's
-       2-column gutter); the bordered ones (user, tool, status) draw their
-       left pipe there and their text at x=5. The prompt box has no border of
-       its own, so the "τ" column widens to 3 to hold the gap the bordered
-       rows spend on their pipe, and the input keeps one column of left
-       padding: the box's highlighted edge and the typed text both land on
-       x=5, the message text column. A TextArea draws its cursor at the
-       border+padding edge, so the caret sits on the pipe column instead of
-       covering the box edge. */
+    /* The prompt row keeps only the main-pane padding: the "τ" sits at x=1,
+       flush with the transcript's left edge, and the box begins directly
+       after it at x=2, two columns left of the message pipes. */
     #prompt-prefix {
-        width: 3;
+        width: 1;
         height: 3;
         padding: 0 0 0 0;
         margin: 0;
@@ -3802,6 +3796,9 @@ class TauTuiApp(App[None]):
         text-style: bold;
     }
 
+    /* The input keeps 1 column of left padding (the caret sits at the
+       border+padding edge and would otherwise cover the box edge); with the
+       box at x=2 its typed text lands at x=3. */
     #prompt {
         width: 1fr;
         height: auto;
