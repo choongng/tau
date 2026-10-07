@@ -597,7 +597,7 @@ class TranscriptMessageWidget(Horizontal):
     TranscriptMessageWidget {
         width: 1fr;
         height: auto;
-        margin: 1 0 0 0;
+        margin: 1 1 0 0;
     }
 
     /* Message text starts two columns from the row's left edge for every
@@ -610,11 +610,11 @@ class TranscriptMessageWidget(Horizontal):
     TranscriptMessageWidget > .transcript-message-body {
         width: 1fr;
         height: auto;
-        padding: 0 1 0 2;
+        padding: 0 1;
     }
 
     TranscriptMessageWidget.-bordered > .transcript-message-body {
-        padding: 0 1 0 1;
+        padding: 0 1;
     }
 
     TranscriptMessageWidget > .transcript-markdown-body > MarkdownParagraph {
@@ -800,9 +800,9 @@ class StreamingTranscriptMessageWidget(ThemedMarkdownWidget):
 
     DEFAULT_CSS = """
     StreamingTranscriptMessageWidget {
-        width: 100%;
+        width: 1fr;
         height: auto;
-        margin: 1 0 0 0;
+        margin: 1 1 0 0;
         padding: 0 1;
     }
 
