@@ -11941,3 +11941,28 @@ async def test_tui_login_provider_search_autofocus() -> None:
 
         search = app.screen.query_one("#login-provider-search", Input)
         assert search.has_focus, "Search input failed to automatically gain focus on screen mount."
+
+
+@pytest.mark.anyio
+async def test_tui_app_down_arrow_returns_to_blank_after_recalling_prompt() -> None:
+    """After Up recalls a previous prompt, Down returns to a blank input."""
+    app = TauTuiApp(FakeSession())
+
+    async with app.run_test() as pilot:
+        prompt = app.query_one("#prompt", TextArea)
+        prompt.text = "first"
+        await pilot.press("enter")
+        await pilot.pause()
+        prompt.text = "second"
+        await pilot.press("enter")
+        await pilot.pause()
+
+        prompt.text = ""
+        await pilot.press("up")
+        await pilot.pause()
+        assert prompt.text == "second"
+
+        await pilot.press("down")
+        await pilot.pause()
+        assert prompt.text == ""
+        assert prompt.cursor_location == (0, 0)
