@@ -3780,7 +3780,7 @@ class TauTuiApp(App[None]):
 
     #prompt-row {
         height: auto;
-        margin: 0 1 1 1;
+        margin: 1 1 1 1;
     }
 
     #prompt-prefix {
