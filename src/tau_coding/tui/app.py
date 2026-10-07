@@ -3787,7 +3787,7 @@ class TauTuiApp(App[None]):
        flush with the transcript's left edge, and the box begins directly
        after it at x=2, two columns left of the message pipes. */
     #prompt-prefix {
-        width: 1;
+        width: 2;
         height: 3;
         padding: 0 0 0 0;
         margin: 0;
@@ -3798,7 +3798,7 @@ class TauTuiApp(App[None]):
 
     /* The input keeps 1 column of left padding (the caret sits at the
        border+padding edge and would otherwise cover the box edge); with the
-       box at x=2 its typed text lands at x=3. */
+       box at x=3 its typed text lands at x=4. */
     #prompt {
         width: 1fr;
         height: auto;
