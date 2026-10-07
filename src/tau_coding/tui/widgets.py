@@ -476,6 +476,10 @@ class TranscriptWindowBoundary(Static):
         self.update(self._label(count), layout=False)
 
     def _label(self, count: int) -> str:
+        # A caller that has nothing left to count gets no row: an empty Static
+        # still reserves a line, which would be a blank row in the transcript.
+        if count <= 0:
+            return ""
         noun = "message" if count == 1 else "messages"
         arrow = "↑" if self.direction == "earlier" else "↓"
         return f"{arrow} Scroll for {count} {self.direction} {noun}"
@@ -593,7 +597,7 @@ class TranscriptMessageWidget(Horizontal):
     TranscriptMessageWidget {
         width: 1fr;
         height: auto;
-        margin: 1 1 2 0;
+        margin: 1 1 0 0;
     }
 
     TranscriptMessageWidget > .transcript-message-body {
@@ -785,7 +789,7 @@ class StreamingTranscriptMessageWidget(ThemedMarkdownWidget):
     StreamingTranscriptMessageWidget {
         width: 1fr;
         height: auto;
-        margin: 1 1 2 1;
+        margin: 1 1 0 1;
         padding: 0 1 0 0;
     }
 
@@ -1206,17 +1210,24 @@ class TranscriptView(VerticalScroll):
         self._bottom_boundary = None
 
         widgets: list[Widget] = []
+        hidden_thinking_widget: TranscriptMessageWidget | None = None
+        last_item = state.items[-1] if state.items else None
+        window_items = state.items[self._window_start : self._window_end]
+        # A hidden-thinking item that anything has followed renders as nothing:
+        # no line, and no blank row standing in for one. It still counts toward
+        # the earlier-messages boundary, which counts items rather than rows.
+        hidden_skipped = sum(
+            1
+            for item in window_items
+            if item.role == "thinking" and not state.show_thinking and item is not last_item
+        )
         if self._window_start > 0:
             self._top_boundary = TranscriptWindowBoundary("earlier", self._window_start)
             widgets.append(self._top_boundary)
 
-        hidden_thinking_widget: TranscriptMessageWidget | None = None
-        last_item = state.items[-1] if state.items else None
-        for item in state.items[self._window_start : self._window_end]:
+        for item in window_items:
             if item.role == "thinking" and not state.show_thinking:
                 if item is not last_item:
-                    # Hidden thinking that anything has followed leaves no line;
-                    # the status line belongs to thinking that is still going.
                     continue
                 if hidden_thinking_widget is None:
                     hidden_thinking_widget = TranscriptMessageWidget(
@@ -1245,7 +1256,10 @@ class TranscriptView(VerticalScroll):
             widgets.append(widget)
 
         if self._window_end < total:
-            self._bottom_boundary = TranscriptWindowBoundary("later", total - self._window_end)
+            self._bottom_boundary = TranscriptWindowBoundary(
+                "later",
+                total - self._window_end + hidden_skipped,
+            )
             widgets.append(self._bottom_boundary)
         elif state.assistant_buffer:
             self._active_assistant_widget = StreamingTranscriptMessageWidget(
