@@ -3694,7 +3694,6 @@ class TauTuiApp(App[None]):
 
     #main-pane {
         width: 1fr;
-        padding: 1 0 0 0;
     }
 
     #transcript {
