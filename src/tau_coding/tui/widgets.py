@@ -613,9 +613,16 @@ class TranscriptMessageWidget(Horizontal):
        pipe, so their text sits two columns from the row's left edge;
        borderless rows (assistant, thinking) sit one column in. The padding
        lives on the body, not on the inner markdown blocks: those inherit the
-       markdown widget's styles, and padding on both would double up. */
+       markdown widget's styles, and padding on both would double up. The
+       bottom padding row — the box's blank interior row — is user-only (see
+       the constructor): the summary-style rows (tools, status) read better
+       sitting close to what follows them. */
     TranscriptMessageWidget > .transcript-message-body {
         height: auto;
+        padding: 0 1 0 1;
+    }
+
+    TranscriptMessageWidget.-user > .transcript-plain-body {
         padding: 0 1 1 1;
     }
 
@@ -661,16 +668,18 @@ class TranscriptMessageWidget(Horizontal):
             self._result_markup,
         )
         super().__init__(classes="transcript-message")
+        # The user box is the only one with blank interior rows, and its body
+        # is always a plain Static (see `_use_plain_transcript_body`), which
+        # is what the interior-padding CSS rule selects on.
+        if item.role == "user":
+            self.add_class("-user")
         # Textual paints a widget's background across its padding but not
         # its margins: the right column that used to be a margin is now
         # padding, so the role background fills it, while the left inset
         # stays a bare margin. Top padding is the user box's blank interior
-        # row and must not move its pipe glyph down; the box's bottom stays
-        # with the body so it does not double up.
-        if item.role == "user":
-            self.styles.padding = (1, 1, 0, 0)
-        else:
-            self.styles.padding = (0, 1, 0, 0)
+        # row and must not move its pipe glyph down; the bottom interior row
+        # lives on the body (see the CSS), and only the user box has one.
+        self.styles.padding = (1, 1, 0, 0) if item.role == "user" else (0, 1, 0, 0)
         foreground, background = _split_rich_style_colors(self._role_style.body)
         self._body_foreground = foreground
         if item.role in _BORDERLESS_TRANSCRIPT_ROLES or item.system_prompt_sources is not None:
@@ -820,7 +829,7 @@ class StreamingTranscriptMessageWidget(ThemedMarkdownWidget):
            (theme.transcript_background) paints the padding column. */
         height: auto;
         margin: 1 0 0 1;
-        padding: 0 1 1 1;
+        padding: 0 1 0 1;
     }
 
     StreamingTranscriptMessageWidget > MarkdownParagraph {

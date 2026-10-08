@@ -2124,7 +2124,7 @@ async def test_transcript_message_widget_renders_full_height_role_block() -> Non
     async with app.run_test(size=(60, 30)) as pilot:
         await pilot.pause()
         widget = app.query_one(TranscriptMessageWidget)
-        body = widget.query_one(".transcript-message-body")
+        body = widget.query_one(".transcript-plain-body")
 
         # A multi-line message must occupy more than a single row so the accent
         # and background have to span the full message height.
@@ -2134,10 +2134,11 @@ async def test_transcript_message_widget_renders_full_height_role_block() -> Non
         # block is rectangular and the accent spans every wrapped line.
         assert widget.styles.background == background
         assert body.styles.background == background
+        # The row pads its top interior row (the user box) and its right
+        # column; the box's bottom interior row lives on the body.
         assert widget.styles.padding.top == 1
-        # The blank row above the block is a margin only: a bottom padding row
-        # would paint a second background row under the message.
         assert widget.styles.padding.bottom == 0
+        assert body.styles.padding.bottom == 1
         edge_type, edge_color = widget.styles.border_left
         assert edge_type != "none"
         assert edge_color == border
