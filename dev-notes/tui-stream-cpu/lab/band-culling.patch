@@ -1,0 +1,733 @@
+diff --git a/src/tau_coding/tui/widgets.py b/src/tau_coding/tui/widgets.py
+index 807ac977..4dc4fa27 100644
+--- a/src/tau_coding/tui/widgets.py
++++ b/src/tau_coding/tui/widgets.py
+@@ -452,6 +452,17 @@ TRANSCRIPT_WINDOW_ITEMS = 200
+ TRANSCRIPT_WINDOW_PAGE_ITEMS = 80
+ TRANSCRIPT_WINDOW_OVERSCAN_ITEMS = 40
+ 
++# The culled band (_BAND_CAP_ITEMS) is what stays mounted while output
++# streams: every mounted row re-lays-out on every streamed fragment, so
++# the band is deliberately smaller than the paged window constants above.
++# It grows and shrinks in _BAND_BATCH_ITEMS steps, so a streamed item
++# costs a mount once per batch instead of once per tick.
++_BAND_CAP_ITEMS = 96
++_BAND_BATCH_ITEMS = 24
++_BAND_KEEP_ROWS = 16
++_BAND_GUESS_ROWS = 8
++_BAND_ANOMALIES: list[str] = []
++
+ 
+ class TranscriptWindowBoundary(Static):
+     """Small paging sentinel shown when transcript items are outside the DOM window."""
+@@ -917,7 +928,7 @@ class StreamingTranscriptMessageWidget(ThemedMarkdownWidget):
+         return selected_text, "\n"
+ 
+ 
+-class TranscriptView(VerticalScroll):
++class TranscriptViewBase(VerticalScroll):
+     """Scrollable transcript view backed by individual selectable message widgets."""
+ 
+     def __init__(self, *args: Any, **kwargs: Any) -> None:
+@@ -1654,6 +1665,701 @@ class TranscriptView(VerticalScroll):
+         )
+ 
+ 
++class TranscriptView(TranscriptViewBase):
++    def __init__(self, *args, **kwargs):
++        self._pending_edge = False
++        self._pending_abs = 0.0
++        self._band_request = False
++        self._band_pending = None
++        super().__init__(*args, **kwargs)
++        self._heights = {}
++        self._pending = False
++        self._in_op = False
++
++    def _log_anomaly(self, msg: str) -> None:
++        """Record a band inconsistency: never fatal. The retune loop
++        rebuilds its view of the window from the mounted rows on every
++        tick, so an anomaly explains a stutter rather than breaking the
++        view."""
++        _BAND_ANOMALIES.append(msg)
++
++
++    def get_content_height(self, container, viewport, width):
++        # spacer-carrying band: super()'s sum (rows + spacer heights) IS
++        # the virtual height; no ledger offset here.
++        return super().get_content_height(container, viewport, width)
++
++
++
++
++    def _band_extent(self):
++        """Measured height of the mounted band (spacer to spacer)."""
++        rows = self._rows()
++        if not rows:
++            return 0
++        first, last = rows[0], rows[-1]
++        # trust ledger when regions are not laid out (height 0)
++        ext = ((last.region.y + (last.styles.margin.top or 0)
++                + last.region.height)
++               - first.region.y)
++        if ext <= 0:
++            ext = sum(self._height_of(self._item_of(r))
++                      for r in rows if self._item_of(r) is not None)
++        # bottom spacer (mounted, unmeasured) counts as an empty row in
++        # region math; the band is items only
++        return ext - 1
++
++
++    def _abs_now(self):
++        """Absolute transcript y currently under the viewport top."""
++        tb = self._top_boundary
++        return self.scroll_y + (tb.region.height if tb is not None else 0)
++
++
++    def _serve_edge_request(self, pairs, rows, cont_h):
++        """Window slide toward an absolute target the band cannot show.
++
++        The viewport sits at a band edge because the request clamped
++        there; the target lies outside the band, so the WINDOW moves
++        toward it one batch per tick. The viewport content is anchored
++        through the operation: _shift_window moves items in or out at
++        both edges and re-establishes the same absolute position at
++        the end, whatever the spacer did meanwhile."""
++        state = self._render_state
++        if state is None or not pairs:
++            return False
++        state = self._render_state
++        if state is None:
++            self._pending_edge = False
++            return False
++        total = len(state.items)
++        target = self._pending_abs
++        if target is None:
++            self._pending_edge = False
++            return False
++        now = self._abs_now()
++        if target < now:
++            if self._window_start <= 0:
++                self._pending_edge = False
++                return False
++            n = min(_BAND_BATCH_ITEMS, self._window_start)
++            self._shift_window(-n)
++            return True
++        band_bottom = now + self._band_extent()
++        if target > band_bottom and self._window_end < total:
++            n = min(_BAND_BATCH_ITEMS, total - self._window_end)
++            self._shift_window(n)
++            return True
++        self._pending_edge = False
++        return False
++
++    def _shift_window(self, n):
++        """Move the window n items in one direction (n<0: toward item
++        0), keeping the band size within its cap and the viewport
++        anchored to the same absolute content.
++
++        n<0: mount -n items at the front; if that puts the band over
++        its cap, unmount the overflow from the END (the viewport is at
++        the band front edge — the end rows are off-screen).
++        n>0: mount n at the end; if over cap, unmount the overflow from
++        the FRONT only when those rows are off-screen (viewport deep in
++        the band); otherwise the slide cannot proceed.
++        Anchor: after mounting/dropping, the absolute position is
++        re-asserted through the boundary, which reads the fresh spacer.
++        """
++        state = self._render_state
++        if state is None or n == 0:
++            return False
++        total = len(state.items)
++        abs_before = self._abs_now()
++        if n < 0:
++            n = min(-n, self._window_start)
++            if n <= 0:
++                return False
++            self._mount_items_front(n)
++            overflow = (self._window_end - self._window_start) - _BAND_CAP_ITEMS
++            if overflow > 0:
++                self._unmount_end(overflow)
++        else:
++            n = min(n, total - self._window_end)
++            if n <= 0:
++                return False
++            self._mount_items_end(n)
++            overflow = (self._window_end - self._window_start) - _BAND_CAP_ITEMS
++            if overflow > 0:
++                self._unmount_front_keep(overflow)
++        self.call_after_refresh(
++            lambda t=abs_before: self.scroll_to(
++                y=t, animate=False, immediate=True, force=True))
++        return True
++
++    def _mount_items_front(self, count):
++        state = self._render_state
++        count = min(count, self._window_start)
++        if count <= 0:
++            return
++        new_items = state.items[self._window_start - count:self._window_start]
++        widgets = [w for it in new_items
++                   if (w := self._widget_for_item(it)) is not None]
++        self._window_start -= len(new_items)
++        rows = self._rows()
++        if widgets:
++            if rows:
++                self.mount(*widgets, before=rows[0])
++            else:
++                self.mount(*widgets, before=self._bottom_boundary)
++        self._sync_boundaries()
++
++    def _mount_items_end(self, count):
++        state = self._render_state
++        total = len(state.items)
++        count = min(count, total - self._window_end)
++        if count <= 0:
++            return
++        items = state.items[self._window_end:self._window_end + count]
++        widgets = [w for it in items if (w := self._widget_for_item(it)) is not None]
++        self._window_end += len(items)
++        if widgets:
++            self.mount(*widgets, before=self._bottom_boundary)
++        self._sync_boundaries()
++
++    def _unmount_rows(self, rows):
++        transient = self._transient_rows()
++        for r in rows:
++            if id(r) in transient:
++                continue  # the base renderer takes it back itself
++            it = self._item_of(r)
++            if it is not None:
++                self._item_widgets.pop(id(it), None)
++            r.remove()
++
++    def _unmount_end(self, count):
++        rows = self._rows()
++        doomed = rows[len(rows) - min(count, max(0, len(rows) - 1)):]
++        self._unmount_rows(doomed)
++        self._window_end -= len(doomed)
++        self._sync_boundaries()
++
++    def _unmount_front_keep(self, count):
++        """Unmount from the band front but never past the viewport:
++        rows within _BAND_KEEP_ROWS of the first visible row stay."""
++        rows = self._rows()
++        cont_h = max(self.container_size.height, 1)
++        first_vis = self._first_visible(rows, cont_h)
++        allowed = max(0, first_vis - _BAND_KEEP_ROWS)
++        doomed = rows[:min(count, allowed)]
++        self._unmount_rows(doomed)
++        self._window_start += len(doomed)
++        self._sync_boundaries()
++
++    def scroll_to(self, x=None, y=None, **kwargs):
++        """Coordinate boundary. Callers arrive in two systems:
++
++        * absolute transcript y — textual's own page/line/home helpers
++          and any code that treats the view as its full virtual range
++          (which it is: spacer + band + spacer adds up exactly);
++        * band-relative y — our own band operations, which pass
++          _in_op=True or _band_request=True and bypass translation.
++
++        No heuristic is needed to tell them apart: everything arriving
++        without a marker is absolute, because the virtual range is the
++        only coordinate system the outside world can see. The band
++        serves what it can and the retune loop moves the band toward a
++        clamped request."""
++        if y is not None and not self._in_op and not self._band_request:
++            tb = self._top_boundary
++            sp = tb.region.height if tb is not None else 0
++            band = float(y) - sp
++            clamped = band < -0.5 or band > self.max_scroll_y + 0.5
++            band = max(0.0, min(band, float(self.max_scroll_y)))
++            self._pending_edge = clamped
++            self._pending_abs = float(y)
++            kwargs["immediate"] = True
++            y = band
++        if self._band_request:
++            self._band_request = False
++        self._schedule_retune()
++        return super().scroll_to(x, y, **kwargs)
++
++    def _scroll_band(self, band_y):
++        """Scroll to a band-relative position (our own operations).
++
++        A band write may legitimately exceed max_scroll_y as measured
++        right now, when the spacer is about to grow this very tick:
++        textual clamps writes against the OLD max, so the write waits
++        for the new layout."""
++        self._band_request = True
++        self._band_pending = float(band_y)
++        self.refresh(layout=True)
++        self.call_after_refresh(self._write_band_pending)
++
++    def _write_band_pending(self):
++        v, self._band_pending = self._band_pending, None
++        if v is None:
++            return
++        self._band_request = True
++        self.scroll_to(y=min(v, float(self.max_scroll_y)),
++                       animate=False, immediate=True, force=True)
++
++    def scroll_home(self, **kwargs):
++        if not self._in_op:
++            kwargs["animate"] = kwargs.get("animate", False)
++            kwargs["immediate"] = True
++            self._schedule_retune()
++            return self.scroll_to(y=0, **kwargs)
++        return super().scroll_home(**kwargs)
++
++    def _rows(self):
++        return [c for c in self.children
++                if isinstance(c, Widget)
++                and c is not self._top_boundary and c is not self._bottom_boundary]
++
++    def _item_of(self, row):
++        return getattr(row, "item", None)
++
++    def _measure(self):
++        for r in self._rows():
++            try:
++                h = r.region.height
++            except Exception:
++                continue
++            if not h:
++                continue
++            self._heights[id(r)] = h
++            item = self._item_of(r)
++            if item is not None:
++                self._heights[id(item)] = h + (r.styles.margin.top or 0)
++
++    def _height_of(self, item):
++        return self._heights.get(id(item), _BAND_GUESS_ROWS)
++
++    # ---- I1 check + rebuild ----
++
++    def _rows_of_state(self):
++        """One pass: drop rows whose item left the state, return the
++        remaining (row, item_index) pairs. State order IS row order: the
++        renderer appends, we append; gaps are hidden-thinking items,
++        which production removes together with their rows."""
++        state = self._render_state
++        if state is None:
++            return []
++        index = {id(it): i for i, it in enumerate(state.items)}
++        out = []
++        for r in list(self._rows()):
++            if isinstance(r, TranscriptWindowBoundary):
++                continue
++            it = self._item_of(r)
++            if it is None:
++                continue  # placeholder: transient, not bookkept
++            idx = index.get(id(it))
++            if idx is None:
++                self._item_widgets.pop(id(it), None)
++                r.remove()
++                continue
++            out.append((r, idx))
++        return out
++
++    def _sync_window_to_rows(self):
++        """Window := span of mounted rows. Any out-of-span stray row is
++        unmounted. Returns list of (row, idx)."""
++        pairs = self._rows_of_state()
++        if not pairs:
++            return []
++        lo = min(i for _, i in pairs)
++        hi = max(i for _, i in pairs)
++        self._window_start = lo
++        self._window_end = hi + 1
++        for r, i in list(pairs):
++            if i < lo or i > hi:
++                it = self._item_of(r)
++                if it is not None:
++                    self._item_widgets.pop(id(it), None)
++                r.remove()
++                pairs.remove((r, i))
++        return pairs
++
++    def _schedule_retune(self, *, now=False):
++        if self._pending:
++            return
++        self._pending = True
++        if now:
++            self.call_next(self._retune_tick)
++        else:
++            self.call_after_refresh(self._retune_tick)
++
++    async def _retune_tick(self):
++        self._pending = False
++        if not self.is_mounted or self._in_op:
++            return
++        self._in_op = True
++        try:
++            mutated = await self._retune_once()
++        except Exception:
++            import traceback
++            traceback.print_exc()
++            self._log_anomaly("retune-exception")
++            mutated = False
++        finally:
++            self._in_op = False
++        if mutated and self.is_mounted:
++            self._schedule_retune()
++
++    async def _retune_once(self):
++        state = self._render_state
++        if state is None or not state.items:
++            return False
++        pairs = self._sync_window_to_rows()
++        self._measure()
++        rows = self._rows()
++        total = len(state.items)
++        cont_h = max(self.container_size.height, 1)
++        n_items = len(pairs)
++
++        # absolute-end: viewport at the true bottom of the virtual range
++        # Follow means: pinned to the true bottom of the virtual range.
++        # That is the ONLY way into the follow path — a follow flag left
++        # over from production's render, with the viewport anywhere
++        # else, must not drive band growth toward the state end (that
++        # loop pins the band at the end and wedges user scroll).
++        # The truth about bottom is the WINDOW, not the virtual range:
++        # a full spacer makes max_scroll_y a fiction until the band
++        # grows. Follow is meaningful exactly when the band ends at the
++        # state end (or nothing remains after it).
++        end_known = self._window_end >= total
++        at_end = end_known and (
++            self._follow_output
++            or self.is_vertical_scroll_end
++            or self.max_scroll_y - self.scroll_y < 2)
++        # The widget IS the virtual range: textual's own arithmetic on
++        # spacer + rows is coherent and complete. A request outside the
++        # band is served by GROWING the band to cover it, which the
++        # retune loop below does; clamping here would pin a request at
++        # a band edge before the band can move.
++
++        if at_end:
++            # Serving follow means the band ENDS at the state end and
++            # the viewport sits at the bottom of the content. It does
++            # NOT mean the band is full: mounting every streamed
++            # fragment one row at a time is what makes streaming O(N)
++            # in mounted widgets. Settle the band to exactly the cap at
++            # both edges (batched), then fall through to the shared
++            # near-edge growth so new items mount batch-wise, never
++            # one per tick.
++            if self._window_end < total and n_items <= _BAND_CAP_ITEMS:
++                self._grow_end(min(_BAND_BATCH_ITEMS, total - self._window_end))
++                return True
++            over = n_items - _BAND_CAP_ITEMS
++            if over > 0 and self._window_start > 0:
++                # over cap: give the front back in _BAND_BATCH_ITEMS-sized steps,
++                # viewport re-pinned to the absolute bottom after
++                n = self._count_for_rows(
++                    pairs, min(over + _BAND_BATCH_ITEMS, self._window_start))
++                if n <= 0:
++                    return False
++                self._drop_front(n, anchor=False)
++                self.call_after_refresh(
++                    lambda: self.scroll_to(y=10 ** 9, animate=False,
++                                           immediate=True, force=True))
++                return True
++            # settled at the end and within cap: fall through to the
++            # user-driven policy below for the small growth cases
++
++        # ---- user-driven viewport ----
++        # The viewport sits at band-relative scroll_y inside a band of
++        # extent (spacer .. spacer). Serve it like a viewport policy:
++        #   * near band top and items remain  -> grow front (bounded)
++        #   * near band bottom and items remain -> grow end (bounded)
++        #   * far above the viewport          -> drop front (bounded)
++        #   * far below the viewport          -> shrink back (bounded)
++        # Bounds: grow keeps the band <= want; drop/shrink keep the
++        # viewport inside with _BAND_KEEP_ROWS rows of margin, and only run when
++        # the band over-serves (>= _BAND_CAP_ITEMS rows or _BAND_KEEP_ROWS*2 of margin).
++        changed = False
++        band_extent = self._band_extent()
++        first_vis = self._first_visible(rows, cont_h)
++        want = max(_BAND_CAP_ITEMS, 2 * cont_h)
++        room = want - n_items
++
++        near_top = self.scroll_y <= cont_h
++        near_bot = band_extent - (self.scroll_y + cont_h) <= cont_h
++
++        if self._pending_edge:
++            if self._serve_edge_request(pairs, rows, cont_h):
++                return True
++        if self._window_start > 0 and near_top and room > 0:
++            before = self._window_start
++            self._grow_front(min(room, self._window_start))
++            changed = self._window_start < before
++        if self._window_end < total and near_bot and room > 0 \
++                and not changed:
++            self._grow_end(min(room, total - self._window_end))
++            changed = True
++
++        # Trim: while the viewport is settled (no unserved request in
++        # flight) and the band is bigger than the viewport needs, give
++        # rows back at both ends — the window must return to its cap
++        # once the band has over-served. Rows within _BAND_KEEP_ROWS of the
++        # viewport are never touched.
++        if not changed and not self._pending_edge and n_items > _BAND_CAP_ITEMS:
++            tail = n_items - first_vis
++            if first_vis >= 2 * _BAND_KEEP_ROWS and self._window_start > 0:
++                before = self._window_start
++                self._unmount_front_keep(
++                    self._count_for_rows(pairs, first_vis - _BAND_KEEP_ROWS))
++                changed = self._window_start > before
++            elif tail >= 2 * _BAND_KEEP_ROWS:
++                # shrink the band from the END toward the viewport:
++                # only rows beyond _BAND_KEEP_ROWS below the last visible row go.
++                rows_all = self._rows()
++                last_vis = self._last_visible(rows_all, cont_h)
++                excess = len(rows_all) - (last_vis + _BAND_KEEP_ROWS)
++                if excess >= _BAND_BATCH_ITEMS:
++                    self._unmount_end(excess)
++                    changed = True
++        return changed
++
++    def _count_for_rows(self, pairs, wanted_rows):
++        """Number of leading in-band items whose heights first cover
++        `wanted_rows` of layout (rows without items count as one)."""
++        total_h = 0
++        n = 0
++        for (r, idx) in pairs:
++            it = self._item_of(r)
++            total_h += (self._height_of(it) if it is not None
++                        else (r.region.height or 1))
++            n += 1
++            if total_h >= wanted_rows:
++                break
++        return n
++
++    def _last_visible(self, rows, cont_h):
++        view_bot = self.scroll_y + cont_h
++        for idx, r in enumerate(rows):
++            if not r.region.height:
++                continue
++            if r.region.y - self.scroll_offset.y >= view_bot:
++                return idx
++        return len(rows)
++
++    def _first_visible(self, rows, cont_h):
++        view_top = self.scroll_y  # band-relative; spacers live in-band
++        for idx, r in enumerate(rows):
++            if not r.region.height:
++                return idx
++            top = r.region.y - self.scroll_offset.y
++            if top + r.region.height >= view_top:
++                return idx
++        return len(rows)
++        return len(rows) - 1
++
++    # ---- I3: band mutations re-anchor to a widget ----
++    def _drop_front(self, count, *, anchor=True):
++        """Remove `count` rows from the band front and unmount them.
++
++        The viewport is *content-anchored by default*: the spacer
++        grows to carry what the band lost, and scroll_y grows to
++        match, so the content under the viewport does not move. Callers
++        that want the viewport to hold its position in the (shifted)
++        coordinate system pass anchor=False and adjust themselves.
++
++        Returns the ledger height moved out of the band."""
++        if self._window_start + count > self._window_end:
++            self._log_anomaly("drop-front-overflow")
++            count = max(0, self._window_end - self._window_start - 1)
++            if count <= 0:
++                return 0
++        rows = self._rows()
++        doomed = rows[:count]
++        removed_h = sum(self._height_of(self._item_of(r))
++                        for r in doomed if self._item_of(r) is not None)
++        for r in doomed:
++            item = self._item_of(r)
++            if item is not None:
++                self._item_widgets.pop(id(item), None)
++            r.remove()
++        self._window_start += count
++        self._sync_boundaries()
++        if anchor:
++            self._restore_scroll(self.scroll_y + removed_h)
++        return removed_h
++
++    def _grow_front(self, count):
++        """Mount `count` items ahead of the band.
++
++        Content-anchored: the spacer shrinks by the ledger height of
++        the newly mounted items, so band scroll grows by the same and
++        the content under the viewport does not move. Synchronous: the
++        spacer is exact immediately (virtual-height widgets); the mount
++        itself settles in the normal layout pass, and the scroll
++        restore is deferred to after it."""
++        state = self._render_state
++        if state is None or count <= 0 or self._window_start <= 0:
++            return
++        count = min(count, self._window_start)
++        new_items = state.items[self._window_start - count:self._window_start]
++        widgets = [w for it in new_items
++                   if (w := self._widget_for_item(it)) is not None]
++        inserted_h = sum(self._height_of(it) for it in new_items)
++        self._window_start -= count
++        rows = self._rows()
++        if widgets:
++            if rows:
++                self.mount(*widgets, before=rows[0])
++            else:
++                self.mount(*widgets, before=self._bottom_boundary)
++        self._sync_boundaries()
++        self._restore_scroll(min(float(self.max_scroll_y),
++                                  self.scroll_y + inserted_h))
++
++    def _grow_end(self, count):
++        state = self._render_state
++        if state is None or count <= 0:
++            return
++        count = min(count, len(state.items) - self._window_end)
++        items = state.items[self._window_end:self._window_end + count]
++        widgets = [w for it in items if (w := self._widget_for_item(it)) is not None]
++        self._window_end += len(items)
++        if widgets:
++            self.mount(*widgets, before=self._bottom_boundary)
++        self._sync_boundaries()
++        self.refresh(layout=True)
++
++    def _restore_scroll(self, band_sy):
++        self._scroll_band(band_sy)
++
++
++
++    def _unmount_stale_rows(self):
++        return self._rows_of_state() and 0
++
++    def _snap_window_to_rows(self):
++        return self._sync_window_to_rows() and True
++
++    def _fix_ledger_and_above(self):
++        state = self._render_state
++        if state is None:
++            return
++        self._measure()
++
++    def _sync_boundaries(self):
++        state = self._render_state
++        if state is None:
++            return
++        total = len(state.items)
++        # spacer heights = ledger sums outside the window
++        if self._window_start > 0:
++            if self._top_boundary is None:
++                self._top_boundary = TranscriptWindowBoundary(
++                    "earlier", self._window_start)
++                rows = self._rows()
++                self.mount(self._top_boundary, before=rows[0] if rows else None)
++                self.refresh(layout=True)
++            else:
++                self._top_boundary.update_count(self._window_start)
++            self._top_boundary.styles.height = sum(
++                self._height_of(it) for it in state.items[:self._window_start])
++        elif self._top_boundary is not None:
++            self._top_boundary.remove()
++            self._top_boundary = None
++        if self._window_end < total:
++            if self._bottom_boundary is None:
++                self._bottom_boundary = TranscriptWindowBoundary(
++                    "later", total - self._window_end)
++                self.mount(self._bottom_boundary)
++                self.refresh(layout=True)
++            else:
++                self._bottom_boundary.update_count(total - self._window_end)
++            self._bottom_boundary.styles.height = sum(
++                self._height_of(it) for it in state.items[self._window_end:])
++        elif self._bottom_boundary is not None:
++            self._bottom_boundary.remove()
++            self._bottom_boundary = None
++
++    def _widget_for_item(self, item):
++        existing = self._item_widgets.get(id(item))
++        if existing is not None:
++            return None
++        state = self._render_state
++        show = state.show_tool_results if state else False
++        w = _transcript_widget(
++            item, theme=self._render_theme, show_tool_results=show,
++            custom_markup=(state.resolve_custom_markup(item, expanded=show)
++                           if item.role == "custom" else None),
++            invocation=state.resolve_tool_invocation(item, expanded=show) if state else None,
++            result_markup=state.resolve_tool_result(item, expanded=show) if state else None)
++        self._item_widgets[id(item)] = w
++        return w
++
++    # ---- production pager off under culling ----
++    def _schedule_window_shift(self, direction):
++        return
++
++    # ---- hooks ----
++    def watch_scroll_y(self, old_value, new_value):
++        # during band ops and content growth, textual moves scroll_y as a
++        # side effect (clamping against a shrinking band). Production's
++        # "user scrolled -> stop following" rule only applies to scrolls
++        # from OUTSIDE us; a shrink caused by our own drop_front keeps
++        # `follow` alive when the view was glued to the band bottom.
++        band_shrink = (
++            self._in_op
++            or (new_value < old_value
++                and new_value >= self.max_scroll_y - 1)
++        )
++        follow_before = self._follow_output
++        super().watch_scroll_y(old_value, new_value)
++        if band_shrink and follow_before and self._render_state is not None:
++            if self._window_end >= len(self._render_state.items):
++                self._follow_output = True
++        self._schedule_retune(now=True)
++
++    def update_from_state(
++        self,
++        state: TuiState,
++        *,
++        theme: TuiTheme = TAU_DARK_THEME,
++    ) -> None:
++        """Full render whenever the band could not serve the base's
++        incremental paths.
++
++        The base's incremental paths assume every item in the mounted
++        window has a row; with the band culled, rows cover only part of
++        the window, so a mid-window append would land out of order. The
++        base's own full-redraw condition (a new or unprojected state) is
++        widened to include that case. Mid-turn -- rows agreeing with the
++        window -- the incremental paths still run and keep their cost."""
++        same_state = self._render_state is state
++        if same_state and self._window_agrees_with_rows():
++            super().update_from_state(state, theme=theme)
++            self._sync_boundaries()
++            self._schedule_retune()
++            return
++        super().update_from_state(state, theme=theme)
++        self._sync_boundaries()
++        self._schedule_retune()
++
++    def _window_agrees_with_rows(self) -> bool:
++        """True when every item in the window is mounted as a row, in
++        order. Transients (the placeholder, the stream widgets the base
++        owns between renders) do not count: they are not window rows."""
++        state = self._render_state
++        if state is None:
++            return False
++        transient = self._transient_rows()
++        index = {id(it): i for i, it in enumerate(state.items)}
++        seen = []
++        for r in self._rows():
++            if isinstance(r, TranscriptWindowBoundary) or id(r) in transient:
++                continue
++            idx = index.get(id(self._item_of(r)))
++            if idx is None:
++                continue
++            seen.append(idx)
++        return seen == list(range(self._window_start, self._window_end))
++
++    def on_size(self, old, new):
++        self._schedule_retune()
++
+ def _identity_index(items: Sequence[ChatItem], target: ChatItem) -> int | None:
+     """Return an item's identity-based index with an O(1) append-path fast path."""
+     if items and items[-1] is target:
