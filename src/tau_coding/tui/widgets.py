@@ -595,9 +595,15 @@ class TranscriptMessageWidget(Horizontal):
 
     DEFAULT_CSS = """
     TranscriptMessageWidget {
-        width: 1fr;
+        /* No width rule on purpose. An explicit `1fr` resolves under
+           border-box against the container minus the row's own margins,
+           so the box stopped one column short of the space it was given
+           and left a screen-background column down its right edge. With
+           no width rule the row fills its container exactly, and the
+           column that used to be the dead gap is the box's own padding
+           column. */
         height: auto;
-        margin: 1 1 0 1;
+        margin: 1 0 0 0;
     }
 
     /* One padding column at each side, inside the highlighted box, for every
@@ -607,7 +613,6 @@ class TranscriptMessageWidget(Horizontal):
        lives on the body, not on the inner markdown blocks: those inherit the
        markdown widget's styles, and padding on both would double up. */
     TranscriptMessageWidget > .transcript-message-body {
-        width: 1fr;
         height: auto;
         padding: 0 1 1 1;
     }
@@ -798,9 +803,11 @@ class StreamingTranscriptMessageWidget(ThemedMarkdownWidget):
 
     DEFAULT_CSS = """
     StreamingTranscriptMessageWidget {
-        width: 1fr;
+        /* No width rule: see TranscriptMessageWidget about the border-box
+           `1fr` column-shrink. The streaming row pads itself, so the outer
+           columns are inside its background. */
         height: auto;
-        margin: 1 1 0 1;
+        margin: 1 0 0 0;
         padding: 0 1 1 1;
     }
 
