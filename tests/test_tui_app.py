@@ -1723,7 +1723,7 @@ async def test_textual_markdown_widget_uses_theme_link_style() -> None:
 
 
 @pytest.mark.anyio
-async def test_transcript_markdown_paragraphs_keep_bottom_margin() -> None:
+async def test_transcript_markdown_paragraph_space_between_but_not_after() -> None:
     app = TauTuiApp(
         FakeSession([AssistantMessage(content="First paragraph.\n\nSecond paragraph.")]),
     )
@@ -1734,7 +1734,32 @@ async def test_transcript_markdown_paragraphs_keep_bottom_margin() -> None:
         blocks = list(app.query(TauMarkdownBlock))
 
     assert len(blocks) == 2
-    assert [block.styles.margin.bottom for block in blocks] == [1, 1]
+    # The gap between paragraphs belongs to the earlier one. The last paragraph
+    # keeps none: the transcript box has no bottom padding to absorb it, so a
+    # trailing margin there renders as a blank row inside the box.
+    assert [block.styles.margin.bottom for block in blocks] == [1, 0]
+
+
+@pytest.mark.anyio
+async def test_status_row_renders_no_blank_row_of_its_own() -> None:
+    app = TauTuiApp(FakeSession())
+
+    async with app.run_test(size=(80, 30)) as pilot:
+        for index in range(3):
+            app.state.add_item("status", f"… status {index}")
+        app._refresh()
+        await pilot.pause()
+
+        rows = [row for row in app.query(TranscriptMessageWidget) if row.item.role == "status"]
+        assert [row.item.text for row in rows] == [
+            "… status 0",
+            "… status 1",
+            "… status 2",
+        ]
+        # Each status row is exactly its one text row: no blank row is folded
+        # inside the box, which is what made a run of them read as pairs.
+        assert [row.region.height for row in rows] == [1, 1, 1]
+        assert [block.styles.margin.bottom for block in app.query(TauMarkdownBlock)] == [0] * 3
 
 
 def test_system_prompt_markdown_highlights_markup_tags_as_inline_code() -> None:

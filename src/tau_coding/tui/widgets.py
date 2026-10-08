@@ -646,8 +646,26 @@ class TranscriptMessageWidget(Horizontal):
         padding: 0 1 1 1;
     }
 
-    TranscriptMessageWidget > .transcript-markdown-body > MarkdownParagraph {
+    /* Textual's default MarkdownParagraph rule is `margin: 0 0 1 0`. Inside a
+       transcript box there is no bottom padding to absorb that trailing row, so
+       it renders as a blank line under the text — for a one-line status or
+       summary row, a blank row inside its own box. Transcript rows end at
+       their text; inter-paragraph space belongs to the paragraphs *between*
+       text (see the prose rule below), not to the last one. */
+    TranscriptMessageWidget > .transcript-markdown-body > TauMarkdownBlock {
+        margin: 0;
+    }
+
+    /* Assistant prose keeps one blank row between its paragraphs. The class is
+       on the rows whose body is free-flowing markdown rather than a one-line
+       summary (see `_transcript_prose_spacing`). The last block loses it again
+       because the body has no bottom padding to absorb it. */
+    TranscriptMessageWidget.-prose > .transcript-markdown-body > TauMarkdownBlock {
         margin: 0 0 1 0;
+    }
+
+    TranscriptMessageWidget.-prose > .transcript-markdown-body > TauMarkdownBlock:last-child {
+        margin-bottom: 0;
     }
 
     """
@@ -700,6 +718,8 @@ class TranscriptMessageWidget(Horizontal):
         self.styles.padding = (1, 0, 0, 0) if item.role == "user" else (0, 0, 0, 0)
         foreground, background = _split_rich_style_colors(self._role_style.body)
         self._body_foreground = foreground
+        if _transcript_prose_spacing(item):
+            self.add_class("-prose")
         if item.role in _BORDERLESS_TRANSCRIPT_ROLES or item.system_prompt_sources is not None:
             self._body_background = None
             self.add_class("-borderless")
@@ -905,8 +925,14 @@ class StreamingTranscriptMessageWidget(ThemedMarkdownWidget):
         padding: 0 0 0 1;
     }
 
-    StreamingTranscriptMessageWidget > MarkdownParagraph {
+    /* Same contract as a finalized row (see TranscriptMessageWidget): space
+       between paragraphs, none trailing after the last one. */
+    StreamingTranscriptMessageWidget > TauMarkdownBlock {
         margin: 0 0 1 0;
+    }
+
+    StreamingTranscriptMessageWidget > TauMarkdownBlock:last-child {
+        margin-bottom: 0;
     }
 
     StreamingTranscriptMessageWidget.-streaming MarkdownFence {
@@ -1825,6 +1851,17 @@ def _split_rich_style_colors(style: str) -> tuple[str | None, str | None]:
     foreground = text_style.color.name if text_style.color is not None else None
     background = text_style.bgcolor.name if text_style.bgcolor is not None else None
     return foreground, background
+
+
+def _transcript_prose_spacing(item: ChatItem) -> bool:
+    """Whether a row's markdown keeps a blank row between its paragraphs.
+
+    Assistant text is prose and reads wrong with its paragraphs run together.
+    Every other markdown role in the transcript — status, thinking, the summary
+    rows — is a one-line note whose body ends at its text, so the blank row
+    Textual's paragraph margin would leave lands inside the row as a gap.
+    """
+    return item.role == "assistant" and item.highlight is None
 
 
 def _use_plain_transcript_body(item: ChatItem) -> bool:
