@@ -2152,8 +2152,8 @@ async def test_transcript_message_widget_renders_full_height_role_block() -> Non
         # block is rectangular and the accent spans every wrapped line.
         assert widget.styles.background == background
         assert body.styles.background == background
-        # The row pads its top interior row (the user box) and its right
-        # column; the box's bottom interior row lives on the body.
+        # The row pads its top interior row (the user box); the box's bottom
+        # interior row lives on the body.
         assert widget.styles.padding.top == 1
         assert widget.styles.padding.bottom == 0
         assert body.styles.padding.bottom == 1
@@ -2163,6 +2163,36 @@ async def test_transcript_message_widget_renders_full_height_role_block() -> Non
 
         # Selecting the whole message still yields the original plain text.
         assert widget.get_selection(SELECT_ALL) == (plain_text, "\n")
+
+
+@pytest.mark.anyio
+async def test_transcript_right_edge_insets() -> None:
+    app = TauTuiApp(FakeSession())
+
+    async with app.run_test(size=(80, 30)) as pilot:
+        await pilot.pause()
+        transcript = app.query_one("#transcript", TranscriptView)
+        app.state.add_item("user", "question " * 30)
+        app.state.add_item("assistant", "answer " * 40)
+        transcript.update_from_state(app.state, theme=TAU_DARK_THEME)
+        await transcript.append_assistant_delta("streamed " * 30, theme=TAU_DARK_THEME)
+        await pilot.pause()
+
+        # The transcript fills the main pane: a `1fr` width would lose the
+        # widest sibling margin (two columns) down its right edge.
+        assert transcript.region.right == app.query_one("#main-pane").region.right
+        user, assistant = (
+            w for w in app.query(TranscriptMessageWidget) if w.item.role in {"user", "assistant"}
+        )
+        # A highlighted box stops one plain column short of the edge...
+        assert user.region.right == transcript.region.right - 1
+        # ...while free text, finalized or streaming, may use the last column,
+        # and both start in the same column so finalizing does not reflow.
+        streaming = app.query_one(StreamingTranscriptMessageWidget)
+        finalized_text = assistant.query_one(".transcript-message-body").content_region
+        assert finalized_text.right == transcript.region.right
+        assert streaming.content_region.right == transcript.region.right
+        assert streaming.content_region.x == finalized_text.x
 
 
 @pytest.mark.anyio

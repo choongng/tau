@@ -610,27 +610,36 @@ class TranscriptMessageWidget(Horizontal):
            border-box against the container minus the row's own margins,
            so the box stopped one column short of the space it was given
            and left a screen-background column down its right edge. With
-           no width rule the row fills its container exactly, and the
-           column that used to be the dead gap is the box's own padding
-           column. The right column stays a plain gap; the left one is a
-           margin so the history stays inset (see the constructor for why
-           only the left can be a margin). */
+           no width rule the row fills its container exactly. The left
+           margin keeps the history inset; the right margin is the one plain
+           column between a highlighted box and the edge of the transcript.
+           Borderless rows drop it (below). */
         height: auto;
+        margin: 1 1 0 1;
+    }
+
+    /* Free text (assistant, thinking) has no right inset at all: it may run
+       to the transcript's last column, like the streaming block does. */
+    TranscriptMessageWidget.-borderless {
         margin: 1 0 0 1;
     }
 
     /* One padding column at each side, inside the highlighted box, for every
-       role. Bordered rows (user, tool, status) spend one more column on their
-       pipe, so their text sits two columns from the row's left edge;
-       borderless rows (assistant, thinking) sit one column in. The padding
-       lives on the body, not on the inner markdown blocks: those inherit the
-       markdown widget's styles, and padding on both would double up. The
-       bottom padding row — the box's blank interior row — is user-only (see
-       the constructor): the summary-style rows (tools, status) read better
-       sitting close to what follows them. */
+       bordered role. Bordered rows (user, tool, status) spend one more column
+       on their pipe, so their text sits two columns from the row's left edge;
+       borderless rows (assistant, thinking) sit one column in and keep no
+       right padding. The padding lives on the body, not on the inner markdown
+       blocks: those inherit the markdown widget's styles, and padding on both
+       would double up. The bottom padding row — the box's blank interior row
+       — is user-only (see the constructor): the summary-style rows (tools,
+       status) read better sitting close to what follows them. */
     TranscriptMessageWidget > .transcript-message-body {
         height: auto;
         padding: 0 1 0 1;
+    }
+
+    TranscriptMessageWidget.-borderless > .transcript-message-body {
+        padding: 0 0 0 1;
     }
 
     TranscriptMessageWidget.-user > .transcript-plain-body {
@@ -684,13 +693,11 @@ class TranscriptMessageWidget(Horizontal):
         # is what the interior-padding CSS rule selects on.
         if item.role == "user":
             self.add_class("-user")
-        # Textual paints a widget's background across its padding but not
-        # its margins: the right column that used to be a margin is now
-        # padding, so the role background fills it, while the left inset
-        # stays a bare margin. Top padding is the user box's blank interior
-        # row and must not move its pipe glyph down; the bottom interior row
-        # lives on the body (see the CSS), and only the user box has one.
-        self.styles.padding = (1, 1, 0, 0) if item.role == "user" else (0, 1, 0, 0)
+        # Top padding is the user box's blank interior row and must not move
+        # its pipe glyph down; the bottom interior row lives on the body (see
+        # the CSS), and only the user box has one. The side insets are
+        # margins (outside the box) and body padding (inside it).
+        self.styles.padding = (1, 0, 0, 0) if item.role == "user" else (0, 0, 0, 0)
         foreground, background = _split_rich_style_colors(self._role_style.body)
         self._body_foreground = foreground
         if item.role in _BORDERLESS_TRANSCRIPT_ROLES or item.system_prompt_sources is not None:
@@ -891,12 +898,11 @@ class StreamingTranscriptMessageWidget(ThemedMarkdownWidget):
     DEFAULT_CSS = """
     StreamingTranscriptMessageWidget {
         /* No width rule: see TranscriptMessageWidget about the border-box
-           `1fr` column-shrink. The right column is padding and the left a
-           margin, same as the finalized row; the widget's own background
-           (theme.transcript_background) paints the padding column. */
+           `1fr` column-shrink. Same text columns as the finalized borderless
+           row: a left margin and one padding column, nothing on the right. */
         height: auto;
         margin: 1 0 0 1;
-        padding: 0 1 0 1;
+        padding: 0 0 0 1;
     }
 
     StreamingTranscriptMessageWidget > MarkdownParagraph {

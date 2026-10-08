@@ -3936,6 +3936,11 @@ class TauTuiApp(App[None]):
     }
 
     #transcript {
+        /* `100%`, not the default `1fr`: in a vertical layout Textual sizes
+           `1fr` widths against the container minus the widest sibling
+           margin (#above-prompt-slot's `0 1`), which left two dead columns
+           down the transcript's right edge. */
+        width: 100%;
         height: 1fr;
         border: none;
         background: $tau-transcript-background;
