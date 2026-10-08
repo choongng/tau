@@ -139,8 +139,9 @@ def buffer_tool_result(
 def read_request(arguments: Mapping[str, object]) -> tuple[int, int | None]:
     """The file line a read with these arguments starts at, and its explicit limit."""
     limit = arguments.get("limit")
-    explicit = isinstance(limit, int) and not isinstance(limit, bool) and limit > 0
-    return read_first_line(arguments), limit if explicit else None
+    if isinstance(limit, int) and not isinstance(limit, bool) and limit > 0:
+        return read_first_line(arguments), limit
+    return read_first_line(arguments), None
 
 
 def read_first_line(arguments: Mapping[str, object]) -> int:

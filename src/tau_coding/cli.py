@@ -621,14 +621,13 @@ def main(
             custom_system_prompt,
             resolved_append_system_prompt,
         )
-        print_options: dict[str, object] = {}
-        if thinking_level_override is not None:
-            print_options["thinking_level_override"] = thinking_level_override
-        if max_turns is not None:
-            print_options["max_turns"] = max_turns
         print_runner = (
-            partial(run_openai_print_mode, **print_options)
-            if print_options
+            partial(
+                run_openai_print_mode,
+                thinking_level_override=thinking_level_override,
+                max_turns=max_turns,
+            )
+            if thinking_level_override is not None or max_turns is not None
             else run_openai_print_mode
         )
         if session is not None:
