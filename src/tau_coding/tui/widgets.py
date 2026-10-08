@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
 import re
 import time
 from collections.abc import Sequence
+from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 from subprocess import TimeoutExpired, run
@@ -33,7 +35,7 @@ from textual.selection import Selection
 from textual.widget import Widget
 from textual.widgets import Collapsible, Static
 from textual.widgets import Markdown as TextualMarkdown
-from textual.widgets.markdown import MarkdownBlock, MarkdownFence, MarkdownStream
+from textual.widgets.markdown import MarkdownBlock, MarkdownFence
 
 from tau_agent.tools import AgentTool, ToolCall
 from tau_coding.context_window import estimate_text_tokens
@@ -818,6 +820,62 @@ class TranscriptMessageWidget(Horizontal):
         return True
 
 
+# Streamed text reaches the screen at most this often. Each Markdown append
+# re-lays out every mounted transcript row, and providers send a fragment per
+# token (often 50-150/s), so appending per fragment spent most of a core on
+# layout. ~10 updates/s still reads as live typing.
+STREAM_FLUSH_INTERVAL_SECONDS = 0.1
+
+
+class TranscriptMarkdownStream:
+    """Append streamed fragments to a Markdown widget at a bounded rate.
+
+    Textual's ``MarkdownStream`` appends whenever its task wakes, which under
+    a fast provider is once per fragment. This one appends the first fragment
+    at once, then waits ``interval`` before taking whatever has piled up.
+    """
+
+    def __init__(self, markdown: TextualMarkdown, *, interval: float) -> None:
+        self._markdown = markdown
+        self._interval = interval
+        self._pending: list[str] = []
+        self._wake = asyncio.Event()
+        self._appending: asyncio.Future[None] | None = None
+        self._task = asyncio.create_task(self._run())
+
+    async def write(self, fragment: str) -> None:
+        """Queue a fragment; it is rendered on the next flush."""
+        if fragment:
+            self._pending.append(fragment)
+            self._wake.set()
+
+    async def stop(self) -> None:
+        """Stop flushing on a timer and render whatever is still queued."""
+        self._task.cancel()
+        with suppress(asyncio.CancelledError):
+            await self._task
+        # A cancel that lands mid-append leaves that append running. Let it
+        # finish: Markdown.append reads its parse position before taking its
+        # lock, so the final flush must start after it.
+        if self._appending is not None:
+            await self._appending
+        if self._pending:
+            await self._markdown.append(self._take_pending())
+
+    def _take_pending(self) -> str:
+        text = "".join(self._pending)
+        self._pending.clear()
+        return text
+
+    async def _run(self) -> None:
+        while True:
+            await self._wake.wait()
+            self._wake.clear()
+            self._appending = asyncio.ensure_future(self._markdown.append(self._take_pending()))
+            await asyncio.shield(self._appending)
+            await asyncio.sleep(self._interval)
+
+
 class StreamingTranscriptMessageWidget(ThemedMarkdownWidget):
     """One assistant or thinking Markdown block that accepts streamed fragments."""
 
@@ -852,7 +910,7 @@ class StreamingTranscriptMessageWidget(ThemedMarkdownWidget):
             raise ValueError("Streaming transcript widgets only support assistant/thinking items")
         self.item = item
         self.selection_text = item.text
-        self._stream: MarkdownStream | None = None
+        self._stream: TranscriptMarkdownStream | None = None
         self._is_streaming = True
         super().__init__(item.text, theme=theme)
         self.add_class("transcript-message")
@@ -864,9 +922,9 @@ class StreamingTranscriptMessageWidget(ThemedMarkdownWidget):
             self.styles.color = foreground
 
     @property
-    def stream(self) -> MarkdownStream:
+    def stream(self) -> TranscriptMarkdownStream:
         if self._stream is None:
-            self._stream = self.get_stream(self)
+            self._stream = TranscriptMarkdownStream(self, interval=STREAM_FLUSH_INTERVAL_SECONDS)
         return self._stream
 
     async def append_fragment(self, fragment: str) -> None:
@@ -878,7 +936,7 @@ class StreamingTranscriptMessageWidget(ThemedMarkdownWidget):
         await self.stream.write(fragment)
 
     async def _stop_stream(self) -> None:
-        """Stop the Textual markdown stream, flushing pending fragments first."""
+        """Stop the markdown stream, flushing pending fragments first."""
         stream = self._stream
         if stream is None:
             return
