@@ -601,9 +601,11 @@ class TranscriptMessageWidget(Horizontal):
            and left a screen-background column down its right edge. With
            no width rule the row fills its container exactly, and the
            column that used to be the dead gap is the box's own padding
-           column. */
+           column. The right column stays a plain gap; the left one is a
+           margin so the history stays inset (see the constructor for why
+           only the left can be a margin). */
         height: auto;
-        margin: 1 0 0 0;
+        margin: 1 0 0 1;
     }
 
     /* One padding column at each side, inside the highlighted box, for every
@@ -659,8 +661,16 @@ class TranscriptMessageWidget(Horizontal):
             self._result_markup,
         )
         super().__init__(classes="transcript-message")
+        # Textual paints a widget's background across its padding but not
+        # its margins: the right column that used to be a margin is now
+        # padding, so the role background fills it, while the left inset
+        # stays a bare margin. Top padding is the user box's blank interior
+        # row and must not move its pipe glyph down; the box's bottom stays
+        # with the body so it does not double up.
         if item.role == "user":
-            self.styles.padding = (1, 0, 0, 0)
+            self.styles.padding = (1, 1, 0, 0)
+        else:
+            self.styles.padding = (0, 1, 0, 0)
         foreground, background = _split_rich_style_colors(self._role_style.body)
         self._body_foreground = foreground
         if item.role in _BORDERLESS_TRANSCRIPT_ROLES or item.system_prompt_sources is not None:
@@ -670,11 +680,12 @@ class TranscriptMessageWidget(Horizontal):
             self._body_background = background
             self.styles.border_left = ("solid", self._role_style.border)
             self.add_class("-bordered")
-            # The row itself carries the role background so the highlight (and
-            # the body's bottom interior padding row) paints edge to edge;
-            # Textual does not paint a widget's background through its margins.
-            if background:
-                self.styles.background = background
+        # Bordered rows carry their role background on the row itself, so
+        # the highlight, the right padding column, and the body's bottom
+        # interior padding row all paint edge to edge. Borderless rows stay
+        # transparent: they are plain prose, and any fill would be visible.
+        if background and self._body_background:
+            self.styles.background = background
 
     def compose(self) -> Any:
         yield self._body_widget()
@@ -804,10 +815,11 @@ class StreamingTranscriptMessageWidget(ThemedMarkdownWidget):
     DEFAULT_CSS = """
     StreamingTranscriptMessageWidget {
         /* No width rule: see TranscriptMessageWidget about the border-box
-           `1fr` column-shrink. The streaming row pads itself, so the outer
-           columns are inside its background. */
+           `1fr` column-shrink. The right column is padding and the left a
+           margin, same as the finalized row; the widget's own background
+           (theme.transcript_background) paints the padding column. */
         height: auto;
-        margin: 1 0 0 0;
+        margin: 1 0 0 1;
         padding: 0 1 1 1;
     }
 
