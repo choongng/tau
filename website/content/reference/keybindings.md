@@ -3,9 +3,9 @@ title: Keyboard shortcuts
 description: Default keys for the Tau TUI, and how to remap them.
 ---
 
-These are the default keys in the interactive [TUI]({{< relref "../guides/tui.md" >}}). Run
+These are the default keys in the interactive [TUI](/guides/tui/). Run
 `/hotkeys` in-session to see them, and remap them in `~/.tau/tui.json` (see
-[Configuration]({{< relref "./configuration.md#tui-settings" >}})).
+[Configuration](/reference/configuration/#tui-settings)).
 
 ## Prompting
 
@@ -47,20 +47,19 @@ These are the default keys in the interactive [TUI]({{< relref "../guides/tui.md
 | `Ctrl+C` | Clear the prompt input |
 | `Ctrl+D` | Quit |
 
-{{% note title="Remapping" %}}
-Keys use Textual's syntax (`ctrl+k`, `shift+tab`, `down`, `f2`, …). Tau rejects
-unknown names, empty keys, and duplicate assignments so mistakes fail early. Any
-key you don't set keeps its default. `Ctrl+B` is also tmux's prefix, where only
-`Ctrl+B Ctrl+B` reaches Tau, so tmux users may prefer another `"toggle_sidebar"`
-key in `~/.tau/tui.json`. `Ctrl+J` inserts a newline in every terminal, tmux
-included. To use `Shift+Enter` instead, your terminal must report it separately
-from `Enter` (under tmux, set `extended-keys` to `always`):
-
-```json
-{
-  "keybindings": {
-    "insert_newline": "shift+enter"
-  }
-}
-```
-{{% /note %}}
+> [!NOTE] Remapping
+> Keys use Textual's syntax (`ctrl+k`, `shift+tab`, `down`, `f2`, …). Tau rejects
+> unknown names, empty keys, and duplicate assignments so mistakes fail early. Any
+> key you don't set keeps its default. `Ctrl+B` is also tmux's prefix, where only
+> `Ctrl+B Ctrl+B` reaches Tau, so tmux users may prefer another `"toggle_sidebar"`
+> key in `~/.tau/tui.json`. `Ctrl+J` inserts a newline in every terminal, tmux
+> included. To use `Shift+Enter` instead, your terminal must report it separately
+> from `Enter` (under tmux, set `extended-keys` to `always`):
+>
+> ```json
+> {
+>   "keybindings": {
+>     "insert_newline": "shift+enter"
+>   }
+> }
+> ```
