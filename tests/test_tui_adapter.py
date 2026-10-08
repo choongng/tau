@@ -144,6 +144,42 @@ def test_tui_adapter_groups_nested_thinking_deltas() -> None:
     assert state.show_thinking is False
 
 
+def test_tui_adapter_keeps_a_new_message_thinking_out_of_the_previous_row() -> None:
+    # A message can end on its thinking (a thinking-only reply, or one whose
+    # answer was cut off). The next message's first fragment opens its own row;
+    # merged into that one it would sit before the new message's start, outlive
+    # the MessageEnd replacement, and show the old and new thinking run together.
+    state = TuiState()
+    adapter = TuiEventAdapter(state)
+    previous = AssistantMessage(content=[ThinkingContent(thinking="old plan")])
+    adapter.apply(MessageStartEvent(message=AssistantMessage()))
+    adapter.apply(MessageEndEvent(message=previous))
+
+    partial = AssistantMessage()
+    adapter.apply(MessageStartEvent(message=partial))
+    adapter.apply(_update(ThinkingDeltaEvent(content_index=0, delta="new ", partial=partial)))
+    adapter.apply(_update(ThinkingDeltaEvent(content_index=0, delta="plan", partial=partial)))
+
+    assert [(item.role, item.text) for item in state.items] == [
+        ("thinking", "old plan"),
+        ("thinking", "new plan"),
+    ]
+
+    adapter.apply(
+        MessageEndEvent(
+            message=AssistantMessage(
+                content=[ThinkingContent(thinking="new plan"), TextContent(text="answer")]
+            )
+        )
+    )
+
+    assert [(item.role, item.text) for item in state.items] == [
+        ("thinking", "old plan"),
+        ("thinking", "new plan"),
+        ("assistant", "answer"),
+    ]
+
+
 def test_tui_state_restores_persisted_assistant_blocks_in_order() -> None:
     state = TuiState()
     state.load_messages(
