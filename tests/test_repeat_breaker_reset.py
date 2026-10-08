@@ -144,9 +144,14 @@ def test_call_key_ignores_duplicate_list_entries() -> None:
     assert key({"task": "T2", "locks": ["a.py", "b.py"]}) != base
     assert key({"task": "T1", "locks": ["a.py", "b.py", "c.py"]}) != base
     assert key({"flags": [1, True]}) != key({"flags": [1]})
-    assert _call_key(
-        ToolCall(id="c", name="pursuit_found", arguments={"task": "T1", "locks": ["a.py", "b.py"]})
-    ) != base
+    assert (
+        _call_key(
+            ToolCall(
+                id="c", name="pursuit_found", arguments={"task": "T1", "locks": ["a.py", "b.py"]}
+            )
+        )
+        != base
+    )
 
 
 @pytest.mark.anyio

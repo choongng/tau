@@ -45,6 +45,9 @@ packages = ["src/tau_ai", "src/tau_agent", "src/tau_coding"]
 line-length = 100
 target-version = "py312"
 src = ["src", "tests"]
+# Beagle check runs and dev-notes lab scripts are generated or throwaway, not
+# project code.
+extend-exclude = [".beagle", "dev-notes"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "SIM"]

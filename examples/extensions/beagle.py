@@ -2605,9 +2605,7 @@ def _commit_setup(root: Path) -> str | None:
     rc, out = _run(["git", "add", "-A", *pathspec], root, timeout=30.0)
     if rc != 0:
         return f"`git add` failed: {out}"
-    rc, out = _run(
-        ["git", "diff", "--cached", "--name-only", *pathspec], root, timeout=30.0
-    )
+    rc, out = _run(["git", "diff", "--cached", "--name-only", *pathspec], root, timeout=30.0)
     if rc != 0:
         return f"`git diff --cached` failed: {out}"
     staged = out.splitlines()
@@ -4488,9 +4486,7 @@ def _module_names(rel: str) -> list[str]:
     return [".".join(parts[i:]) for i in range(len(parts))]
 
 
-def _judged_sources(
-    entries: list[str], root: Path, check: str = ""
-) -> tuple[list[str], list[str]]:
+def _judged_sources(entries: list[str], root: Path, check: str = "") -> tuple[list[str], list[str]]:
     """(source, helpers) among `entries`' non-test .py files.
 
     Run R31: a worker saved tests/casegen.py, a generator no test imported and the
@@ -4625,8 +4621,8 @@ def _open_mixed_refusal(scope: list[str], goal: Path, task: str, check: str) -> 
     removed = [*source, *helpers]
     return (
         f"{held} This call runs a worker: pursuit_step task={task} "
-        f"scope=[{', '.join(narrowed)}] notes=\"delete {', '.join(_first_few(removed))} if "
-        "this task wrote it; the code belongs to a later task\"." + _helper_note(helpers)
+        f'scope=[{", ".join(narrowed)}] notes="delete {", ".join(_first_few(removed))} if '
+        'this task wrote it; the code belongs to a later task".' + _helper_note(helpers)
     )
 
 
@@ -4949,9 +4945,28 @@ def _unread_cases(root: Path, entries: list[str]) -> tuple[str, str] | None:
 #: Case keys that hold a case's label, inputs or provenance rather than its answer.
 _CASE_NON_ANSWER_KEYS = frozenset(
     {
-        "name", "id", "title", "case", "source", "sources", "citation", "description",
-        "desc", "notes", "note", "comment", "input", "inputs", "in", "args", "arguments",
-        "ops", "operations", "operation", "setup", "given",
+        "name",
+        "id",
+        "title",
+        "case",
+        "source",
+        "sources",
+        "citation",
+        "description",
+        "desc",
+        "notes",
+        "note",
+        "comment",
+        "input",
+        "inputs",
+        "in",
+        "args",
+        "arguments",
+        "ops",
+        "operations",
+        "operation",
+        "setup",
+        "given",
     }
 )
 
@@ -5202,9 +5217,9 @@ def _test_structure_problem(tree: ast.Module) -> str | None:
             bound.add(node.id)
         elif isinstance(node, ast.arg):
             bound.add(node.arg)
-        elif isinstance(
-            node, ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef
-        ) or (isinstance(node, ast.ExceptHandler | ast.MatchAs | ast.MatchStar) and node.name):
+        elif isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef) or (
+            isinstance(node, ast.ExceptHandler | ast.MatchAs | ast.MatchStar) and node.name
+        ):
             bound.add(node.name)
         elif isinstance(node, ast.MatchMapping) and node.rest:
             bound.add(node.rest)
@@ -5286,6 +5301,7 @@ def _cases_test_problem(root: Path, entries: list[str]) -> tuple[str, str] | Non
                     "comparison or arithmetic, so it cannot pass against any one code"
                 )
     return None
+
 
 #: Words a case's source must quote from references/*.txt to count as found.
 SOURCE_QUOTE_MIN_WORDS = 4
@@ -5462,14 +5478,10 @@ def _renders_result(text: str, result: object) -> bool:
     if isinstance(result, list):
         want = [int(v) for v in result]
         bases = (10, 16) if all(0 <= v <= 255 for v in want) else (10,)
-        return any(
-            _holds_sequence(run, want) for base in bases for run in _value_runs(text, base)
-        )
+        return any(_holds_sequence(run, want) for base in bases for run in _value_runs(text, base))
     if isinstance(result, int | float):
         tokens = {str(v) for run in _value_runs(text, 10) for v in run}
-        tokens |= {
-            str(int(m.group(2), 16)) for m in _VALUE_TOKEN.finditer(text) if m.group(1)
-        }
+        tokens |= {str(int(m.group(2), 16)) for m in _VALUE_TOKEN.finditer(text) if m.group(1)}
         return str(result) in tokens or str(result) in text
     flat = "".join(str(result).split()).lower()
     if flat in "".join(text.split()).lower():
@@ -5486,9 +5498,7 @@ def _searchable_result(value: object) -> bool:
     if isinstance(value, bool) or value is None:
         return False
     if isinstance(value, list):
-        return bool(value) and all(
-            isinstance(v, int) and not isinstance(v, bool) for v in value
-        )
+        return bool(value) and all(isinstance(v, int) and not isinstance(v, bool) for v in value)
     if isinstance(value, int | float | str):
         return len(str(value).strip()) >= RESULT_MIN_CHARS
     return False
@@ -5558,9 +5568,7 @@ def _result_unquoted(case: object, references: list[list[str]]) -> bool:
     return not any(_renders_result(text, result) for text in texts for result in results)
 
 
-def _unquoted_cases(
-    root: Path, entries: list[str]
-) -> tuple[str, int, int, list[str], bool] | None:
+def _unquoted_cases(root: Path, entries: list[str]) -> tuple[str, int, int, list[str], bool] | None:
     """(data file, unfound, total, up to 3 names, whether by result) for cases whose source
     does not tie them to references/*.txt.
 
@@ -5600,9 +5608,7 @@ def _unquoted_cases(
         unfound = [
             _case_label(case, i)
             for i, case in enumerate(cases)
-            if not any(
-                _quotes_reference(s, text) for s in _source_strings(case) for text in texts
-            )
+            if not any(_quotes_reference(s, text) for s in _source_strings(case) for text in texts)
         ]
         if cases and 2 * len(unfound) > len(cases):
             return rel, len(unfound), len(cases), unfound[:3], False
@@ -5967,9 +5973,7 @@ def _committed_cases_tests(
     return found
 
 
-def _live_data_holder(
-    task: str, nodes: list[dict[str, Any]], data: list[str], goal: Path
-) -> str:
+def _live_data_holder(task: str, nodes: list[dict[str, Any]], data: list[str], goal: Path) -> str:
     """The live leaf to work for `data`: the first open or pending task whose scope
     or pending locks name a `data` file, or the first live leaf under it when it is
     a container; "" when no live task holds the data.
@@ -5990,9 +5994,7 @@ def _live_data_holder(
 
     def leaf(node_id: str, seen: set[str]) -> str:
         parts = [
-            n
-            for n in nodes
-            if str(n.get("parent") or "") == node_id and n.get("status") in live
+            n for n in nodes if str(n.get("parent") or "") == node_id and n.get("status") in live
         ]
         if not parts:
             return "" if node_id in containers else node_id
@@ -6580,8 +6582,7 @@ def _pytest_node_missing_problem(command: str, scope: list[str], root: Path) -> 
             n.name
             for n in tree.body
             if (
-                isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
-                and n.name.startswith("test")
+                isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name.startswith("test")
             )
             or (isinstance(n, ast.ClassDef) and n.name.startswith("Test"))
         ]
@@ -6743,9 +6744,7 @@ def _self_import(command: str, scope: list[str], root: Path | None) -> tuple[str
     return found
 
 
-def _data_self_import(
-    command: str, scope: list[str], root: Path | None
-) -> tuple[str, str] | None:
+def _data_self_import(command: str, scope: list[str], root: Path | None) -> tuple[str, str] | None:
     """`_self_import` for a scope of data and tests only, where the test is a data test."""
     if not (_scope_has_data(scope) and _only_data_and_tests(scope)):
         return None
@@ -7005,11 +7004,7 @@ def _check_data_reads(command: str, root: Path) -> list[str]:
             if not _cases_test_reads(test, named.name):
                 continue
             beside = (test.parent / named.name).relative_to(root).as_posix()
-            data = (
-                named.as_posix()
-                if len(named.parts) > 1 and (root / named).is_file()
-                else beside
-            )
+            data = named.as_posix() if len(named.parts) > 1 and (root / named).is_file() else beside
             if data not in found:
                 found.append(data)
     return found
@@ -7800,9 +7795,7 @@ def _implementation_in_tests_lead(root: Path, scope: list[str], check: str = "")
     changed = [
         rel
         for rel in _changed_files(root)
-        if _in_scope(rel, scope, root)
-        and (root / rel).is_file()
-        and (runs is None or rel in runs)
+        if _in_scope(rel, scope, root) and (root / rel).is_file() and (runs is None or rel in runs)
     ]
     by_file: dict[str, list[str]] = {}
     for where in _implementation_in_tests(root, changed):
@@ -8288,8 +8281,7 @@ def _unproven_call(
         base = "src/" if (root / "src").is_dir() else ""
         for test in tests:
             found = _imported_modules(root, [test]) or [
-                f"{base}{name.replace('.', '/')}.py"
-                for name in _test_project_imports(root / test)
+                f"{base}{name.replace('.', '/')}.py" for name in _test_project_imports(root / test)
             ]
             if found:
                 done_when, added = f"python3 -m pytest -q {test}", found[:1]
@@ -9041,9 +9033,7 @@ def _locked_scope_problem(
     if not held:
         return None
     rest = [entry for entry in scope if os.path.normpath(entry.strip()) not in held]
-    return _known_answers_fix_route(
-        held[0], goal, task, task_title, rest=rest, done_when=done_when
-    )
+    return _known_answers_fix_route(held[0], goal, task, task_title, rest=rest, done_when=done_when)
 
 
 #: Retries beagle allows a task its own check blocked.
@@ -10246,12 +10236,16 @@ def _escalation(
     # Run R23 E34-E46: the breaker quotes only a result's first line, so the call
     # goes there, short enough to survive its quote, with notes elided if need be.
     lead = f"pursuit_step: {task} not run — call instead: "
-    short = _working_call(
-        task, arguments, record, root, data_test_passes, bound_fails, bare=True
-    )
+    short = _working_call(task, arguments, record, root, data_test_passes, bound_fails, bare=True)
     if len(lead) + len(short) > ESCALATION_HEAD_CHARS:
         short = _working_call(
-            task, arguments, record, root, data_test_passes, bound_fails, bare=True,
+            task,
+            arguments,
+            record,
+            root,
+            data_test_passes,
+            bound_fails,
+            bare=True,
             notes="…",
         )
     head = f"{lead}{short}\n{count} steps on it have left it not done."
@@ -10272,10 +10266,7 @@ def _escalation_options(task: str, count: int, head: str, rerun: str | None = No
             f'- pursuit_step task="{task}", new_route=true, with a rewritten done_when and '
             "notes saying what the new route does differently (the criteria stay);\n"
         )
-        why = (
-            "another sub-agent on it, however its scope or notes are put, would only add "
-            "one more"
-        )
+        why = "another sub-agent on it, however its scope or notes are put, would only add one more"
     else:
         why = "its check passes each time, and only the close keeps it open"
     return (
@@ -10367,15 +10358,13 @@ def _escalation_lacks(
     lacks = []
     if arguments.get("new_route") is not True:
         lacks.append(
-            "This call has no new_route=true, so it asks for another sub-agent on the "
-            "same route."
+            "This call has no new_route=true, so it asks for another sub-agent on the same route."
         )
     criteria = " ".join(str(arguments.get("criteria") or "").split())
     bound_criteria = " ".join(str(record.get("criteria") or "").split())
     if criteria and bound_criteria and criteria != bound_criteria:
         lacks.append(
-            f"Its criteria differ from {task}'s: leave criteria out, since a new route "
-            "keeps them."
+            f"Its criteria differ from {task}'s: leave criteria out, since a new route keeps them."
         )
     bound_check = " ".join(str(record.get("done_when") or "").split())
     done_when = " ".join(str(arguments.get("done_when") or "").split())
@@ -10408,7 +10397,7 @@ def _escalation_lacks(
                 f"Its done_when is the bound check `{bound_check}`, which runs {test}: "
                 f"that fails with ImportError until a later task writes {module}, and no "
                 "path in this scope creates it. The check a sub-agent can pass is the data "
-                f"test only: done_when=\"{data_check}\".{_scope_note(needs, scope)}"
+                f'test only: done_when="{data_check}".{_scope_note(needs, scope)}'
             )
         elif done_when and not _keeps_bound_check(bound_check, scope, root, bound_fails):
             lacks.append(
@@ -10617,8 +10606,7 @@ def _killed_attempt_context(
         parts.append(f"The attempt before it reported:\n{shown}")
         if check and verdict[1]:
             parts.append(
-                f"`{check}` exit {verdict[0]} after that attempt:\n"
-                f"{verdict[1][-CHECK_TAIL_CHARS:]}"
+                f"`{check}` exit {verdict[0]} after that attempt:\n{verdict[1][-CHECK_TAIL_CHARS:]}"
             )
     if run.transcript is not None:
         changes = _scope_changes(root, scope)
@@ -11026,7 +11014,7 @@ def make_step_tool() -> Any:
                 f"Bind the data test only: {test} imports {module}, which a later task writes."
             )
             taken = (
-                f"Took done_when=\"{done_when}\" as {task}'s new route without new_route=true: "
+                f'Took done_when="{done_when}" as {task}\'s new route without new_route=true: '
                 f"it is the data test tau proposed, since the bound check runs {test}, which "
                 f"imports {module} that no path in its scope creates. Scope: {json.dumps(scope)}."
                 "\n\n"
@@ -11081,9 +11069,7 @@ def make_step_tool() -> Any:
                     done_when = ""
                 scoped = (
                     _scope_problem(route_scope, task, nodes, root)
-                    or _locked_scope_problem(
-                        route_scope, root, title, task, done_when or old_check
-                    )
+                    or _locked_scope_problem(route_scope, root, title, task, done_when or old_check)
                     or _sibling_owned_check_problem(
                         done_when or old_check, route_scope, task, nodes, root
                     )
@@ -13313,9 +13299,7 @@ _STEERED_VERBS = {
         "cycle that nothing then starts; only withdrawing one, `beagle pursuit depend "
         "<task> <after> --drop --reason '<why>'`, runs from bash"
     ),
-    "next": (
-        "pursuit_step with no arguments, which picks the ready task and says what to send"
-    ),
+    "next": ("pursuit_step with no arguments, which picks the ready task and says what to send"),
     "commit": (
         "nothing: pursuit_step commits the files a task changed in its scope before it "
         "closes the task"

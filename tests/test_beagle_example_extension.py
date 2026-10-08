@@ -3249,8 +3249,7 @@ async def test_known_answers_close_refuses_a_cases_test_naming_absent_cases(
     text = await _refused_r20(tmp_path, fake_beagle, project)
 
     assert (
-        'tests/test_cases.py looks up case "send_composition", which tests/cases.json '
-        "does not hold"
+        'tests/test_cases.py looks up case "send_composition", which tests/cases.json does not hold'
     ) in text
 
 
@@ -3275,8 +3274,7 @@ async def test_known_answers_close_refuses_a_cases_test_that_never_reads_expecte
     text = await _refused_r20(tmp_path, fake_beagle, project)
 
     assert (
-        "tests/test_cases.py never reads the cases' answers "
-        '("expected" in tests/cases.json)'
+        'tests/test_cases.py never reads the cases\' answers ("expected" in tests/cases.json)'
     ) in text
 
 
@@ -4374,9 +4372,7 @@ async def test_an_implementation_task_naming_the_cases_cannot_hold_a_locked_file
         },
     )
 
-    assert "T0002 not opened — tests/test_cases.py is locked as the known answers" in (
-        result.text
-    )
+    assert "T0002 not opened — tests/test_cases.py is locked as the known answers" in (result.text)
     assert _pursuit_calls(fake_beagle, "open") == [] and _runs(fake_tau) == []
 
     module = _module()
@@ -5841,9 +5837,7 @@ def test_oracle_with_code_ignores_unimported_helper_under_tests_dir(tmp_path: Pa
     assert beagle._oracle_with_code_problem(["tests/"], goal) is None
 
     # The check naming it, or a scope test importing it, makes it judged code.
-    named = beagle._oracle_with_code_problem(
-        ["tests/"], goal, "T0002", "python3 tests/casegen.py"
-    )
+    named = beagle._oracle_with_code_problem(["tests/"], goal, "T0002", "python3 tests/casegen.py")
     assert named is not None and "the code it judges (tests/casegen.py)" in named
     (project / "tests" / "test_gen.py").write_text("from casegen import main\n")
     imported = beagle._oracle_with_code_problem(["tests/"], goal)
@@ -9178,8 +9172,7 @@ async def test_fourth_step_after_three_not_done_is_refused_with_choices(
     assert "The next step on it runs no sub-agent" in results[2].text
     for refused in (fourth, fifth):
         assert refused.text.startswith(
-            'pursuit_step: T0002 not run — call instead: pursuit_step task="T0002", '
-            "new_route=true"
+            'pursuit_step: T0002 not run — call instead: pursuit_step task="T0002", new_route=true'
         )
         assert "\n3 steps on it have left it not done." in refused.text
         assert 'pursuit_plan task="T0002"' in refused.text
@@ -11926,9 +11919,7 @@ async def test_bound_check_fails_by_its_last_run_or_a_pre_run(tmp_path: Path) ->
     (tmp_path / "tests").mkdir()
     (tmp_path / "tests" / "test_case_data.py").write_text("", encoding="utf-8")
     assert not await module._bound_check_fails("T0002", {}, record, tmp_path)
-    assert not await module._bound_check_fails(
-        "T0002", {"done_when": "true"}, record, tmp_path
-    )
+    assert not await module._bound_check_fails("T0002", {"done_when": "true"}, record, tmp_path)
     module._LAST_CHECK_EXIT[key] = 1
     try:
         assert await module._bound_check_fails("T0002", {}, record, tmp_path)
@@ -12535,7 +12526,7 @@ async def test_not_done_leads_with_unwritten_import_and_data_test_check(
         "The check cannot pass: tests/test_cases.py imports interval_tree_clocks, which no "
         f"task in reach writes; amend done_when to `{R16_DATA_CHECK}`."
     )
-    assert f'scope={json.dumps([*R16_SCOPE, "tests/test_case_data.py"])}' in result.text
+    assert f"scope={json.dumps([*R16_SCOPE, 'tests/test_case_data.py'])}" in result.text
     assert f'done_when="{R16_DATA_CHECK}", it is taken as this task\'s new route' in result.text
 
 
@@ -12930,9 +12921,7 @@ async def test_step_on_waiting_task_names_what_it_waits_on(
 
     assert "T0011 is not a task to work now: it waits on T0010 (open)" in waiting.text
     assert 'work T0010 first: pursuit_step task="T0010"' in waiting.text
-    assert "T0006 is not a task to work now: it is a container of T0010, T0011" in (
-        container.text
-    )
+    assert "T0006 is not a task to work now: it is a container of T0010, T0011" in (container.text)
     for result in (waiting, container):
         assert "or it waits" not in result.text
     assert _pursuit_calls(fake_beagle, "open") == []
@@ -14799,9 +14788,7 @@ def test_not_run_call_does_not_carry_notes_restoring_self_import(tmp_path: Path)
         "tests/test_case_data.py, and confirm cobs/__init__.py exists"
     )
 
-    refusal = module._escalation(
-        "T0003", 3, {"task": "T0003", "notes": restore}, record, project
-    )
+    refusal = module._escalation("T0003", 3, {"task": "T0003", "notes": restore}, record, project)
     kept = module._escalation(
         "T0003", 3, {"task": "T0003", "notes": "Fix the hex of case 4"}, record, project
     )
@@ -15205,9 +15192,7 @@ def test_split_commit_puts_back_before_committing(tmp_path: Path, beagle: Path) 
     (project / "tests" / "test_cases.py").write_bytes(R28_STRIPPED_TEST)
     module._LAST_CHECK_EXIT[(str(project), "T0007")] = 0
 
-    said = module._commit_before_split(
-        project, "T0007", ["tests/"], ["tests/test_cases.py"], goal
-    )
+    said = module._commit_before_split(project, "T0007", ["tests/"], ["tests/test_cases.py"], goal)
 
     assert said == f"{R28_PUT_BACK}tests/test_cases.py."
     assert (project / "tests" / "test_cases.py").read_bytes() == R14_LOCKED_TEST
@@ -15325,8 +15310,7 @@ def test_known_answers_note_keeps_existing_import(tmp_path: Path) -> None:
     (plain / "tests" / "test_data.py").write_text("from src.itc import Clock\n")
     said = module._known_answers_note(R28_FIX_CHECK, R28_FIX_SCOPE, plain)
     assert (
-        "tests/test_cases.py is the check: it reads tests/cases.json and imports none of "
-        "the code;"
+        "tests/test_cases.py is the check: it reads tests/cases.json and imports none of the code;"
     ) in said
 
 
@@ -16609,9 +16593,7 @@ async def test_known_answer_source_must_hold_expected_result(
     # R34: single_zero_byte's source was its input line, "1 | 00", and its expected
     # [1, 0] was wrong; the reference's next line gives 01 01 00.
     module = _module()
-    reference = [
-        module._normalised(line) for line in R34_REFERENCE.splitlines() if line.strip()
-    ]
+    reference = [module._normalised(line) for line in R34_REFERENCE.splitlines() if line.strip()]
     right = [3, 17, 34, 2, 51, 0]
     long = [255, *range(1, 255), 0]
     held = {

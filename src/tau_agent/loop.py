@@ -470,4 +470,3 @@ def _aborted_message(model: str, reason: str | None) -> AssistantMessage:
         stop_reason="aborted",
         error_message=reason or "Operation aborted",
     )
-

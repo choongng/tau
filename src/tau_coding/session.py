@@ -4396,9 +4396,7 @@ class CodingSession:
             messages,
             custom_instructions="\n\n".join(focus) or None,
         )
-        prompt += (
-            f"\n\nKeep the whole summary under {COMPACTION_SUMMARY_MAX_CHARS} characters."
-        )
+        prompt += f"\n\nKeep the whole summary under {COMPACTION_SUMMARY_MAX_CHARS} characters."
         text_parts: list[str] = []
         final_text: str | None = None
         response_usages: list[Usage] = []
