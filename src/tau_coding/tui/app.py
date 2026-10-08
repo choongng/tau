@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import errno
+import gc
 import os
 import stat
 import tempfile
@@ -3536,6 +3537,21 @@ class OAuthLoginScreen(ModalScreen[OAuthCredential | _LoginFlowAction | None]):
 RESERVED_EXTENSION_INTERCEPTOR_KEYS: frozenset[str] = frozenset({"ctrl+c", "ctrl+d"})
 
 
+def _collect_garbage_while_idle() -> None:
+    """Run a full garbage collection now, then freeze what survives.
+
+    A long session holds a few hundred thousand objects, so Python's automatic
+    full collection pauses the UI for 100-400ms, and it tends to fire while
+    text is streaming. Collecting once the agent settles keeps that pause out
+    of streaming. Freezing the survivors leaves the automatic collector only
+    the objects the next turn creates. Each call unfreezes first, so cycles
+    among older objects are still collected, just a turn late.
+    """
+    gc.unfreeze()
+    gc.collect()
+    gc.freeze()
+
+
 class TauTuiApp(App[None]):
     """Interactive Textual frontend for a ``CodingSession``."""
 
@@ -4647,6 +4663,10 @@ class TauTuiApp(App[None]):
         await self.session.emit_pending_session_start()
         if self.initial_prompt and self.initial_prompt.strip():
             await self._submit_prompt(self.initial_prompt.strip())
+        else:
+            # Startup leaves the heap full of import-time objects; freeze them
+            # before the first turn. An initial prompt collects when it settles.
+            self.call_after_refresh(_collect_garbage_while_idle)
 
     async def on_event(self, event: events.Event) -> None:
         """Consult extension key interceptors before Textual's dispatch.
@@ -4689,6 +4709,8 @@ class TauTuiApp(App[None]):
             self._activity_timer = None
         self._terminal_title.restore()
         self._clear_extension_components()
+        # Hand frozen objects back to the collector once nothing will re-freeze them.
+        gc.unfreeze()
 
     def on_app_blur(self) -> None:
         """Remember that terminal attention should be requested when the run settles."""
@@ -5997,8 +6019,10 @@ class TauTuiApp(App[None]):
                 ):
                     _attach_diagnostic_log_path_to_error(self.state, self.session)
                 await self._apply_streaming_transcript_event(event)
-                if isinstance(event, AgentSettledEvent) and not self._app_has_focus:
-                    self._terminal_notification.notify_turn_finished()
+                if isinstance(event, AgentSettledEvent):
+                    self.call_after_refresh(_collect_garbage_while_idle)
+                    if not self._app_has_focus:
+                        self._terminal_notification.notify_turn_finished()
         except Exception as exc:  # noqa: BLE001 - surface unexpected worker errors in the TUI
             if active_run_id != self._prompt_run_id:
                 return
