@@ -8686,6 +8686,59 @@ async def test_worker_write_in_scope_or_tmp_allowed(
 
 
 @pytest.mark.anyio
+async def test_worker_scope_guard_refuses_writes_into_beagle_store(
+    tmp_path: Path, beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Run R35: W15-W17 "recorded the close" by writing these into .git/beagle/.
+    runtime = _scoped_worker(tmp_path, monkeypatch)
+    monkeypatch.setenv("BEAGLE_TAU_WORKER_TASK", "T0006")
+    calls = [
+        ("write", {"path": ".git/beagle/logs/T0006.result.md", "content": "done\n"}),
+        ("write", {"path": ".git/beagle/T0006.md", "content": "done\n"}),
+        ("write", {"path": ".git/beagle/finding/T0006.md", "content": "x\n"}),
+        ("edit", {"path": ".git/beagle/memory/T0006.md", "old": "a", "new": "b"}),
+        ("bash", {"command": "echo closed > .git/beagle/obligations/T0006.md"}),
+        ("bash", {"command": "echo closed | tee .git/beagle/pursuit/T0006.md"}),
+        ("bash", {"command": "mkdir -p .git/beagle/findings"}),
+        ("bash", {"command": "cd .git && printf x >> beagle/findings/T0006.md"}),
+    ]
+
+    for tool, arguments in calls:
+        result = await _tool_with_hooks(runtime, tool).execute("c1", arguments)
+
+        assert "beagle's store under .git/beagle/ is the driver's, and so is the close" in (
+            result.text
+        ), (tool, arguments)
+        assert "Put your result in your report." in result.text
+        assert "outside T0006's scope" not in result.text
+
+
+@pytest.mark.anyio
+async def test_worker_scope_guard_allows_task_log_named_in_brief(
+    tmp_path: Path, beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # beagle's brief redirects a task's runs to .git/beagle/logs/<task>.log, and
+    # tau's rewrite of that habit keeps the path: that one file is the worker's.
+    runtime = _scoped_worker(tmp_path, monkeypatch)
+    for command in (
+        "pytest -q > .git/beagle/logs/T0003.log 2>&1",
+        "pytest -q 2>&1 | tee .git/beagle/logs/T0003.log",
+    ):
+        result = await _tool_with_hooks(runtime, "bash").execute("c1", {"command": command})
+
+        assert result.text == "ran", command
+    for command in (
+        "pytest -q > .git/beagle/logs/T0004.log 2>&1",
+        "pytest -q > .git/beagle/logs/T0003.log.md 2>&1",
+        "rm -rf .git/beagle/logs",
+    ):
+        result = await _tool_with_hooks(runtime, "bash").execute("c2", {"command": command})
+
+        assert "beagle's store under .git/beagle/ is the driver's" in result.text, command
+        assert "The one file there that is yours is .git/beagle/logs/T0003.log" in result.text
+
+
+@pytest.mark.anyio
 async def test_opening_a_task_with_no_scope_is_refused(
     tmp_path: Path, beagle: Path, fake_beagle: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

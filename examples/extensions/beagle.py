@@ -13281,6 +13281,31 @@ def _idle_bash_refusal(
     )
 
 
+def _task_log(root: Path, task: str) -> Path | None:
+    """The one file under .git/beagle/ a worker sent on `task` may write: the log
+    beagle's brief redirects its runs to (`_brief_scratch`), or None with no task."""
+    return root / ".git" / "beagle" / "logs" / f"{task}.log" if task else None
+
+
+def _store_write_refusal(rel: Path, root: Path, log: Path | None) -> str:
+    """Why a worker may not write `rel` under .git/beagle/.
+
+    Run R35: W15-W17 wrote .git/beagle/logs/T0006.result.md, .git/beagle/T0006.md
+    and .git/beagle/{finding,memory,obligations,pursuit,findings}/T0006.md to
+    record a close the driver runs.
+    """
+    own = (
+        f" The one file there that is yours is {log.relative_to(root)}, the log your "
+        "runs are redirected to."
+        if log is not None
+        else ""
+    )
+    return (
+        f"refusing to write {rel}: beagle's store under .git/beagle/ is the driver's, "
+        "and so is the close. Put your result in your report." + own
+    )
+
+
 def make_worker_scope_guard() -> Any:
     """Build the `tool_call` guard that keeps a worker's writes inside its task's scope.
 
@@ -13288,7 +13313,8 @@ def make_worker_scope_guard() -> Any:
     `tests/` over .gitignore with two turns left, and the next three steps went
     to repairing it. A worker sent with a scope (`BEAGLE_TAU_WORKER_SCOPE`) may
     write in it, outside the project (/tmp), in beagle's store (the record guard
-    has that) and `.git/beagle/` (the task's log). A link in the project is
+    has that) and the task's log, `.git/beagle/logs/<task>.log`; nothing else
+    under `.git/beagle/` (run R35). A link in the project is
     judged by its own path, and one an inline script makes may not point out
     of the project. A worker with no scope is not held. Any worker sent on a
     task is kept from reading the trees beside its project. Fails open.
@@ -13368,12 +13394,20 @@ def make_worker_scope_guard() -> Any:
             if goal is None:
                 return None
             root = _resolved(goal.parent.parent)
-            allowed = [_resolved(goal.parent), root / ".git" / "beagle"]
+            allowed = [_resolved(goal.parent)]
+            store = root / ".git" / "beagle"
+            log = _task_log(root, os.environ.get(WORKER_TASK_ENV, "").strip())
+            in_store = False
             hits = 0
             for target in targets:
                 target = _own_path(target, root)
                 if target != root and root not in target.parents:
                     continue  # outside the project: /tmp, /dev/null
+                if target == log:
+                    continue
+                if target == store or store in target.parents:
+                    in_store = True
+                    break
                 if any(target == a or a in target.parents for a in allowed):
                     continue
                 if _CACHE_DIRS & set(target.parts):
@@ -13392,6 +13426,8 @@ def make_worker_scope_guard() -> Any:
         except Exception:  # noqa: BLE001 - fail open, never block on a guard bug
             return None
         rel = target.relative_to(root) if target != root else target
+        if in_store:
+            return ToolCallHookResult(block=True, reason=_store_write_refusal(rel, root, log))
         source = (
             # Run R09: refused src/, W4 wrote the library to tests/itc/ instead.
             " The implementation does not go under tests/ either: it is a later "
