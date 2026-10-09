@@ -11317,14 +11317,21 @@ def make_step_tool() -> Any:
                         problem = f"its check `{old_check}` cannot judge the work: {problem}"
                     return _step_result(f"pursuit_step: no new route for {task} — {problem}")
                 old_criteria = str(record.get("criteria") or "").strip()
-                if criteria and old_criteria and criteria != old_criteria:
-                    return _step_result(
-                        f"pursuit_step: no new route for {task} — a new route changes how "
-                        f"the work is done or checked, not what it is for, so it keeps the "
-                        f"criteria: {old_criteria!r}. If the end itself is wrong, that is "
-                        "the user's to change: ask them. Call pursuit_step again without "
-                        "criteria."
-                    )
+                if (
+                    criteria
+                    and old_criteria
+                    and " ".join(criteria.split()) != " ".join(old_criteria.split())
+                ):
+                    # Run R36 #24, #28, #29: refused here for the criteria alone, ahead
+                    # of the same-route check below, and the driver sent them again.
+                    notes = f"{notes}\n\nCriteria sent with this route: {criteria}"
+                    taken = (
+                        f"Criteria kept from {task}; yours went into the notes: a new "
+                        "route changes how the work is done or checked, not what it is "
+                        f"for, so it keeps {old_criteria!r}. If the end itself is wrong, "
+                        "that is the user's to change: ask them.\n\n"
+                    ) + taken
+                    criteria = old_criteria
                 # Checked before the spawn, which supersedes the task for good:
                 # run R06 spawned T0008, then refused to open it on a check that
                 # already passed, and left a successor with no criteria.
@@ -11339,7 +11346,7 @@ def make_step_tool() -> Any:
                     # test was the bound check already.
                     taken += kept_check
                     done_when = ""
-                # The criteria are the bound task's here: other ones were refused above.
+                # The criteria are the bound task's here: other ones went into the notes.
                 same_route = " ".join((done_when or old_check).split()) == " ".join(
                     old_check.split()
                 ) and sorted(route_scope) == sorted(_strings(record.get("scope")))

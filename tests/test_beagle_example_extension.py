@@ -6505,10 +6505,9 @@ async def test_pursuit_step_spawns_a_new_route_for_a_blocked_task(
 
     no_notes = await step.execute("c1", new_check)
     no_check = await step.execute("c0", {"task": "T0002", "notes": "x"})
-    new_end = await step.execute("c2", {**new_check, "notes": "x", "criteria": "it parses"})
     result = await step.execute("c3", {**new_check, "notes": "check the file it writes"})
 
-    assert "needs notes" in no_notes.text and "keeps the criteria" in new_end.text
+    assert "needs notes" in no_notes.text
     # Not retried on the grep, and no successor left behind with it.
     assert "cannot judge the work" in no_check.text and "reads .beagle/" in no_check.text
     [spawn] = _pursuit_calls(fake_beagle, "spawn")
@@ -6521,6 +6520,39 @@ async def test_pursuit_step_spawns_a_new_route_for_a_blocked_task(
     assert opened[opened.index("--scope") + 1] == "src/parser.py"
     [close] = _pursuit_calls(fake_beagle, "close")
     assert close[0] == "T0003" and _pursuit_calls(fake_beagle, "retry") == []
+    assert "superseded by T0003" in result.text and "T0003 — Parser: closed done" in result.text
+
+
+@pytest.mark.anyio
+async def test_new_route_changed_criteria_kept_and_moved_to_notes(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # R36 #24, #28, #29: a new route with rewritten criteria was refused outright.
+    monkeypatch.chdir(_pursuit_project(tmp_path))
+    _blocked_task(fake_beagle, done_when="grep -q parser .beagle/tree/T0002.md")
+    successor = {"id": "T0003", "title": "Parser", "status": "pending", "done_when": ""}
+    (fake_beagle / "show-T0003.out").write_text(json.dumps(successor))
+    (fake_beagle / "spawn.out").write_text("T0002 superseded by T0003\n")
+    (fake_beagle / "brief.out").write_text("# T0003: Parser\n")
+    runtime, _ = _bound(tmp_path)
+    call = {"task": "T0002", "done_when": "grep -q done done.txt", "notes": "check the file"}
+
+    result = await _tool(runtime, "pursuit_step").execute(
+        "c1", {**call, "criteria": "it parses lines"}
+    )
+
+    assert result.text.startswith("Criteria kept from T0002; yours went into the notes")
+    assert "no new route" not in result.text
+    [spawn] = _pursuit_calls(fake_beagle, "spawn")
+    delta = spawn[spawn.index("--approach-delta") + 1]
+    assert delta.startswith("check the file") and "it parses lines" in delta
+    [opened] = _pursuit_calls(fake_beagle, "open")
+    assert opened[0] == "T0003"
+    assert opened[opened.index("--criteria") + 1] == "the parser reads input"
     assert "superseded by T0003" in result.text and "T0003 — Parser: closed done" in result.text
 
 
@@ -9503,6 +9535,36 @@ async def test_new_route_identical_check_and_scope_refused_after_escalation(
     taken = await step.execute("r9", {**same, "done_when": "grep -qx done done.txt"})
     assert "T0003" in taken.text
     assert [call[0] for call in _pursuit_calls(fake_beagle, "spawn")] == ["T0002"]
+
+
+@pytest.mark.anyio
+async def test_new_route_changed_criteria_with_bound_check_gets_unchanged_route_refusal(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # R36 #24: T0002's own check and scope at the escalation count, with new
+    # criteria, got the criteria refusal and never T0292's same-route one.
+    monkeypatch.chdir(_pursuit_project(tmp_path))
+    _failing_open_task(fake_beagle, monkeypatch)
+    runtime, _ = _bound(tmp_path)
+    step = _tool(runtime, "pursuit_step")
+    await _stays_open(step, fake_beagle, 3)
+    record = json.loads((fake_beagle / "show.out").read_text()) | {"criteria": "c"}
+    (fake_beagle / "show.out").write_text(json.dumps(record))
+    _r35_successor(fake_beagle)
+    call = {"task": "T0002", "new_route": True, "notes": "try harder", "attempts": 1}
+    call |= {"done_when": "grep -q done done.txt", "scope": STAYS_OPEN_SCOPE}
+
+    refused = await step.execute("r1", {**call, "criteria": "the clock ticks"})
+
+    assert len(_runs(fake_tau)) == 3
+    assert _pursuit_calls(fake_beagle, "spawn") == []
+    assert refused.text.startswith("pursuit_step: T0002 not run — ")
+    assert "a new route that changes nothing gets the same result" in refused.text
+    assert "keeps the criteria" not in refused.text
 
 
 def test_escalation_with_kept_check_offers_split_not_new_route(tmp_path: Path) -> None:
