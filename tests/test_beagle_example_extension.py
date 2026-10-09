@@ -3859,6 +3859,130 @@ async def test_unquoted_cases_verdict_shows_each_named_case_source(
     assert "Case third has no source string to search." in verdict
 
 
+#: The examples table of Run R37's reference, a Wikipedia text export, on the
+#: lines it holds there (references/Consistent_Overhead_Byte_Stuffing.txt:66-82).
+R37_REFERENCE = (
+    "Consistent Overhead Byte Stuffing\n"
+    + "\n" * 64
+    + (
+        "Example | Unencoded data (hex)\n"
+        "| Data bytes | Encoded with COBS (hex)\n"
+        "\n"
+        "1 | 00\n"
+        "| 1 | 01 01 00\n"
+        "\n"
+        "2 | 00 00\n"
+        "| 2 | 01 01 01 00\n"
+        "\n"
+        "3 | 00 11 00\n"
+        "| 3 | 01 02 11 01 00\n"
+        "\n"
+        "4 | 11 22 00 33\n"
+        "| 4 | 03 11 22 02 33 00\n"
+        "\n"
+        "5 | 11 22 33 44\n"
+        "| 4 | 05 11 22 33 44 00\n"
+    )
+)
+
+
+#: R37's cases key their answers "result", not "out".
+R37_CHECK = "grep -q result tests/cases.json"
+
+
+def _cases_with_cobs_reference(
+    tmp_path: Path, fake_beagle: Path, monkeypatch: pytest.MonkeyPatch, cases: list[Any]
+) -> Path:
+    """A known-answers task writing `cases`, in a project with Run R37's reference."""
+    project = _cases_with_reference(tmp_path, fake_beagle, monkeypatch, cases)
+    (project / "references" / "itc2008.txt").unlink()
+    (project / "references" / "Consistent_Overhead_Byte_Stuffing.txt").write_text(R37_REFERENCE)
+    _ready_task(fake_beagle, R37_CHECK)
+    return project
+
+
+@pytest.mark.anyio
+async def test_unquoted_verdict_points_at_the_lines_holding_case_values(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Run R37: workers paraphrased sources for five steps; the verdict said what was
+    searched, never that the case's values were on the table rows at lines 69-70."""
+    cases = [
+        {
+            "inputs": "00",
+            "result": "01 01 00",
+            "source": "Example 1 shows unencoded data 00 encodes to 01 01 00 with COBS",
+        },
+        {
+            "inputs": "00 00",
+            "result": "01 01 01 00",
+            "source": "Line 72 shows 2 | 00 00 and line 73 shows | 2 | 01 01 01 00",
+        },
+        {
+            "inputs": "11 22 00 33",
+            "result": "03 11 22 02 33 00",
+            "source": "Example Unencoded data hex Encoded with COBS hex",
+        },
+        {
+            "inputs": "11 22 33 44",
+            "result": "05 11 22 33 44 00",
+            "source": "| 4 | 05 11 22 33 44 00",
+        },
+    ]
+    _cases_with_cobs_reference(tmp_path, fake_beagle, monkeypatch, cases)
+
+    result = await _step_cases(tmp_path, locks=CASES_SCOPE, done_when=R37_CHECK)
+
+    verdict = result.text.split("Last report")[0]
+    assert "3 of 4 cases in tests/cases.json have no source quoting" in verdict
+    assert (
+        "Case #1's values are on Consistent_Overhead_Byte_Stuffing.txt:69-70: "
+        '"1 | 00" / "| 1 | 01 01 00"; copy one of those lines as its source.'
+    ) in verdict
+    assert 'Consistent_Overhead_Byte_Stuffing.txt:72-73: "2 | 00 00" / "| 2 | 01 01 01 00"' in (
+        verdict
+    )
+    # Not line 69 or 70, which hold 00 but not the result.
+    assert "Case #2's values are on Consistent_Overhead_Byte_Stuffing.txt:72-73" in verdict
+    assert "Case #3's values are on Consistent_Overhead_Byte_Stuffing.txt:78-79" in verdict
+    assert "No line of" not in verdict
+
+
+@pytest.mark.anyio
+async def test_unquoted_verdict_says_when_no_line_holds_the_values(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Run R37: a case whose inputs no reference line holds may not come from the
+    reference at all; the verdict says so instead of pointing at a line."""
+    cases = [
+        {"inputs": "de ad be ef", "result": "05 de ad be ef 00", "source": "Example 9 encodes"},
+        {"inputs": "00", "result": "02 07 00", "source": "Example 1 shows 00"},
+        {"inputs": "11 22 33 44", "result": "05 11 22 33 44 00", "source": "Example 5 shows"},
+    ]
+    _cases_with_cobs_reference(tmp_path, fake_beagle, monkeypatch, cases)
+
+    result = await _step_cases(tmp_path, locks=CASES_SCOPE, done_when=R37_CHECK)
+
+    verdict = result.text.split("Last report")[0]
+    assert (
+        "No line of references/*.txt holds case #1's inputs; check it comes from the reference."
+    ) in verdict
+    # "00" alone is on many lines and none gives its result: no line is shown.
+    assert "case #2's inputs" not in verdict and "Case #2's values" not in verdict
+    assert (
+        "Case #3's values are on Consistent_Overhead_Byte_Stuffing.txt:81-82: "
+        '"5 | 11 22 33 44" / "| 4 | 05 11 22 33 44 00"'
+    ) in verdict
+
+
 @pytest.mark.anyio
 async def test_close_accepts_cases_whose_sources_quote_references(
     tmp_path: Path,

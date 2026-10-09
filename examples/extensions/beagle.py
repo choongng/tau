@@ -5807,6 +5807,141 @@ def _searched_sources(flagged: list[tuple[str, str]]) -> str:
     return " ".join(lines)
 
 
+#: Keys whose values a case feeds the code, which a reference example line shows.
+_CASE_INPUT_KEYS = frozenset(
+    {
+        "input",
+        "inputs",
+        "in",
+        "args",
+        "arguments",
+        "ops",
+        "operations",
+        "operation",
+        "setup",
+        "given",
+    }
+)
+#: Value tokens one input must render for a line holding it alone to be shown.
+VALUE_RUN_MIN_TOKENS = 3
+#: Chars of a reference line a value-location sentence quotes.
+VALUE_LINE_CHARS = 120
+
+
+def _case_inputs(case: object) -> list[object]:
+    """The searchable values under a case's input keys, at any depth."""
+    if not isinstance(case, dict):
+        return []
+    return [
+        item
+        for key, value in case.items()
+        if str(key).lower() in _CASE_INPUT_KEYS
+        for item in _input_values(value)
+        if _searchable_result(item)
+    ]
+
+
+def _value_tokens(value: object) -> int:
+    if isinstance(value, list):
+        return len(value)
+    return len(re.findall(r"[0-9A-Za-z]+", str(value)))
+
+
+def _value_line(
+    label: str, case: object, references: list[tuple[str, list[tuple[int, str]]]]
+) -> str:
+    """Where in `references` a flagged case's input values are, for its verdict.
+
+    Run R37: workers paraphrased sources ("Example 1 shows unencoded data 00
+    encodes to 01 01 00") while the reference held the example as a two-line
+    table row, `1 | 00` then `| 1 | 01 01 00`. A line holds the inputs when
+    each renders on it as `_renders_result` reads a whole value.
+
+    An input such as `00` is on many lines, so the line shown is the first
+    that holds the inputs with every result on it or the next line. Without
+    such a line, the first holding the inputs alone is shown only when one
+    input is a run of VALUE_RUN_MIN_TOKENS or more tokens, which a line holds
+    by chance rarely; else nothing is said, rather than point at a random
+    line, unless no line holds the inputs at all.
+    """
+    inputs = _case_inputs(case)
+    if not inputs:
+        return ""
+    results = _case_results(case)
+
+    def holds_inputs(text: str) -> bool:
+        return all(_renders_result(text, value, whole=True) for value in inputs)
+
+    paired: tuple[str, int, int] | None = None
+    alone: tuple[str, int, int] | None = None
+    for name, lines in references:
+        for at, (_, text) in enumerate(lines):
+            if not holds_inputs(text):
+                continue
+            after = at + 1 if at + 1 < len(lines) else at
+            pair = (name, at, after)
+            alone = alone or pair
+            near = [text, lines[after][1]]
+            if results and all(
+                any(_renders_result(line, result, whole=narrow) for line in near)
+                for result, narrow in results
+            ):
+                paired = pair
+                break
+        if paired:
+            break
+    distinct = max(_value_tokens(value) for value in inputs) >= VALUE_RUN_MIN_TOKENS
+    found = paired or (alone if distinct else None)
+    if found is None:
+        if alone:
+            return ""
+        return (
+            f"No line of {REFERENCES_DIR}/*.txt holds case {label}'s inputs; "
+            "check it comes from the reference."
+        )
+    name, at, after = found
+    lines = dict(references)[name]
+
+    def quoted(index: int) -> str:
+        text = lines[index][1].strip()
+        if len(text) > VALUE_LINE_CHARS:
+            text = text[:VALUE_LINE_CHARS] + "…"
+        return f'"{text}"'
+
+    first, last = lines[at][0], lines[after][0]
+    if after == at:
+        return f"Case {label}'s values are on {name}:{first}: {quoted(at)}; copy it as its source."
+    span = f"{first}-{last}" if last == first + 1 else f"{first},{last}"
+    return (
+        f"Case {label}'s values are on {name}:{span}: {quoted(at)} / {quoted(after)}; "
+        "copy one of those lines as its source."
+    )
+
+
+def _value_lines(root: Path, data: str, named: list[str]) -> str:
+    """Where in references/*.txt each case `named` in `data` has its input values."""
+    references: list[tuple[str, list[tuple[int, str]]]] = []
+    refs = root / REFERENCES_DIR
+    for path in sorted(refs.glob("*.txt")) if refs.is_dir() else []:
+        try:
+            raw = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        numbered = [(n, line) for n, line in enumerate(raw.splitlines(), 1) if line.strip()]
+        references.append((path.name, numbered))
+    try:
+        cases = _cases_list(json.loads((root / data).read_text(encoding="utf-8")))
+    except (OSError, ValueError):
+        return ""
+    labelled: dict[str, object] = {}
+    for i, case in enumerate(cases):
+        labelled.setdefault(_case_label(case, i), case)
+    sentences = [
+        _value_line(name, labelled[name], references) for name in named if name in labelled
+    ]
+    return " ".join(sentence for sentence in sentences if sentence)
+
+
 def _reads_locked_data(root: Path, test: str, data: list[str]) -> bool:
     """Whether `test` reads one of the `data` files and imports a project module.
 
@@ -12672,6 +12807,8 @@ def make_step_tool() -> Any:
         if unquoted:
             state = "stays blocked" if retrying else "stays open"
             data, missing, total, named, _, sources = unquoted
+            located = _value_lines(root, data, named)
+            located = f"{located} " if located else ""
             return _not_done(
                 root,
                 task,
@@ -12680,6 +12817,7 @@ def make_step_tool() -> Any:
                 f"and nothing is locked: {missing} of {total} cases in {data} have no source "
                 f"quoting {REFERENCES_DIR}/*.txt (e.g. {', '.join(named)}), so nothing ties "
                 f"them to the reference. {_searched_sources(sources)} "
+                f"{located}"
                 "The sub-agent must give each case a `source` that "
                 f"copies, verbatim, at least {SOURCE_QUOTE_MIN_WORDS} words of a line of "
                 f"{REFERENCES_DIR}/*.txt it comes from. A bare file:line, page number or URL "
