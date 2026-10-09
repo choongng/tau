@@ -3808,6 +3808,34 @@ async def test_close_keeps_cases_open_when_most_sources_quote_nothing(
 
 
 @pytest.mark.anyio
+async def test_unquoted_cases_verdict_shows_flagged_source_text(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Run R36: three verdicts named the cases but not what was searched in them.
+    cases = [
+        {"name": "first", "in": "1", "out": "2", "source": "itc2008.txt:221 (not in it at all)"},
+        {"name": "second", "in": "x", "out": "y", "source": "itc2008.txt:251"},
+        {"name": "third", "in": "a", "out": "b"},
+    ]
+    _cases_with_reference(tmp_path, fake_beagle, monkeypatch, cases)
+
+    result = await _step_cases(tmp_path, locks=CASES_SCOPE)
+
+    verdict = result.text.split("Last report")[0]
+    assert "3 of 3 cases in tests/cases.json have no source quoting references/*.txt" in verdict
+    assert (
+        'Case first\'s source, "itc2008.txt:221 (not in it at all)", was searched: no run of '
+        "4 or more of its words" in verdict
+    )
+    assert "was found in references/*.txt." in verdict
+    assert _pursuit_calls(fake_beagle, "close") == []
+
+
+@pytest.mark.anyio
 async def test_close_accepts_cases_whose_sources_quote_references(
     tmp_path: Path,
     beagle: Path,
@@ -3908,6 +3936,122 @@ def test_r15_cases_all_quote_the_reference(tmp_path: Path) -> None:
     (tmp_path / "tests").mkdir()
     (tmp_path / "tests" / "cases.json").write_text(json.dumps(R15_UNFOUND_CASES))
     assert module._unquoted_cases(tmp_path, ["tests/cases.json"]) is None
+
+
+_FULL = "\u2588\u2588\u2588\u2588"
+#: R36's references/interval-tree-clocks.txt, lines 74-86, verbatim.
+R36_REFERENCE = (
+    f"The user writes the data to A, which creates ID 1 = {_FULL}, increments the counter "
+    f"to 1 = {_FULL} also.\n"
+    "\n"
+    "A synchronizes with B by forking the stamp, giving IDs {1,0} = "
+    "\u2588\u2588\u2592\u2592 and {0,1} = \u2592\u2592\u2588\u2588. "
+    f"The counter remains 1 = {_FULL}.\n"
+    "\n"
+    "The user writes data to B, which increments B's counter to {0,2}.\n"
+    "\n"
+    "Then we're able to sync. The problem happens whenever we swap steps 2 and 3 however:\n"
+    "\n"
+    f"The user writes the data to A, which creates ID 1 = {_FULL}, increments the counter "
+    f"to 1 = {_FULL} also.\n"
+    "\n"
+    f"The user writes data to B, which creates ID 1 = {_FULL}, increments the counter to "
+    f"1 = {_FULL} also.\n"
+    "\n"
+    "The system can only assume both data sets are equivalent since the clocks are the same.\n"
+)
+#: R36's final tests/cases.json (W2-W4): a file:line label, then the quote in parentheses.
+R36_CASES = [
+    {
+        "description": "Identity local update",
+        "input": {"id": "A", "event": 1, "remote_event": None},
+        "expected": {"id": "A", "event": 2, "remote_event": None},
+        "source": "interval-tree-clocks.txt:114 (The user writes the data to A, which "
+        f"creates ID 1 = {_FULL})",
+    },
+    {
+        "description": "Remote update with higher event",
+        "input": {"id": "A", "event": 1, "remote_event": {"id": "B", "event": 5}},
+        "expected": {"id": "A", "event": 2, "remote_event": {"id": "B", "event": 5}},
+        "source": f"interval-tree-clocks.txt:115 (The counter remains 1 = {_FULL})",
+    },
+    {
+        "description": "Remote update with lower event",
+        "input": {"id": "A", "event": 10, "remote_event": {"id": "B", "event": 5}},
+        "expected": {"id": "A", "event": 11, "remote_event": {"id": "B", "event": 5}},
+        "source": "interval-tree-clocks.txt:116 (The user writes data to B, which increments "
+        "B's counter to {0,2})",
+    },
+    {
+        "description": "Merge and conflict detection",
+        "input": {"id": "A", "event": 1, "remote_event": {"id": "B", "event": 1}},
+        "expected": {"id": "A", "event": 2, "remote_event": {"id": "B", "event": 1}},
+        "source": "interval-tree-clocks.txt:118 (The system can only assume both data sets "
+        "are equivalent since the clocks are the same.)",
+    },
+]
+
+
+def _r36_project(tmp_path: Path, cases: list[Any]) -> Path:
+    (tmp_path / "references").mkdir()
+    (tmp_path / "references" / "interval-tree-clocks.txt").write_text(
+        R36_REFERENCE, encoding="utf-8"
+    )
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "tests" / "cases.json").write_text(json.dumps(cases), encoding="utf-8")
+    return tmp_path
+
+
+def test_quotes_reference_finds_parenthesised_quote_after_file_line_label(
+    tmp_path: Path,
+) -> None:
+    # Run R36: W2-W4 wrote every source this way; the check flagged all 4.
+    module = _module()
+    reference = module._normalised(R36_REFERENCE)
+    for case in R36_CASES:
+        assert module._quotes_reference(case["source"], reference), case["source"]
+    assert module._quotes_reference(
+        "refs.txt:116 [The user writes data to B, which increments B's counter to {0,2}]",
+        reference,
+    )
+    assert module._quotes_reference(
+        "refs.txt:118 The system can only assume both data sets are equivalent", reference
+    )
+    assert not module._quotes_reference(
+        "refs.txt:116 (The user writes data to C, which increments it)", reference
+    )
+    project = _r36_project(tmp_path, R36_CASES)
+    assert module._unquoted_cases(project, ["tests/cases.json"]) is None
+
+
+def test_quoted_context_finds_parenthesised_quote() -> None:
+    module = _module()
+    lines = [module._normalised(line) for line in R36_REFERENCE.splitlines() if line.strip()]
+    context = module._quoted_context(R36_CASES[2]["source"], lines)
+    assert context == [
+        "the user writes data to b, which increments b's counter to {0,2}.",
+        "then we're able to sync. the problem happens whenever we swap steps 2 and 3 however:",
+    ]
+    assert module._lines_after(R36_CASES[2]["source"], lines) == context[1:]
+
+
+def test_bare_file_line_source_still_flagged_unquoted(tmp_path: Path) -> None:
+    # Run R36's first verdict, on W1's bare labels, was right and stays so.
+    module = _module()
+    reference = module._normalised(R36_REFERENCE)
+    assert not module._quotes_reference("refs.txt:12", reference)
+    assert not module._quotes_reference("interval-tree-clocks.txt:114", reference)
+    assert [m.group(0) for m in module._QUOTE_MARKS.finditer("refs.txt:12 [0] (1, 2)")] == []
+    bare = [{**case, "source": case["source"].split(" (")[0]} for case in R36_CASES]
+    found = module._unquoted_cases(_r36_project(tmp_path, bare), ["tests/cases.json"])
+    assert found == (
+        "tests/cases.json",
+        4,
+        4,
+        ["#1", "#2", "#3"],
+        False,
+        "interval-tree-clocks.txt:114",
+    )
 
 
 #: R15's tests/cases.json, all 32 cases, verbatim as compact JSON.
@@ -16978,7 +17122,8 @@ async def test_known_answer_source_must_hold_expected_result(
     assert not (project / ".beagle" / "locked").exists()
     assert _pursuit_calls(fake_beagle, "close") == []
     found = module._unquoted_cases(project, ["tests/cases.json"])
-    assert found == ("tests/cases.json", 1, 3, ["zero_with_data"], True)
+    assert found is not None
+    assert found[:5] == ("tests/cases.json", 1, 3, ["zero_with_data"], True)
     cases[0]["out"] = [1, 2, 17, 1, 0]
     (project / "tests" / "cases.json").write_text(json.dumps(cases))
     assert module._unquoted_cases(project, ["tests/cases.json"]) is None
@@ -17119,7 +17264,8 @@ def test_input_equal_result_checked_against_quoted_reference_line(tmp_path: Path
     (tmp_path / "tests").mkdir()
     (tmp_path / "tests" / "cases.json").write_text(json.dumps(R35_CASES))
     found = module._unquoted_cases(tmp_path, ["tests/cases.json"])
-    assert found == ("tests/cases.json", 2, 8, ["empty_input", "254_bytes_no_zero"], True)
+    assert found is not None
+    assert found[:5] == ("tests/cases.json", 2, 8, ["empty_input", "254_bytes_no_zero"], True)
     (tmp_path / "tests" / "cases.json").write_text(json.dumps([*examples, right_254]))
     assert module._unquoted_cases(tmp_path, ["tests/cases.json"]) is None
 

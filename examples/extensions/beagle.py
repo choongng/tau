@@ -5307,8 +5307,24 @@ def _cases_test_problem(root: Path, entries: list[str]) -> tuple[str, str] | Non
 SOURCE_QUOTE_MIN_WORDS = 4
 #: Key fragments that mark where a case keeps its source text.
 SOURCE_KEY_PARTS = ("source", "cite", "quote", "ref")
-#: Pairs of marks a quote may sit between inside a longer source string.
-_QUOTE_MARKS = re.compile(r'"([^"]+)"|“([^”]+)”|`([^`]+)`|\'([^\']{12,})\'')
+#: Pairs of marks a quote may sit between inside a longer source string. Run
+#: R36: sources were a file:line label then the quote in parentheses; a bracket
+#: or parenthesis span needs 12 or more chars, so an index like `[0]` is no quote.
+_QUOTE_MARKS = re.compile(
+    r'"([^"]+)"|“([^”]+)”|`([^`]+)`|\'([^\']{12,})\'|\(([^()]{12,})\)|\[([^\[\]]{12,})\]'
+)
+#: A leading `<file>:<line>` (or line range) label on a source string.
+_SOURCE_LABEL = re.compile(r"^\s*[\w./-]+:\d+(?:\s*[-–]\s*\d+)?\s*[:,;—-]?\s*")
+
+
+def _quote_candidates(text: str) -> list[str]:
+    """`text` whole, without a leading file:line label, and each span in `_QUOTE_MARKS`."""
+    candidates = [text]
+    unlabelled = _SOURCE_LABEL.sub("", text, count=1)
+    if unlabelled != text:
+        candidates.append(unlabelled)
+    candidates += [next(g for g in m.groups() if g) for m in _QUOTE_MARKS.finditer(text)]
+    return candidates
 
 
 def _normalised(text: str) -> str:
@@ -5348,14 +5364,14 @@ def _source_strings(case: object) -> list[str]:
 
 
 def _quotes_reference(text: str, reference: str) -> bool:
-    """Whether `text`, whole, quoted in it, or split at an ellipsis or colon, is in `reference`.
+    """Whether `text`, whole, unlabelled, quoted in it, or split at an ellipsis or colon,
+    is in `reference`.
 
     Run R15: a leading label ('send: This operation is ...' against the
     reference's 'send This operation ...') and a formula after a colon that
     the reference's PDF extraction spaced differently hid verbatim quotes.
     """
-    candidates = [text]
-    candidates += [next(g for g in m.groups() if g) for m in _QUOTE_MARKS.finditer(text)]
+    candidates = _quote_candidates(text)
     candidates += [part for c in list(candidates) for part in re.split(r"\.\.\.|…|:\s", c)]
     for candidate in candidates:
         quote = _normalised(candidate).strip(" \"'`“”.,;:")
@@ -5544,9 +5560,7 @@ def _quoted_spans(source: str, lines: list[str]) -> list[tuple[int, int]]:
     spans: list[tuple[int, int]] = []
     joined = " ".join(lines)
     starts = list(itertools.accumulate((len(line) + 1 for line in lines), initial=0))
-    candidates = [source]
-    candidates += [next(g for g in m.groups() if g) for m in _QUOTE_MARKS.finditer(source)]
-    for candidate in candidates:
+    for candidate in _quote_candidates(source):
         quote = _normalised(candidate).strip(" \"'`“”.,;:")
         if not quote:
             continue
@@ -5599,9 +5613,11 @@ def _result_unquoted(case: object, references: list[list[str]]) -> bool:
     return not any(_renders_result(text, result) for result, texts in checked for text in texts)
 
 
-def _unquoted_cases(root: Path, entries: list[str]) -> tuple[str, int, int, list[str], bool] | None:
-    """(data file, unfound, total, up to 3 names, whether by result) for cases whose source
-    does not tie them to references/*.txt.
+def _unquoted_cases(
+    root: Path, entries: list[str]
+) -> tuple[str, int, int, list[str], bool, str] | None:
+    """(data file, unfound, total, up to 3 names, whether by result, the first one's source)
+    for cases whose source does not tie them to references/*.txt.
 
     Runs R12 and R14: cases cited bare URLs, nothing, or `itc2008.txt:221`,
     a line that held a page number. A source counts as found when at least
@@ -5612,7 +5628,11 @@ def _unquoted_cases(root: Path, entries: list[str]) -> tuple[str, int, int, list
     line or prose, and 8 expected values were wrong. Any case with a searchable
     result (`_case_results`) must have it in its source or the reference line
     after the one quoted; run R35, a short or input-equal one in the quoted
-    reference line or the one after it. The last element is then True.
+    reference line or the one after it. The fifth element is then True.
+
+    Run R36: the verdict named the cases, not what was searched in them, so a
+    driver could not see that the check missed quotes in parentheses. The last
+    element is the first flagged case's source strings, joined, or "".
     """
     refs = root / REFERENCES_DIR
     texts = []
@@ -5638,20 +5658,37 @@ def _unquoted_cases(root: Path, entries: list[str]) -> tuple[str, int, int, list
         except (OSError, ValueError):
             continue
         unfound = [
-            _case_label(case, i)
+            (i, case)
             for i, case in enumerate(cases)
             if not any(_quotes_reference(s, text) for s in _source_strings(case) for text in texts)
         ]
         if cases and 2 * len(unfound) > len(cases):
-            return rel, len(unfound), len(cases), unfound[:3], False
-        wrong = [
-            _case_label(case, i)
-            for i, case in enumerate(cases)
-            if _result_unquoted(case, references)
-        ]
+            names = [_case_label(case, i) for i, case in unfound[:3]]
+            source = " | ".join(_source_strings(unfound[0][1]))
+            return rel, len(unfound), len(cases), names, False, source
+        wrong = [(i, case) for i, case in enumerate(cases) if _result_unquoted(case, references)]
         if wrong:
-            return rel, len(wrong), len(cases), wrong[:3], True
+            names = [_case_label(case, i) for i, case in wrong[:3]]
+            source = " | ".join(_source_strings(wrong[0][1]))
+            return rel, len(wrong), len(cases), names, True, source
     return None
+
+
+#: Chars of a flagged case's source a verdict quotes.
+SEARCHED_SOURCE_CHARS = 240
+
+
+def _searched_source(name: str, source: str) -> str:
+    """What the source-quote check searched in case `name`, for its verdict."""
+    if not source.strip():
+        return f"Case {name} has no source string to search."
+    shown = source if len(source) <= SEARCHED_SOURCE_CHARS else source[:SEARCHED_SOURCE_CHARS] + "…"
+    return (
+        f'Case {name}\'s source, "{shown}", was searched: no run of '
+        f"{SOURCE_QUOTE_MIN_WORDS} or more of its words (whole, after a file:line label, or "
+        "inside quote marks, parentheses or brackets) was found in "
+        f"{REFERENCES_DIR}/*.txt."
+    )
 
 
 def _reads_locked_data(root: Path, test: str, data: list[str]) -> bool:
@@ -12333,7 +12370,7 @@ def make_step_tool() -> Any:
         unquoted = _unquoted_cases(root, locks) if locks else None
         if unquoted and unquoted[4]:
             state = "stays blocked" if retrying else "stays open"
-            data, missing, total, named, _ = unquoted
+            data, missing, total, named, _, _ = unquoted
             return _not_done(
                 root,
                 task,
@@ -12356,7 +12393,7 @@ def make_step_tool() -> Any:
             )
         if unquoted:
             state = "stays blocked" if retrying else "stays open"
-            data, missing, total, named, _ = unquoted
+            data, missing, total, named, _, first_source = unquoted
             return _not_done(
                 root,
                 task,
@@ -12364,7 +12401,8 @@ def make_step_tool() -> Any:
                 f"{route}{undid}{task} — {title}: the check passes, but the task {state} "
                 f"and nothing is locked: {missing} of {total} cases in {data} have no source "
                 f"quoting {REFERENCES_DIR}/*.txt (e.g. {', '.join(named)}), so nothing ties "
-                "them to the reference: the sub-agent must give each case a `source` that "
+                f"them to the reference. {_searched_source(named[0], first_source)} "
+                "The sub-agent must give each case a `source` that "
                 f"copies, verbatim, at least {SOURCE_QUOTE_MIN_WORDS} words of a line of "
                 f"{REFERENCES_DIR}/*.txt it comes from. A bare file:line, page number or URL "
                 "is not a source."
