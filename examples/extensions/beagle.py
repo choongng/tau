@@ -5386,8 +5386,9 @@ def _case_label(case: object, index: int) -> str:
 
 #: Key fragments that mark a case's expected result.
 RESULT_KEY_PARTS = ("expect", "result", "output", "want", "answer")
-#: A scalar or string result shorter than this is not searched for: "1", "ok"
-#: or a bool occurs in, or is absent from, any source by chance.
+#: A scalar or string result shorter than this is searched for only in the
+#: reference lines its source quotes: "1", "ok" or "00" occurs in, or is
+#: absent from, a whole source by chance.
 RESULT_MIN_CHARS = 4
 #: A number-like token in a source: decimal, hex with 0x or \x, or bare hex digits.
 _VALUE_TOKEN = re.compile(r"(0x|\\x)?([0-9a-fA-F]+)(?![0-9a-zA-Z])", re.IGNORECASE)
@@ -5500,15 +5501,18 @@ def _searchable_result(value: object) -> bool:
     if isinstance(value, list):
         return bool(value) and all(isinstance(v, int) and not isinstance(v, bool) for v in value)
     if isinstance(value, int | float | str):
-        return len(str(value).strip()) >= RESULT_MIN_CHARS
+        return bool(str(value).strip())
     return False
 
 
-def _case_results(case: object) -> list[object]:
-    """The searchable results under a case's result-like keys that are not one of its inputs.
+def _case_results(case: object) -> list[tuple[object, bool]]:
+    """(result, narrow) for each searchable result under a case's result-like keys.
 
-    Run R34: expected_decoded equalled the input a source quoted, so it shows
-    nothing about whether the source gives the result.
+    A result is narrow when it is shorter than RESULT_MIN_CHARS or equal to one
+    of the case's inputs: found anywhere in a source it shows nothing, so only
+    the reference lines the source quotes may hold it. Run R34: expected_decoded
+    equalled the input a source quoted. Run R35: empty_input's "00" equalled its
+    input and was under RESULT_MIN_CHARS, and was wrong.
     """
     if not isinstance(case, dict):
         return []
@@ -5518,14 +5522,15 @@ def _case_results(case: object) -> list[object]:
         if str(key).lower() in _CASE_NON_ANSWER_KEYS
         and not any(part in str(key).lower() for part in SOURCE_KEY_PARTS)
     ]
-    results: list[object] = []
+    results: list[tuple[object, bool]] = []
 
     def walk(value: object) -> None:
         if isinstance(value, dict):
             for item in value.values():
                 walk(item)
-        elif _searchable_result(value) and value not in inputs:
-            results.append(value)
+        elif _searchable_result(value):
+            short = not isinstance(value, list) and len(str(value).strip()) < RESULT_MIN_CHARS
+            results.append((value, short or value in inputs))
 
     for key, value in case.items():
         name = str(key).lower()
@@ -5534,9 +5539,9 @@ def _case_results(case: object) -> list[object]:
     return results
 
 
-def _lines_after(source: str, lines: list[str]) -> list[str]:
-    """The next non-blank reference line after each line a quote in `source` ends on."""
-    found: list[str] = []
+def _quoted_spans(source: str, lines: list[str]) -> list[tuple[int, int]]:
+    """(first, last) index of the reference lines each quote in `source` spans."""
+    spans: list[tuple[int, int]] = []
     joined = " ".join(lines)
     starts = list(itertools.accumulate((len(line) + 1 for line in lines), initial=0))
     candidates = [source]
@@ -5547,25 +5552,51 @@ def _lines_after(source: str, lines: list[str]) -> list[str]:
             continue
         at = joined.find(quote)
         while at >= 0:
-            line = bisect.bisect_right(starts, at + len(quote) - 1) - 1
-            if line + 1 < len(lines):
-                found.append(lines[line + 1])
+            first = bisect.bisect_right(starts, at) - 1
+            last = bisect.bisect_right(starts, at + len(quote) - 1) - 1
+            spans.append((first, last))
             at = joined.find(quote, at + 1)
-    return found
+    return spans
+
+
+def _lines_after(source: str, lines: list[str]) -> list[str]:
+    """The next non-blank reference line after each line a quote in `source` ends on."""
+    return [lines[last + 1] for _, last in _quoted_spans(source, lines) if last + 1 < len(lines)]
+
+
+def _quoted_context(source: str, lines: list[str]) -> list[str]:
+    """The reference lines a quote in `source` spans, and the next non-blank one."""
+    return [
+        line for first, last in _quoted_spans(source, lines) for line in lines[first : last + 2]
+    ]
 
 
 def _result_unquoted(case: object, references: list[list[str]]) -> bool:
-    """Whether `case` has a searchable result that neither its source nor the reference
-    line after the quoted one holds."""
+    """Whether `case` has a checkable result and none of them is where it must be.
+
+    A wide result must be in the case's source or the reference line after the
+    quoted one; a narrow one (`_case_results`) in the quoted reference line or
+    the one after it. A narrow result is not checked when the source quotes no
+    reference line.
+    """
     results = _case_results(case)
     if not results:
         return False
     sources = _source_strings(case)
-    texts = [*sources]
+    wide = [*sources]
+    narrow: list[str] = []
     for lines in references:
         for source in sources:
-            texts += _lines_after(source, lines)
-    return not any(_renders_result(text, result) for text in texts for result in results)
+            wide += _lines_after(source, lines)
+            narrow += _quoted_context(source, lines)
+    checked = [
+        (result, narrow if is_narrow else wide)
+        for result, is_narrow in results
+        if narrow or not is_narrow
+    ]
+    if not checked:
+        return False
+    return not any(_renders_result(text, result) for result, texts in checked for text in texts)
 
 
 def _unquoted_cases(root: Path, entries: list[str]) -> tuple[str, int, int, list[str], bool] | None:
@@ -5580,7 +5611,8 @@ def _unquoted_cases(root: Path, entries: list[str]) -> tuple[str, int, int, list
     Run R34: every source was verbatim, but 11 of 13 quoted the case's input
     line or prose, and 8 expected values were wrong. Any case with a searchable
     result (`_case_results`) must have it in its source or the reference line
-    after the one quoted; the last element is then True.
+    after the one quoted; run R35, a short or input-equal one in the quoted
+    reference line or the one after it. The last element is then True.
     """
     refs = root / REFERENCES_DIR
     texts = []

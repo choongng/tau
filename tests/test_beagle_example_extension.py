@@ -3820,7 +3820,7 @@ async def test_close_accepts_cases_whose_sources_quote_references(
         {
             "name": "join",
             "in": "x",
-            "out": "y",
+            "out": "e2",
             "refs": ['itc2008.txt:7 "JOIN((i1, e1),   (i2, e2)) = (sum(i1, i2)"'],
         },
         {"name": "norm", "in": "(1, 1)", "out": "1", "quote": "norm((0, 0)) = 0 and"},
@@ -16850,6 +16850,161 @@ async def test_known_answer_source_must_hold_expected_result(
     cases[0]["out"] = [1, 2, 17, 1, 0]
     (project / "tests" / "cases.json").write_text(json.dumps(cases))
     assert module._unquoted_cases(project, ["tests/cases.json"]) is None
+
+
+#: R35's references/Consistent_Overhead_Byte_Stuffing.txt, lines 31-33, 45-47 and 66-88.
+R35_REFERENCE = (
+    "COBS transforms an arbitrary string of bytes in the range [0,255] into bytes in the "
+    "range [1,255]. Having eliminated all zero bytes from the data, a zero byte can now be "
+    "used to unambiguously mark the end of the transformed data. This is done by appending "
+    "a zero byte to the transformed data, thus forming a packet consisting of the "
+    "COBS-encoded data (the payload) to unambiguously mark the end of the packet.\n"
+    "\n"
+    "(Any other byte value may be reserved as the packet delimiter, but using zero "
+    "simplifies the description.)\n"
+    "As a special exception, if a packet ends with a group of 254 non-zero bytes, it is "
+    "not necessary to add the trailing zero byte. This saves one byte in some situations.\n"
+    "\n"
+    "Linked list description\n"
+    "Example | Unencoded data (hex)\n"
+    "| Data bytes | Encoded with COBS (hex)\n"
+    "\n"
+    "1 | 00\n"
+    "| 1 | 01 01 00\n"
+    "\n"
+    "2 | 00 00\n"
+    "| 2 | 01 01 01 00\n"
+    "\n"
+    "3 | 00 11 00\n"
+    "| 3 | 01 02 11 01 00\n"
+    "\n"
+    "4 | 11 22 00 33\n"
+    "| 4 | 03 11 22 02 33 00\n"
+    "\n"
+    "5 | 11 22 33 44\n"
+    "| 4 | 05 11 22 33 44 00\n"
+    "\n"
+    "6 | 11 00 00 00\n"
+    "| 4 | 02 11 01 01 01 00\n"
+    "\n"
+    "7 | 01 02 03 ... FD FE\n"
+    "| 254 | FF 01 02 03 ... FD FE 00\n"
+)
+_R35_254 = " ".join(f"{b:02x}" for b in range(1, 255))
+#: R35's final tests/cases.json, cases 1-8: empty_input's "00" equals its input and is
+#: wrong; the six worked examples are right; 254_bytes_no_zero lacks the trailing 00.
+R35_CASES = [
+    {
+        "name": "empty_input",
+        "input": "00",
+        "expected": "00",
+        "source": [
+            "COBS transforms an arbitrary string of bytes in the range [0,255] into bytes in "
+            "the range [1,255]. Having eliminated all zero bytes from the data, a zero byte can "
+            "now be used to unambiguously mark the end of the transformed data.",
+            "As a special exception, if a packet ends with a group of 254 non-zero bytes, it is "
+            "not necessary to add the trailing zero byte. This saves one byte in some situations.",
+        ],
+    },
+    *(
+        {
+            "name": f"worked_example_{data.replace(' ', '_')}",
+            "input": data,
+            "expected": encoded,
+            "source": [f"{row} | {data}", f"| {size} | {encoded}"],
+        }
+        for row, data, size, encoded in (
+            (1, "00", 1, "01 01 00"),
+            (2, "00 00", 2, "01 01 01 00"),
+            (3, "00 11 00", 3, "01 02 11 01 00"),
+            (4, "11 22 00 33", 4, "03 11 22 02 33 00"),
+            (5, "11 22 33 44", 4, "05 11 22 33 44 00"),
+            (6, "11 00 00 00", 4, "02 11 01 01 01 00"),
+        )
+    ),
+    {
+        "name": "254_bytes_no_zero",
+        "input": _R35_254,
+        "expected": f"ff {_R35_254}",
+        "source": [
+            "7 | 01 02 03 ... FD FE",
+            "| 254 | FF 01 02 03 ... FD FE 00",
+            "As a special exception, if a packet ends with a group of 254 non-zero bytes, it is "
+            "not necessary to add the trailing zero byte. This saves one byte in some situations.",
+        ],
+    },
+]
+
+
+def _r35_reference() -> list[str]:
+    module = _module()
+    return [module._normalised(line) for line in R35_REFERENCE.splitlines() if line.strip()]
+
+
+def test_short_result_checked_against_quoted_reference_line() -> None:
+    # Audit 10: a result under RESULT_MIN_CHARS was never searched for, so R35's
+    # "00" passed; now it must be on the quoted reference line or the next one.
+    module = _module()
+    reference = _r35_reference()
+    assert len("01") < module.RESULT_MIN_CHARS
+    held = {
+        "on-line": {"in": [5], "expected": "01", "source": "| 1 | 01 01 00"},
+        "next-line": {"in": [5], "expected": "44", "source": "| 4 | 03 11 22 02 33 00"},
+        "number": {"in": [5], "expected": 1, "source": "| 1 | 01 01 00"},
+        "quoted": {"in": [5], "expected": "33", "source": 'the row "4 | 11 22 00 33"'},
+    }
+    for name, case in held.items():
+        assert not module._result_unquoted(case, [reference]), name
+    wrong = {
+        "absent": {"in": [5], "expected": "03", "source": "| 1 | 01 01 00"},
+        "number": {"in": [5], "expected": 7, "source": "| 1 | 01 01 00"},
+        "elsewhere": {"in": [5], "expected": "44", "source": "| 1 | 01 01 00"},
+    }
+    for name, case in wrong.items():
+        assert module._result_unquoted(case, [reference]), name
+
+
+def test_input_equal_result_checked_against_quoted_reference_line(tmp_path: Path) -> None:
+    # R35: empty_input's expected "00" equalled its input, and its sources quoted
+    # prose whose lines give no "00"; it is flagged, the six right worked examples
+    # and a right 254-byte case in the elided form are not.
+    module = _module()
+    reference = _r35_reference()
+    empty, *examples, short_254 = R35_CASES
+    assert module._result_unquoted(empty, [reference])
+    for case in examples:
+        assert not module._result_unquoted(case, [reference]), case["name"]
+    assert module._result_unquoted(short_254, [reference])
+    right_254 = {**short_254, "expected": f"ff {_R35_254} 00"}
+    assert not module._result_unquoted(right_254, [reference])
+    on_line = {"input": "00 11 00", "expected": "00 11 00", "source": "3 | 00 11 00"}
+    assert not module._result_unquoted(on_line, [reference])
+    off_line = {"input": "00 11 00", "expected": "00 11 00", "source": "| 1 | 01 01 00"}
+    assert module._result_unquoted(off_line, [reference])
+
+    (tmp_path / "references").mkdir()
+    (tmp_path / "references" / "cobs.txt").write_text(R35_REFERENCE)
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "tests" / "cases.json").write_text(json.dumps(R35_CASES))
+    found = module._unquoted_cases(tmp_path, ["tests/cases.json"])
+    assert found == ("tests/cases.json", 2, 8, ["empty_input", "254_bytes_no_zero"], True)
+    (tmp_path / "tests" / "cases.json").write_text(json.dumps([*examples, right_254]))
+    assert module._unquoted_cases(tmp_path, ["tests/cases.json"]) is None
+
+
+def test_short_result_with_no_quoted_context_is_not_flagged() -> None:
+    # "1" or "ok" occurs in, or is absent from, unquoted text by chance: with no
+    # reference line quoted there is nothing narrow to check it against.
+    module = _module()
+    reference = _r35_reference()
+    for case in (
+        {"in": [5], "expected": "1", "source": "prose without values"},
+        {"in": [5], "expected": "ok", "source": "prose without values"},
+        {"in": [5], "expected": 7, "source": "nothing the reference holds"},
+        {"in": "00", "expected": "00", "source": "prose without values"},
+        {"in": "00 11", "expected": "00 11", "source": "nothing the reference holds"},
+    ):
+        assert not module._result_unquoted(case, [reference]), case
 
 
 @pytest.mark.anyio
