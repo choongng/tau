@@ -242,6 +242,19 @@ OUTPUT_LIMIT_NUDGE = (
     "dropped. Do not work the whole problem out again in your head: take the next "
     "concrete step now with a tool call, or answer briefly."
 )
+# A reply that ends on "stop" with no tool call, its text holding a chat
+# template's tool-call markup, wrote its call as text: the loop would end the
+# run there. R37 (qwen, dev-notes/itc-runs/R37.md, class 3): a worker's last
+# reply was `<tool_call> <function=bash> <parameter=command> cd …` with
+# stopReason "stop", and its run ended with no report. The follow-up asks for
+# the call again, bounded in a row (a reply that makes a tool call resets it)
+# and per run.
+MAX_TEXT_TOOL_CALL_FOLLOW_UPS = 2
+MAX_TEXT_TOOL_CALL_FOLLOW_UPS_PER_RUN = 4
+TEXT_TOOL_CALL_NUDGE = (
+    "Your last reply wrote a tool call as text, so it did not run. Make the call "
+    "as a tool call, or answer without the markup."
+)
 # A request whose streamed reasoning is plainly looping is stopped and handled
 # as an output-limit cut-off. R36 (gemma, dev-notes/itc-runs/R36.md, class 1):
 # seven driver turns ran 21k-49k reasoning chars of loop to the 8,192-token cap
@@ -765,6 +778,9 @@ class CodingSession:
         self._length_continuations = 0
         #: Nudges this run whose reply made no tool call.
         self._run_length_continuations = 0
+        #: Follow-ups in a row, and this run, to replies that wrote a tool call as text.
+        self._text_tool_call_follow_ups = 0
+        self._run_text_tool_call_follow_ups = 0
         #: Whether the next turn to end is the reply to an output-limit nudge.
         self._awaiting_nudge_reply = False
         #: Whether the next loop request is a nudge's, sent with thinking off.
@@ -2038,6 +2054,7 @@ class CodingSession:
             # provider (compaction, naming) get the bare one.
             self._unguard_requests()
             self._length_continuations = self._run_length_continuations = 0
+            self._text_tool_call_follow_ups = self._run_text_tool_call_follow_ups = 0
             self._awaiting_nudge_reply = self._next_request_thinking_off = False
             self._recent_calls.clear()
             self._recent_heads.clear()
@@ -2045,6 +2062,7 @@ class CodingSession:
             self._refused_call_ids.clear()
         if isinstance(event, TurnEndEvent):
             self._continue_after_output_limit(event)
+            self._continue_after_text_tool_call(event)
         if isinstance(event, TurnEndEvent) and self._run_continues_after(event):
             async for signal in self._compact_between_turns():
                 yield signal
@@ -2082,6 +2100,36 @@ class CodingSession:
         self._awaiting_nudge_reply = True
         self._next_request_thinking_off = True
         nudge = UserMessage(content=OUTPUT_LIMIT_NUDGE)
+        self._record_message_origin(nudge, delivery="follow_up", source="extension")
+        self._harness.follow_up_message(nudge)
+
+    def _continue_after_text_tool_call(self, event: TurnEndEvent) -> None:
+        """Ask again when a reply wrote its tool call as text instead of making it.
+
+        Only a reply that ended on "stop" counts: a length stop is the
+        output-limit nudge's, and an error or abort ends the run. The text must
+        hold the template's own call markup (`TEMPLATE_TOOL_CALL_TOKEN`), so a
+        reply that names `<tool_call>` in prose is left to end the run.
+        """
+        message = event.message
+        if not isinstance(message, AssistantMessage):
+            return
+        if (
+            message.tool_calls
+            or message.stop_reason != "stop"
+            or not TEMPLATE_TOOL_CALL_TOKEN.search(message.text)
+        ):
+            self._text_tool_call_follow_ups = 0
+            return
+        if (
+            self._text_tool_call_follow_ups >= MAX_TEXT_TOOL_CALL_FOLLOW_UPS
+            or self._run_text_tool_call_follow_ups >= MAX_TEXT_TOOL_CALL_FOLLOW_UPS_PER_RUN
+        ):
+            self._text_tool_call_follow_ups = 0
+            return
+        self._text_tool_call_follow_ups += 1
+        self._run_text_tool_call_follow_ups += 1
+        nudge = UserMessage(content=TEXT_TOOL_CALL_NUDGE)
         self._record_message_origin(nudge, delivery="follow_up", source="extension")
         self._harness.follow_up_message(nudge)
 

@@ -1,16 +1,24 @@
-"""A tool call whose arguments carry chat-template tool-call tokens is refused."""
+"""Chat-template tool-call tokens: refused in arguments, followed up in text."""
 
 from pathlib import Path
 
 import pytest
 
 from pi_event_helpers import assistant_done, assistant_start
-from tau_agent import AgentTool, AgentToolResult, AssistantMessage, TextContent, ToolCall
+from tau_agent import (
+    AgentTool,
+    AgentToolResult,
+    AssistantMessage,
+    TextContent,
+    ToolCall,
+    UserMessage,
+)
 from tau_agent.messages import assistant_content
 from tau_agent.session import JsonlSessionStorage
 from tau_agent.types import JSONValue
 from tau_ai import FakeProvider
 from tau_coding import CodingSession, CodingSessionConfig, TauResourcePaths
+from tau_coding.session import TEXT_TOOL_CALL_NUDGE
 
 #: Run R36's founding statement, as gemma sent it: the tail is the reply's
 #: next call and its reasoning, run into this call's last string.
@@ -27,6 +35,12 @@ R36_DESCRIPTION = (
 )
 #: The qwen form R02 and R15 left at the end of a worker's text.
 QWEN_SPILL = "Report written.</tool_call>\n<tool_call>\n<function=bash>\n<parameter=command>"
+#: Run R37's E08 worker ended its run on this reply, with stopReason "stop".
+R37_TEXT_CALL = (
+    "<tool_call>\n<function=bash>\n<parameter=command>\ncd /home/choong/cobs && "
+    "python3 -m pytest -q tests/test_case_data.py --collect-only\n</parameter>\n"
+    "</function>\n</tool_call>"
+)
 
 
 def _turns(name: str, *arguments: dict[str, JSONValue]) -> list[list[object]]:
@@ -193,3 +207,93 @@ async def test_tool_args_with_ordinary_angle_brackets_run(tmp_path: Path) -> Non
 
     assert ran == [{"text": text} for text in ordinary]
     assert not any(r.startswith("Not run") for r in results)
+
+
+def _says(text: str) -> list[object]:
+    return [
+        assistant_start(model="fake"),
+        assistant_done(message=AssistantMessage(content=text, stop_reason="stop")),
+    ]
+
+
+def _calls_note(arguments: dict[str, JSONValue]) -> list[object]:
+    call = ToolCall(id="call-real", name="note", arguments=arguments)
+    return [
+        assistant_start(model="fake"),
+        assistant_done(
+            message=AssistantMessage(
+                content=assistant_content("Calling.", [call]), stop_reason="toolUse"
+            )
+        ),
+    ]
+
+
+async def _text_session(
+    tmp_path: Path, turns: list[list[object]]
+) -> tuple[CodingSession, FakeProvider, list[object]]:
+    ran: list[object] = []
+    provider = FakeProvider(turns)
+    session = await CodingSession.load(
+        CodingSessionConfig(
+            provider=provider,
+            model="fake",
+            system="You are Tau.",
+            storage=JsonlSessionStorage(tmp_path / "session.jsonl"),
+            cwd=tmp_path,
+            tools=[_recording_tool(ran)],
+        )
+    )
+    return session, provider, ran
+
+
+def _follow_ups(session: CodingSession) -> list[UserMessage]:
+    return [
+        message
+        for message in session.messages
+        if isinstance(message, UserMessage) and message.text == TEXT_TOOL_CALL_NUDGE
+    ]
+
+
+@pytest.mark.anyio
+async def test_text_reply_with_tool_call_markup_is_followed_up(tmp_path: Path) -> None:
+    session, provider, ran = await _text_session(
+        tmp_path, [_says(R37_TEXT_CALL), _calls_note({"text": "run it"}), _says("Report.")]
+    )
+
+    await _run(session)
+
+    assert provider.calls[1][2][-1].text == TEXT_TOOL_CALL_NUDGE
+    assert ran == [{"text": "run it"}]
+    assert len(provider.calls) == 3
+    assert len(_follow_ups(session)) == 1
+
+
+@pytest.mark.anyio
+async def test_text_tool_call_follow_ups_are_bounded(tmp_path: Path) -> None:
+    # Two in a row, then the run ends; a real call resets the streak, and the
+    # per-run cap of four stops a model that acts just enough in between.
+    session, provider, _ = await _text_session(tmp_path, [_says(R37_TEXT_CALL) for _ in range(5)])
+    await _run(session)
+    assert len(provider.calls) == 3
+    assert len(_follow_ups(session)) == 2
+
+    gemma = '<|tool_call>call:bash{command:<|"|>ls<|"|>}<tool_call|>'
+    cycle = [_says(R37_TEXT_CALL), _says(gemma), _calls_note({"text": "x"})]
+    (tmp_path / "per-run").mkdir()
+    session, provider, ran = await _text_session(tmp_path / "per-run", [*cycle * 3, _says("End.")])
+    await _run(session)
+    assert len(_follow_ups(session)) == 4
+    # The fifth markup reply, after the second real call, is not followed up.
+    assert len(ran) == 2
+    assert len(provider.calls) == 7
+
+
+@pytest.mark.anyio
+async def test_reply_naming_the_tag_in_prose_is_not_followed_up(tmp_path: Path) -> None:
+    prose = "Qwen wraps a call in <tool_call> tags; this reply only names them."
+    session, provider, _ = await _text_session(tmp_path, [_says(prose), _says("Unreached.")])
+
+    await _run(session)
+
+    assert len(provider.calls) == 1
+    assert _follow_ups(session) == []
