@@ -1,0 +1,14 @@
++++
+id = "001285-pursuit"
+ordinal = 1285
+kind = "pursuit"
+timestamp = "2026-10-09T21:09:45+00:00"
+summary = "pursuit open T0308: R36 fix: a turn whose reasoning repeats is cut early; the output-limit nudge sends thinking off"
+metric_command = ""
+drains = []
+hooks = []
++++
+
+criteria: In tau's session loop (src/tau_coding/session.py): (1) while a turn streams reasoning, a repetition detector stops the request once the reasoning is plainly looping (a line recurring N times while distinct lines are a small fraction of the lines so far; thresholds named constants), and the turn is handled exactly as an output-limit cut-off; ordinary long reasoning with no such repetition is never cut. (2) _continue_after_output_limit sends its nudged follow-up request with thinking off for that one request only; the session's thinking level is unchanged afterwards. (3) The per-run bound MAX_OUTPUT_LIMIT_CONTINUATIONS_PER_RUN counts only nudges whose reply made no tool call; the in-a-row bound still stops a model that never acts. Keyed on stop reason, the reasoning's own repetition and tool calls; no model names. Tests in tests/test_session_output_limit.py, including a negative test that non-repeating reasoning is not cut; existing session tests pass.
+decided by: sh -c 'echo "f88c1d66e61888978e5a7a549ed587e217c27da626ca9eb3f017e81ac9b61b7e  .beagle/checks/T0308/T0308.sh" | sha256sum -c --quiet && bash .beagle/checks/T0308/T0308.sh'
+budget: 150000 tokens
