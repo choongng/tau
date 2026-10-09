@@ -12720,3 +12720,68 @@ async def test_tui_app_down_arrow_returns_to_blank_after_recalling_prompt() -> N
         await pilot.pause()
         assert prompt.text == ""
         assert prompt.cursor_location == (0, 0)
+
+
+@pytest.mark.anyio
+async def test_page_keys_scroll_transcript_while_prompt_has_focus() -> None:
+    app = TauTuiApp(
+        FakeSession(
+            messages=[
+                UserMessage(content=f"message {index}\n" + "line\n" * 4) for index in range(12)
+            ]
+        )
+    )
+
+    async with app.run_test(size=(40, 12)) as pilot:
+        await pilot.pause()
+        transcript = app.query_one("#transcript", TranscriptView)
+        assert isinstance(app.focused, PromptInput)
+        bottom_y = transcript.scroll_y
+        assert bottom_y > 0
+
+        await pilot.press("pageup")
+        await pilot.pause()
+        assert transcript.scroll_y < bottom_y
+        assert isinstance(app.focused, PromptInput)
+
+        await pilot.press("pagedown")
+        await pilot.pause()
+        assert transcript.scroll_y == bottom_y
+
+
+@pytest.mark.anyio
+async def test_page_keys_page_across_the_bounded_transcript_window(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from tau_coding.tui import widgets as tui_widgets
+
+    monkeypatch.setattr(tui_widgets, "TRANSCRIPT_WINDOW_ITEMS", 6)
+    monkeypatch.setattr(tui_widgets, "TRANSCRIPT_WINDOW_PAGE_ITEMS", 2)
+    app = TauTuiApp(
+        FakeSession(
+            messages=[
+                UserMessage(content=f"message {index}\n" + "line\n" * 4) for index in range(12)
+            ]
+        )
+    )
+
+    async with app.run_test(size=(40, 30)) as pilot:
+        await pilot.pause()
+        transcript = app.query_one("#transcript", TranscriptView)
+        assert transcript._window_start == 6
+
+        for _ in range(100):
+            await pilot.press("pageup")
+            await pilot.pause()
+            if transcript._window_start == 0 and transcript.scroll_y == 0:
+                break
+        assert transcript._window_start == 0
+        assert transcript.scroll_y == 0
+
+        for _ in range(100):
+            await pilot.press("pagedown")
+            await pilot.pause()
+            if transcript._window_end == 12 and transcript.is_vertical_scroll_end:
+                break
+        assert transcript._window_end == 12
+        assert transcript.is_vertical_scroll_end
