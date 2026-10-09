@@ -1640,8 +1640,13 @@ async def _talk(proc: asyncio.subprocess.Process, brief: str, events: _WorkerEve
     return err
 
 
-#: A tool call written out as text, which a turn-capped worker can end on.
-_TOOL_CALL_MARKUP = re.compile(r"<tool_call>|<function=")
+#: A tool call written out as text, which a turn-capped worker can end on: the
+#: angle form (`<tool_call><function=…>`) and the pipe-delimited form, whose
+#: call and channel tokens ended Run R36's worker descriptions and founding
+#: statement (`<tool_call|><|channel>thought…<|tool_call>call:bash{…`).
+_TOOL_CALL_MARKUP = re.compile(
+    r"<tool_call>|<function=|<\|(?:tool_call|channel)>|<(?:tool_call|channel)\|>"
+)
 
 
 def _unreported_changes(cwd: Path, scope: list[str]) -> str:

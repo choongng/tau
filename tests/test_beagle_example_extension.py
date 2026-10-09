@@ -9438,6 +9438,34 @@ async def test_short_report_before_markup_is_kept(
     assert "<tool_call>" not in text
 
 
+#: Run R36 W1: a report whose text ran into the next call's pipe-delimited tokens.
+R36_PIPE_MARKUP = "<tool_call|><|channel>thought\n<channel|><|tool_call>call:bash{command:"
+
+
+def test_tool_call_markup_matches_channel_tokens() -> None:
+    markup = _module()._TOOL_CALL_MARKUP
+    for token in ("<|tool_call>", "<tool_call|>", "<|channel>", "<channel|>"):
+        assert markup.search(f"done.{token}"), token
+    for text in ("<b>bold</b>", "List<String>", "a < b > c", "the tool_call channel", "<channel>"):
+        assert not markup.search(text), text
+
+
+@pytest.mark.anyio
+async def test_report_before_markup_cuts_at_pipe_tool_call(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _ready_task(fake_beagle)
+    text = await _raw_markup_step(tmp_path, monkeypatch, "Wrote the cases.\n" + R36_PIPE_MARKUP)
+
+    assert text.count("Wrote the cases.") == 1 and "cut here" in text
+    assert "<|channel>" not in text and "<tool_call|>" not in text
+    assert "Changed or new in its scope: cases.json" in text
+
+
 @pytest.mark.anyio
 async def test_bare_raw_tool_call_report_is_still_replaced(
     tmp_path: Path,
