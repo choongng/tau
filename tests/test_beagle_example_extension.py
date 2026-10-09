@@ -8889,6 +8889,64 @@ async def test_worker_scope_guard_refuses_writes_into_beagle_store(
         assert "outside T0006's scope" not in result.text
 
 
+def _known_answers_worker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, title: str
+) -> ExtensionRuntime:
+    runtime = _scoped_worker(tmp_path, monkeypatch, scope=".")
+    project = Path.cwd()
+    (project / "references").mkdir(exist_ok=True)
+    tree = project / ".beagle" / "tree"
+    tree.mkdir(parents=True, exist_ok=True)
+    (tree / "T0003.md").write_text(f'+++\nid = "T0003"\ntitle = "{title}"\n+++\n')
+    return runtime
+
+
+@pytest.mark.anyio
+async def test_worker_scope_guard_known_answers_refuses_new_source_module(
+    tmp_path: Path, beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # R36: the known-answers worker, scoped ".", wrote itc/core.py and a cases
+    # test that passes against it.
+    runtime = _known_answers_worker(tmp_path, monkeypatch, "Known answers: cases from the paper")
+    calls = [
+        ("write", {"path": "itc/core.py", "content": "def update(): pass\n"}),
+        ("write", {"path": "src/itc/__init__.py", "content": ""}),
+        ("edit", {"path": "clock.py", "old": "a", "new": "b"}),
+        ("bash", {"command": "mkdir -p itc && echo x > itc/core.py"}),
+    ]
+
+    for tool, arguments in calls:
+        result = await _tool_with_hooks(runtime, tool).execute("c1", arguments)
+
+        assert "T0003 is the known-answers task" in result.text, (tool, arguments)
+        assert "The code is a later task" in result.text
+        assert "written from the references" in result.text
+
+
+@pytest.mark.anyio
+async def test_worker_scope_guard_known_answers_allows_test_helper(
+    tmp_path: Path, beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runtime = _known_answers_worker(tmp_path, monkeypatch, "Known answers: cases from the paper")
+    calls = [
+        ("write", {"path": "tests/conftest.py", "content": "import pytest\n"}),
+        ("write", {"path": "tests/helpers.py", "content": "def load(): pass\n"}),
+        ("write", {"path": "tests/test_cases.py", "content": "def test_x(): pass\n"}),
+        ("write", {"path": "tests/cases.json", "content": "[]\n"}),
+        ("write", {"path": "docs/cases.md", "content": "# Cases\n"}),
+        ("bash", {"command": "echo '[]' > tests/cases.json"}),
+    ]
+
+    for tool, arguments in calls:
+        result = await _tool_with_hooks(runtime, tool).execute("c1", arguments)
+
+        assert result.text == "ran", (tool, arguments)
+    # A task that is not the known-answers task writes its code as before.
+    other = _known_answers_worker(tmp_path / "other", monkeypatch, "Build the clock")
+    code = {"path": "itc/core.py", "content": "def update(): pass\n"}
+    assert (await _tool_with_hooks(other, "write").execute("c2", code)).text == "ran"
+
+
 @pytest.mark.anyio
 async def test_worker_scope_guard_allows_task_log_named_in_brief(
     tmp_path: Path, beagle: Path, monkeypatch: pytest.MonkeyPatch
@@ -16120,6 +16178,33 @@ def test_cases_first_on_known_answers_task_says_drop_code_from_scope(tmp_path: P
     assert "T0002 is the known-answers task: drop itc/clock.py from scope" in by_title
     assert "pursuit_plan" not in by_title and "pursuit_plan" not in by_locks
     assert 'scope ["tests/cases.json", "tests/test_case_data.py"]' in by_locks
+
+
+def test_cases_first_refuses_whole_tree_scope_on_known_answers_task(tmp_path: Path) -> None:
+    # R36: #21's scope ["tests/", ".", "docs/"] held no new .py when it opened, so
+    # nothing was dropped, and W1 wrote itc/core.py beside the cases.
+    module = _module()
+    project = _r12_project(tmp_path)
+    goal = project / ".beagle" / "pursuit.toml"
+    title = "Known answers: write the cases from the paper"
+
+    wide = module._cases_first_problem(["tests/", ".", "docs/"], "T0002", title, goal, [])
+    bare = module._cases_first_problem(["./"], "T0002", title, goal, [])
+    empty = module._cases_first_problem(["", "tests/cases.json"], "T0002", title, goal, [])
+    by_locks = module._cases_first_problem(
+        [".", "tests/cases.json"], "T0002", "Clocks", goal, [], ["tests/cases.json"]
+    )
+
+    assert wide is not None and bare is not None and empty is not None and by_locks is not None
+    assert "T0002 is the known-answers task: drop . from scope (the code is a later task)" in wide
+    assert 'scope ["tests/", "docs/"]' in wide
+    assert "drop ./ from scope" in bare
+    assert f"scope {json.dumps(list(module._CASES_FIRST_SCOPE))}" in bare
+    assert 'drop "" from scope' in empty and 'scope ["tests/cases.json"]' in empty
+    assert 'scope ["tests/cases.json"]' in by_locks
+    # A task that is not the known-answers task keeps its whole-tree scope.
+    assert module._cases_first_problem(["."], "T0003", "Build the clock", goal, []) is None
+    assert module._cases_first_problem(["", "./"], "T0003", "Build the clock", goal, []) is None
 
 
 def _r29_nodes(title: str) -> list[dict[str, Any]]:

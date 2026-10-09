@@ -4763,11 +4763,18 @@ def _module_of(rel: str) -> str:
     return path.replace("/", ".")
 
 
-def _new_modules(scope: list[str], root: Path) -> list[tuple[str, str]]:
+def _new_modules(
+    scope: list[str], root: Path, *, whole_tree: bool = False
+) -> list[tuple[str, str]]:
     """Each new (absent at HEAD) source module a scope names: (entry, dotted name).
 
     A non-test .py file counts, and so does a package directory under src/ or
-    the root; a bare `src/` names a module not yet known, given as "".
+    the root; a bare `src/` names a module not yet known, given as "". With
+    `whole_tree`, a whole-tree entry ("", ".", "./") names one the same way.
+
+    Run R36: the known-answers task's scope `["tests/", ".", "docs/"]` held no
+    new .py file when it opened, so nothing was named, and its worker wrote
+    itc/core.py beside the cases.
     """
     head = _head_files(root)
 
@@ -4779,6 +4786,9 @@ def _new_modules(scope: list[str], root: Path) -> list[tuple[str, str]]:
     found: list[tuple[str, str]] = []
     for entry in scope:
         rel = entry.strip().rstrip("/")
+        whole = whole_tree and os.path.normpath(rel or ".") == "."
+        if whole:
+            rel = "."
         parts = Path(rel).parts
         if not rel or _is_test_path(rel) or Path(rel).name in {"tests", "test"}:
             continue
@@ -4802,8 +4812,8 @@ def _new_modules(scope: list[str], root: Path) -> list[tuple[str, str]]:
             or (len(parts) == 2 and parts[0] == "src" and parts[1].isidentifier())
             or (len(parts) == 1 and parts[0].isidentifier() and parts[0] not in _NOT_PACKAGES)
         )
-        if package and absent(rel):
-            found.append((entry, "" if parts == ("src",) else parts[-1]))
+        if whole or (package and absent(rel)):
+            found.append((entry, "" if whole or parts == ("src",) else parts[-1]))
     return found
 
 
@@ -6110,12 +6120,13 @@ def _cases_first_problem(
     root = goal.parent.parent
     if not (root / REFERENCES_DIR).is_dir():
         return None
-    new = _new_modules(scope, root)
+    asked = set(_lock_paths(locks or [], root))
+    known_answers = _names_known_answers(title) or bool(asked & set(_CASES_FIRST_SCOPE))
+    new = _new_modules(scope, root, whole_tree=known_answers)
     if not new:
         return None
     locked_data = [rel for rel in _locked(goal) if _is_cases_data(rel)]
     committed = _committed_cases_tests(root, goal, task, nodes or []) if locked_data else []
-    asked = set(_lock_paths(locks or [], root))
     for rel, owner in committed:
         if rel in asked:
             # The route below asks for this: a done task's committed test,
@@ -6144,11 +6155,14 @@ def _cases_first_problem(
     if not unjudged:
         return None
     entry, module = unjudged[0]
-    if _names_known_answers(title) or asked & set(_CASES_FIRST_SCOPE):
+    if known_answers:
         # Run R29: the known-answers task itself was told to split off known answers.
-        rest = [e for e in scope if not _new_modules([e], root)] or list(_CASES_FIRST_SCOPE)
+        rest = [e for e in scope if not _new_modules([e], root, whole_tree=True)] or list(
+            _CASES_FIRST_SCOPE
+        )
+        shown = entry if entry.strip() else json.dumps(entry)
         return (
-            f"Cases first: {task} is the known-answers task: drop {entry} from scope (the "
+            f"Cases first: {task} is the known-answers task: drop {shown} from scope (the "
             f"code is a later task) and call pursuit_step again with scope "
             f"{json.dumps(rest)}."
         )
@@ -13226,14 +13240,50 @@ def _scratch_like(rel: Path) -> bool:
     return bool(_SCRATCH_WORDS & set(re.split(r"[^a-z0-9]+", rel.stem.lower())))
 
 
-def _task_check(goal: Path, task: str) -> str:
-    """The task's bound `done_when`, read from its record in the pursuit's tree; or ""."""
+def _task_record(goal: Path, task: str) -> dict[str, Any]:
+    """The task's record in the pursuit's tree, or {}."""
     try:
         text = (goal.parent / "tree" / f"{task}.md").read_text(encoding="utf-8")
-        record = tomllib.loads(text.split("+++")[1])
+        return tomllib.loads(text.split("+++")[1])
     except (OSError, IndexError, ValueError):
-        return ""
-    return str(record.get("done_when") or "")
+        return {}
+
+
+def _task_check(goal: Path, task: str) -> str:
+    """The task's bound `done_when`, read from its record in the pursuit's tree; or ""."""
+    return str(_task_record(goal, task).get("done_when") or "")
+
+
+def _known_answers_source_refusal(
+    target: Path, root: Path, goal: Path, task: str, head: list[set[str] | None]
+) -> str | None:
+    """Why a known-answers worker may not write `target`, or None.
+
+    With references/ there, the task whose title names the known answers
+    (`_names_known_answers`, as `_cases_first_problem` judges it) writes no new
+    non-test .py outside a tests directory; a conftest or helper under tests/
+    is its own. Run R36: scope `["tests/", ".", "docs/"]` let W1 write
+    itc/core.py and a cases test that passes against it. `head` caches the
+    files at HEAD across a call's targets.
+    """
+    rel = target.relative_to(root).as_posix()
+    if not rel.endswith(".py") or _is_test_path(rel) or _in_tests_dir(rel):
+        return None
+    if not (root / REFERENCES_DIR).is_dir():
+        return None
+    if not _names_known_answers(str(_task_record(goal, task).get("title") or "")):
+        return None
+    if not head:
+        head.append(_head_files(root))
+    at_head = head[0]
+    if (rel in at_head) if at_head is not None else target.exists():
+        return None
+    return (
+        f"refusing to write {rel}: {task} is the known-answers task, and new source is "
+        "the code its cases will judge. The code is a later task, and its cases are "
+        "written from the references, not from code: name the module they import in "
+        "your report."
+    )
 
 
 def _check_imports(check: str, root: Path, rel: Path) -> bool:
@@ -13444,7 +13494,8 @@ def make_worker_scope_guard() -> Any:
     to repairing it. A worker sent with a scope (`BEAGLE_TAU_WORKER_SCOPE`) may
     write in it, outside the project (/tmp), in beagle's store (the record guard
     has that) and the task's log, `.git/beagle/logs/<task>.log`; nothing else
-    under `.git/beagle/` (run R35). A link in the project is
+    under `.git/beagle/` (run R35). A known-answers task's worker writes no new
+    source outside tests/ (run R36). A link in the project is
     judged by its own path, and one an inline script makes may not point out
     of the project. A worker with no scope is not held. Any worker sent on a
     task is kept from reading the trees beside its project. Fails open.
@@ -13529,6 +13580,7 @@ def make_worker_scope_guard() -> Any:
             log = _task_log(root, os.environ.get(WORKER_TASK_ENV, "").strip())
             in_store = False
             hits = 0
+            head: list[set[str] | None] = []
             for target in targets:
                 target = _own_path(target, root)
                 if target != root and root not in target.parents:
@@ -13542,6 +13594,9 @@ def make_worker_scope_guard() -> Any:
                     continue
                 if _CACHE_DIRS & set(target.parts):
                     continue
+                known = _known_answers_source_refusal(target, root, goal, task, head)
+                if known is not None:
+                    return ToolCallHookResult(block=True, reason=known)
                 if _scope_hit(target, root, scope) is None:
                     break
                 hits += 1
