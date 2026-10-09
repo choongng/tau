@@ -5378,6 +5378,21 @@ def _source_strings(case: object) -> list[str]:
     return found if keyed else _strings_in(case)
 
 
+def _has_source_key(case: object) -> bool:
+    """Whether a case has a source-like key at any depth (`_source_strings` reads it)."""
+    if isinstance(case, dict):
+        return any(
+            any(part in str(key).lower() for part in SOURCE_KEY_PARTS) or _has_source_key(item)
+            for key, item in case.items()
+        )
+    return isinstance(case, list) and any(_has_source_key(item) for item in case)
+
+
+def _flagged_source(case: object) -> str:
+    """A flagged case's source strings for its verdict, or "" when it has no source key."""
+    return " | ".join(_source_strings(case)) if _has_source_key(case) else ""
+
+
 def _quotes_reference(text: str, reference: str) -> bool:
     """Whether `text`, whole, unlabelled, quoted in it, or split at an ellipsis or colon,
     is in `reference`.
@@ -5691,8 +5706,8 @@ def _result_unquoted(case: object, references: list[list[str]]) -> bool:
 
 def _unquoted_cases(
     root: Path, entries: list[str]
-) -> tuple[str, int, int, list[str], bool, str] | None:
-    """(data file, unfound, total, up to 3 names, whether by result, the first one's source)
+) -> tuple[str, int, int, list[str], bool, list[tuple[str, str]]] | None:
+    """(data file, unfound, total, up to 3 names, whether by result, each named one's source)
     for cases whose source does not tie them to references/*.txt.
 
     Runs R12 and R14: cases cited bare URLs, nothing, or `itc2008.txt:221`,
@@ -5740,13 +5755,18 @@ def _unquoted_cases(
         ]
         if cases and 2 * len(unfound) > len(cases):
             names = [_case_label(case, i) for i, case in unfound[:3]]
-            source = " | ".join(_source_strings(unfound[0][1]))
-            return rel, len(unfound), len(cases), names, False, source
+            sources = [
+                (name, _flagged_source(case))
+                for name, (_, case) in zip(names, unfound, strict=False)
+            ]
+            return rel, len(unfound), len(cases), names, False, sources
         wrong = [(i, case) for i, case in enumerate(cases) if _result_unquoted(case, references)]
         if wrong:
             names = [_case_label(case, i) for i, case in wrong[:3]]
-            source = " | ".join(_source_strings(wrong[0][1]))
-            return rel, len(wrong), len(cases), names, True, source
+            sources = [
+                (name, _flagged_source(case)) for name, (_, case) in zip(names, wrong, strict=False)
+            ]
+            return rel, len(wrong), len(cases), names, True, sources
     return None
 
 
@@ -5765,6 +5785,26 @@ def _searched_source(name: str, source: str) -> str:
         "inside quote marks, parentheses or brackets) was found in "
         f"{REFERENCES_DIR}/*.txt."
     )
+
+
+def _searched_sources(flagged: list[tuple[str, str]]) -> str:
+    """What the source-quote check searched in each named case, for its verdict.
+
+    Audit 11: the verdict showed only the first case's source; a worker fixing
+    the others had to guess what was wrong with theirs.
+    """
+    if not flagged:
+        return ""
+    lines = [_searched_source(*flagged[0])]
+    for name, source in flagged[1:]:
+        if not source.strip():
+            lines.append(f"Case {name} has no source string to search.")
+            continue
+        shown = (
+            source if len(source) <= SEARCHED_SOURCE_CHARS else source[:SEARCHED_SOURCE_CHARS] + "…"
+        )
+        lines.append(f'Case {name}\'s source, "{shown}", was not found either.')
+    return " ".join(lines)
 
 
 def _reads_locked_data(root: Path, test: str, data: list[str]) -> bool:
@@ -12497,7 +12537,7 @@ def make_step_tool() -> Any:
             )
         if unquoted:
             state = "stays blocked" if retrying else "stays open"
-            data, missing, total, named, _, first_source = unquoted
+            data, missing, total, named, _, sources = unquoted
             return _not_done(
                 root,
                 task,
@@ -12505,7 +12545,7 @@ def make_step_tool() -> Any:
                 f"{route}{undid}{task} — {title}: the check passes, but the task {state} "
                 f"and nothing is locked: {missing} of {total} cases in {data} have no source "
                 f"quoting {REFERENCES_DIR}/*.txt (e.g. {', '.join(named)}), so nothing ties "
-                f"them to the reference. {_searched_source(named[0], first_source)} "
+                f"them to the reference. {_searched_sources(sources)} "
                 "The sub-agent must give each case a `source` that "
                 f"copies, verbatim, at least {SOURCE_QUOTE_MIN_WORDS} words of a line of "
                 f"{REFERENCES_DIR}/*.txt it comes from. A bare file:line, page number or URL "

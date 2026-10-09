@@ -3836,6 +3836,30 @@ async def test_unquoted_cases_verdict_shows_flagged_source_text(
 
 
 @pytest.mark.anyio
+async def test_unquoted_cases_verdict_shows_each_named_case_source(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Audit 11: only the first named case's source was shown.
+    cases = [
+        {"name": "first", "in": "1", "out": "2", "source": "itc2008.txt:221 (not in it at all)"},
+        {"name": "second", "in": "x", "out": "y", "source": "itc2008.txt:251"},
+        {"name": "third", "in": "a", "out": "b"},
+    ]
+    _cases_with_reference(tmp_path, fake_beagle, monkeypatch, cases)
+
+    result = await _step_cases(tmp_path, locks=CASES_SCOPE)
+
+    verdict = result.text.split("Last report")[0]
+    assert 'Case first\'s source, "itc2008.txt:221 (not in it at all)", was searched' in verdict
+    assert 'Case second\'s source, "itc2008.txt:251", was not found either.' in verdict
+    assert "Case third has no source string to search." in verdict
+
+
+@pytest.mark.anyio
 async def test_close_accepts_cases_whose_sources_quote_references(
     tmp_path: Path,
     beagle: Path,
@@ -4052,7 +4076,11 @@ def test_bare_file_line_source_still_flagged_unquoted(tmp_path: Path) -> None:
         4,
         ["#1", "#2", "#3"],
         False,
-        "interval-tree-clocks.txt:114",
+        [
+            ("#1", "interval-tree-clocks.txt:114"),
+            ("#2", "interval-tree-clocks.txt:115"),
+            ("#3", "interval-tree-clocks.txt:116"),
+        ],
     )
 
 
