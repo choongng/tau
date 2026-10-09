@@ -10307,6 +10307,14 @@ def _escalation(
     demand = _judge_kept_open(task, root)
     if demand:
         return _judge_escalation(task, count, demand)
+    if record and _unchanged_route(task, arguments, record, root, data_test_passes, bound_fails):
+        bound = " ".join(str(record.get("done_when") or "").split())
+        said = (
+            f"{count} steps on it have left it not done, on its bound check `{bound}` and "
+            "its scope. The only new route left keeps both, and a new route that changes "
+            "nothing gets the same result."
+        )
+        return _unchanged_route_escalation(task, count, record, said)
     lacks = _escalation_lacks(task, arguments, record, root, data_test_passes, bound_fails)
     # Run R16 E34 dropped the done_when line, and the driver resent without it.
     call = _working_call(task, arguments, record, root, data_test_passes, bound_fails)
@@ -10484,23 +10492,16 @@ def _escalation_lacks(
     return lacks
 
 
-def _working_call(
+def _working_route(
     task: str,
-    arguments: dict[str, Any],
-    record: dict[str, Any] | None,
+    arguments: Mapping[str, Any],
+    record: Mapping[str, Any],
     root: Path | None,
     data_test_passes: bool = False,
     bound_fails: bool = False,
-    *,
-    bare: bool = False,
-    notes: str | None = None,
-) -> str:
-    """The new-route call an escalation takes, spelled out with every argument it needs.
-
-    `bare` leaves out what to add to it; `notes` stands in for the call's own.
-    """
-    record = record or {}
-    record_scope = _strings(record.get("scope"))
+) -> tuple[str, list[str], list[str] | None]:
+    """The done_when ("" when none is known) and scope of the new route an
+    escalation offers, and the data files `_unproven_data_route` adds, or None."""
     bound_check = " ".join(str(record.get("done_when") or "").split())
     done_when = " ".join(str(arguments.get("done_when") or "").split())
     if done_when and _kept_bound(arguments, record, root):
@@ -10529,6 +10530,82 @@ def _working_call(
         # Run R23 E30: the model's own amended check failed on the tree and ran a
         # test in its scope, and the escalation called it the bound one.
         check = bound_check
+    return check, needs, unproven
+
+
+def _unchanged_route(
+    task: str,
+    arguments: Mapping[str, Any],
+    record: Mapping[str, Any],
+    root: Path | None,
+    data_test_passes: bool = False,
+    bound_fails: bool = False,
+) -> bool:
+    """Whether the only new route an escalation could offer keeps the bound check
+    and the bound scope, so it would change nothing.
+
+    Run R35 E18, E26, E34 offered such a route three times; each spawned an heir
+    with the same check and scope, and each heir was left not done the same way.
+    """
+    bound_check = " ".join(str(record.get("done_when") or "").split())
+    check, needs, unproven = _working_route(
+        task, arguments, record, root, data_test_passes, bound_fails
+    )
+    return (
+        bool(bound_check)
+        and unproven is None
+        and check == bound_check
+        and sorted(needs) == sorted(_strings(record.get("scope")))
+    )
+
+
+def _split_call(task: str, record: Mapping[str, Any]) -> str:
+    """The pursuit_plan call splitting `task` one file of its scope per part, or ""
+    when its scope has fewer than two files."""
+    files = _strings(record.get("scope"))
+    if len(files) < 2:
+        return ""
+    parts = [f"{rel}::the work in {rel}" for rel in files]
+    return f"pursuit_plan task={json.dumps(task)}, parts={json.dumps(parts)}"
+
+
+def _unchanged_route_escalation(task: str, count: int, record: Mapping[str, Any], said: str) -> str:
+    """The escalation of a task whose only new route keeps its check and scope:
+    `said` says why, then the split of its files one per part, or stopping."""
+    split = _split_call(task, record)
+    lead = f"pursuit_step: {task} not run — "
+    if split and len(lead) + len("call instead: ") + len(split) <= ESCALATION_HEAD_CHARS:
+        head = f"{lead}call instead: {split}"
+    else:
+        head = f"{lead}split it or stop."
+    head += f"\n{said}"
+    if split:
+        head += f"\nThe call that works, whole: {split}"
+    return _escalation_options(task, count, head, rerun="")
+
+
+def _working_call(
+    task: str,
+    arguments: dict[str, Any],
+    record: dict[str, Any] | None,
+    root: Path | None,
+    data_test_passes: bool = False,
+    bound_fails: bool = False,
+    *,
+    bare: bool = False,
+    notes: str | None = None,
+) -> str:
+    """The new-route call an escalation takes, spelled out with every argument it needs.
+
+    `bare` leaves out what to add to it; `notes` stands in for the call's own.
+    """
+    record = record or {}
+    record_scope = _strings(record.get("scope"))
+    bound_check = " ".join(str(record.get("done_when") or "").split())
+    scope = _strings(arguments.get("scope")) or record_scope
+    check, needs, unproven = _working_route(
+        task, arguments, record, root, data_test_passes, bound_fails
+    )
     given = _drop_self_import_restore(
         str(arguments.get("notes") or "").strip(), bound_check, record_scope or scope, root
     )
@@ -10650,6 +10727,28 @@ async def _offered_data_test_passes(
     return not await _passes_only_by_uncommitted(
         route[2], [route[3], _predecessor_scope(dict(record), root)], root
     )
+
+
+def _carry_not_done(root: Path, task: str, successor: str) -> None:
+    """Give `successor`, a new route keeping `task`'s check and scope, what the step
+    tool counts of `task` not done.
+
+    Run R35: each such heir (T0002, T0005, T0006, T0007) started at no steps, so
+    every new route bought three more sub-agents with nothing changed.
+    """
+    old, new = (str(root), task), (str(root), successor)
+    if old in _NOT_DONE:
+        _NOT_DONE[new] = _NOT_DONE[old]
+    if old in _NOT_DONE_SCOPE:
+        _NOT_DONE_SCOPE[new] = _NOT_DONE_SCOPE[old]
+    if old in _NOT_DONE_DEMAND:
+        _NOT_DONE_DEMAND[new] = _NOT_DONE_DEMAND[old]
+    if old in _LAST_CHECK_EXIT:
+        _LAST_CHECK_EXIT[new] = _LAST_CHECK_EXIT[old]
+    if old in _LAST_CHECK_FAILURE:
+        _LAST_CHECK_FAILURE[new] = _LAST_CHECK_FAILURE[old]
+    if old in _NOT_DONE_CHECK_FAILED:
+        _NOT_DONE_CHECK_FAILED.add(new)
 
 
 def _forget_task(root: Path, task: str) -> None:
@@ -10790,7 +10889,16 @@ def _escalated_calls(workable: list[str], root: Path | None) -> str:
     for t in workable:
         count = _NOT_DONE.get((str(root), t), 0)
         if count >= ESCALATE_AFTER:
-            call = _working_call(t, {}, _shown(t, root), root)
+            shown = _shown(t, root)
+            if _unchanged_route(t, {}, shown, root):
+                split = _split_call(t, shown)
+                said += (
+                    f"\n{t} has had {count} steps on its bound check and scope, and a new "
+                    "route that changes nothing gets the same result: "
+                    + (f"split it, {split}, or stop." if split else "split it or stop.")
+                )
+                continue
+            call = _working_call(t, {}, shown, root)
             said += f"\n{t} has had {count} steps and runs only by a new route: {call}"
     return said
 
@@ -11144,6 +11252,25 @@ def make_step_tool() -> Any:
                     # test was the bound check already.
                     taken += kept_check
                     done_when = ""
+                # The criteria are the bound task's here: other ones were refused above.
+                same_route = " ".join((done_when or old_check).split()) == " ".join(
+                    old_check.split()
+                ) and sorted(route_scope) == sorted(_strings(record.get("scope")))
+                tried = _NOT_DONE.get((str(root), task), 0)
+                if same_route and tried >= ESCALATE_AFTER:
+                    # Run R35 #8, #12, #16: each such route spawned an heir that
+                    # was left not done the same way.
+                    return _step_result(
+                        _unchanged_route_escalation(
+                            task,
+                            tried,
+                            record,
+                            f"No new route for {task}: its done_when `{old_check}`, scope and "
+                            f"criteria are {task}'s own, and {tried} steps on them have left "
+                            "it not done, and a new route that changes nothing gets the same "
+                            "result.",
+                        )
+                    )
                 scoped = (
                     _scope_problem(route_scope, task, nodes, root)
                     or _locked_scope_problem(route_scope, root, title, task, done_when or old_check)
@@ -11199,6 +11326,8 @@ def make_step_tool() -> Any:
                     )
                 route = f"{taken}{spawned}\n\n"
                 spawns[:] = [(task, successor, spawned)]
+                if same_route:
+                    _carry_not_done(root, task, successor)
                 _forget_task(root, task)
                 task = successor
                 criteria = old_criteria or criteria

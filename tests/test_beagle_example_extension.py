@@ -9196,12 +9196,19 @@ async def test_new_route_resets_the_not_done_count(
     await _stays_open(step, fake_beagle, 3)
     (fake_beagle / "spawn.out").write_text("T0002 superseded by T0003\n")
     successor = {"id": "T0003", "title": "Parser", "status": "open"}
-    successor |= {"done_when": "grep -q done done.txt", "scope": STAYS_OPEN_SCOPE}
+    successor |= {"done_when": "grep -qx done done.txt", "scope": STAYS_OPEN_SCOPE}
     (fake_beagle / "show-T0003.out").write_text(json.dumps(successor))
 
+    # A route with a new check; one keeping check and scope carries the count.
     rerouted = await step.execute(
         "r1",
-        {"task": "T0002", "new_route": True, "notes": "write done.txt first", "attempts": 1},
+        {
+            "task": "T0002",
+            "new_route": True,
+            "done_when": "grep -qx done done.txt",
+            "notes": "write done.txt first",
+            "attempts": 1,
+        },
     )
 
     assert len(_runs(fake_tau)) == 4
@@ -9209,6 +9216,131 @@ async def test_new_route_resets_the_not_done_count(
     assert "not run" not in rerouted.text
     module = _loaded_module()
     assert [key[1] for key in module._NOT_DONE] == ["T0003"]
+
+
+def _r35_successor(fake_beagle: Path) -> None:
+    """T0002's new route spawns T0003, with T0002's check and scope."""
+    (fake_beagle / "spawn.out").write_text("T0002 superseded by T0003\n")
+    successor = {"id": "T0003", "title": "Parser", "status": "open", "criteria": "c"}
+    successor |= {"done_when": "grep -q done done.txt", "scope": STAYS_OPEN_SCOPE}
+    (fake_beagle / "show-T0003.out").write_text(json.dumps(successor))
+
+
+@pytest.mark.anyio
+async def test_new_route_same_check_carries_not_done_count(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # R35 #8, #12, #16: each new route kept T0002's check and scope, and each heir
+    # (T0005, T0006, T0007) started at no steps, so it got three more sub-agents.
+    monkeypatch.chdir(_pursuit_project(tmp_path))
+    _failing_open_task(fake_beagle, monkeypatch)
+    runtime, _ = _bound(tmp_path)
+    step = _tool(runtime, "pursuit_step")
+    await _stays_open(step, fake_beagle, 2)
+    module = _loaded_module()
+    (key,) = [key for key in module._NOT_DONE if key[1] == "T0002"]
+    demand = "the sub-agent must load every case from the data file"
+    module._NOT_DONE_DEMAND[key] = demand
+    _r35_successor(fake_beagle)
+
+    rerouted = await step.execute(
+        "r1", {"task": "T0002", "new_route": True, "notes": "try again", "attempts": 1}
+    )
+    (fake_beagle / "next.out").write_text(json.dumps({"open": ["T0003"], "ready": []}))
+    after = await step.execute("r2", {"task": "T0003", "attempts": 1})
+
+    assert len(_runs(fake_tau)) == 3
+    assert "T0003" in rerouted.text and "stays open" in rerouted.text
+    # The heir's worker heard the demand T0002's close left.
+    assert demand.rstrip(".") in _runs(fake_tau)[2]["stdin"]
+    assert module._NOT_DONE[(key[0], "T0003")] == module.ESCALATE_AFTER
+    assert (key[0], "T0002") not in module._NOT_DONE
+    assert after.text.startswith("pursuit_step: T0003 not run")
+    # The carry is of check, scope and counts alone: no prompt's words.
+    module._NOT_DONE.clear()
+    module._NOT_DONE_DEMAND.clear()
+    module._NOT_DONE[key] = 2
+    module._NOT_DONE_DEMAND[key] = demand
+    module._carry_not_done(Path(key[0]), "T0002", "T0009")
+    assert module._NOT_DONE[(key[0], "T0009")] == 2
+    assert module._NOT_DONE_DEMAND[(key[0], "T0009")] == demand
+
+
+@pytest.mark.anyio
+async def test_new_route_identical_check_and_scope_refused_after_escalation(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # R35 E18, E26, E34 offered, and #8, #12, #16 sent, a new route with T0002's
+    # own done_when and scope after three not-done steps.
+    monkeypatch.chdir(_pursuit_project(tmp_path))
+    _failing_open_task(fake_beagle, monkeypatch)
+    runtime, _ = _bound(tmp_path)
+    step = _tool(runtime, "pursuit_step")
+    await _stays_open(step, fake_beagle, 3)
+    _r35_successor(fake_beagle)
+    same = {"task": "T0002", "new_route": True, "notes": "try harder", "attempts": 1}
+    spelled = {**same, "done_when": "grep -q done done.txt", "scope": STAYS_OPEN_SCOPE}
+    reordered = {**spelled, "scope": list(reversed(STAYS_OPEN_SCOPE)), "criteria": "c"}
+
+    refused = [
+        await step.execute(f"r{n}", call) for n, call in enumerate((same, spelled, reordered))
+    ]
+
+    assert len(_runs(fake_tau)) == 3
+    assert _pursuit_calls(fake_beagle, "spawn") == []
+    for result in refused:
+        first = result.text.splitlines()[0]
+        assert first.startswith("pursuit_step: T0002 not run — call instead: pursuit_plan task=")
+        assert "a new route that changes nothing gets the same result" in result.text
+        assert "new_route=true" not in result.text
+        assert "tell the user what blocks it" in result.text
+    # A route with a check of its own is still taken.
+    taken = await step.execute("r9", {**same, "done_when": "grep -qx done done.txt"})
+    assert "T0003" in taken.text
+    assert [call[0] for call in _pursuit_calls(fake_beagle, "spawn")] == ["T0002"]
+
+
+def test_escalation_with_kept_check_offers_split_not_new_route(tmp_path: Path) -> None:
+    # R35 E18, E26, E34: "call instead: pursuit_step task=…, new_route=true,
+    # done_when=<the bound check>", with the bound scope: a route that changed nothing.
+    module = _module()
+    record = {"id": "T0002", "status": "open", "criteria": "c", "done_when": R15_CHECK}
+    record |= {"scope": R15_SCOPE}
+    call = {"task": "T0002", "new_route": True, "done_when": R15_CHECK, "notes": "again"}
+
+    text = module._escalation("T0002", 3, call, record, tmp_path, False, True)
+
+    parts = [f"{rel}::the work in {rel}" for rel in R15_SCOPE]
+    split = f'pursuit_plan task="T0002", parts={json.dumps(parts)}'
+    assert _quoted_head(text) == f"pursuit_step: T0002 not run — call instead: {split}"
+    assert f"The call that works, whole: {split}" in text
+    assert "a new route that changes nothing gets the same result" in text
+    assert "new_route=true" not in text and "rewritten done_when" not in text
+    assert "tell the user what blocks it" in text
+    assert module._setup_milestone(parts) is None
+    assert all(module._rerun_only_part([part]) is None for part in parts)
+    # A scope of one file has no split: the escalation says to split or stop.
+    one = {**record, "done_when": R23_CHECK, "scope": ["tests/test_case_data.py"]}
+    alone = module._escalation(
+        "T0002", 3, {**call, "done_when": R23_CHECK}, one, tmp_path, False, True
+    )
+    assert alone.startswith("pursuit_step: T0002 not run — split it or stop.")
+    assert "new_route=true" not in alone
+    # A call whose scope differs from the bound one still gets the new route.
+    scoped = module._escalation(
+        "T0002", 3, {**call, "scope": R15_SCOPE[1:]}, record, tmp_path, False, True
+    )
+    assert scoped.startswith(
+        'pursuit_step: T0002 not run — call instead: pursuit_step task="T0002", new_route=true'
+    )
 
 
 @pytest.mark.anyio
@@ -11828,17 +11960,24 @@ async def test_escalation_names_the_missing_new_route_flag(
     first = await step.execute("e19", dict(R15_ESCALATED_CALL))
     again = await step.execute("e21", dict(R15_ESCALATED_CALL))
 
+    # The call keeps T0002's scope: a scope of its own makes the new route differ.
+    narrowed = {**R15_ESCALATED_CALL, "scope": R15_SCOPE[1:]}
+    scoped = await step.execute("e23", narrowed)
+
     assert len(_runs(fake_tau)) == 3
     assert first.text == again.text
-    assert first.text.startswith(
+    assert scoped.text.startswith(
         'pursuit_step: T0002 not run — call instead: pursuit_step task="T0002", new_route=true'
     )
-    assert "\n3 steps on it have left it not done." in first.text
-    lacks = first.text.index("This call has no new_route=true")
-    assert lacks < first.text.index("Choose one:")
+    assert "\n3 steps on it have left it not done." in scoped.text
+    lacks = scoped.text.index("This call has no new_route=true")
+    assert lacks < scoped.text.index("Choose one:")
     # Run R23: a bound check that fails now and runs files in scope is kept.
-    assert "Its done_when is the bound one" not in first.text
-    assert f"done_when={json.dumps(R15_CHECK)}" in first.text.splitlines()[0]
+    assert "Its done_when is the bound one" not in scoped.text
+    assert f"done_when={json.dumps(R15_CHECK)}" in scoped.text.splitlines()[0]
+    # Run R35: with the bound check and scope both kept, a new route changes nothing.
+    assert first.text.startswith("pursuit_step: T0002 not run — call instead: pursuit_plan task=")
+    assert "new_route=true" not in first.text
     assert _pursuit_calls(fake_beagle, "spawn") == []
 
 
@@ -11957,10 +12096,12 @@ async def test_escalation_says_criteria_must_be_left_out_when_they_differ(
 ) -> None:
     monkeypatch.chdir(_pursuit_project(tmp_path))
     step = await _escalated_r15_step(tmp_path, fake_beagle, monkeypatch)
-    bound = {**R15_ESCALATED_CALL, "criteria": "Write the known answers from the reference."}
+    # A scope of its own, so the escalation offers a new route rather than a split.
+    call = {**R15_ESCALATED_CALL, "scope": R15_SCOPE[1:]}
+    bound = {**call, "criteria": "Write the known answers from the reference."}
 
-    differing = await step.execute("e21", dict(R15_ESCALATED_CALL))
-    again = await step.execute("e23", dict(R15_ESCALATED_CALL))
+    differing = await step.execute("e21", dict(call))
+    again = await step.execute("e23", dict(call))
     same = await step.execute("e25", bound)
 
     assert differing.text == again.text
