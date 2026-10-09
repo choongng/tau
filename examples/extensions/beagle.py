@@ -5531,6 +5531,24 @@ def _searchable_result(value: object) -> bool:
     return False
 
 
+def _input_values(value: object) -> list[object]:
+    """`value` and every value in a dict nested in it, booleans and None aside.
+
+    A list's own scalars are not taken one by one: a count equal to one byte
+    of an input is still an answer.
+    """
+    found = [] if isinstance(value, bool) or value is None else [value]
+    if isinstance(value, dict):
+        items = list(value.values())
+    elif isinstance(value, list):
+        items = [item for item in value if isinstance(item, dict | list)]
+    else:
+        items = []
+    for item in items:
+        found += _input_values(item)
+    return found
+
+
 def _case_results(case: object) -> list[tuple[object, bool]]:
     """(result, narrow) for each searchable result under a case's result-like keys.
 
@@ -5539,16 +5557,22 @@ def _case_results(case: object) -> list[tuple[object, bool]]:
     the reference lines the source quotes may hold it. Run R34: expected_decoded
     equalled the input a source quoted. Run R35: empty_input's "00" equalled its
     input and was under RESULT_MIN_CHARS, and was wrong.
+
+    Run R36: an expected dict echoed its input's nested id "A" beside the event
+    it changed. Inputs are compared at any depth, and when some result differs
+    from every input the ones equal to an input are dropped: an echoed field
+    is not an answer.
     """
     if not isinstance(case, dict):
         return []
     inputs = [
-        value
+        item
         for key, value in case.items()
         if str(key).lower() in _CASE_NON_ANSWER_KEYS
         and not any(part in str(key).lower() for part in SOURCE_KEY_PARTS)
+        for item in _input_values(value)
     ]
-    results: list[tuple[object, bool]] = []
+    results: list[tuple[object, bool, bool]] = []
 
     def walk(value: object) -> None:
         if isinstance(value, dict):
@@ -5556,13 +5580,16 @@ def _case_results(case: object) -> list[tuple[object, bool]]:
                 walk(item)
         elif _searchable_result(value):
             short = not isinstance(value, list) and len(str(value).strip()) < RESULT_MIN_CHARS
-            results.append((value, short or value in inputs))
+            echoed = any(type(item) is type(value) and item == value for item in inputs)
+            results.append((value, short, echoed))
 
     for key, value in case.items():
         name = str(key).lower()
         if name == "out" or any(part in name for part in RESULT_KEY_PARTS):
             walk(value)
-    return results
+    if not all(echoed for _, _, echoed in results):
+        results = [result for result in results if not result[2]]
+    return [(value, short or echoed) for value, short, echoed in results]
 
 
 def _quoted_spans(source: str, lines: list[str]) -> list[tuple[int, int]]:
@@ -5596,12 +5623,13 @@ def _quoted_context(source: str, lines: list[str]) -> list[str]:
 
 
 def _result_unquoted(case: object, references: list[list[str]]) -> bool:
-    """Whether `case` has a checkable result and none of them is where it must be.
+    """Whether `case` has a checkable result that is not where it must be.
 
     A wide result must be in the case's source or the reference line after the
     quoted one; a narrow one (`_case_results`) in the quoted reference line or
     the one after it. A narrow result is not checked when the source quotes no
-    reference line.
+    reference line. Each checked result must be found, not any one: run R36's
+    echoed id "A" was in every quoted line.
     """
     results = _case_results(case)
     if not results:
@@ -5620,7 +5648,9 @@ def _result_unquoted(case: object, references: list[list[str]]) -> bool:
     ]
     if not checked:
         return False
-    return not any(_renders_result(text, result) for result, texts in checked for text in texts)
+    return not all(
+        any(_renders_result(text, result) for text in texts) for result, texts in checked
+    )
 
 
 def _unquoted_cases(

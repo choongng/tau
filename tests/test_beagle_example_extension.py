@@ -4021,7 +4021,9 @@ def test_quotes_reference_finds_parenthesised_quote_after_file_line_label(
         "refs.txt:116 (The user writes data to C, which increments it)", reference
     )
     project = _r36_project(tmp_path, R36_CASES)
-    assert module._unquoted_cases(project, ["tests/cases.json"]) is None
+    found = module._unquoted_cases(project, ["tests/cases.json"])
+    # The quotes are found; what still flags cases is their results (T0314).
+    assert found is not None and found[4] is True
 
 
 def test_quoted_context_finds_parenthesised_quote() -> None:
@@ -4052,6 +4054,75 @@ def test_bare_file_line_source_still_flagged_unquoted(tmp_path: Path) -> None:
         False,
         "interval-tree-clocks.txt:114",
     )
+
+
+def test_case_results_drops_fields_equal_to_nested_inputs() -> None:
+    # Run R36: each expected dict echoed the nested input id "A" (and "B", 5)
+    # beside the one event it changed; only the changed event is an answer.
+    module = _module()
+    assert [module._case_results(case) for case in R36_CASES] == [
+        [(2, True)],
+        [(2, True)],
+        [(11, True)],
+        [(2, True)],
+    ]
+    nested = {
+        "input": {"ops": [{"peer": "left side", "n": [1, 2]}], "flag": True},
+        "expected": {"peer": "left side", "n": [1, 2], "count": 1, "total": "three nine"},
+    }
+    assert module._case_results(nested) == [(1, True), ("three nine", False)]
+    # Every result equal to an input: none is dropped, each is narrow (R34, R35).
+    echo = {"input": {"data": "00 11 00"}, "expected": {"data": "00 11 00"}}
+    assert module._case_results(echo) == [("00 11 00", True)]
+
+
+def test_result_unquoted_requires_each_changed_field(tmp_path: Path) -> None:
+    # Run R36: "A" was in every quoted line, so one echoed field passed each
+    # case. Cases #1, #3 and #4 give an event that is in neither the quoted line
+    # nor the next one. Case #2's event 2 is in the line after its quote,
+    # "...b's counter to {0,2}.", which the rule accepts, so it is not asserted.
+    module = _module()
+    lines = [module._normalised(line) for line in R36_REFERENCE.splitlines() if line.strip()]
+    first, _, third, fourth = R36_CASES
+    for case in (first, third, fourth):
+        assert module._result_unquoted(case, [lines]), case["description"]
+    found = module._unquoted_cases(_r36_project(tmp_path, R36_CASES), ["tests/cases.json"])
+    assert found is not None
+    assert found[:5] == ("tests/cases.json", 3, 4, ["#1", "#3", "#4"], True)
+    # Two changed fields, one on the quoted line and one nowhere near it.
+    half = {
+        "input": {"id": "B", "event": 0},
+        "expected": {"id": "B", "event": 2, "peers": 11},
+        "source": "interval-tree-clocks.txt:116 (The user writes data to B, which "
+        "increments B's counter to {0,2})",
+    }
+    assert module._result_unquoted(half, [lines])
+
+
+def test_result_unquoted_passes_when_each_changed_field_quoted(tmp_path: Path) -> None:
+    module = _module()
+    lines = [module._normalised(line) for line in R36_REFERENCE.splitlines() if line.strip()]
+    source = (
+        "interval-tree-clocks.txt:116 (The user writes data to B, which increments "
+        "B's counter to {0,2})"
+    )
+    right = [
+        {
+            "name": "one",
+            "input": {"id": "B", "event": {"counter": [0, 1]}},
+            "expected": {"id": "B", "event": {"counter": [0, 2]}},
+            "source": source,
+        },
+        {
+            "name": "two",
+            "input": {"id": "B", "event": 0, "remote": {"id": "A", "event": 3}},
+            "expected": {"id": "B", "event": 2, "step": 3, "remote": {"id": "A", "event": 3}},
+            "source": source,
+        },
+    ]
+    for case in right:
+        assert not module._result_unquoted(case, [lines]), case["name"]
+    assert module._unquoted_cases(_r36_project(tmp_path, right), ["tests/cases.json"]) is None
 
 
 #: R15's tests/cases.json, all 32 cases, verbatim as compact JSON.
