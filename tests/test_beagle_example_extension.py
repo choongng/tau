@@ -4079,16 +4079,14 @@ def test_case_results_drops_fields_equal_to_nested_inputs() -> None:
 def test_result_unquoted_requires_each_changed_field(tmp_path: Path) -> None:
     # Run R36: "A" was in every quoted line, so one echoed field passed each
     # case. Cases #1, #3 and #4 give an event that is in neither the quoted line
-    # nor the next one. Case #2's event 2 is in the line after its quote,
-    # "...b's counter to {0,2}.", which the rule accepts, so it is not asserted.
+    # nor the next one; case #2's event 2 is only inside "{0,2}" on the next.
     module = _module()
     lines = [module._normalised(line) for line in R36_REFERENCE.splitlines() if line.strip()]
-    first, _, third, fourth = R36_CASES
-    for case in (first, third, fourth):
+    for case in R36_CASES:
         assert module._result_unquoted(case, [lines]), case["description"]
     found = module._unquoted_cases(_r36_project(tmp_path, R36_CASES), ["tests/cases.json"])
     assert found is not None
-    assert found[:5] == ("tests/cases.json", 3, 4, ["#1", "#3", "#4"], True)
+    assert found[:5] == ("tests/cases.json", 4, 4, ["#1", "#2", "#3"], True)
     # Two changed fields, one on the quoted line and one nowhere near it.
     half = {
         "input": {"id": "B", "event": 0},
@@ -4097,6 +4095,44 @@ def test_result_unquoted_requires_each_changed_field(tmp_path: Path) -> None:
         "increments B's counter to {0,2})",
     }
     assert module._result_unquoted(half, [lines])
+
+
+def test_result_unquoted_flags_all_four_r36_wrong_cases(tmp_path: Path) -> None:
+    # Audit 11: case #2 quotes "The counter remains 1" for an event of 2, and
+    # passed on the 2 inside "{0,2}" on the line after its quote.
+    module = _module()
+    lines = [module._normalised(line) for line in R36_REFERENCE.splitlines() if line.strip()]
+    flagged = [
+        f"#{i + 1}" for i, case in enumerate(R36_CASES) if module._result_unquoted(case, [lines])
+    ]
+    assert flagged == ["#1", "#2", "#3", "#4"]
+    found = module._unquoted_cases(_r36_project(tmp_path, R36_CASES), ["tests/cases.json"])
+    assert found is not None and found[1:5] == (4, 4, ["#1", "#2", "#3"], True)
+
+
+def test_narrow_result_inside_a_larger_token_on_next_line_is_not_found() -> None:
+    # T0293's line after a quote holds a narrow result only as a whole value.
+    module = _module()
+    lines = ["the counter remains 1.", "b's counter goes to {0,2}, then (1, 2)."]
+    for event in (0, 1, 2, "2"):
+        case = {
+            "input": {"id": "A"},
+            "expected": {"event": event},
+            "source": "'the counter remains 1'",
+        }
+        assert module._result_unquoted(case, [lines]) == (event != 1), event
+    for after in ("then it is 2.", "event = 2", "event: 2;", "{2}", "[0, 2] ... 2"):
+        case = {"input": {"id": "A"}, "expected": {"event": 2}, "source": "'the counter remains 1'"}
+        assert not module._result_unquoted(case, [[lines[0], after]]), after
+    for after in ("event 12", "2nd", "v2", "[0,2]", "(1; 2)", "{ 2 , 0 }"):
+        case = {"input": {"id": "A"}, "expected": {"event": 2}, "source": "'the counter remains 1'"}
+        assert module._result_unquoted(case, [[lines[0], after]]), after
+    # The quoted line itself keeps T0293's rule: its "{0,2}" holds 2.
+    quoted = {"input": {"id": "A"}, "expected": {"event": 2}, "source": "'goes to {0,2}'"}
+    assert not module._result_unquoted(quoted, [lines[::-1]])
+    assert module._renders_result("{0,2}", 2) and not module._renders_result("{0,2}", 2, whole=True)
+    assert module._renders_result("44", "44", whole=True)
+    assert not module._renders_result("344", "44", whole=True)
 
 
 def test_result_unquoted_passes_when_each_changed_field_quoted(tmp_path: Path) -> None:

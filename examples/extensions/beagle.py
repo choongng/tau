@@ -5499,24 +5499,48 @@ def _holds_sequence(run: list[int | str], want: list[int]) -> bool:
     return True
 
 
-def _renders_result(text: str, result: object) -> bool:
+#: A bracketed group of several values, such as `{0,2}` or `(1, 2)`.
+_VALUE_GROUP = re.compile(r"[\[{(]\s*[^\s,;\[\]{}()]+(?:\s*[,;]\s*[^\s,;\[\]{}()]+)+\s*[\]})]")
+
+
+def _bounded(text: str, value: str) -> bool:
+    """Whether `value` occurs in `text`, whitespace aside, with no letter or digit
+    either side of it."""
+    words = value.split()
+    if not words:
+        return False
+    body = r"\s*".join(re.escape(word) for word in words)
+    found = re.search(rf"(?<![0-9A-Za-z]){body}(?![0-9A-Za-z])", text, re.IGNORECASE)
+    return found is not None
+
+
+def _renders_result(text: str, result: object, whole: bool = False) -> bool:
     """Whether `text` holds `result` as the reference would print it.
 
     A list of ints as decimal tokens or two-digit hex bytes (with or without 0x
     or \\x, with or without separators), a long one by its head and tail around
     an ellipsis; a number by str() or hex; a string by itself, whitespace aside,
     or as the bytes it spells in hex.
+
+    With `whole`, a number or string must be a whole value: bounded by no
+    letter or digit, and not one of a bracketed group of several values.
     """
     if isinstance(result, list):
         want = [int(v) for v in result]
         bases = (10, 16) if all(0 <= v <= 255 for v in want) else (10,)
         return any(_holds_sequence(run, want) for base in bases for run in _value_runs(text, base))
+    if whole:
+        text = _VALUE_GROUP.sub(" ", text)
     if isinstance(result, int | float):
         tokens = {str(v) for run in _value_runs(text, 10) for v in run}
         tokens |= {str(int(m.group(2), 16)) for m in _VALUE_TOKEN.finditer(text) if m.group(1)}
-        return str(result) in tokens or str(result) in text
-    flat = "".join(str(result).split()).lower()
-    if flat in "".join(text.split()).lower():
+        if str(result) in tokens:
+            return True
+        return _bounded(text, str(result)) if whole else str(result) in text
+    if whole:
+        if _bounded(text, str(result)):
+            return True
+    elif "".join(str(result).split()).lower() in "".join(text.split()).lower():
         return True
     spelled = str(result).strip().lower()
     if not re.fullmatch(r"(?:(?:0x|\\x)?[0-9a-f]{2}[\s,:\-]*)+", spelled):
@@ -5631,31 +5655,38 @@ def _result_unquoted(case: object, references: list[list[str]]) -> bool:
     """Whether `case` has a checkable result that is not where it must be.
 
     A wide result must be in the case's source or the reference line after the
-    quoted one; a narrow one (`_case_results`) in the quoted reference line or
-    the one after it. A narrow result is not checked when the source quotes no
-    reference line. Each checked result must be found, not any one: run R36's
-    echoed id "A" was in every quoted line.
+    quoted one; a narrow one (`_case_results`) in the quoted reference line or,
+    as a whole value, the one after it. A narrow result is not checked when the
+    source quotes no reference line. Each checked result must be found, not any
+    one: run R36's echoed id "A" was in every quoted line.
+
+    Audit 11: R36 case #2 quoted "The counter remains 1" for an event of 2, and
+    passed on the 2 in "{0,2}" on the next line.
     """
     results = _case_results(case)
     if not results:
         return False
     sources = _source_strings(case)
-    wide = [*sources]
-    narrow: list[str] = []
+    quoted: list[str] = []
+    after: list[str] = []
     for lines in references:
         for source in sources:
-            wide += _lines_after(source, lines)
-            narrow += _quoted_context(source, lines)
-    checked = [
-        (result, narrow if is_narrow else wide)
-        for result, is_narrow in results
-        if narrow or not is_narrow
-    ]
+            after += _lines_after(source, lines)
+            for first, last in _quoted_spans(source, lines):
+                quoted += lines[first : last + 1]
+    wide = [*sources, *after]
+
+    def found(result: object, is_narrow: bool) -> bool:
+        if not is_narrow:
+            return any(_renders_result(text, result) for text in wide)
+        return any(_renders_result(text, result) for text in quoted) or any(
+            _renders_result(text, result, whole=True) for text in after
+        )
+
+    checked = [(result, is_narrow) for result, is_narrow in results if quoted or not is_narrow]
     if not checked:
         return False
-    return not all(
-        any(_renders_result(text, result) for text in texts) for result, texts in checked
-    )
+    return not all(found(result, is_narrow) for result, is_narrow in checked)
 
 
 def _unquoted_cases(
