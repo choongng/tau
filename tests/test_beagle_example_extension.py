@@ -11720,10 +11720,12 @@ async def test_worker_bash_default_timeout_is_short(
         assert _module()._worker_bash_timeout() == default
 
 
-def _stop_gate_sends(monkeypatch: pytest.MonkeyPatch, cwd: Path, *, has_ui: bool) -> list[str]:
+def _stop_gate_sends(
+    monkeypatch: pytest.MonkeyPatch, cwd: Path, *, has_ui: bool, module: Any = None
+) -> list[str]:
     from types import SimpleNamespace
 
-    module = _module()
+    module = module or _module()
     monkeypatch.setattr(module, "_FOUND_AWAITS_USER", True)
     monkeypatch.setattr(module, "_STOP_GATE_SENT", 0)
     sent: list[str] = []
@@ -17312,6 +17314,191 @@ def test_not_done_escalation_text_matches_step_refusal(
 
     assert result == listed
     assert refused == result.replace("T0006 is still open — ", "pursuit_step: T0006 not run — ", 1)
+
+
+#: R37 E08: the data test's output once step 6's sub-agents opened a cwd-relative path.
+R37_FAILURE_TAIL = (
+    "F\n=== FAILURES ===\n___ test_cases ___\n"
+    '    with open("../cases.json") as f:\n'
+    "E   FileNotFoundError: [Errno 2] No such file or directory: '../cases.json'\n"
+    "tests/test_case_data.py:5: FileNotFoundError\n"
+    "FAILED tests/test_case_data.py::test_cases - FileNotFoundError: [Errno 2] No such\n"
+    "1 failed in 0.02s\n"
+)
+R37_ERROR = "FileNotFoundError: [Errno 2] No such file or directory: '../cases.json'"
+
+
+def _r37_broken_check(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, passing: int = 5
+) -> tuple[Any, Path, dict[str, Any], str]:
+    """R37 T0004: `passing` not-done steps whose check passed and the close judge kept
+    open, the first two on T0002 and carried by its new route, then a step whose
+    check failed. Returns that step's result text."""
+    project = _git_project(tmp_path, monkeypatch)
+    data_check = _r32_tree(project)
+    module = _module()
+    for n in range(passing):
+        if n == 2:
+            module._carry_not_done(project, "T0002", "T0004")
+            module._forget_task(project, "T0002")
+        task = "T0002" if n < 2 else "T0004"
+        module._LAST_CHECK_EXIT[(str(project), task)] = 0
+        module._not_done(project, task, R32_SCOPE, R32_STAYS_OPEN)
+    module._note_check_run((str(project), "T0004"), data_check, (1, R37_FAILURE_TAIL))
+    text = module._not_done(project, "T0004", R32_SCOPE, "T0004 — the check fails").text
+    record = {"id": "T0004", "status": "open", "criteria": "c", "done_when": data_check}
+    return module, project, record | {"scope": R32_SCOPE}, text
+
+
+def test_unchanged_route_escalation_says_the_last_check_failed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Run R37 E09-E17: six refusals said T0004's "check passes each time, and only
+    # the close keeps it open"; the last check had failed, FileNotFoundError.
+    module, project, record, _ = _r37_broken_check(tmp_path, monkeypatch)
+    module._BROKEN_RERUN_SPENT.add((str(project), "T0004"))
+    record["scope"] = ["tests/"]  # R37's one entry, so no split is offered
+
+    text = module._unchanged_route_escalation("T0004", 6, record, "No new route.", project)
+
+    assert module._check_error_line(R37_FAILURE_TAIL) == R37_ERROR
+    assert text.startswith("pursuit_step: T0004 not run — split it or stop.\nNo new route.")
+    assert f"6 steps without a pass, and the last step's check failed: {R37_ERROR}." in text
+    assert "its check passes each time" not in text
+    # A task whose every step passed its check keeps the judge's reason.
+    judged, j_project, j_record, _ = _judge_only_escalated(tmp_path / "judged", monkeypatch)
+    kept = judged._unchanged_route_escalation("T0006", 3, j_record, "No new route.", j_project)
+    assert "its check passes each time, and only the close keeps it open" in kept
+    assert "check failed" not in kept
+
+
+def test_check_broken_after_passing_steps_earns_one_notes_rerun(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Run R37 E08-E17: five steps passed T0004's check, the sixth broke it, and the
+    # driver named the fix; the cap refused the step, the new route and the read.
+    module, project, record, text = _r37_broken_check(tmp_path, monkeypatch)
+    notes = f"The last step broke the check, which passed before: {R37_ERROR}. Fix that."
+    call = f'pursuit_step task="T0004", notes={json.dumps(notes)}'
+    refused = {"task": "T0004", "new_route": True, "scope": R32_SCOPE, "notes": "again"}
+
+    escalation = module._escalation("T0004", 6, refused, record, project, False, False)
+    unchanged = module._unchanged_route_escalation("T0004", 6, record, "No new route.", project)
+
+    assert f"T0004 is still open — call instead: {call}" in text
+    for said in (escalation, unchanged):
+        assert f"The call that works, whole: {call}" in said
+        assert f"- {call}, once:" in said
+        assert f"the last step's check failed: {R37_ERROR}" in said
+        assert "new_route=true" not in said and "its check passes each time" not in said
+    assert _quoted_head(escalation).startswith(
+        'pursuit_step: T0004 not run — call instead: pursuit_step task="T0004", notes='
+    )
+    assert "\nNo new route.\n" in unchanged
+    # The offered call is the one the step guard takes past the cap.
+    taken = {"task": "T0004", "notes": notes}
+    assert module._broken_check_rerun("T0004", taken, record, project)
+    assert not module._broken_check_rerun("T0004", {**taken, "new_route": True}, record, project)
+    assert not module._broken_check_rerun("T0004", {"task": "T0004"}, record, project)
+    moved = {**taken, "done_when": "python3 -m pytest -q tests/test_other.py"}
+    assert not module._broken_check_rerun("T0004", moved, record, project)
+    # A check that had failed on an earlier step was not broken by the last one.
+    failed, f_project, f_record, _ = _judge_only_escalated(
+        tmp_path / "failed", monkeypatch, check_failed=True
+    )
+    f_key = (str(f_project), "T0006")
+    failed._note_check_run(f_key, f_record["done_when"], (1, R37_FAILURE_TAIL))
+    failed._not_done(f_project, "T0006", R32_SCOPE, "T0006 — the check fails")
+    assert failed._broken_check("T0006", f_project) == ""
+    assert not failed._broken_check_rerun("T0006", {**taken, "task": "T0006"}, f_record, f_project)
+
+
+@pytest.mark.anyio
+async def test_regression_rerun_is_offered_once(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Run R37: the step that broke T0004's passing check earns one rerun at that
+    # failure past the cap; a rerun that fails again leaves the cap standing.
+    monkeypatch.chdir(_pursuit_project(tmp_path))
+    _failing_open_task(fake_beagle, monkeypatch)
+    runtime, _ = _bound(tmp_path)
+    step = _tool(runtime, "pursuit_step")
+    await _stays_open(step, fake_beagle, 1)
+    module = _loaded_module()
+    (key,) = list(module._NOT_DONE)
+    # Steps 1-4 passed the check; step 5 broke it.
+    module._NOT_DONE[key] = 5
+    module._NOT_DONE_CHECK_FAILED[key] = 5
+    module._note_check_run(key, "grep -q done done.txt", (1, R37_FAILURE_TAIL))
+
+    plain = await step.execute("s1", {"task": "T0002", "attempts": 1})
+    notes = f"The last step broke the check, which passed before: {R37_ERROR}. Fix that."
+    rerun = await step.execute("s2", {"task": "T0002", "notes": notes, "attempts": 1})
+    again = await step.execute("s3", {"task": "T0002", "notes": notes, "attempts": 1})
+
+    assert plain.text.startswith(
+        f'pursuit_step: T0002 not run — call instead: pursuit_step task="T0002", '
+        f"notes={json.dumps(notes)}"
+    )
+    assert len(_runs(fake_tau)) == 2
+    assert "not run" not in rerun.text.splitlines()[0]
+    assert module._NOT_DONE[key] == 6
+    assert again.text.startswith("pursuit_step: T0002 not run")
+    assert 'pursuit_step task="T0002", notes=' not in again.text
+    assert ", once:" not in again.text
+    assert module._broken_check("T0002", Path(key[0])) == ""
+    # Spent, it stays spent on the task a new route keeps check and scope for.
+    module._carry_not_done(Path(key[0]), "T0002", "T0009")
+    assert (key[0], "T0009") in module._BROKEN_RERUN_SPENT
+    assert module._NOT_DONE_CHECK_FAILED[(key[0], "T0009")] == 5
+
+
+def test_scope_read_refusal_names_the_escalation_when_split_or_stop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Run R37 E16: the driver's read of tests/test_case_data.py was refused with "say
+    # what to fix in pursuit_step's notes", a step the cap refused too.
+    module, project, _ = _judge_only_results(tmp_path, monkeypatch, 6)
+    assert module.JUDGE_NOTES_UNTIL == 6
+
+    refused = module._held_read("read", {"path": "tests/test_cases.py"}, project)
+
+    assert refused is not None and refused.block
+    assert "in the scope of T0006" in refused.reason
+    assert "T0006 is still open — split it or stop." in refused.reason
+    assert "pursuit_step's notes" not in refused.reason and "new_route=true" not in refused.reason
+    # A check broken after passing steps: the read refusal offers the rerun.
+    broken, b_project, _, _ = _r37_broken_check(tmp_path / "broken", monkeypatch)
+    cat = broken._held_read("bash", {"command": "cat tests/test_case_data.py"}, b_project)
+    assert cat is not None
+    assert 'T0004 is still open — call instead: pursuit_step task="T0004", notes=' in cat.reason
+    assert R37_ERROR in cat.reason and "pursuit_step's notes" not in cat.reason
+
+
+def test_stop_gate_names_escalated_task_options(
+    tmp_path: Path, beagle: Path, fake_beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Run R37: both stop-gate follow-ups said "Call pursuit_step with no arguments",
+    # which the cap refused for T0004; the third stop ended the run at 20 min.
+    module, project, _, _ = _r37_broken_check(tmp_path, monkeypatch)
+    root = {"id": "T0001", "parent": "", "status": "pending", "container": True}
+    nodes = [root, {"id": "T0003", "parent": "T0001", "status": "pending"}]
+    nodes.append({"id": "T0004", "parent": "T0001", "status": "open"})
+    (fake_beagle / "tree.out").write_text(json.dumps({"nodes": nodes}))
+
+    monkeypatch.setattr(module, "BEAGLE_BIN", str(fake_beagle / "beagle"))
+    [sent] = _stop_gate_sends(monkeypatch, project, has_ui=False, module=module)
+
+    assert sent.startswith("[beagle] The pursuit is not done")
+    escalated = sent.partition("At the step cap:\n")[2]
+    assert escalated.startswith(
+        'T0004 is still open — call instead: pursuit_step task="T0004", notes='
+    )
+    assert R37_ERROR in escalated and "T0003" not in escalated
 
 
 @pytest.mark.anyio
