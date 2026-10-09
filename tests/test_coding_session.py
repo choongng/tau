@@ -5214,8 +5214,9 @@ async def test_session_continues_a_turn_cut_off_at_the_output_limit(tmp_path: Pa
 
 @pytest.mark.anyio
 async def test_output_limit_nudges_are_capped_per_run(tmp_path: Path) -> None:
-    # Thinking itself out of room, then one tool call, over and over, would
-    # reset a count of nudges in a row forever.
+    # Thinking itself out of room twice, then one tool call, over and over,
+    # would reset a count of nudges in a row forever. Only the nudges whose
+    # reply made no tool call count toward the bound per run.
     call = ToolCall(id="call-1", name="fetch", arguments={})
 
     def truncated() -> list[object]:
@@ -5235,7 +5236,7 @@ async def test_output_limit_nudges_are_capped_per_run(tmp_path: Path) -> None:
             ),
         ]
 
-    script = [truncated(), acts()] * 10
+    script = [truncated(), truncated(), acts()] * 10
     provider = FakeProvider(script)
     session = await CodingSession.load(
         CodingSessionConfig(
@@ -5255,7 +5256,11 @@ async def test_output_limit_nudges_are_capped_per_run(tmp_path: Path) -> None:
         for message in session.messages
         if isinstance(message, UserMessage) and message.text.startswith("Your last reply hit")
     ]
-    assert len(nudged) == 6
+    # Five rounds of two nudges, one answered by a cut-off (counted) and one
+    # by a tool call (not counted); the sixth cut-off answering a nudge meets
+    # the bound of six, is not nudged, and ends the run.
+    assert len(nudged) == 11
+    assert len(provider.calls) == 17
 
 
 def test_llama_cpp_context_size_error_is_an_overflow() -> None:

@@ -7,7 +7,7 @@ import json
 import re
 import shutil
 import string
-from collections import deque
+from collections import Counter, deque
 from collections.abc import AsyncIterator, Callable, Hashable, Mapping, Sequence
 from contextlib import suppress
 from dataclasses import dataclass, field, replace
@@ -27,16 +27,26 @@ from tau_agent.harness import AgentHarness, AgentHarnessConfig, QueuedMessages
 from tau_agent.messages import (
     AgentMessage,
     AssistantMessage,
+    AssistantMessageDiagnostic,
     CustomMessage,
     TextContent,
+    ThinkingContent,
     ToolCall,
     Usage,
     UserMessage,
     message_text,
     sum_usage,
 )
-from tau_agent.provider import ModelProvider
-from tau_agent.provider_events import AssistantDoneEvent, AssistantErrorEvent, TextDeltaEvent
+from tau_agent.provider import CancellationToken, ModelProvider
+from tau_agent.provider_events import (
+    AssistantDoneEvent,
+    AssistantErrorEvent,
+    AssistantMessageEvent,
+    TextDeltaEvent,
+    ThinkingDeltaEvent,
+    ThinkingEndEvent,
+    ToolCallStartEvent,
+)
 from tau_agent.session import (
     BranchSummaryEntry,
     CompactionEntry,
@@ -225,6 +235,24 @@ OUTPUT_LIMIT_NUDGE = (
     "dropped. Do not work the whole problem out again in your head: take the next "
     "concrete step now with a tool call, or answer briefly."
 )
+# A request whose streamed reasoning is plainly looping is stopped and handled
+# as an output-limit cut-off. R36 (gemma, dev-notes/itc-runs/R36.md, class 1):
+# seven driver turns ran 21k-49k reasoning chars of loop to the 8,192-token cap
+# with no tool call (E44: 837 lines, 54 distinct; E68: 2,719 lines of one
+# token), and the nudged replies acted. Looping means some line has recurred
+# REASONING_LOOP_REPEATS times while distinct lines are under
+# REASONING_LOOP_DISTINCT_FRACTION of the lines, over all the reasoning so far
+# (from REASONING_LOOP_MIN_LINES lines on) or over its last REASONING_LOOP_WINDOW
+# lines, which catches a loop after a long sound start. A line that is one unit
+# of at most REASONING_LOOP_RUN_UNIT chars repeated for REASONING_LOOP_RUN_CHARS
+# chars is a loop too. Reasoning that repeats a short line a few times among
+# varied ones meets none of these.
+REASONING_LOOP_REPEATS = 8
+REASONING_LOOP_DISTINCT_FRACTION = 0.25
+REASONING_LOOP_MIN_LINES = 40
+REASONING_LOOP_WINDOW = 64
+REASONING_LOOP_RUN_CHARS = 2_000
+REASONING_LOOP_RUN_UNIT = 40
 TREE_RUNNING_MESSAGE = "Tau is still working. Press Escape to interrupt before using /tree."
 
 
@@ -274,6 +302,176 @@ async def _finish_aborted_session_close(session: CodingSession) -> None:
     # attempted by CodingSession's durable, idempotent close task.
     with suppress(BaseException):
         task.result()
+
+
+class _ReasoningLoopDetector:
+    """Tell, as reasoning streams in, when it has plainly started looping."""
+
+    def __init__(self) -> None:
+        self._line: list[str] = []
+        self._line_chars = 0
+        self._line_checked_at = 0
+        self._tail = ""
+        self._counts: Counter[str] = Counter()
+        self._lines = 0
+        self._top = 0
+        self._window: deque[str] = deque()
+        self._window_counts: Counter[str] = Counter()
+        self.details: dict[str, JSONValue] = {}
+
+    def feed(self, delta: str) -> bool:
+        """Take the next reasoning delta; return whether the reasoning loops."""
+        *ended, rest = delta.split("\n")
+        if ended:
+            ended[0] = "".join((*self._line, ended[0]))
+            self._line, self._line_chars, self._line_checked_at = [], 0, 0
+            self._tail = ""
+            for line in ended:
+                if self._add(line.strip()):
+                    return True
+        if rest:
+            self._line.append(rest)
+            self._line_chars += len(rest)
+            self._tail = (self._tail + rest)[-REASONING_LOOP_RUN_CHARS:]
+        return self._run_loops()
+
+    def _add(self, line: str) -> bool:
+        if not line:
+            return False
+        self._lines += 1
+        count = self._counts[line] + 1
+        self._counts[line] = count
+        self._top = max(self._top, count)
+        self._window.append(line)
+        self._window_counts[line] += 1
+        if len(self._window) > REASONING_LOOP_WINDOW:
+            dropped = self._window.popleft()
+            self._window_counts[dropped] -= 1
+            if not self._window_counts[dropped]:
+                del self._window_counts[dropped]
+        if (
+            self._lines >= REASONING_LOOP_MIN_LINES
+            and self._top >= REASONING_LOOP_REPEATS
+            and len(self._counts) < REASONING_LOOP_DISTINCT_FRACTION * self._lines
+        ):
+            repeated, count = self._counts.most_common(1)[0]
+            return self._found(repeated, count, lines=self._lines, distinct=len(self._counts))
+        if (
+            len(self._window) == REASONING_LOOP_WINDOW
+            and len(self._window_counts) < REASONING_LOOP_DISTINCT_FRACTION * REASONING_LOOP_WINDOW
+        ):
+            repeated, count = self._window_counts.most_common(1)[0]
+            if count >= REASONING_LOOP_REPEATS:
+                return self._found(
+                    repeated, count, lines=REASONING_LOOP_WINDOW, distinct=len(self._window_counts)
+                )
+        return False
+
+    def _run_loops(self) -> bool:
+        """Whether the line being written is one short unit over and over."""
+        if (
+            self._line_chars < REASONING_LOOP_RUN_CHARS
+            or self._line_chars - self._line_checked_at < REASONING_LOOP_RUN_UNIT
+        ):
+            return False
+        self._line_checked_at = self._line_chars
+        tail = self._tail
+        for unit in range(1, REASONING_LOOP_RUN_UNIT + 1):
+            if tail[unit:] == tail[:-unit]:
+                self.details = {"kind": "run", "unit": tail[:unit], "chars": self._line_chars}
+                return True
+        return False
+
+    def _found(self, line: str, repeats: int, *, lines: int, distinct: int) -> bool:
+        self.details = {
+            "kind": "lines",
+            "line": line[:200],
+            "repeats": repeats,
+            "lines": lines,
+            "distinct": distinct,
+        }
+        return True
+
+
+class _RequestGuard:
+    """The provider a harness run's loop sends its requests through.
+
+    Each request's reasoning is watched, and one that plainly loops is stopped
+    and ends as an output-limit cut-off, so the session nudges as it would at
+    the cap. A request that answers an output-limit nudge goes to a
+    thinking-off twin of the provider where the session can build one.
+    """
+
+    def __init__(self, inner: ModelProvider, session: CodingSession) -> None:
+        self.inner = inner
+        self._session = session
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(self.inner, name)
+
+    def stream_response(
+        self,
+        *,
+        model: str,
+        system: str,
+        messages: list[AgentMessage],
+        tools: list[AgentTool],
+        signal: CancellationToken | None = None,
+        session_id: str | None = None,
+    ) -> AsyncIterator[AssistantMessageEvent]:
+        provider = self._session._request_provider(self.inner)
+        return _cut_looping_reasoning(
+            provider.stream_response(
+                model=model,
+                system=system,
+                messages=messages,
+                tools=tools,
+                signal=signal,
+                session_id=session_id,
+            )
+        )
+
+
+async def _cut_looping_reasoning(
+    source: AsyncIterator[AssistantMessageEvent],
+) -> AsyncIterator[AssistantMessageEvent]:
+    """Pass a response's events on, ending it at the length limit if it loops."""
+    detector = _ReasoningLoopDetector()
+    watching = True
+    try:
+        async for event in source:
+            yield event
+            if isinstance(event, ToolCallStartEvent):
+                watching = False
+            if not (
+                watching and isinstance(event, ThinkingDeltaEvent) and detector.feed(event.delta)
+            ):
+                continue
+            partial = event.partial
+            block = (
+                partial.content[event.content_index]
+                if event.content_index < len(partial.content)
+                else None
+            )
+            if isinstance(block, ThinkingContent):
+                yield ThinkingEndEvent(
+                    content_index=event.content_index, content=block.thinking, partial=partial
+                )
+            diagnostic = AssistantMessageDiagnostic(
+                type="reasoning_loop_cut", details=detector.details
+            )
+            message = partial.model_copy(
+                update={
+                    "stop_reason": "length",
+                    "diagnostics": [*(partial.diagnostics or []), diagnostic],
+                }
+            )
+            yield AssistantDoneEvent(reason="length", message=message)
+            return
+    finally:
+        aclose = getattr(source, "aclose", None)
+        if aclose is not None:
+            await aclose()
 
 
 @dataclass(frozen=True, slots=True)
@@ -558,7 +756,14 @@ class CodingSession:
         self._pending_message_writes: dict[int, _PendingMessageWrite] = {}
         self._prompt_cache_misses = PromptCacheMissDetector()
         self._length_continuations = 0
+        #: Nudges this run whose reply made no tool call.
         self._run_length_continuations = 0
+        #: Whether the next turn to end is the reply to an output-limit nudge.
+        self._awaiting_nudge_reply = False
+        #: Whether the next loop request is a nudge's, sent with thinking off.
+        self._next_request_thinking_off = False
+        #: The thinking-off twin of a provider, built for nudged requests.
+        self._thinking_off_twin: tuple[ModelProvider, ModelProvider] | None = None
         #: The latest tool calls that ran, each with a digest of its result.
         self._recent_calls: deque[tuple[str, int]] = deque(maxlen=REPEATED_CALL_WINDOW)
         #: The first line of the latest result of each call in `_recent_calls`.
@@ -1818,7 +2023,11 @@ class CodingSession:
                 await self._extension_runtime.emit_event(cache_miss)
                 yield cache_miss
         if isinstance(event, AgentStartEvent):
+            # The run's loop holds the guard from here; later reads of the
+            # provider (compaction, naming) get the bare one.
+            self._unguard_requests()
             self._length_continuations = self._run_length_continuations = 0
+            self._awaiting_nudge_reply = self._next_request_thinking_off = False
             self._recent_calls.clear()
             self._recent_heads.clear()
             self._refused_in_a_row = 0
@@ -1836,13 +2045,19 @@ class CodingSession:
         with no reply and no tool call; the loop would end the run there, and
         an unattended run would sit idle. The nudge goes in as a follow-up, so
         the loop sends one more request (the truncated reasoning is left out
-        of it), and the between-turn compaction still applies. Bounded in a
-        row and per run, so a model that keeps thinking itself out of room,
-        acting just enough in between, does stop.
+        of it), and the between-turn compaction still applies. That request
+        goes with thinking off: the reasoning it would redo is what ran out.
+        Bounded in a row, so a model that never acts does stop, and per run
+        over the nudges whose reply made no tool call, so a model that keeps
+        thinking itself out of room, acting just enough in between, stops too.
         """
         message = event.message
         if not isinstance(message, AssistantMessage):
             return
+        if self._awaiting_nudge_reply:
+            self._awaiting_nudge_reply = False
+            if not message.tool_calls:
+                self._run_length_continuations += 1
         if message.stop_reason != "length" or message.tool_calls:
             self._length_continuations = 0
             return
@@ -1853,10 +2068,55 @@ class CodingSession:
             self._length_continuations = 0
             return
         self._length_continuations += 1
-        self._run_length_continuations += 1
+        self._awaiting_nudge_reply = True
+        self._next_request_thinking_off = True
         nudge = UserMessage(content=OUTPUT_LIMIT_NUDGE)
         self._record_message_origin(nudge, delivery="follow_up", source="extension")
         self._harness.follow_up_message(nudge)
+
+    def _guard_requests(self) -> None:
+        """Send the requests of the harness run about to start through a guard.
+
+        The harness loop takes its provider once, when the run starts, so the
+        guard is in place for that and taken out at the run's start event.
+        """
+        provider = self._harness.config.provider
+        if isinstance(provider, _RequestGuard):
+            provider = provider.inner
+        self._harness.config.provider = _RequestGuard(provider, self)
+
+    def _unguard_requests(self) -> None:
+        provider = self._harness.config.provider
+        if isinstance(provider, _RequestGuard):
+            self._harness.config.provider = provider.inner
+
+    def _request_provider(self, provider: ModelProvider) -> ModelProvider:
+        """The provider one loop request goes to: thinking off for a nudge's."""
+        if not self._next_request_thinking_off:
+            return provider
+        self._next_request_thinking_off = False
+        return self._thinking_off_provider(provider) or provider
+
+    def _thinking_off_provider(self, provider: ModelProvider) -> ModelProvider | None:
+        """A twin of the session's provider with thinking off, if it has one.
+
+        Built as a thinking change would build it, but only used for one
+        request: the session's thinking level stays as it is.
+        """
+        if self._thinking_level == "off" or "off" not in self.available_thinking_levels:
+            return None
+        twin = self._thinking_off_twin
+        if twin is not None and twin[0] is provider:
+            return twin[1]
+        try:
+            off, _ = self._build_runtime_provider(
+                inference_provider=self._inference_provider, thinking_level="off"
+            )
+        except ProviderConfigError:
+            return None
+        self._owned_providers.append(off)
+        self._thinking_off_twin = (provider, off)
+        return off
 
     def _run_continues_after(self, event: TurnEndEvent) -> bool:
         """Whether the loop will send another request in this run."""
@@ -2614,6 +2874,7 @@ class CodingSession:
         await self._extension_runtime.emit_event(retry_start)
         yield retry_start
 
+        self._guard_requests()
         retry_events = self._harness.continue_()
         self._invalidate_context_usage_cache()
         final_error: str | None = None
@@ -2645,6 +2906,7 @@ class CodingSession:
                 async for signal in self._signals_after(retry_event):
                     yield signal
         finally:
+            self._unguard_requests()
             aclose = getattr(retry_events, "aclose", None)
             if aclose is not None:
                 with suppress(Exception):
@@ -2670,6 +2932,7 @@ class CodingSession:
         self,
         *,
         inference_provider: str | None,
+        thinking_level: ThinkingLevel | None = None,
     ) -> tuple[ClosableModelProvider, ProviderConfig]:
         if self._runtime_provider_config is None:
             raise ProviderConfigError("Runtime provider configuration is unavailable")
@@ -2681,7 +2944,7 @@ class CodingSession:
                 provider_config,
                 credential_store=self._credential_store,
                 model=committed_model,
-                thinking_level=self._thinking_level,
+                thinking_level=thinking_level or self._thinking_level,
                 inference_provider=inference_provider,
                 response_headers_observer=(
                     self._observe_response_headers
@@ -3731,6 +3994,7 @@ class CodingSession:
             else:
                 prompt_message = UserMessage(content=expanded_content)
             self._record_message_origin(prompt_message, delivery="prompt", source=source)
+            self._guard_requests()
             events = self._harness.prompt_message(prompt_message)
             self._invalidate_context_usage_cache()
             async for event in events:
@@ -3796,6 +4060,7 @@ class CodingSession:
                     )
                     await self._extension_runtime.emit_event(retry_start)
                     yield retry_start
+                    self._guard_requests()
                     events = self._harness.continue_()
                     self._invalidate_context_usage_cache()
                     overflow_retry_error: str | None = None
@@ -3845,6 +4110,7 @@ class CodingSession:
             )
             raise
         finally:
+            self._unguard_requests()
             try:
                 await self._reconcile_run_persistence(events, context=context)
             finally:
@@ -3866,6 +4132,7 @@ class CodingSession:
         settled_event: AgentSettledEvent | None = None
         route_failure_message: AssistantMessage | None = None
         try:
+            self._guard_requests()
             events = self._harness.continue_()
             self._invalidate_context_usage_cache()
             async for event in events:
@@ -3903,6 +4170,7 @@ class CodingSession:
             )
             raise
         finally:
+            self._unguard_requests()
             try:
                 await self._reconcile_run_persistence(events, context=context)
             finally:
