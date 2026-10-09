@@ -9916,6 +9916,24 @@ def _kept_data_check(done_when: str, scope: list[str], bound: str, root: Path) -
     )
 
 
+def _kept_bound_note(
+    bound: str, notes: str, reason: str, scope: list[str], root: Path
+) -> str | None:
+    """The note for running `notes` against an open task's bound check when its
+    rewritten done_when was rejected for `reason`; None when the call is refused,
+    as it is without notes or when the bound check cannot pass on `scope` either.
+
+    Audit 10: refusing the call dropped the driver's notes, and the step with them.
+    """
+    if not notes or not bound or _check_problem(bound) is not None:
+        return None
+    if _imports_unwritten(bound, scope, root) is not None:
+        # Run R35 #10: a bound data test importing unwritten code fails whatever
+        # the notes do; the refusal names the fix.
+        return None
+    return f"Kept the bound check `{bound}`; the new done_when was not taken: {reason}\n\n"
+
+
 def _shown(task: str, root: Path) -> dict[str, Any]:
     """`task`'s record from `beagle pursuit show`, or {}."""
     rc, out = _pursuit(["show", task], root)
@@ -11567,8 +11585,12 @@ def make_step_tool() -> Any:
             # Open already, with a check the model now writes differently: the
             # bound one could not judge the work (prose, a usage error), and
             # repeating the old one forever is the loop this breaks.
+            before = route
+            own_scope = scope or _strings(record.get("scope"))
+            rejected: tuple[str, str] | None = None
             chained, prose = _and_chain(done_when)
             if prose is not None or chained is None:
+                advice = ""
                 if (
                     prose is not None
                     and "has a bare" in prose
@@ -11577,88 +11599,102 @@ def make_step_tool() -> Any:
                 ):
                     # Run R17 #23-#25 were told to name a new test in scope; the
                     # bound check was one valid command all along.
-                    prose += (
+                    advice = (
                         f" The bound check `{bound_check}` stands: it is one valid "
                         "command; leave done_when out to keep it."
                     )
-                return _step_result(f"pursuit_step: {task}'s check not changed — {prose}")
-            route += _bound_note(done_when, chained)
-            done_when = chained
-            amend_problem = _amend_problem(
-                done_when,
-                bound_check,
-                _pending_locks(goal, task) + _strings(arguments.get("locks")),
-                root,
-            )
-            if amend_problem is not None:
-                return _step_result(f"pursuit_step: {task}'s check not changed — {amend_problem}")
-            own_scope = scope or _strings(record.get("scope"))
-            unwritten = (
-                _locked_scope_problem(own_scope, root, title, task, done_when)
-                or _sibling_owned_check_problem(done_when, own_scope, task, nodes, root)
-                or _pytest_node_missing_problem(done_when, own_scope, root)
-                or _pytest_node_import_only_problem(done_when, own_scope, root)
-            ) or (
-                await _unwritten_check_problem(
-                    done_when,
-                    own_scope,
-                    task,
-                    root,
-                    _predecessor_scope(record, root),
-                    bound=bound_check,
-                    locks=_pending_locks(goal, task) + _strings(arguments.get("locks")),
-                    is_open=True,
+                rejected = (f"{prose}", advice)
+            else:
+                route += _bound_note(done_when, chained)
+                done_when = chained
+                problem = (
+                    _amend_problem(
+                        done_when,
+                        bound_check,
+                        _pending_locks(goal, task) + _strings(arguments.get("locks")),
+                        root,
+                    )
+                    or _locked_scope_problem(own_scope, root, title, task, done_when)
+                    or _sibling_owned_check_problem(done_when, own_scope, task, nodes, root)
+                    or _pytest_node_missing_problem(done_when, own_scope, root)
+                    or _pytest_node_import_only_problem(done_when, own_scope, root)
+                    or await _unwritten_check_problem(
+                        done_when,
+                        own_scope,
+                        task,
+                        root,
+                        _predecessor_scope(record, root),
+                        bound=bound_check,
+                        locks=_pending_locks(goal, task) + _strings(arguments.get("locks")),
+                        is_open=True,
+                    )
                 )
-            )
-            if unwritten is not None:
-                return _step_result(f"pursuit_step: {task}'s check not changed — {unwritten}")
-            pre_rc, pre_out = await _run_check(done_when, root, DEFAULT_CHECK_TIMEOUT)
-            if pre_rc == 0 and await _passes_only_by_uncommitted(
-                done_when, [own_scope, _predecessor_scope(record, root)], root
-            ):
-                # Run R18: the T0151 refusal had the open's blind spot.
-                route += _on_disk_note(done_when, task)
-            elif pre_rc == 0:
-                keep = (
-                    f" Keep the bound check `{bound_check}`: leave done_when out to keep it."
-                    if bound_check and _check_problem(bound_check) is None
-                    else ""
+                if problem is not None:
+                    rejected = (problem, "")
+                else:
+                    pre_rc, pre_out = await _run_check(done_when, root, DEFAULT_CHECK_TIMEOUT)
+                    if pre_rc == 0 and await _passes_only_by_uncommitted(
+                        done_when, [own_scope, _predecessor_scope(record, root)], root
+                    ):
+                        # Run R18: the T0151 refusal had the open's blind spot.
+                        route += _on_disk_note(done_when, task)
+                    elif pre_rc == 0:
+                        keep = (
+                            f" Keep the bound check `{bound_check}`: leave done_when out to "
+                            "keep it."
+                            if bound_check and _check_problem(bound_check) is None
+                            else ""
+                        )
+                        rejected = (
+                            f"`{done_when}` already passes before any work, so it would "
+                            f"close {task} on no work.",
+                            keep,
+                        )
+                    broke = _check_broke(pre_rc, pre_out) if rejected is None else None
+                    if broke is not None:
+                        rejected = (
+                            f"the check could not run: `{broke}` (exit {pre_rc}).",
+                            " Correct the command and call pursuit_step again.",
+                        )
+            if rejected is not None:
+                reason, advice = rejected
+                kept_note = _kept_bound_note(bound_check, notes, reason, own_scope, root)
+                if kept_note is None:
+                    return _step_result(
+                        f"pursuit_step: {task}'s check not changed — {reason}{advice}"
+                    )
+                # Audit 10: each rejection dropped the driver's notes on an open
+                # task; the bound check stays and they run, as `_kept_data_check`'s do.
+                route = before + kept_note
+                done_when = bound_check
+            else:
+                argv = ["amend", task, "--done-when", done_when]
+                if criteria and criteria != str(record.get("criteria") or "").strip():
+                    argv += ["--criteria", criteria]
+                argv += ["--reason", "the bound check could not judge the work; rewritten"]
+                rc, amended = _pursuit(argv, root)
+                if rc != 0:
+                    return _step_result(
+                        f"pursuit_step: `beagle pursuit amend` refused the new check (exit {rc}):"
+                        f"\n{amended}"
+                    )
+                opened = amended
+                record = {**record, "done_when": done_when}
+                # Run R23 #11: the old check's unproven mark refused the new check as
+                # already passing. `beagle pursuit amend` takes no --scope, so the
+                # record keeps its scope and this step runs on the call's.
+                _UNPROVEN.discard((str(root), task))
+                _LAST_CHECK_EXIT.pop((str(root), task), None)
+                _LAST_CHECK_FAILURE.pop((str(root), task), None)
+                kept = _strings(record.get("scope"))
+                route += (
+                    f"{task}'s check is now `{done_when}`, run on scope {json.dumps(own_scope)}"
                 )
-                return _step_result(
-                    f"pursuit_step: {task}'s check not changed — `{done_when}` already passes "
-                    f"before any work, so it would close {task} on no work.{keep}"
+                route += (
+                    f"; its record keeps scope {json.dumps(kept)}.\n\n"
+                    if scope and kept and list(scope) != kept
+                    else ".\n\n"
                 )
-            broke = _check_broke(pre_rc, pre_out)
-            if broke is not None:
-                return _step_result(
-                    f"pursuit_step: {task}'s check not changed — the check could not run: "
-                    f"`{broke}` (exit {pre_rc}). Correct the command and call pursuit_step again."
-                )
-            argv = ["amend", task, "--done-when", done_when]
-            if criteria and criteria != str(record.get("criteria") or "").strip():
-                argv += ["--criteria", criteria]
-            argv += ["--reason", "the bound check could not judge the work; rewritten"]
-            rc, amended = _pursuit(argv, root)
-            if rc != 0:
-                return _step_result(
-                    f"pursuit_step: `beagle pursuit amend` refused the new check (exit {rc}):"
-                    f"\n{amended}"
-                )
-            opened = amended
-            record = {**record, "done_when": done_when}
-            # Run R23 #11: the old check's unproven mark refused the new check as
-            # already passing. `beagle pursuit amend` takes no --scope, so the
-            # record keeps its scope and this step runs on the call's.
-            _UNPROVEN.discard((str(root), task))
-            _LAST_CHECK_EXIT.pop((str(root), task), None)
-            _LAST_CHECK_FAILURE.pop((str(root), task), None)
-            kept = _strings(record.get("scope"))
-            route += f"{task}'s check is now `{done_when}`, run on scope {json.dumps(own_scope)}"
-            route += (
-                f"; its record keeps scope {json.dumps(kept)}.\n\n"
-                if scope and kept and list(scope) != kept
-                else ".\n\n"
-            )
         elif not retrying and data_route is not None:
             # Run R16 resent T0002 and T0010 on such a check (#5, #6, #12, #13): the
             # open check had passed only because the test was not written yet.

@@ -16398,6 +16398,138 @@ async def test_open_task_rejected_done_when_still_runs_notes(
         assert R16_CHECK not in spawn
 
 
+def _open_task_in_scope(fake_beagle: Path, scope: list[str], check: str) -> None:
+    """T0002 open on `check`, its record holding `scope`."""
+    _open_task(fake_beagle, check=check)
+    record = json.loads((fake_beagle / "show.out").read_text())
+    (fake_beagle / "show.out").write_text(json.dumps({**record, "status": "open", "scope": scope}))
+
+
+async def _kept_bound_step(
+    tmp_path: Path, fake_beagle: Path, fake_tau: Path, done_when: str, reason: str
+) -> None:
+    """The step on open T0002 with notes and `done_when` runs the notes on the bound
+    check, with a note that `done_when` was not taken for `reason`."""
+    runtime, _ = _bound(tmp_path)
+    notes = "Write done.txt saying done"
+    args = {"task": "T0002", "done_when": done_when, "notes": notes}
+
+    result = await _tool(runtime, "pursuit_step").execute("c1", args)
+
+    assert "check not changed" not in result.text
+    assert (
+        "Kept the bound check `grep -q done done.txt`; the new done_when was not taken: "
+        in result.text
+    )
+    assert reason in result.text
+    assert _pursuit_calls(fake_beagle, "amend") == []
+    record = json.loads((fake_beagle / "show.out").read_text())
+    assert record["done_when"] == "grep -q done done.txt"
+    [run, *_] = _runs(fake_tau)
+    assert notes in run["stdin"]
+
+
+@pytest.mark.anyio
+async def test_open_task_rejected_done_when_already_passes_runs_notes_on_bound_check(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Audit 10: the rejection of a done_when that already passed dropped the notes.
+    project = _git_project(tmp_path, monkeypatch)
+    monkeypatch.chdir(project)
+    (project / "x.txt").write_text("x\n")
+    monkeypatch.setenv("FAKE_TAU_SUCCEEDS_ON", "99")
+    _open_task_in_scope(fake_beagle, ["done.txt"], "grep -q done done.txt")
+
+    await _kept_bound_step(
+        tmp_path, fake_beagle, fake_tau, "grep -q x x.txt", "`grep -q x x.txt` already passes"
+    )
+
+
+@pytest.mark.anyio
+async def test_open_task_rejected_done_when_amend_problem_runs_notes_on_bound_check(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Audit 10: an `_amend_problem` rejection dropped the notes.
+    project = _git_project(tmp_path, monkeypatch)
+    monkeypatch.chdir(project)
+    monkeypatch.setenv("FAKE_TAU_SUCCEEDS_ON", "99")
+    _open_task_in_scope(fake_beagle, ["done.txt"], "grep -q done done.txt")
+
+    await _kept_bound_step(
+        tmp_path,
+        fake_beagle,
+        fake_tau,
+        "python3 -m pytest --collect-only -q tests/",
+        "runs pytest --collect-only",
+    )
+
+
+@pytest.mark.anyio
+async def test_open_task_rejected_done_when_unwritten_runs_notes_on_bound_check(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Audit 10: an unwritten-check rejection (a pytest node no worker on this scope
+    # can write) dropped the notes.
+    project = _git_project(tmp_path, monkeypatch)
+    monkeypatch.chdir(project)
+    (project / "tests").mkdir()
+    (project / "tests" / "test_other.py").write_text("def test_x():\n    assert True\n")
+    monkeypatch.setenv("FAKE_TAU_SUCCEEDS_ON", "99")
+    _open_task_in_scope(fake_beagle, ["done.txt"], "grep -q done done.txt")
+
+    await _kept_bound_step(
+        tmp_path,
+        fake_beagle,
+        fake_tau,
+        "python3 -m pytest -q tests/test_other.py::test_missing",
+        "names `test_missing`, which is not in tests/test_other.py",
+    )
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("notes", ["", "Write done.txt saying done"])
+async def test_open_task_rejected_done_when_without_runnable_bound_check_still_refuses(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    notes: str,
+) -> None:
+    # Audit 10: a bound check that cannot run, or a call with no notes, keeps the
+    # refusal; there are no notes to run, or no check to run them against.
+    project = _git_project(tmp_path, monkeypatch)
+    monkeypatch.chdir(project)
+    (project / "x.txt").write_text("x\n")
+    bound = "grep -q done done.txt" if not notes else "true"
+    _open_task_in_scope(fake_beagle, ["done.txt"], bound)
+    runtime, _ = _bound(tmp_path)
+    args = {"task": "T0002", "done_when": "grep -q x x.txt"}
+    if notes:
+        args["notes"] = notes
+
+    result = await _tool(runtime, "pursuit_step").execute("c1", args)
+
+    assert result.text.startswith(
+        "pursuit_step: T0002's check not changed — `grep -q x x.txt` already passes before "
+        "any work, so it would close T0002 on no work."
+    )
+    assert "Kept the bound check" not in result.text
+    assert _pursuit_calls(fake_beagle, "amend") == [] and _runs(fake_tau) == []
+
+
 @pytest.mark.anyio
 @pytest.mark.parametrize("committed", [False, True])
 async def test_data_route_refusal_leads_with_its_call(
