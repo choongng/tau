@@ -29,7 +29,8 @@ from textual.containers import Container, Horizontal, Vertical, VerticalScroll
 from textual.content import Content, Span
 from textual.content import Style as TextualStyle  # type: ignore[attr-defined]
 from textual.css.query import NoMatches
-from textual.geometry import Offset
+from textual.geometry import Offset, Spacing
+from textual.layout import Layout
 from textual.message import Message
 from textual.selection import Selection
 from textual.widget import Widget
@@ -700,6 +701,7 @@ class TranscriptMessageWidget(Horizontal):
         )
         self._theme = theme
         self._role_style = _chat_item_role_style(item, theme)
+        self._joined_to_previous = False
         self._plain_render_key = (
             self.selection_text,
             self._role_style,
@@ -737,6 +739,22 @@ class TranscriptMessageWidget(Horizontal):
 
     def compose(self) -> Any:
         yield self._body_widget()
+
+    def set_joined_to_previous(self, joined: bool) -> None:
+        """Drop the blank row above this row when it continues a run of rows.
+
+        An inline style, not a class: the transcript calls this from its
+        `pre_layout`, and a class change would only restyle on a later frame,
+        while an inline margin is read by the layout that is about to run.
+        """
+        if joined == self._joined_to_previous:
+            return
+        self._joined_to_previous = joined
+        if joined:
+            margin = self.styles.margin
+            self.styles.margin = Spacing(0, margin.right, margin.bottom, margin.left)
+        else:
+            self.styles.clear_rule("margin")
 
     def _body_widget(self) -> Widget:
         body: Static | ThemedMarkdownWidget
@@ -1047,6 +1065,29 @@ class TranscriptView(VerticalScroll):
     def on_mount(self) -> None:
         """Follow new transcript content until the user scrolls away."""
         self.follow_output()
+
+    def pre_layout(self, layout: Layout) -> None:
+        """Run consecutive tool rows together; keep the gap around the run.
+
+        Calls from one assistant message already share a row, so a burst of
+        tool work split across messages showed as one row with no gaps next to
+        several rows with gaps. A tool row that directly follows another loses
+        its top margin, so the whole burst reads as one block, separated by the
+        usual blank row from whatever comes before and after it. This runs at
+        every layout rather than at each mount, because rows are mounted,
+        removed and reordered along many paths (streaming, windowing, the
+        thinking toggle), and adjacency is only certain here.
+        """
+        del layout
+        previous_is_tool = False
+        for child in self.children:
+            if not isinstance(child, TranscriptMessageWidget | StreamingTranscriptMessageWidget):
+                continue
+            if isinstance(child, TranscriptMessageWidget) and child.item.role == "tool":
+                child.set_joined_to_previous(previous_is_tool)
+                previous_is_tool = True
+            else:
+                previous_is_tool = False
 
     def follow_output(self) -> None:
         """Return to follow mode for a user-driven turn or explicit jump to bottom."""

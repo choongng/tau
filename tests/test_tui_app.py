@@ -10277,6 +10277,55 @@ async def test_hidden_thinking_line_is_not_stranded_by_a_thinking_only_message()
 
 
 @pytest.mark.anyio
+async def test_consecutive_tool_rows_run_together_with_a_gap_around_the_run() -> None:
+    app = TauTuiApp(FakeSession())
+
+    async def stream(event: AgentEvent) -> None:
+        app.adapter.apply(event)
+        await app._apply_streaming_transcript_event(event)
+
+    def gaps() -> list[tuple[str, int]]:
+        rows = [
+            child
+            for child in app.query_one("#transcript", TranscriptView).children
+            if isinstance(child, TranscriptMessageWidget | StreamingTranscriptMessageWidget)
+        ]
+        return [
+            (row.item.role, row.region.y - (previous.region.y + previous.region.height))
+            for previous, row in zip(rows, rows[1:], strict=False)
+        ]
+
+    async with app.run_test(size=(100, 40)) as pilot:
+        await pilot.pause()
+        await stream(AgentStartEvent())
+        await stream(MessageEndEvent(message=AssistantMessage(content="Starting.")))
+        # Calls from separate messages land in separate rows; calls from one
+        # message share a row. Either way a burst of tool work is one block.
+        for index in range(3):
+            call = ToolCall(
+                id=f"call-{index}",
+                name="bash",
+                arguments={"command": "ls", "description": f"Step {index}"},
+            )
+            for event in _thinking_message_events(f"plan {index}", (call,)):
+                await stream(event)
+        await stream(MessageEndEvent(message=AssistantMessage(content="Done.")))
+        await pilot.pause()
+
+        assert gaps() == [("tool", 1), ("tool", 0), ("tool", 0), ("assistant", 1)]
+
+        # Revealed thinking sits between the calls, so they are no longer a
+        # run: every row is separated again.
+        await pilot.press("ctrl+t")
+        await pilot.pause()
+        assert {gap for _, gap in gaps()} == {1}
+
+        await pilot.press("ctrl+t")
+        await pilot.pause()
+        assert gaps() == [("tool", 1), ("tool", 0), ("tool", 0), ("assistant", 1)]
+
+
+@pytest.mark.anyio
 async def test_tui_app_restored_thinking_toggles_in_persisted_order() -> None:
     app = TauTuiApp(
         FakeSession(
