@@ -6665,24 +6665,59 @@ def _check_test_files(command: str, root: Path) -> list[str]:
     return found
 
 
-def _imports_unwritten(command: str, scope: list[str], root: Path) -> tuple[str, str] | None:
-    """(test, module) when the check runs a test importing a module that does not
-    exist and that no path in `scope` would create, or None.
+def _imports_unwritten(
+    command: str, scope: list[str], root: Path
+) -> tuple[str, str, tuple[str, ...]] | None:
+    """(test, module, via) when the check runs a test importing a module that does not
+    exist and that no path in `scope` would create, or None. `via` holds the project
+    test files, in order, through which `test` imports `module`; () when it imports
+    `module` itself.
 
     Run R15 E9 amended the known-answers task's check to run tests/test_cases.py,
     which imports itc_clocks.itc that only a later task writes; no worker on the
     tests/ scope could pass it. A later part whose scope holds the module may bind
-    the same test.
+    the same test. Run R35: tests/test_case_data.py imported test_cases, which
+    imported the unwritten module; a test_* import was skipped, so none of this saw it.
     """
     if not scope:
         return None
     for rel in _check_test_files(command, root):
-        test = root / rel
-        for names in _test_imports(test):
-            if names[0].split(".")[0].startswith("test_"):
-                continue
-            if not any(_module_written(n, root, test.parent, scope) for n in names):
-                return rel, names[0]
+        found = _unwritten_import(root / rel, scope, root, set())
+        if found is not None:
+            return rel, found[0], found[1]
+    return None
+
+
+def _sibling_test(name: str, test: Path, root: Path) -> Path | None:
+    """The project test file an import of `name` in `test` names: a test_* module
+    beside `test`, at the root or in a tests package; or None."""
+    rel = name.replace(".", "/")
+    if not rel.rsplit("/", 1)[-1].startswith("test_"):
+        return None
+    for base in (test.parent, root, root / "tests"):
+        if (base / f"{rel}.py").is_file():
+            return base / f"{rel}.py"
+    return None
+
+
+def _unwritten_import(
+    test: Path, scope: list[str], root: Path, seen: set[Path]
+) -> tuple[str, tuple[str, ...]] | None:
+    """(module, via) for the first module `test` imports, itself or through the
+    sibling tests in `via`, that does not exist and no path in `scope` creates."""
+    seen.add(test.resolve())
+    for names in _test_imports(test):
+        siblings = [path for n in names if (path := _sibling_test(n, test, root)) is not None]
+        if siblings or names[0].split(".")[0].startswith("test_"):
+            for sibling in siblings:
+                if sibling.resolve() in seen:
+                    continue
+                found = _unwritten_import(sibling, scope, root, seen)
+                if found is not None:
+                    return found[0], (sibling.relative_to(root).as_posix(), *found[1])
+            continue
+        if not any(_module_written(n, root, test.parent, scope) for n in names):
+            return names[0], ()
     return None
 
 
@@ -6712,7 +6747,7 @@ def _data_test_route(
     found = _imports_unwritten(command, scope, root)
     if found is None:
         return None
-    test, module = found
+    test, module = found[0], found[1]
     data_test = _data_test(test, scope, root)
     if data_test == test:
         return None
@@ -6727,24 +6762,42 @@ def _self_import_note(command: str, scope: list[str], root: Path) -> str:
     then proposed binding that same test, and no worker ran to drop the import.
     """
     found = _self_import(command, scope, root)
-    if found is None:
-        return ""
-    test, module = found
+    return f"\n\n{_import_chain_note(*found)}" if found is not None else ""
+
+
+def _import_chain_note(test: str, module: str, via: tuple[str, ...]) -> str:
+    """What a data test that imports unwritten `module`, itself or through `via`, must
+    change.
+
+    Run R35: tests/test_case_data.py imported test_cases, which imported the unwritten
+    module; W8's direct import was refused and its `import test_cases` passed.
+    """
+    if not via:
+        return (
+            f"{test} imports {module}, which no path in this scope creates; a data test "
+            "reads only the data file and imports none of the code: remove that import."
+        )
+    chain = "".join(f"{sibling}, which imports " for sibling in via)
     return (
-        f"\n\n{test} imports {module}, which no path in this scope creates; a data test "
-        "reads only the data file and imports none of the code: remove that import."
+        f"{test} imports {chain}{module}, which no path in this scope creates: a data "
+        f"test imports no other test; copy what it needs into {test} or read the data "
+        "file directly."
     )
 
 
-def _self_import(command: str, scope: list[str], root: Path | None) -> tuple[str, str] | None:
-    """(test, module) for a check whose data test imports unwritten code, or None."""
+def _self_import(
+    command: str, scope: list[str], root: Path | None
+) -> tuple[str, str, tuple[str, ...]] | None:
+    """(test, module, via) for a check whose data test imports unwritten code, or None."""
     found = _imports_unwritten(command, scope, root) if scope and root and command else None
     if found is None or _data_test(found[0], scope, root) != found[0]:
         return None
     return found
 
 
-def _data_self_import(command: str, scope: list[str], root: Path | None) -> tuple[str, str] | None:
+def _data_self_import(
+    command: str, scope: list[str], root: Path | None
+) -> tuple[str, str, tuple[str, ...]] | None:
     """`_self_import` for a scope of data and tests only, where the test is a data test."""
     if not (_scope_has_data(scope) and _only_data_and_tests(scope)):
         return None
@@ -7061,6 +7114,17 @@ def _tests_only_proof_note(command: str, scope: list[str], root: Path | None) ->
     )
 
 
+def _data_test_imports_unwritten(data_check: str, scope: list[str], root: Path) -> str:
+    """What the data test `data_check` runs must change when it imports unwritten code
+    too, itself or through a sibling test; or "".
+
+    Run R35 #10: the data test imported the cases test, which imported the unwritten
+    module, and the data test was kept as the check that could pass.
+    """
+    found = _imports_unwritten(data_check, scope, root)
+    return _import_chain_note(*found) if found is not None else ""
+
+
 def _imports_unwritten_problem(command: str, scope: list[str], root: Path) -> str | None:
     """Why a check cannot pass on this scope because a test it runs imports unwritten
     code, naming the data-only test to bind instead; or None."""
@@ -7068,6 +7132,15 @@ def _imports_unwritten_problem(command: str, scope: list[str], root: Path) -> st
     if route is None:
         return None
     test, module, data_check, needs = route
+    neither = _data_test_imports_unwritten(data_check, scope, root)
+    if neither:
+        return (
+            f"{test} fails with ImportError until a later task writes {module}, and no path "
+            "in this scope creates it; neither it nor the data test can pass on this scope. "
+            f"{neither} Then this task's check runs the data test only (`{data_check}`)."
+            f"{_scope_note(needs, scope)} Call pursuit_step again with that, and that fix as "
+            "notes."
+        )
     return (
         f"{test} fails with ImportError until a later task writes {module}, and no path "
         "in this scope creates it, so no sub-agent on this scope can pass it. This task's "
@@ -9799,6 +9872,10 @@ def _kept_data_check(done_when: str, scope: list[str], bound: str, root: Path) -
         return None
     route = _data_test_route(done_when, scope, root)
     if route is None or not _bound_is_data_check(bound, route[2], root):
+        return None
+    if _data_test_imports_unwritten(bound, scope, root):
+        # Run R35 #10: the kept data test imported the code through a sibling test,
+        # as unpassable as the done_when; `_imports_unwritten_problem` refuses both.
         return None
     test, module = route[0], route[1]
     return (

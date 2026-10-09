@@ -11720,6 +11720,7 @@ def test_imports_unwritten_counts_stdlib_installed_and_project_modules(tmp_path:
     assert module._imports_unwritten("pytest -q tests/test_helped.py", ["tests/"], tmp_path) == (
         "tests/test_helped.py",
         "helpers",
+        (),
     )
     (tests / "test_helped.py").unlink()
 
@@ -11727,10 +11728,12 @@ def test_imports_unwritten_counts_stdlib_installed_and_project_modules(tmp_path:
     assert module._imports_unwritten("pytest -q tests/test_missing.py", ["tests/"], tmp_path) == (
         "tests/test_missing.py",
         "pkg.absent",
+        (),
     )
     assert module._imports_unwritten("pytest -q tests/", ["tests/"], tmp_path) == (
         "tests/test_missing.py",
         "pkg.absent",
+        (),
     )
     assert module._imports_unwritten("pytest -q tests/", ["pkg/absent.py"], tmp_path) is None
 
@@ -11757,6 +11760,7 @@ def test_stub_beside_the_tests_is_not_a_written_module(tmp_path: Path) -> None:
     assert module._imports_unwritten(check, scope, tmp_path) == (
         "tests/test_cases.py",
         "interval_tree_clocks",
+        (),
     )
     assert module._data_test_route(check, scope, tmp_path) == (
         "tests/test_cases.py",
@@ -16902,3 +16906,111 @@ async def test_known_answers_brief_import_error_is_a_defect(
         R35_COLLECTION_TAIL, ["cobs.py", "tests/"], project
     )
     assert code_scope and said not in code_scope
+
+
+def test_imports_unwritten_follows_sibling_test_import(tmp_path: Path) -> None:
+    # R35 E22-E26: tests/test_case_data.py imported test_cases, which imported the
+    # unwritten module; the test_* import was skipped and the chain went unseen.
+    module = _module()
+    tests = tmp_path / "tests"
+    tests.mkdir()
+    (tests / "test_codec.py").write_text("import json\nfrom codec import encode\n")
+    (tests / "test_data.py").write_text("import json\nimport test_codec\n")
+    scope = ["tests/cases.json", "tests/test_data.py"]
+    check = "python3 -m pytest -q tests/test_data.py"
+
+    assert module._imports_unwritten(check, scope, tmp_path) == (
+        "tests/test_data.py",
+        "codec",
+        ("tests/test_codec.py",),
+    )
+    # From a tests package, through two siblings, and round a cycle.
+    (tests / "test_data.py").write_text("from tests.test_mid import x\n")
+    (tests / "test_mid.py").write_text("import test_data\nfrom test_codec import encode\n")
+    assert module._imports_unwritten(check, scope, tmp_path) == (
+        "tests/test_data.py",
+        "codec",
+        ("tests/test_mid.py", "tests/test_codec.py"),
+    )
+    # Written code, or code a path in scope creates, is no chain.
+    assert module._imports_unwritten(check, [*scope, "codec.py"], tmp_path) is None
+    (tmp_path / "codec.py").write_text("def encode(): ...\n")
+    assert module._imports_unwritten(check, scope, tmp_path) is None
+    # A test_* import that is no project file is skipped, as before.
+    (tests / "test_data.py").write_text("import test_elsewhere\n")
+    assert module._imports_unwritten(check, scope, tmp_path) is None
+
+
+def test_self_import_note_names_chain_through_sibling_test(tmp_path: Path) -> None:
+    # R35: the self-import note returned "" for a data test importing the code
+    # through the cases test.
+    module = _module()
+    check = _case_data_test(tmp_path)
+    data_test = tmp_path / "tests" / "test_case_data.py"
+    data_test.write_text("import test_cases\n" + data_test.read_text())
+    (tmp_path / "tests" / "test_cases.py").write_text(R32_CASES_TEST)
+
+    note = module._self_import_note(check, R26_DATA_SCOPE, tmp_path).strip()
+
+    assert note == (
+        "tests/test_case_data.py imports tests/test_cases.py, which imports "
+        "interval_tree_clocks, which no path in this scope creates: a data test imports "
+        "no other test; copy what it needs into tests/test_case_data.py or read the data "
+        "file directly."
+    )
+    # A direct import keeps its own note.
+    data_test.write_text("import interval_tree_clocks\n")
+    direct = module._self_import_note(check, R26_DATA_SCOPE, tmp_path).strip()
+    assert direct.startswith("tests/test_case_data.py imports interval_tree_clocks, which")
+    assert direct.endswith("remove that import.")
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("new_route", [False, True])
+async def test_kept_data_check_not_kept_when_data_test_imports_code_transitively(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    new_route: bool,
+) -> None:
+    # R35 #10 (E24): the cases test was refused and the bound data test kept, though
+    # it imported the cases test and with it the unwritten module.
+    project = _git_project(tmp_path, monkeypatch)
+    monkeypatch.chdir(project)
+    data_check = _r32_tree(project)
+    data_test = project / "tests" / "test_case_data.py"
+    data_test.write_text("from test_cases import Clock\n" + data_test.read_text())
+    module = _module()
+    chain = (
+        "tests/test_case_data.py imports tests/test_cases.py, which imports "
+        "interval_tree_clocks, which no path in this scope creates: a data test imports "
+        "no other test; copy what it needs into tests/test_case_data.py or read the data "
+        "file directly."
+    )
+
+    assert module._kept_data_check(R16_CHECK, R32_SCOPE, data_check, project) is None
+    problem = module._imports_unwritten_problem(R16_CHECK, R32_SCOPE, project)
+    assert "neither it nor the data test can pass on this scope" in problem
+    assert chain in problem
+
+    monkeypatch.setenv("FAKE_TAU_SUCCEEDS_ON", "99")
+    _open_task(fake_beagle, check=data_check)
+    record = json.loads((fake_beagle / "show.out").read_text())
+    (fake_beagle / "show.out").write_text(
+        json.dumps({**record, "status": "open", "scope": R32_SCOPE})
+    )
+    (fake_beagle / "spawn.out").write_text("T0002 superseded by T0003\n")
+    runtime, _ = _bound(tmp_path)
+    args = {"task": "T0002", "done_when": R16_CHECK, "scope": R32_SCOPE, "notes": "fix it"}
+    if new_route:
+        args["new_route"] = True
+
+    result = await _tool(runtime, "pursuit_step").execute("c1", args)
+
+    assert "Kept done_when=" not in result.text
+    assert "neither it nor the data test can pass" in result.text
+    assert chain in result.text
+    assert _pursuit_calls(fake_beagle, "amend") == []
+    assert _runs(fake_tau) == []
