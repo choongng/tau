@@ -10466,13 +10466,17 @@ def _notes_only_call(task: str, notes: str) -> str:
     return f"pursuit_step task={json.dumps(task)}, notes={json.dumps(notes, ensure_ascii=False)}"
 
 
-def _judge_escalation(task: str, count: int, demand: str) -> str:
+def _judge_escalation(task: str, count: int, demand: str, lead: str = "") -> str:
     """The escalation of a task only the close's own judge kept open.
 
     Run R33 #13-#24: every not-done step had passed its check, yet the escalation
     asked for a new done_when, which the data-route rewrite put back to the bound
-    one; no call passed both, and the driver resent one call 12 times.
+    one; no call passed both, and the driver resent one call 12 times. Run R36
+    E57, E63: the not-done result and the not-workable refusal still said the next
+    step runs no sub-agent, so they render this too, with `lead` in place of the
+    refusal's "pursuit_step: <task> not run — ".
     """
+    lead = lead or f"pursuit_step: {task} not run — "
     reason = demand.rstrip(".")
     said = (
         f"\n{count} steps on it have left it not done, each with its check passing: the "
@@ -10480,10 +10484,10 @@ def _judge_escalation(task: str, count: int, demand: str) -> str:
         "keep the bound one (leave done_when and new_route out)."
     )
     if count >= JUDGE_NOTES_UNTIL:
-        head = f"pursuit_step: {task} not run — split it or stop.{said}"
+        head = f"{lead}split it or stop.{said}"
         return _escalation_options(task, count, head, rerun="")
     call = _notes_only_call(task, reason)
-    lead = f"pursuit_step: {task} not run — call instead: "
+    lead += "call instead: "
     short = call
     if len(lead) + len(short) > ESCALATION_HEAD_CHARS:
         short = _notes_only_call(task, "…")
@@ -10900,9 +10904,7 @@ def _not_done(
         if _LAST_CHECK_EXIT.get(key, 0) != 0:
             _NOT_DONE_CHECK_FAILED.add(key)
     if count >= ESCALATE_AFTER:
-        text += "\n\n" + _escalation(task, count).replace(
-            f"pursuit_step: {task} not run: ", "The next step on it runs no sub-agent: ", 1
-        )
+        text += "\n\n" + _still_open_escalation(task, count, root)
     elif count >= DRIVER_READS_UNTIL and scope:
         text += (
             f"\n\nThe files in {task}'s scope are the sub-agent's while it is open: "
@@ -10910,6 +10912,18 @@ def _not_done(
             f'or give it a new route (pursuit_step task="{task}", new_route=true).'
         )
     return _step_result(text)
+
+
+def _still_open_escalation(task: str, count: int, root: Path) -> str:
+    """What a not-done result, and a refusal pointing at `task`, say once `count`
+    steps have left it not done: the notes-only rerun when only the close's judge
+    kept it open, else that the next step runs no sub-agent."""
+    demand = _judge_kept_open(task, root)
+    if demand:
+        return _judge_escalation(task, count, demand, lead=f"{task} is still open — ")
+    return _escalation(task, count).replace(
+        f"pursuit_step: {task} not run: ", "The next step on it runs no sub-agent: ", 1
+    )
 
 
 def _held_scope(target: Path, root: Path) -> tuple[str, str, int] | None:
@@ -10976,6 +10990,9 @@ def _escalated_calls(workable: list[str], root: Path | None) -> str:
     for t in workable:
         count = _NOT_DONE.get((str(root), t), 0)
         if count >= ESCALATE_AFTER:
+            if _judge_kept_open(t, root):
+                said += "\n" + _still_open_escalation(t, count, root)
+                continue
             shown = _shown(t, root)
             if _unchanged_route(t, {}, shown, root):
                 split = _split_call(t, shown)

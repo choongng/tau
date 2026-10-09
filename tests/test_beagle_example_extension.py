@@ -16979,6 +16979,93 @@ def test_repeated_escalation_refusal_names_notes_only_call(
     assert json.dumps(long) in elided
 
 
+def _judge_only_results(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, steps: int, *, check_failed: bool = False
+) -> tuple[Any, Path, list[str]]:
+    """R36 T0006: `steps` not-done results, each with its check passing unless
+    `check_failed`, and the text each returned."""
+    project = _git_project(tmp_path, monkeypatch)
+    _r32_tree(project)
+    module = _module()
+    key = (str(project), "T0006")
+    texts = []
+    for n in range(steps):
+        module._LAST_CHECK_EXIT[key] = 1 if check_failed and n == 0 else 0
+        text = "T0006 — Cases: the check still fails" if check_failed and n == 0 else R32_STAYS_OPEN
+        texts.append(module._not_done(project, "T0006", R32_SCOPE, text).text)
+    return module, project, texts
+
+
+def test_not_done_escalation_offers_notes_rerun_when_only_close_kept_open(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # R36 E57, E63: all four not-done steps had passed their check, yet the result
+    # said the next step runs no sub-agent and asked for a rewritten done_when.
+    module, project, texts = _judge_only_results(tmp_path, monkeypatch, ESCALATE_STEPS)
+
+    tail = texts[-1].removeprefix(R32_STAYS_OPEN)
+    notes_call = f'pursuit_step task="T0006", notes={json.dumps(R32_DEMAND.rstrip("."))}'
+    assert tail.lstrip().startswith(f"T0006 is still open — call instead: {notes_call}")
+    assert f"- {notes_call}," in tail
+    assert "runs no sub-agent" not in tail and "rewritten done_when" not in tail
+    assert "new_route=true" not in tail
+    # Once JUDGE_NOTES_UNTIL is reached, it offers a split or a stop.
+    for _ in range(module.JUDGE_NOTES_UNTIL - ESCALATE_STEPS):
+        late = module._not_done(project, "T0006", R32_SCOPE, R32_STAYS_OPEN)
+    assert "T0006 is still open — split it or stop." in late.text
+    assert "notes=" not in late.text and "rewritten done_when" not in late.text
+    # A task its check kept open keeps the escalation it had.
+    _, _, failed = _judge_only_results(
+        tmp_path / "failed", monkeypatch, ESCALATE_STEPS, check_failed=True
+    )
+    assert "The next step on it runs no sub-agent: " in failed[-1]
+    assert "rewritten done_when" in failed[-1]
+
+
+def test_escalated_calls_offers_notes_rerun_when_only_close_kept_open(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # R36 E57, E63: the refusal of a step on another task said T0006 ran only by a
+    # new route; a notes-only step (#25) then ran a worker.
+    module, project, _ = _judge_only_results(tmp_path, monkeypatch, ESCALATE_STEPS)
+
+    said = module._escalated_calls(["T0006"], project)
+
+    notes_call = f'pursuit_step task="T0006", notes={json.dumps(R32_DEMAND.rstrip("."))}'
+    assert said.startswith(f"\nT0006 is still open — call instead: {notes_call}")
+    assert "runs only by a new route" not in said and "new_route=true" not in said
+    assert "rewritten done_when" not in said
+    # The call it offers is the one a step takes rather than refuses.
+    record = {"id": "T0006", "status": "open", "criteria": "c", "done_when": _r32_tree(project)}
+    taken = {"task": "T0006", "notes": R32_DEMAND.rstrip(".")}
+    assert module._judge_notes_rerun("T0006", taken, record | {"scope": R32_SCOPE}, project)
+    # A task its check kept open still runs only by a new route.
+    failed, f_project, _ = _judge_only_results(
+        tmp_path / "failed", monkeypatch, ESCALATE_STEPS, check_failed=True
+    )
+    assert "runs only by a new route" in failed._escalated_calls(["T0006"], f_project)
+
+
+@pytest.mark.parametrize("steps", [ESCALATE_STEPS, 4, 6])
+def test_not_done_escalation_text_matches_step_refusal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, steps: int
+) -> None:
+    # R36: the result, the not-workable refusal and the refused step each said a
+    # different thing about one task state.
+    module, project, texts = _judge_only_results(tmp_path, monkeypatch, steps)
+    record = {"id": "T0006", "status": "open", "criteria": "c", "done_when": _r32_tree(project)}
+    call = {"task": "T0006", "new_route": True, "scope": R32_SCOPE, "notes": "retry"}
+
+    result = texts[-1].removeprefix(R32_STAYS_OPEN).lstrip("\n")
+    listed = module._escalated_calls(["T0006"], project).lstrip("\n")
+    refused = module._escalation(
+        "T0006", steps, call, record | {"scope": R32_SCOPE}, project, False, False
+    )
+
+    assert result == listed
+    assert refused == result.replace("T0006 is still open — ", "pursuit_step: T0006 not run — ", 1)
+
+
 @pytest.mark.anyio
 async def test_locked_scope_refusal_offers_scope_without_locked(
     tmp_path: Path,
