@@ -12723,7 +12723,7 @@ async def test_tui_app_down_arrow_returns_to_blank_after_recalling_prompt() -> N
 
 
 @pytest.mark.anyio
-async def test_page_keys_scroll_transcript_while_prompt_has_focus() -> None:
+async def test_page_keys_jump_transcript_while_prompt_has_focus() -> None:
     app = TauTuiApp(
         FakeSession(
             messages=[
@@ -12739,12 +12739,19 @@ async def test_page_keys_scroll_transcript_while_prompt_has_focus() -> None:
         bottom_y = transcript.scroll_y
         assert bottom_y > 0
 
+        page = transcript.scrollable_content_region.height
         await pilot.press("pageup")
-        await pilot.pause()
-        assert transcript.scroll_y < bottom_y
+        assert transcript.scroll_y == bottom_y - page
         assert isinstance(app.focused, PromptInput)
 
-        await pilot.press("pagedown")
+        # The page keys jump like the wheel does: soon after the key, the
+        # view is already a page up, not partway through a glide. pilot.press
+        # waits animations out, so call the action directly.
+        app.action_page_transcript_up()
+        await asyncio.sleep(0.05)
+        assert transcript.scroll_y == bottom_y - 2 * page
+
+        await pilot.press("pagedown", "pagedown")
         await pilot.pause()
         assert transcript.scroll_y == bottom_y
 
