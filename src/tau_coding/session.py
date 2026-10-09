@@ -223,6 +223,13 @@ REPEATED_CALL_QUOTE = 300
 #: Tools that change the workspace: after one, a call's earlier result no
 #: longer predicts what it gives now, so the calls before it are forgotten.
 WORKSPACE_CHANGING_TOOLS = frozenset({"pursuit_step", "write", "edit"})
+#: A chat template's tool-call and channel control tokens. Gemma's pipe forms
+#: are never ordinary text; qwen's `<tool_call>` counts only with a function
+#: or JSON call opening after it, so a file that names the tag is left alone.
+TEMPLATE_TOOL_CALL_TOKEN = re.compile(
+    r"<\|tool_call>|<tool_call\|>|<\|channel>|<channel\|>"
+    r"|</?tool_call>\s*(?:<function=|\{\s*\"name\"\s*:)"
+)
 #: Characters a compaction summary is held to. The cut reserves this much for
 #: the summary before it is written, so a long summary cannot push the
 #: compacted context past the headroom the cut left.
@@ -1632,7 +1639,11 @@ class CodingSession:
         refusals in a row the run is stopped: a model that ignores the note
         that many times will not take it.
         """
-        problem = self._tool_run_as_command(call) or self._repeated_call(call)
+        problem = (
+            _template_tokens_in_arguments(call)
+            or self._tool_run_as_command(call)
+            or self._repeated_call(call)
+        )
         if problem is None:
             self._refused_in_a_row = 0
             return False, None
@@ -6079,6 +6090,33 @@ def _call_sentence(text: str, tools: set[str]) -> str | None:
             if len(sentence) > REPEATED_CALL_QUOTE:
                 sentence = sentence[found.start() :]
             return sentence[:REPEATED_CALL_QUOTE]
+    return None
+
+
+def _template_tokens_in_arguments(call: ToolCall) -> str | None:
+    """Why `call`'s arguments carry a chat template's tool-call tokens, or None.
+
+    Run R36's gemma driver ended its founding statement with
+    `<tool_call|><|channel>thought…<|tool_call>call:bash{command:`: the
+    reply's next call and its reasoning ran into this call's last string, and
+    were stored as the pursuit's goal.
+    """
+    pending: list[tuple[str, JSONValue]] = list(call.arguments.items())
+    while pending:
+        name, value = pending.pop(0)
+        if isinstance(value, str):
+            match = TEMPLATE_TOOL_CALL_TOKEN.search(value)
+            if match is not None:
+                token = match.group(0).split(">", 1)[0] + ">"
+                return (
+                    f"its arguments carry the chat template's own tool-call tokens "
+                    f"(`{token}` in `{name}`), so the reply's next call ran into this "
+                    "one; send one call per reply, with the text alone."
+                )
+        elif isinstance(value, dict):
+            pending.extend((f"{name}.{key}", item) for key, item in value.items())
+        elif isinstance(value, list):
+            pending.extend((f"{name}[{i}]", item) for i, item in enumerate(value))
     return None
 
 
