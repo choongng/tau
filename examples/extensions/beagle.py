@@ -5821,19 +5821,60 @@ def _bounded(text: str, value: str) -> bool:
     return found is not None
 
 
+#: One decimal number, a fraction kept, in a nested list result's rendering.
+_DECIMAL = re.compile(r"(?<![0-9A-Za-z.])\d+(?:\.\d+)?(?![0-9A-Za-z]|\.\d)")
+
+
+def _result_numbers(value: object) -> list[int | float] | None:
+    """A list result's numbers in order, nested lists flattened, or None when an
+    item at any depth is not a number or a list."""
+    if not isinstance(value, list):
+        return None
+    numbers: list[int | float] = []
+    for item in value:
+        if isinstance(item, list):
+            inner = _result_numbers(item)
+            if inner is None:
+                return None
+            numbers += inner
+        elif isinstance(item, int | float) and not isinstance(item, bool):
+            numbers.append(item)
+        else:
+            return None
+    return numbers
+
+
+def _renders_decimals(text: str, want: list[int | float]) -> bool:
+    """Whether a whole run of decimal numbers in `text` is `want`, value for value."""
+    run: list[float] = []
+    end = 0
+    for match in _DECIMAL.finditer(text):
+        if run and not _VALUE_SEPARATOR.fullmatch(text[end : match.start()]):
+            if run == want:
+                return True
+            run = []
+        run.append(float(match.group()))
+        end = match.end()
+    return run == want
+
+
 def _renders_result(text: str, result: object, whole: bool = False) -> bool:
     """Whether `text` holds `result` as the reference would print it.
 
     A list of ints as decimal tokens or two-digit hex bytes (with or without 0x
     or \\x, with or without separators), a long one by its head and tail around
-    an ellipsis; a number by str() or hex; a string by itself, whitespace aside,
+    an ellipsis; a nested list by all its numbers in order, a fraction as
+    decimals; a number by str() or hex; a string by itself, whitespace aside,
     or as the bytes it spells in hex.
 
     With `whole`, a number or string must be a whole value: bounded by no
     letter or digit, and not one of a bracketed group of several values.
     """
     if isinstance(result, list):
-        want = [int(v) for v in result]
+        flat = _result_numbers(result) or []
+        if not all(isinstance(v, int) for v in flat):
+            return _renders_decimals(text, [float(v) for v in flat])
+        want = [int(v) for v in flat]
         bases = (10, 16) if all(0 <= v <= 255 for v in want) else (10,)
         return any(_holds_sequence(run, want) for base in bases for run in _value_runs(text, base))
     if whole:
@@ -5861,7 +5902,7 @@ def _searchable_result(value: object) -> bool:
     if isinstance(value, bool) or value is None:
         return False
     if isinstance(value, list):
-        return bool(value) and all(isinstance(v, int) and not isinstance(v, bool) for v in value)
+        return bool(_result_numbers(value))
     if isinstance(value, int | float | str):
         return bool(str(value).strip())
     return False
@@ -5959,7 +6000,13 @@ def _quoted_context(source: str, lines: list[str]) -> list[str]:
 
 
 def _result_unquoted(case: object, references: list[list[str]]) -> bool:
-    """Whether `case` has a checkable result that is not where it must be.
+    """Whether `case` has a checkable result that is not where it must be."""
+    return _result_found(case, references) is False
+
+
+def _result_found(case: object, references: list[list[str]]) -> bool | None:
+    """Whether each of `case`'s checkable results is where it must be, or None
+    when it has none to check.
 
     A wide result must be in the case's source or the reference line after the
     quoted one; a narrow one (`_case_results`) in the quoted reference line or,
@@ -5969,10 +6016,12 @@ def _result_unquoted(case: object, references: list[list[str]]) -> bool:
 
     Audit 11: R36 case #2 quoted "The counter remains 1" for an event of 2, and
     passed on the 2 in "{0,2}" on the next line.
+
+    Run R44: a bare `true` has nothing to search, so it is not judged.
     """
     results = _case_results(case)
     if not results:
-        return False
+        return None
     sources = _source_strings(case)
     quoted: list[str] = []
     after: list[str] = []
@@ -5992,8 +6041,8 @@ def _result_unquoted(case: object, references: list[list[str]]) -> bool:
 
     checked = [(result, is_narrow) for result, is_narrow in results if quoted or not is_narrow]
     if not checked:
-        return False
-    return not all(found(result, is_narrow) for result, is_narrow in checked)
+        return None
+    return all(found(result, is_narrow) for result, is_narrow in checked)
 
 
 def _unquoted_cases(
@@ -6020,7 +6069,8 @@ def _unquoted_cases(
 
     Run R43: the hold named only the failing cases, and later workers changed
     sources an earlier close had accepted. The last element names the cases
-    that pass both rules, for the hold to say to keep.
+    that pass both rules, for the hold to say to keep. Run R44: a case whose
+    result was not judged (`_result_found` None) is not named there.
     """
     refs = root / REFERENCES_DIR
     texts = []
@@ -6050,9 +6100,14 @@ def _unquoted_cases(
             for i, case in enumerate(cases)
             if not any(_quotes_reference(s, text) for s in _source_strings(case) for text in texts)
         ]
-        wrong = [(i, case) for i, case in enumerate(cases) if _result_unquoted(case, references)]
-        held = {i for i, _ in unfound} | {i for i, _ in wrong}
-        sourced = [_case_label(case, i) for i, case in enumerate(cases) if i not in held]
+        verdicts = [_result_found(case, references) for case in cases]
+        wrong = [(i, case) for i, case in enumerate(cases) if verdicts[i] is False]
+        held = {i for i, _ in unfound}
+        sourced = [
+            _case_label(case, i)
+            for i, case in enumerate(cases)
+            if i not in held and verdicts[i] is True
+        ]
         if cases and 2 * len(unfound) > len(cases):
             names = [_case_label(case, i) for i, case in unfound[:3]]
             sources = [
@@ -6156,7 +6211,7 @@ def _case_inputs(case: object) -> list[object]:
 
 def _value_tokens(value: object) -> int:
     if isinstance(value, list):
-        return len(value)
+        return len(_result_numbers(value) or value)
     return len(re.findall(r"[0-9A-Za-z]+", str(value)))
 
 

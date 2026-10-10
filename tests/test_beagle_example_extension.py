@@ -4766,6 +4766,59 @@ def test_narrow_result_inside_a_larger_token_on_next_line_is_not_found() -> None
     assert not module._renders_result("344", "44", whole=True)
 
 
+def test_result_unquoted_requires_a_nested_result_not_one_scalar() -> None:
+    # Run R44: fork_of_seed's nested id was not searched, so its counter 0
+    # alone passed it against a quote that gives another nested value.
+    module = _module()
+    lines = [
+        "half = ((0, 0.5), (0.5, 1)), the counter stays 0.",
+        "split(1) = ((1, 0), (0, 1)), the counter stays 0.",
+    ]
+    source = "split(1) = ((1, 0), (0, 1)),"
+    wrong = {
+        "name": "fork_of_seed",
+        "input": {"id": 1},
+        "expected": {"id": [[0, 0.5], [0.5, 1]], "counter": 0, "ok": True},
+        "source": source,
+    }
+    assert module._result_unquoted(wrong, [lines])
+    swapped = {**wrong, "expected": {"id": [[0, 1], [1, 0]], "counter": 0}}
+    assert module._result_unquoted(swapped, [lines])
+    right = {**wrong, "expected": {"id": [[1, 0], [0, 1]], "counter": 0, "ok": True}}
+    assert not module._result_unquoted(right, [lines])
+    halves = {**wrong, "source": "half = ((0, 0.5), (0.5, 1)),"}
+    assert not module._result_unquoted(halves, [lines])
+    assert module._renders_result("[[0, 0.5], [0.5, 1]]", [[0, 0.5], [0.5, 1]])
+    assert not module._renders_result("(0, 0.5), (0.5, 1), (1, 2)", [[0, 0.5], [0.5, 1]])
+    assert not module._renders_result("0.5, 1", [[0, 0.5], [0.5, 1]])
+    assert not module._searchable_result([[0, "a"]])
+
+
+def test_keep_sourced_omits_a_case_with_no_searchable_result(tmp_path: Path) -> None:
+    # Run R44: causality_conflict_detection expected `true`, had nothing to
+    # search, and was listed as sourced for later workers to keep.
+    module = _module()
+    quote = "split(1) = ((1, 0), (0, 1)), the counter stays 0."
+    (tmp_path / "references").mkdir()
+    (tmp_path / "references" / "ref.txt").write_text(f"Splitting.\n{quote}\nThe end.\n")
+    cases = [
+        {"name": "kept", "input": {"id": 1}, "expected": [[1, 0], [0, 1]], "source": quote},
+        {"name": "bare", "input": {"id": 1}, "expected": True, "source": quote},
+        {"name": "empty", "input": {"id": 1}, "expected": None, "source": quote},
+        {"name": "wrong", "input": {"id": 1}, "expected": [[0, 1], [1, 0]], "source": quote},
+    ]
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "tests" / "cases.json").write_text(json.dumps(cases))
+    lines = [module._normalised(quote)]
+    assert module._result_found(cases[1], [lines]) is None
+    assert not module._result_unquoted(cases[1], [lines])
+    found = module._unquoted_cases(tmp_path, ["tests/cases.json"])
+    assert found is not None
+    assert found[1:5] == (1, 4, ["wrong"], True)
+    assert found[6] == ["kept"]
+    assert module._keep_sourced(found[6]) == "Already sourced, keep unchanged: kept."
+
+
 def test_result_unquoted_passes_when_each_changed_field_quoted(tmp_path: Path) -> None:
     module = _module()
     lines = [module._normalised(line) for line in R36_REFERENCE.splitlines() if line.strip()]
@@ -4976,7 +5029,11 @@ def test_r15_full_cases_file_all_quote_the_reference(tmp_path: Path) -> None:
     assert unfound == []
     (tmp_path / "tests").mkdir()
     (tmp_path / "tests" / "cases.json").write_text(R15_FULL_CASES_JSON, encoding="utf-8")
-    assert module._unquoted_cases(tmp_path, ["tests/cases.json"]) is None
+    # Run R44: the nested results are judged whole, and most of these prose
+    # quotes do not give them; the one quoting "(1, 0)" stays sourced.
+    found = module._unquoted_cases(tmp_path, ["tests/cases.json"])
+    assert found is not None and found[4] is True
+    assert found[6] == ["seed-stamp-is-one"]
 
 
 def test_known_answers_guidance_asks_for_a_quoted_source(tmp_path: Path) -> None:
