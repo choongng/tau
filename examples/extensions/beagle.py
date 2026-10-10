@@ -7465,6 +7465,71 @@ def _import_chain_note(test: str, module: str, via: tuple[str, ...]) -> str:
     )
 
 
+def _import_line(test_path: Path, name: str) -> str:
+    """The source line of the first import in `test_path` naming module `name` or a
+    submodule of it, stripped; "" when the AST has none."""
+    try:
+        text = test_path.read_text(encoding="utf-8")
+        tree = ast.parse(text)
+    except (OSError, SyntaxError, ValueError):
+        return ""
+    lines = text.splitlines()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            names = [alias.name for alias in node.names]
+        elif isinstance(node, ast.ImportFrom) and node.module and not node.level:
+            names = [node.module]
+        else:
+            continue
+        if any(n == name or n.startswith(f"{name}.") for n in names):
+            return lines[node.lineno - 1].strip()
+    return ""
+
+
+def _data_test_unwritten_import(
+    command: str, scope: list[str], root: Path
+) -> tuple[str, str, str, str] | None:
+    """(test, module, import line, data file) when, on a scope of data and tests, the
+    check runs a scoped test that imports, itself or through a sibling test, a module
+    neither the tree nor the installed packages provide and no scope path creates, and
+    `_data_test_route` has no other data test to bind instead; or None.
+
+    Run R41 T0005: tests/test_case_data.py imported the unwritten module, and the
+    not-done result's Next offered a corrected done_when.
+    """
+    if not (_scope_has_data(scope) and _only_data_and_tests(scope)):
+        return None
+    found = _imports_unwritten(command, scope, root)
+    if found is None or not _in_scope(found[0], scope, root):
+        return None
+    if _data_test_route(command, scope, root) is not None:
+        return None
+    test, module, via = found
+    imported = Path(via[0]).stem if via else module
+    data = next((r.rstrip("/") for r in scope if Path(r.rstrip("/")).suffix not in {"", ".py"}), "")
+    return test, module, _import_line(root / test, imported), data
+
+
+def _data_test_import_said(
+    task: str, check: str, found: tuple[str, str, str, str]
+) -> tuple[str, str]:
+    """The not-done lead and Next for a data test that imports unwritten code."""
+    test, module, line, data = found
+    at = f" (`{line}`)" if line else ""
+    return (
+        f"{test} imports {module}{at}, which neither the project tree nor the installed "
+        f"packages provide and no path in this scope creates, so the check fails for that "
+        f"import: {test} is the data test: it loads {data} only and must import none of "
+        "the code. The check is right; the import is the work: remove it, and check the "
+        "data's own fields. The cases run against the code in the cases test, under the "
+        "task that writes the code.",
+        f'Next: pursuit_step with task="{task}" and notes saying {test} must import none '
+        f"of the code: remove {f'`{line}`' if line else f'its import of {module}'} and every "
+        f"use of {module}, and test only what {data} holds. Pass no done_when: `{check}` "
+        "stays the check.",
+    )
+
+
 def _self_import(
     command: str, scope: list[str], root: Path | None
 ) -> tuple[str, str, tuple[str, ...]] | None:
@@ -13272,6 +13337,23 @@ def make_step_tool() -> Any:
                     "taken as this task's new route.\n\n"
                 )
             collection = _collection_failure_lead(verdict[1], scope, root)
+            self_imported = _data_test_unwritten_import(check, scope, root)
+            if self_imported is not None:
+                # Run R41 T0005: told to pass a corrected done_when, the driver
+                # weakened the check instead of having the import dropped.
+                import_lead, next_step = _data_test_import_said(task, check, self_imported)
+                unpassable = f"{import_lead}\n\n"
+            else:
+                next_step = (
+                    f'Next: pursuit_step with task="{task}" and notes saying what to fix. '
+                    + (
+                        f"{if_line}If this route is wrong: "
+                        + _spawn_limit_offer(task, check, scope, fresh)
+                        if _at_spawn_limit(task, fresh := _tree_nodes(root))
+                        else f"{if_line}If this route is wrong, pursuit_step with "
+                        f'task="{task}", new_route=true and notes saying what to do instead.'
+                    )
+                )
             return _not_done(
                 root,
                 task,
@@ -13287,14 +13369,7 @@ def make_step_tool() -> Any:
                 + ("" if collection else _implementation_in_tests_lead(root, scope, check))
                 + _unreported_runs(unreported, attempt)
                 + f"Last report:\n{shown}\n\n"
-                f'Next: pursuit_step with task="{task}" and notes saying what to fix. '
-                + (
-                    f"{if_line}If this route is wrong: "
-                    + _spawn_limit_offer(task, check, scope, fresh)
-                    if _at_spawn_limit(task, fresh := _tree_nodes(root))
-                    else f"{if_line}If this route is wrong, pursuit_step with "
-                    f'task="{task}", new_route=true and notes saying what to do instead.'
-                ),
+                + next_step,
             )
         if proof is not None and not proof.proven:
             state = "stays blocked" if retrying else "stays open"

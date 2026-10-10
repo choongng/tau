@@ -15999,6 +15999,115 @@ async def test_data_test_route_does_not_propose_the_importing_test_itself(
     ) in run["stdin"]
 
 
+R41_DATA_TEST = (
+    "import json\nfrom pathlib import Path\n\n\n"
+    "def test_case_data():\n"
+    "    import cobs\n\n"
+    "    for case in json.loads(Path(__file__).with_name('cases.json').read_text()):\n"
+    "        assert cobs.encode(bytes.fromhex(case['input'])).hex() == case['expected']\n"
+)
+
+
+async def _r41_not_done(
+    project: Path, fake_beagle: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> str:
+    """The not-done text of one failing step on R41 T0005's data-and-tests scope."""
+    monkeypatch.chdir(project)
+    check = _case_data_test(project)
+    (project / "tests" / "test_case_data.py").write_text(R41_DATA_TEST)
+    (project / "tests" / "cases.json").write_text(
+        '[{"name": "one zero", "input": "00", "expected": "0101"}]\n'
+    )
+    monkeypatch.setenv("FAKE_TAU_SUCCEEDS_ON", "99")
+    record = {"id": "T0005", "title": "Known answers", "status": "open"}
+    record |= {"scope": R26_DATA_SCOPE, "criteria": "cases", "done_when": check}
+    (fake_beagle / "show.out").write_text(json.dumps(record))
+    (fake_beagle / "next.out").write_text(json.dumps({"open": ["T0005"], "ready": []}))
+    (fake_beagle / "brief.out").write_text("# T0005: Known answers\n")
+    runtime, _ = _bound(tmp_path)
+    result = await _tool(runtime, "pursuit_step").execute("c1", {"task": "T0005", "attempts": 1})
+    return result.text
+
+
+@pytest.mark.anyio
+async def test_not_done_names_data_test_importing_unwritten_module(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # R41 T0005: the data test imported cobs, which no task in scope could write,
+    # and the not-done result never said the data test broke its own brief.
+    project = _pursuit_project(tmp_path)
+
+    text = await _r41_not_done(project, fake_beagle, tmp_path, monkeypatch)
+
+    assert "the check still fails after 1 sub-agent run(s)" in text
+    assert (
+        "tests/test_case_data.py imports cobs (`import cobs`), which neither the project "
+        "tree nor the installed packages provide and no path in this scope creates"
+    ) in text
+    assert (
+        "tests/test_case_data.py is the data test: it loads tests/cases.json only and must "
+        "import none of the code."
+    ) in text
+
+
+@pytest.mark.anyio
+async def test_not_done_keeps_result_when_data_test_imports_a_module_the_tree_has(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # With the module on disk the import is not the defect: the result is as before.
+    project = _pursuit_project(tmp_path)
+    (project / "cobs.py").write_text("def encode(data):\n    return b''\n")
+
+    text = await _r41_not_done(project, fake_beagle, tmp_path, monkeypatch)
+
+    assert "the check still fails after 1 sub-agent run(s)" in text
+    assert "is the data test" not in text
+    assert 'Next: pursuit_step with task="T0005" and notes saying what to fix.' in text
+
+
+def test_data_test_importing_only_installed_modules_is_not_named(tmp_path: Path) -> None:
+    project = _pursuit_project(tmp_path)
+    check = _case_data_test(project)
+    data_test = project / "tests" / "test_case_data.py"
+    data_test.write_text("import pytest\nimport anyio\n" + data_test.read_text())
+
+    assert _module()._data_test_unwritten_import(check, R26_DATA_SCOPE, project) is None
+
+
+@pytest.mark.anyio
+async def test_data_test_import_next_is_notes_not_done_when(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # R41 T0005's "Next:" offered a corrected done_when, and the driver weakened
+    # the check to a structural `python3 -c`.
+    project = _pursuit_project(tmp_path)
+
+    text = await _r41_not_done(project, fake_beagle, tmp_path, monkeypatch)
+
+    [next_step] = [line for line in text.splitlines() if line.startswith("Next:")]
+    assert next_step == (
+        'Next: pursuit_step with task="T0005" and notes saying tests/test_case_data.py must '
+        "import none of the code: remove `import cobs` and every use of cobs, and test only "
+        "what tests/cases.json holds. Pass no done_when: `python3 -m pytest -q "
+        "tests/test_case_data.py` stays the check."
+    )
+    assert "corrected done_when" not in text
+    assert "amend done_when" not in text
+    assert "new_route" not in text
+
+
 async def _first_known_answers_brief(
     tmp_path: Path, fake_beagle: Path, fake_tau: Path, monkeypatch: pytest.MonkeyPatch
 ) -> str:
