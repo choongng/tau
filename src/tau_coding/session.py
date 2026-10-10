@@ -220,6 +220,9 @@ REPEATED_CALL_WINDOW = 10
 REPEATED_CALL_STOP = 8
 #: Characters of a repeated call's earlier result its refusal quotes.
 REPEATED_CALL_QUOTE = 300
+#: How the note `buffer_tool_result` puts after a cut read begins; it names
+#: the offset to continue from.
+READ_CUT_NOTE = "[Read cut:"
 #: Tools that change the workspace: after one, a call's earlier result no
 #: longer predicts what it gives now, so the calls before it are forgotten.
 WORKSPACE_CHANGING_TOOLS = frozenset({"pursuit_step", "write", "edit"})
@@ -1824,14 +1827,29 @@ class CodingSession:
             tools = {tool.name for tool in self._harness.config.tools}
             if _named_call(head, tools) is None:
                 head = _call_sentence(text, tools) or head
+        first_line, limit = read_request(call.arguments)
+        buffered = self._buffer_result(
+            result, tool_name=call.name, first_line=first_line, limit=limit
+        )
+        if buffered is not result:
+            # Run R42's worker re-read a cut file eight times, each refusal
+            # quoting the file's first line: quote the cut note the model saw,
+            # which names the offset to continue from.
+            shown = "\n".join(b.text for b in buffered.content if isinstance(b, TextContent))
+            note = next(
+                (
+                    line.strip()
+                    for line in reversed(shown.splitlines())
+                    if line.strip().startswith(READ_CUT_NOTE)
+                ),
+                "",
+            )
+            head = note[:REPEATED_CALL_QUOTE] or head
+        result = buffered
         self._recent_heads[key] = head
         live = {seen for seen, _ in self._recent_calls}
         for stale in [seen for seen in self._recent_heads if seen not in live]:
             del self._recent_heads[stale]
-        first_line, limit = read_request(call.arguments)
-        result = self._buffer_result(
-            result, tool_name=call.name, first_line=first_line, limit=limit
-        )
         if cut_note is not None:
             result = result.model_copy(
                 update={"content": [*result.content, TextContent(text=cut_note)]}
