@@ -1,0 +1,14 @@
++++
+id = "001631-pursuit"
+ordinal = 1631
+kind = "pursuit"
+timestamp = "2026-10-10T20:23:57+00:00"
+summary = "pursuit open T0382: R43 fix: a known-answers test that passes without the code it imports is held"
+metric_command = ""
+drains = []
+hooks = []
++++
+
+criteria: The known-answers close holds a cases test that imports a module the tree does not provide and still passes (its import is guarded, so it judges nothing yet), naming the test and the guard; a cases test that imports no code, or whose import resolves, closes as before. An open whose bound-locked test already passes without the module it imports offers the known-answers fix split (_known_answers_fix_route), not the bind-it / it-already-passes pair that refuse each other. Structural (AST import + a run), no domain words. Tests test_known_answers_close_holds_a_cases_test_that_passes_without_the_code, test_open_on_a_locked_test_passing_without_its_module_offers_the_fix_split; whole file passes, ruff clean.
+decided by: sh -c 'echo "51ad8e3a2ff7631b43e3a3b1ea649db7fb4db7d3ada082f43dcba2a8438cc0d2  .beagle/checks/T0382/T0382.sh" | sha256sum -c --quiet && bash .beagle/checks/T0382/T0382.sh'
+budget: 80000 tokens
