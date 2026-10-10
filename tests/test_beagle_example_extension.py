@@ -18400,6 +18400,71 @@ def test_input_equal_result_checked_against_quoted_reference_line(tmp_path: Path
     assert module._unquoted_cases(tmp_path, ["tests/cases.json"]) is None
 
 
+#: A C decoder of the kind R35's reference ends with: statements, not results.
+C_SNIPPET = (
+    "Decoding is the reverse:\n"
+    "if (block && (code != 0xff)) // write a zero unless at the end\n"
+    "*decode++ = 0;\n"
+    "code = 0xff;\n"
+    "if (code == 0) {\n"
+    "} else if (code == 1)\n"
+    "length--;\n"
+)
+
+
+def test_result_lines_name_hex_table_rows_not_code_lines(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Audit 13: on R35's reference the close named only `*decode++ = 0;`, as a hex
+    # byte held a letter, so no table row of the worked examples was a value.
+    module = _module()
+    (tmp_path / "references").mkdir()
+    reference = C_SNIPPET + R35_REFERENCE
+    (tmp_path / "references" / "cobs.txt").write_text(reference)
+    lines = reference.splitlines()
+    rows = [
+        f'cobs.txt:{n} "{line}"'
+        for n, line in enumerate(lines, 1)
+        if "|" in line and any(ch.isdigit() for ch in line)
+    ]
+    assert len(rows) == 14
+    assert module._result_lines(tmp_path) == rows[: module.RESULT_LINES_MAX]
+
+    monkeypatch.setattr(module, "RESULT_LINES_MAX", 100)
+    named = module._result_lines(tmp_path)
+    assert named == rows
+    assert any('"| 4 | 03 11 22 02 33 00"' in line for line in named)
+    assert any('"| 254 | FF 01 02 03 ... FD FE 00"' in line for line in named)
+    assert not any("decode" in line or "code" in line for line in named)
+    assert not any("Example" in line or "Data bytes" in line for line in named)
+
+
+def test_result_lines_skip_code_statements(tmp_path: Path) -> None:
+    # A statement assigning a value reads as a relation with a value on its
+    # right; its `;`, `++`/`--` step or block brace marks it as code.
+    module = _module()
+    code = [
+        "*out++ = 0;",
+        "mask = 0x1f;",
+        "total = 12;",
+        "n = --k == 2",
+        "if (n == 0) {",
+        "} else if (n == 1)",
+    ]
+    results = ["f(2) = (4, 1)", "mask → 0x1f", "| 2 | 0A 1F 00", "0A 1F 00"]
+    for line in code:
+        assert not module._result_line(line, "For example:"), line
+    for line in results:
+        assert module._result_line(line, "For example:"), line
+    assert not module._result_line("e1 = e2", "For example:")  # a name, not a byte
+
+    (tmp_path / "references").mkdir()
+    (tmp_path / "references" / "f.txt").write_text(
+        "The step, for example:\n" + "\n".join(code[:3]) + "\nf(2) = (4, 1)\n"
+    )
+    assert module._result_lines(tmp_path) == ['f.txt:5 "f(2) = (4, 1)"']
+
+
 def test_short_result_with_no_quoted_context_is_not_flagged() -> None:
     # "1" or "ok" occurs in, or is absent from, unquoted text by chance: with no
     # reference line quoted there is nothing narrow to check it against.

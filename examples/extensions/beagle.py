@@ -6045,23 +6045,46 @@ RESULT_LINES_MAX = 4
 RESULT_LINE_CHARS = 80
 #: A relation between an expression and its value: `=`, `≡`, `∼`, `→`, `->`, `=>`.
 _RESULT_RELATION = re.compile(r"(?<![<>!=])(?:->|=>|==|⇒|→|↦|≡|∼|~|=)")
+#: A value that holds letters: a `0x1f`, or a run of two or more hex bytes split by
+#: spaces (`0A 1F 00`, `01 02 ... FE`); a lone `e1` is a name, not a byte.
+_HEX_VALUE = re.compile(
+    r"(?<![\w.])(?:0[xX][0-9A-Fa-f]+|[0-9A-Fa-f]{2}(?:\s+(?:(?:\.\.\.|…)\s+)?[0-9A-Fa-f]{2})+)"
+    r"(?![\w.])"
+)
+#: A line of code rather than a result: a statement's trailing `;`, a block's
+#: brace, or a `++`/`--` step such as `*p++`.
+_CODE_LINE = re.compile(r";$|^[{}]$|^\}|\{$|[\w)\]](?:\+\+|--(?![->]))|(?:\+\+|--)[\w*(]")
 
 
 def _concrete(text: str) -> bool:
-    """Whether `text` is a value alone: a digit, and no letter or variable name."""
-    return any(ch.isdigit() for ch in text) and not any(ch.isalpha() for ch in text)
+    """Whether `text` is a value alone: a digit, and no letter outside a hex value."""
+    rest = _HEX_VALUE.sub("", text)
+    return any(ch.isdigit() for ch in text) and not any(ch.isalpha() for ch in rest)
+
+
+def _table_row(text: str) -> bool:
+    """Whether `text` is a table row of values: two or more cells, each a value sequence."""
+    cells = [cell.strip() for cell in text.split("|")]
+    filled = [cell for cell in cells if cell]
+    return len(filled) >= 2 and all(_concrete(cell) for cell in filled)
 
 
 def _result_line(text: str, lead: str) -> bool:
     """Whether a reference line gives a concrete result.
 
-    Either a relation whose right side is a value alone (`split(1) = ((1, 0), (0, 1))`,
-    not the rule `split((0, i)) = ((0, i1), (0, i2))`), or a worked example: a line
-    of values alone after a prose line ending in a colon.
+    A table row of values (`3 | 0A 1F 00`); a single relation whose right side is a
+    value alone (`f(2) = (4, 1)`, not the rule `f(x) = (2x, 1)` nor the chain
+    `1 = (1) = ((1))`); or a worked example: a line of values alone after a prose
+    line ending in a colon. A line of code (`n = 0;`, `*p++`) is none of them.
     """
+    if _CODE_LINE.search(text):
+        return False
+    if "|" in text and _table_row(text):
+        return True
     relation = _RESULT_RELATION.search(text)
     if relation and text[: relation.start()].strip():
-        return _concrete(text[relation.end() :])
+        right = text[relation.end() :]
+        return not _RESULT_RELATION.search(right) and _concrete(right)
     return _concrete(text) and lead.rstrip().endswith(":") and any(ch.isalpha() for ch in lead)
 
 
