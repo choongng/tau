@@ -16531,7 +16531,11 @@ R41_DATA_TEST = (
 
 
 async def _r41_not_done(
-    project: Path, fake_beagle: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    project: Path,
+    fake_beagle: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    scope: list[str] = R26_DATA_SCOPE,
 ) -> str:
     """The not-done text of one failing step on R41 T0005's data-and-tests scope."""
     monkeypatch.chdir(project)
@@ -16542,7 +16546,7 @@ async def _r41_not_done(
     )
     monkeypatch.setenv("FAKE_TAU_SUCCEEDS_ON", "99")
     record = {"id": "T0005", "title": "Known answers", "status": "open"}
-    record |= {"scope": R26_DATA_SCOPE, "criteria": "cases", "done_when": check}
+    record |= {"scope": scope, "criteria": "cases", "done_when": check}
     (fake_beagle / "show.out").write_text(json.dumps(record))
     (fake_beagle / "next.out").write_text(json.dumps({"open": ["T0005"], "ready": []}))
     (fake_beagle / "brief.out").write_text("# T0005: Known answers\n")
@@ -16593,6 +16597,52 @@ async def test_not_done_keeps_result_when_data_test_imports_a_module_the_tree_ha
     assert "the check still fails after 1 sub-agent run(s)" in text
     assert "is the data test" not in text
     assert 'Next: pursuit_step with task="T0005" and notes saying what to fix.' in text
+
+
+@pytest.mark.anyio
+async def test_data_test_unwritten_import_on_a_directory_scope(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # R44 T0002: the scope was ['tests/'], the cases data sat under it, and the
+    # data test's unwritten import was never named, as it was for listed files.
+    project = _pursuit_project(tmp_path)
+
+    text = await _r41_not_done(project, fake_beagle, tmp_path, monkeypatch, ["tests/"])
+
+    assert (
+        "tests/test_case_data.py imports cobs (`import cobs`), which neither the project "
+        "tree nor the installed packages provide and no path in this scope creates"
+    ) in text
+    assert (
+        "tests/test_case_data.py is the data test: it loads tests/cases.json only and must "
+        "import none of the code."
+    ) in text
+    [next_step] = [line for line in text.splitlines() if line.startswith("Next:")]
+    assert next_step.startswith(
+        'Next: pursuit_step with task="T0005" and notes saying tests/test_case_data.py must '
+        "import none of the code: remove `import cobs`"
+    )
+    assert "Pass no done_when" in next_step and "new_route" not in text
+    (project / "tests" / "cases.json").unlink()
+    check = "python3 -m pytest -q tests/test_case_data.py"
+    assert _module()._data_test_unwritten_import(check, ["tests/"], project) is None
+
+
+def test_scope_has_data_counts_a_data_file_under_a_directory_entry(tmp_path: Path) -> None:
+    module = _module()
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "tests" / "test_m.py").write_text("def test_m():\n    pass\n")
+    assert not module._scope_has_data(["tests/"], tmp_path)
+    (tmp_path / "tests" / "data").mkdir()
+    (tmp_path / "tests" / "data" / "cases.json").write_text("[]\n")
+    assert module._scope_has_data(["tests/"], tmp_path)
+    assert module._scope_has_data(["tests"], tmp_path)
+    assert module._scope_data(["tests/"], tmp_path) == ["tests/data/cases.json"]
+    assert not module._scope_has_data(["tests/"])
 
 
 def test_data_test_importing_only_installed_modules_is_not_named(tmp_path: Path) -> None:

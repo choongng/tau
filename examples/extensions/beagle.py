@@ -7592,7 +7592,7 @@ def _data_test_unwritten_import(
     Run R41 T0005: tests/test_case_data.py imported the unwritten module, and the
     not-done result's Next offered a corrected done_when.
     """
-    if not (_scope_has_data(scope) and _only_data_and_tests(scope)):
+    if not _only_data_and_tests(scope) or not (data := _scope_data(scope, root)):
         return None
     found = _imports_unwritten(command, scope, root)
     if found is None or not _in_scope(found[0], scope, root):
@@ -7601,8 +7601,7 @@ def _data_test_unwritten_import(
         return None
     test, module, via = found
     imported = Path(via[0]).stem if via else module
-    data = next((r.rstrip("/") for r in scope if Path(r.rstrip("/")).suffix not in {"", ".py"}), "")
-    return test, module, _import_line(root / test, imported), data
+    return test, module, _import_line(root / test, imported), data[0]
 
 
 def _data_test_import_said(
@@ -9356,9 +9355,31 @@ def _in_scope(rel: str, scope: list[str], root: Path | None = None) -> bool:
     return any(rel == s.rstrip("/") or rel.startswith(s.rstrip("/") + "/") for s in scope)
 
 
-def _scope_has_data(scope: list[str]) -> bool:
-    """Whether `scope` names a data file (a file with a suffix other than .py)."""
-    return any(Path(rel.rstrip("/")).suffix not in {"", ".py"} for rel in scope)
+def _scope_data(scope: list[str], root: Path | None = None) -> list[str]:
+    """The data files `scope` names (a suffix other than .py) and, given `root`, the
+    cases data files on disk under a directory entry.
+
+    Run R44 T0002: the scope was ['tests/'], the cases data sat under it, and only
+    file entries were counted, so the data test's unwritten import went unnamed.
+    """
+    found: list[str] = []
+    for entry in scope:
+        rel = entry.rstrip("/")
+        if Path(rel).suffix not in {"", ".py"}:
+            found.append(rel)
+        elif root is not None and (root / rel).is_dir():
+            for path in sorted((root / rel).rglob("*")):
+                with contextlib.suppress(ValueError):
+                    under = path.relative_to(root).as_posix()
+                    if path.is_file() and _is_cases_data(under) and under not in found:
+                        found.append(under)
+    return found
+
+
+def _scope_has_data(scope: list[str], root: Path | None = None) -> bool:
+    """Whether `scope` names a data file (a file with a suffix other than .py) or,
+    given `root`, holds a cases data file under a directory entry."""
+    return bool(_scope_data(scope, root))
 
 
 def _imported_modules(root: Path, scope: list[str]) -> list[str]:
