@@ -4738,6 +4738,38 @@ def test_references_brief_states_line_counts_and_read_cost(tmp_path: Path) -> No
     assert "by line range" in module._references_brief(tmp_path, context_only=True)
 
 
+def test_references_brief_says_how_to_search_references(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # R40: workers re-read whole references 6-20 times and still invented values.
+    module = _module()
+    refs = tmp_path / "references"
+    refs.mkdir()
+    (refs / "paper.txt").write_text("the value is 42\n")
+    (refs / "index.json").write_text(
+        json.dumps({"request": "x", "fetched": {"paper.txt": "https://e.org/p"}})
+    )
+    real = shutil.which
+    monkeypatch.setattr(
+        module.shutil, "which", lambda name, *a, **k: "/bin/tilth" if name == "tilth" else None
+    )
+    brief = module._references_brief(tmp_path, context_only=True)
+    tilth = 'tilth "<words>" --scope references'
+    assert module._reference_search() == tilth
+    assert f"{module.QUOTED_SOURCE_NOTE} To find the line that gives a value" in brief
+    assert f"`{tilth}`, rather than reading the reference through." in brief
+    assert tilth not in module._references_brief(tmp_path)
+
+    monkeypatch.setattr(
+        module.shutil, "which", lambda name, *a, **k: None if name == "tilth" else real(name)
+    )
+    grep = 'grep -n -i -F "<words>" references/*.txt'
+    assert module._reference_search() == grep
+    fallback = module._references_brief(tmp_path, context_only=True)
+    assert f"`{grep}`, rather than reading the reference through." in fallback
+    assert "tilth" not in fallback
+
+
 def test_a_witness_block_is_read_from_the_end_of_a_report() -> None:
     witness = _module()._witness
     assert witness(WITNESSED_REPORT) == ("src/clock.py", "    return a + b", "    return a - b")
@@ -11861,6 +11893,45 @@ async def test_no_write_guard_counts_in_scope_paging(
 
 
 @pytest.mark.anyio
+async def test_reread_refusal_on_reference_offers_search(
+    tmp_path: Path, beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # R40: a refused reference re-read said only "write now"; drivers fell back on grep.
+    module = _module()
+    monkeypatch.setenv(module.WORKER_MAX_TURNS_ENV, "10")
+    real = shutil.which
+    monkeypatch.setattr(
+        module.shutil, "which", lambda name, *a, **k: None if name == "tilth" else real(name)
+    )
+    runtime = _scoped_worker(tmp_path, monkeypatch, scope="tests/x.py")
+    project = tmp_path / "project"
+    (project / "references").mkdir()
+    (project / "references" / "paper.txt").write_text("the value is 42\n")
+    (project / "notes.txt").write_text("x\n")
+    read = _tool_with_hooks(runtime, "read")
+
+    early = [await read.execute(f"r{i}", {"path": "references/paper.txt"}) for i in range(5)]
+    late = await read.execute("r5", {"path": "references/paper.txt"})
+    other = module._reread_refusal("read", {"path": "notes.txt"}, project, ("tests/x.py",), 6)
+
+    assert all(result.text == "ran" for result in early)
+    assert "refusing to read references/paper.txt: 5 of 10 calls used" in late.text
+    grep = 'grep -n -i -F "<words>" references/*.txt'
+    assert f"Search the references instead with bash, `{grep}`, for the line" in late.text
+    assert "then write tests/x.py now." in late.text
+    assert other is not None and "Search the references" not in other
+
+    monkeypatch.setattr(
+        module.shutil, "which", lambda name, *a, **k: "/bin/tilth" if name == "tilth" else None
+    )
+    refusal = module._reread_refusal(
+        "read", {"path": "references/paper.txt"}, project, ("tests/x.py",), 6
+    )
+    assert refusal is not None
+    assert '`tilth "<words>" --scope references`' in refusal
+
+
+@pytest.mark.anyio
 async def test_no_write_guard_counts_bash_runs_without_writes(
     tmp_path: Path, beagle: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -18497,6 +18568,30 @@ async def test_judge_only_escalation_names_cases_and_result_lines(
     assert lines in notes and json.dumps(lines, ensure_ascii=False)[1:-1] in text
     assert "only the close's source check keeps it open, on case nested_twist" in text
     assert "unit_twist" not in text  # its source gives its result
+
+
+def test_unanswered_case_note_says_how_to_search(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # R40: workers re-quoted rule lines; the note says how to find a result line.
+    module = _module()
+    monkeypatch.setattr(
+        module.shutil, "which", lambda name, *a, **k: "/bin/tilth" if name == "tilth" else None
+    )
+    (tmp_path / "references").mkdir()
+    bare = module._unanswered_case_note(tmp_path)
+    assert bare.endswith(
+        'To find lines that give a result, search with bash: `tilth "<words>" --scope references`.'
+    )
+
+    (tmp_path / "references" / "rules.txt").write_text(RULES_REFERENCE)
+    monkeypatch.setattr(module.shutil, "which", lambda name, *a, **k: None)
+    listed = module._unanswered_case_note(tmp_path)
+    assert "Lines of references/*.txt that give a concrete result: " in listed
+    assert listed.endswith(
+        "To find more lines that give a result, search with bash: "
+        '`grep -n -i -F "<words>" references/*.txt`.'
+    )
 
 
 @pytest.mark.anyio

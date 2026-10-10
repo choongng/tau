@@ -2531,6 +2531,26 @@ QUOTED_SOURCE_NOTE = (
 )
 
 
+def _reference_search(words: str = "<words>") -> str:
+    """The shell command that finds the lines of references/*.txt holding `words`.
+
+    Run R40: workers re-read whole references 6-20 times and still invented
+    values, and drivers refused a re-read fell back on grep. tilth prints each
+    match with its line number; without it, `grep -n` does.
+    """
+    if shutil.which("tilth"):
+        return f'tilth "{words}" --scope {REFERENCES_DIR}'
+    return f'grep -n -i -F "{words}" {REFERENCES_DIR}/*.txt'
+
+
+def _reference_search_note() -> str:
+    """The sentence saying how to find the reference line that gives a value."""
+    return (
+        "To find the line that gives a value, search for words from it with bash, "
+        f"`{_reference_search()}`, rather than reading the reference through."
+    )
+
+
 def _references_brief(root: Path, context_only: bool = False) -> str:
     """The worker brief's part from `references/index.json`: request and references.
 
@@ -2567,7 +2587,7 @@ def _references_brief(root: Path, context_only: bool = False) -> str:
         )
         parts.append(f"{lead}:\n<<<\n{request}\n>>>")
     if context_only and fetched:
-        parts.append(QUOTED_SOURCE_NOTE)
+        parts.append(f"{QUOTED_SOURCE_NOTE} {_reference_search_note()}")
         parts.append(
             "A case needs only the lines it cites: read those by line range "
             "(offset and limit), not the whole file."
@@ -6207,7 +6227,10 @@ def _unanswered_case_note(root: Path) -> str:
             + "; ".join(candidates)
             + "."
         )
-    return note
+    return (
+        f"{note} To find {'more ' if candidates else ''}lines that give a result, search "
+        f"with bash: `{_reference_search()}`."
+    )
 
 
 def _reads_locked_data(root: Path, test: str, data: list[str]) -> bool:
@@ -14393,6 +14416,8 @@ def _reread_refusal(
     quarter of the cap: a write may need it, and a file too long to page within
     the cap is queried instead. `reads` counts each file's reads so far. Run
     R34: W9 paged the in-scope 4048-line tests/cases.json 27 times and wrote nothing.
+    Run R40: workers re-read whole references 6-20 times; a refused read of one
+    offers the search that finds the line instead.
     """
     cap = _worker_max_turns()
     if tool != "read":
@@ -14426,6 +14451,13 @@ def _reread_refusal(
             f"{calls - 1} of {cap} calls are used with nothing written. Query it instead, "
             "e.g. `python3 -c` over the file for the case or line you need, and write "
             f"{', '.join(scope)} now."
+        )
+    # A scope never names references/ (`_scope_problem`), so their re-reads land here.
+    if root / REFERENCES_DIR in target.parents:
+        return (
+            f"refusing to read {path}: {calls - 1} of {cap} calls used and nothing written. "
+            f"Search the references instead with bash, `{_reference_search()}`, for the "
+            f"line that gives the value you need, then write {', '.join(scope)} now."
         )
     return (
         f"refusing to read {path}: {calls - 1} of {cap} calls used and nothing written. "
