@@ -19047,3 +19047,133 @@ async def test_kept_data_check_not_kept_when_data_test_imports_code_transitively
     assert chain in result.text
     assert _pursuit_calls(fake_beagle, "amend") == []
     assert _runs(fake_tau) == []
+
+
+#: R40 class 4: T0011's check ran a test that was neither on disk nor in its scope.
+R40_ABSENT_CHECK = "python3 -m pytest -q tests/test_case_data.py tests/test_cases_source.py"
+
+
+@pytest.mark.anyio
+async def test_open_refuses_check_running_absent_file_outside_scope(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # R40 class 4: T0011 opened with scope [tests/cases.json] on a check running
+    # tests/test_cases_source.py, absent; pytest exited 4 and workers met 21 refusals.
+    project = _pursuit_project(tmp_path)
+    monkeypatch.chdir(project)
+    _case_data_test(project)
+    (project / "tests" / "cases.json").write_text('[{"name": "seed", "result": 1}]\n')
+    scope = ["tests/cases.json"]
+    widened = ["tests/cases.json", "tests/test_cases_source.py"]
+    _ready_task(fake_beagle)
+    runtime, _ = _bound(tmp_path)
+    step = _tool(runtime, "pursuit_step")
+    args = {"task": "T0002", "criteria": "cases", "done_when": R40_ABSENT_CHECK}
+
+    refused = await step.execute("c1", {**args, "scope": scope})
+
+    assert refused.text.startswith("pursuit_step: T0002 not opened — ")
+    assert (
+        "runs tests/test_cases_source.py, which is not on disk and outside the scope "
+        "(tests/cases.json)" in refused.text
+    )
+    assert "Writes outside the scope are refused" in refused.text
+    assert f"scope={json.dumps(widened)}" in refused.text
+    assert _pursuit_calls(fake_beagle, "open") == []
+
+    # The call it gives opens: the absent test in scope is the work.
+    taken = await step.execute("c2", {**args, "scope": widened})
+    assert "not opened" not in taken.text
+    [opened] = _pursuit_calls(fake_beagle, "open")
+    assert opened[opened.index("--done-when") + 1] == R40_ABSENT_CHECK
+
+    guard = _module()._absent_check_file_problem
+    for check, held in (
+        (R40_ABSENT_CHECK, widened),
+        (R40_ABSENT_CHECK, ["tests/"]),
+        (R40_ABSENT_CHECK, []),
+        ("python3 -m pytest -q tests/test_case_data.py", scope),
+        ("grep -q x tests/test_cases_source.py", scope),
+    ):
+        assert guard(check, held, project) is None, (check, held)
+    script = guard("python3 tests/test_cases_source.py", scope, project)
+    assert script is not None and "tests/test_cases_source.py" in script
+
+
+@pytest.mark.anyio
+async def test_not_done_names_absent_check_file_outside_scope(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # R40 class 4: T0011's not-done results showed pytest's exit 4 and nothing named
+    # why no worker could pass it; T0013 and T0014 kept the same scope.
+    project = _pursuit_project(tmp_path)
+    monkeypatch.chdir(project)
+    _case_data_test(project)
+    (project / "tests" / "cases.json").write_text('[{"name": "seed", "result": 1}]\n')
+    scope = ["tests/cases.json"]
+    widened = json.dumps(["tests/cases.json", "tests/test_cases_source.py"])
+    monkeypatch.setenv("FAKE_TAU_SUCCEEDS_ON", "99")
+    _open_task_in_scope(fake_beagle, scope, R40_ABSENT_CHECK)
+    runtime, _ = _bound(tmp_path)
+    step = _tool(runtime, "pursuit_step")
+
+    result = await step.execute("c1", {"task": "T0002", "notes": "go", "attempts": 2})
+
+    said = (
+        f"`{R40_ABSENT_CHECK}` exits 4 on tests/test_cases_source.py, which is not on disk "
+        "and outside T0002's scope (tests/cases.json). Writes outside the scope are refused"
+    )
+    assert said in result.text
+    assert f'task="T0002", new_route=true, scope={widened}' in result.text
+    assert "If the check itself is wrong" not in result.text
+    assert len(_runs(fake_tau)) == 1
+
+    module = _module()
+    out = "ERROR: file or directory not found: tests/test_cases_source.py\n"
+    broke = module._check_broke(4, out, scope, project)
+    assert broke is not None and "tests/test_cases_source.py" in broke
+    assert "(tests/cases.json)" in broke
+    assert module._check_broke(4, out) is None
+    assert module._check_broke(4, out, ["tests/"], project) is None
+
+    (fake_beagle / "spawn.out").write_text("T0002 superseded by T0003\n")
+    route = {"task": "T0002", "new_route": True, "scope": scope, "notes": "try again"}
+    refused = await step.execute("c2", route)
+    assert refused.text.startswith("pursuit_step: no new route for T0002 — ")
+    assert "tests/test_cases_source.py" in refused.text
+    assert "(tests/cases.json)" in refused.text and f"scope={widened}" in refused.text
+    assert _pursuit_calls(fake_beagle, "spawn") == []
+
+
+@pytest.mark.anyio
+async def test_brief_scope_line_says_outside_writes_are_refused(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # R40 class 4: W13 read "(paths changed outside it are named at close)" as leave
+    # to write outside the scope, which the worker guard refuses.
+    beagle_line = "Scope: tests/cases.json (paths changed outside it are named at close)\n"
+    told = _module()._without_beagle_habits(beagle_line)
+    assert told == "Scope: tests/cases.json (writes outside it are refused)\n"
+
+    monkeypatch.chdir(_pursuit_project(tmp_path))
+    _open_task_in_scope(fake_beagle, ["done.txt"], "grep -q done done.txt")
+    (fake_beagle / "brief.out").write_text(f"# T0002: Parser\nDo the parser.\n{beagle_line}")
+    runtime, _ = _bound(tmp_path)
+
+    await _tool(runtime, "pursuit_step").execute("c1", {"task": "T0002", "attempts": 1})
+
+    [run, *_] = _runs(fake_tau)
+    assert "Scope: tests/cases.json (writes outside it are refused)" in run["stdin"]
+    assert "named at close" not in run["stdin"]

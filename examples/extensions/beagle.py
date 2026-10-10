@@ -8172,15 +8172,53 @@ async def _run_check(command: str, root: Path, timeout: float) -> tuple[int, str
     return proc.returncode or 0, f"{out}\n{note}".strip() if note else out
 
 
-def _check_broke(rc: int, output: str) -> str | None:
+def _absent_outside_scope(
+    rc: int, output: str, scope: list[str] | None, root: Path | None
+) -> list[str]:
+    """The paths a pytest exit 4 found no file or directory at that are not on disk
+    and outside `scope`: no worker on that scope may write them (run R40 class 4)."""
+    if rc != 4 or not scope or root is None:
+        return []
+    found: list[str] = []
+    for match in re.finditer(r"file or directory not found:\s*(\S+)", output):
+        rel = _root_relative(match.group(1).split("::")[0].rstrip("/"), root)
+        if rel is None:
+            continue
+        rel = os.path.normpath(rel)
+        if rel not in found and not (root / rel).exists() and not _in_scope(rel, scope, root):
+            found.append(rel)
+    return found
+
+
+def _absent_outside_scope_said(task: str, check: str, absent: list[str], scope: list[str]) -> str:
+    """Why `check` cannot pass on `scope`: it exits 4 on `absent`, out of every worker's reach."""
+    files = ", ".join(absent)
+    return (
+        f"`{check}` exits 4 on {files}, which is not on disk and outside {task}'s scope "
+        f"({', '.join(scope)}). Writes outside the scope are refused, so no worker can "
+        "write it, and the check cannot pass on this scope."
+    )
+
+
+def _check_broke(
+    rc: int, output: str, scope: list[str] | None = None, root: Path | None = None
+) -> str | None:
     """The first error line of a check run that could not run at all, or None.
 
     R13 bound `git diff --stat: x.md`, which exits 129 on the option before
     reading any file, and spent two workers on it. Exit 129 (git usage), 127
     (command not found), 2 or 64 with a `usage:` line, or a SyntaxError in an
     inline script mean no work can make the check pass; exit 1 is a check that
-    fails, as it should before the work.
+    fails, as it should before the work. Given the task's `scope` and `root`, so
+    does pytest's exit 4 on a file not on disk and outside the scope (run R40
+    class 4), and the line names that file and the scope.
     """
+    absent = _absent_outside_scope(rc, output, scope, root)
+    if absent and scope:
+        return (
+            f"file or directory not found: {', '.join(absent)}, which is not on disk and "
+            f"outside the scope ({', '.join(scope)})"
+        )
     lines = [line.strip() for line in output.splitlines() if line.strip()]
     raw = output.splitlines()
     for i, line in enumerate(raw):
@@ -9778,6 +9816,13 @@ _HABIT_LOG = re.compile(r">\s*(\S+\.log)\b")
 _SHOW_ASIDE = re.compile(r"[;,]?\s*`beagle pursuit show[^`]*` has the whole record")
 
 
+#: beagle's brief's aside on its Scope line, and what tau says instead. Run R40
+#: class 4: W13 read the aside as leave to write outside the scope, which the
+#: worker guard refuses.
+_SCOPE_ASIDE = "(paths changed outside it are named at close)"
+_SCOPE_REFUSED = "(writes outside it are refused)"
+
+
 def _without_beagle_habits(brief: str, bound: str | None = None) -> str:
     """beagle's brief without the lines that tell a worker to run `beagle`.
 
@@ -9788,6 +9833,7 @@ def _without_beagle_habits(brief: str, bound: str | None = None) -> str:
     dropped, and the `beagle pursuit show` aside is cut. `bound` is the
     command's prefix, from `_command_bound` (by default for no memory cap and
     the default dispatch timeout). Run R39: the line says what exit 124 means.
+    The Scope line says writes outside it are refused (`_SCOPE_REFUSED`).
     """
     if bound is None:
         bound = _command_bound(None, DEFAULT_DISPATCH_TIMEOUT)
@@ -9814,7 +9860,7 @@ def _without_beagle_habits(brief: str, bound: str | None = None) -> str:
         elif "beagle pursuit recheck" in line:
             continue
         else:
-            lines.append(_SHOW_ASIDE.sub("", line))
+            lines.append(_SHOW_ASIDE.sub("", line).replace(_SCOPE_ASIDE, _SCOPE_REFUSED))
     return "".join(lines)
 
 
@@ -10421,6 +10467,42 @@ async def _data_route_on_disk(
         f"what it should test. {test} imports {module}, which a later task writes, and the "
         f"data test `{data_check}` already passes on the committed tree, so neither check "
         f"can tell {task}'s work from none."
+    )
+
+
+def _absent_check_file_problem(command: str, scope: list[str], root: Path) -> str | None:
+    """Why a check runs a test file that is not on disk and `scope` does not hold, or None.
+
+    Run R40 class 4: T0011, scope tests/cases.json, ran tests/test_cases_source.py,
+    which was not on disk; pytest exited 4, and workers met 21 scope refusals writing
+    it across three routes on the same scope. A test in scope and not on disk is the
+    work, and is left alone.
+    """
+    if not scope:
+        return None
+    absent: list[str] = []
+    for rel in _check_run_files(command, root):
+        path = os.path.normpath(rel)
+        if (
+            path.endswith(".py")
+            and _is_test_path(path)
+            and path not in absent
+            and not (root / path).exists()
+            and _runs_test_file(command, rel)
+            and not _in_scope(path, scope, root)
+        ):
+            absent.append(path)
+    if not absent:
+        return None
+    files = ", ".join(absent)
+    it = "it" if len(absent) == 1 else "them"
+    return (
+        f"done_when `{command}` runs {files}, which {'is' if len(absent) == 1 else 'are'} "
+        f"not on disk and outside the scope ({', '.join(scope)}). Writes outside the scope "
+        f"are refused, so no worker can write {it}, and the check fails on {it} whatever "
+        f"the work does. If this task writes {files}, call pursuit_step again with the "
+        f"same task, criteria and done_when, and scope={json.dumps([*scope, *absent])}; "
+        "else name only test files that exist."
     )
 
 
@@ -11468,7 +11550,7 @@ async def _bound_check_fails(
     if last is not None:
         return last != 0
     rc, out = await _run_check(bound_check, root, DEFAULT_CHECK_TIMEOUT)
-    return rc != 0 and _check_broke(rc, out) is None
+    return rc != 0 and _check_broke(rc, out, _strings(record.get("scope")), root) is None
 
 
 def _keeps_bound_check(
@@ -12148,6 +12230,7 @@ def make_step_tool() -> Any:
                     or _oracle_with_code_problem(route_scope, goal, task, done_when or old_check)
                     or _locked_test_problem(done_when or old_check, route_scope, goal)
                     or _import_scope_problem(done_when or old_check, route_scope, root)
+                    or _absent_check_file_problem(done_when or old_check, route_scope, root)
                     or _pytest_node_missing_problem(done_when or old_check, route_scope, root)
                     or _pytest_node_import_only_problem(done_when or old_check, route_scope, root)
                 ) or await _unwritten_check_problem(
@@ -12164,6 +12247,15 @@ def make_step_tool() -> Any:
                     return _step_result(f"pursuit_step: no new route for {task} — {scoped}")
                 new_check = done_when or old_check
                 rehearsed = await _run_check(new_check, root, DEFAULT_CHECK_TIMEOUT)
+                outside = _absent_outside_scope(rehearsed[0], rehearsed[1], route_scope, root)
+                if outside:
+                    # Run R40 class 4: T0013 and T0014 kept T0011's scope, which could
+                    # not hold the test its check ran.
+                    return _step_result(
+                        f"pursuit_step: no new route for {task} — "
+                        + _absent_outside_scope_said(task, new_check, outside, route_scope)
+                        + f" Send the call again with scope={json.dumps([*route_scope, *outside])}."
+                    )
                 if rehearsed[0] != 0 and _check_stopped(new_check, root) is not None:
                     # Run R30 #22: a -9 here fell through to the open, which ran the
                     # check to the cap a second time.
@@ -12315,6 +12407,7 @@ def make_step_tool() -> Any:
                     )
                     or _locked_test_problem(done_when, scope, goal)
                     or _import_scope_problem(done_when, scope, root)
+                    or _absent_check_file_problem(done_when, scope, root)
                     or _pytest_node_missing_problem(done_when, scope, root)
                     or _pytest_node_import_only_problem(done_when, scope, root)
                 ) or await _unwritten_check_problem(
@@ -12355,7 +12448,7 @@ def make_step_tool() -> Any:
                     f"pursuit_step: {task} not opened — "
                     + _already_passes(done_when, task, now, done_by, rewritten_from=rewritten_from)
                 )
-            broke = _check_broke(pre_rc, pre_out)
+            broke = _check_broke(pre_rc, pre_out, scope, root)
             if broke is not None:
                 return _step_result(
                     f"pursuit_step: {task} not opened — the check could not run: `{broke}` "
@@ -12453,6 +12546,7 @@ def make_step_tool() -> Any:
                     )
                     or _locked_scope_problem(own_scope, root, title, task, done_when)
                     or _sibling_owned_check_problem(done_when, own_scope, task, nodes, root)
+                    or _absent_check_file_problem(done_when, own_scope, root)
                     or _pytest_node_missing_problem(done_when, own_scope, root)
                     or _pytest_node_import_only_problem(done_when, own_scope, root)
                     or await _unwritten_check_problem(
@@ -12487,7 +12581,9 @@ def make_step_tool() -> Any:
                             f"close {task} on no work.",
                             keep,
                         )
-                    broke = _check_broke(pre_rc, pre_out) if rejected is None else None
+                    broke = (
+                        _check_broke(pre_rc, pre_out, own_scope, root) if rejected is None else None
+                    )
                     if broke is not None:
                         rejected = (
                             f"the check could not run: `{broke}` (exit {pre_rc}).",
@@ -12891,6 +12987,9 @@ def make_step_tool() -> Any:
             if cannot_pass is not None:
                 # Run R16 sent W4, W6, W8, W10 and W12 after this was already known.
                 break
+            if _absent_outside_scope(verdict[0], verdict[1], scope, root):
+                # Run R40 class 4: W9-W13 met 21 scope refusals on the file it ran.
+                break
             if verdict[0] == 124:
                 # Run R39: told only "the check timed out after 60s", W9 re-ran the hang.
                 retry_note += f"Exit 124 means the check did not finish: {HANG_MEANING} "
@@ -12983,6 +13082,17 @@ def make_step_tool() -> Any:
             if no_tests is not None:
                 if_line = ""
             unpassable = ""
+            outside = _absent_outside_scope(verdict[0], verdict[1], scope, root)
+            if outside:
+                # Run R40 class 4: nothing named why every worker on T0011 failed.
+                if_line = ""
+                unpassable = (
+                    _absent_outside_scope_said(task, check, outside, scope)
+                    + f" Give it a new route whose scope holds it: pursuit_step "
+                    f"task={json.dumps(task)}, new_route=true, "
+                    f"scope={json.dumps([*scope, *outside])}, notes saying to write "
+                    f"{', '.join(outside)}.\n\n"
+                )
             on_disk = (
                 await _data_route_on_disk(
                     task,
