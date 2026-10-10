@@ -115,8 +115,10 @@ def beagle(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     monkeypatch.delenv("BEAGLE_TAU_WORKER", raising=False)
     # Workers and checks run uncapped unless a test turns the cap on.
     monkeypatch.setenv("BEAGLE_TAU_MEMORY_MAX", "off")
-    # Never the real beagle: a test that wants one takes `fake_beagle`.
+    # Never the real beagle: a test that wants one takes `fake_beagle`. The cached
+    # `_module()` read BEAGLE_BIN when the first test to use it loaded it (T0344).
     monkeypatch.setenv("BEAGLE_BIN", str(tmp_path / "no-beagle-bin"))
+    monkeypatch.setattr(_module(), "BEAGLE_BIN", str(tmp_path / "no-beagle-bin"))
     monkeypatch.chdir(tmp_path)  # the process cwd is not a pursuit unless a test says so
     return root
 
@@ -155,6 +157,7 @@ def fake_beagle(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     script.write_text(f"#!{sys.executable}\n{FAKE_BEAGLE}", encoding="utf-8")
     script.chmod(0o755)
     monkeypatch.setenv("BEAGLE_BIN", str(script))
+    monkeypatch.setattr(_module(), "BEAGLE_BIN", str(script))
     monkeypatch.setenv("FAKE_BEAGLE_DIR", str(here))
     return here
 
