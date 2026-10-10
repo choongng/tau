@@ -49,6 +49,12 @@ R37_TEXT_CALL = (
     "python3 -m pytest -q tests/test_case_data.py --collect-only\n</parameter>\n"
     "</function>\n</tool_call>"
 )
+#: Run R44's W5 sent this as its whole reply (stopReason "stop"), trimmed: the
+#: qwen call with no opening `<tool_call>`.
+R44_UNOPENED_CALL = (
+    "<function=bash><parameter=command>ls -la /home/choong/itc/</parameter>"
+    "<parameter=description>List project structure</parameter></function></tool_call>"
+)
 
 
 def _turns(name: str, *arguments: dict[str, JSONValue]) -> list[list[object]]:
@@ -289,6 +295,14 @@ async def test_text_tool_call_follow_ups_are_bounded(tmp_path: Path) -> None:
     assert len(provider.calls) == 3
     assert len(_follow_ups(session)) == 2
 
+    (tmp_path / "unopened").mkdir()
+    session, provider, _ = await _text_session(
+        tmp_path / "unopened", [_says(R44_UNOPENED_CALL) for _ in range(5)]
+    )
+    await _run(session)
+    assert len(provider.calls) == 3
+    assert len(_follow_ups(session)) == 2
+
     gemma = '<|tool_call>call:bash{command:<|"|>ls<|"|>}<tool_call|>'
     cycle = [_says(R37_TEXT_CALL), _says(gemma), _calls_note({"text": "x"})]
     (tmp_path / "per-run").mkdir()
@@ -298,6 +312,33 @@ async def test_text_tool_call_follow_ups_are_bounded(tmp_path: Path) -> None:
     # The fifth markup reply, after the second real call, is not followed up.
     assert len(ran) == 2
     assert len(provider.calls) == 7
+
+
+@pytest.mark.anyio
+async def test_text_tool_call_without_opening_tag_is_followed_up(tmp_path: Path) -> None:
+    session, provider, ran = await _text_session(
+        tmp_path, [_says(R44_UNOPENED_CALL), _calls_note({"text": "run it"}), _says("Report.")]
+    )
+
+    await _run(session)
+
+    assert provider.calls[1][2][-1].text == TEXT_TOOL_CALL_NUDGE
+    assert ran == [{"text": "run it"}]
+    assert len(_follow_ups(session)) == 1
+
+    for i, prose in enumerate(
+        (
+            "I will call <function=bash> to list the files.",
+            "The bash function runs `ls`; </function> closes a call.",
+        )
+    ):
+        (tmp_path / f"prose-{i}").mkdir()
+        session, provider, _ = await _text_session(
+            tmp_path / f"prose-{i}", [_says(prose), _says("Unreached.")]
+        )
+        await _run(session)
+        assert len(provider.calls) == 1
+        assert _follow_ups(session) == []
 
 
 @pytest.mark.anyio

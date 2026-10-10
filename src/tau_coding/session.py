@@ -229,9 +229,12 @@ WORKSPACE_CHANGING_TOOLS = frozenset({"pursuit_step", "write", "edit"})
 #: A chat template's tool-call and channel control tokens. Gemma's pipe forms
 #: are never ordinary text; qwen's `<tool_call>` counts only with a function
 #: or JSON call opening after it, so a file that names the tag is left alone.
+#: Without the tag, qwen's call counts by its function opening on a parameter
+#: or its function close on the tag's close, so a bare `<function=x>` does not.
 TEMPLATE_TOOL_CALL_TOKEN = re.compile(
     r"<\|tool_call>|<tool_call\|>|<\|channel>|<channel\|>"
     r"|</?tool_call>\s*(?:<function=|\{\s*\"name\"\s*:)"
+    r"|<function=[\w.-]+>\s*<parameter=|</function>\s*</tool_call>"
 )
 #: How the sent call closed just before a leaked template tail: a string's end
 #: quote (bare, escaped, or gemma's `<|"|>`) and the call's closing brace.
