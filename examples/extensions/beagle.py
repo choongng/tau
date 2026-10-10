@@ -5114,12 +5114,16 @@ def _method_and_value(tree: ast.AST) -> str | None:
     return None
 
 
-def _answers_compared(tree: ast.AST, answers: Collection[str]) -> bool:
+def _answers_compared(
+    tree: ast.AST, answers: Collection[str], against: Collection[str] = ()
+) -> bool:
     """Whether a value read under one of the `answers` keys reaches an assert or comparison.
 
     Run R30: the locked test loaded each case's answer and asserted only a
     roundtrip. A read is a subscript, `.get()` or attribute by an answer key; a
     name assigned or looped from one, or a function returning one, carries it.
+    With `against`, only an assert or comparison that also takes the result of a
+    call to one of those functions counts; a call given an answer yields none.
     """
 
     def reads(node: ast.AST) -> bool:
@@ -5164,17 +5168,67 @@ def _answers_compared(tree: ast.AST, answers: Collection[str]) -> bool:
             ):
                 carriers.add(node.name)
         grew = len(carriers) > before
+
+    def result(node: ast.AST) -> bool:
+        if not against:
+            return True
+        for sub in ast.walk(node):
+            if (
+                isinstance(sub, ast.Call)
+                and isinstance(sub.func, ast.Name)
+                and sub.func.id in against
+                and sub.func.id not in carriers
+                and not any(reads(arg) for arg in [*sub.args, *(k.value for k in sub.keywords)])
+            ):
+                return True
+            if isinstance(sub, ast.Name) and sub.id in results:
+                return True
+        return False
+
+    results: set[str] = set()
+    grew = bool(against)
+    while grew:
+        before = len(results)
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Assign) and result(node.value):
+                results.update(n for target in node.targets for n in names(target))
+            elif (
+                isinstance(node, ast.AnnAssign | ast.AugAssign | ast.NamedExpr)
+                and node.value is not None
+                and result(node.value)
+            ) or (
+                isinstance(node, ast.For | ast.AsyncFor | ast.comprehension) and result(node.iter)
+            ):
+                results.update(names(node.target))
+        grew = len(results) > before
     for node in ast.walk(tree):
-        if isinstance(node, ast.Assert | ast.Compare) and reads(node):
+        if isinstance(node, ast.Assert | ast.Compare) and reads(node) and result(node):
             return True
         if (
             isinstance(node, ast.Call)
             and isinstance(node.func, ast.Attribute)
             and node.func.attr.startswith("assert")
             and reads(node)
+            and result(node)
         ):
             return True
     return False
+
+
+def _called_module_functions(tree: ast.Module) -> list[str]:
+    """The module-level functions, other than test* ones, that the module calls by name."""
+    called = {
+        node.func.id
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+    }
+    return [
+        node.name
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef)
+        and not node.name.startswith("test")
+        and node.name in called
+    ]
 
 
 #: Names a module has bound without an import or assignment in its own source.
@@ -5214,6 +5268,11 @@ def _cases_problem_fix(root: Path, test: str, problem: str) -> str:
         fix = (
             "make it import the code under test and compare each case's answer with "
             "the code's result"
+        )
+    elif problem.startswith("checks its own copy "):
+        fix = (
+            "delete the functions it defines, import the code under test, and compare each "
+            "case's answer with the code's result"
         )
     elif problem.startswith("uses ") and " without importing " in problem:
         fix = f"import {problem.rpartition(' without importing ')[2]} in it"
@@ -5353,7 +5412,9 @@ def _cases_test_problem(root: Path, entries: list[str]) -> tuple[str, str] | Non
     method and as a number. Read from each test's AST; nothing is run. The
     unread-answers check applies only to tests importing the project, as the
     data's own shape test reads no answers. Run R39: a cases test copying the
-    data test, with no test importing the project, is refused too.
+    data test, with no test importing the project, is refused too. Run R40: a
+    test importing no project module that compared the answers with the results
+    of functions it defined itself checked its own copy, not the code.
     """
     files = []
     for entry in entries:
@@ -5383,6 +5444,18 @@ def _cases_test_problem(root: Path, entries: list[str]) -> tuple[str, str] | Non
             broken = _test_structure_problem(tree)
             if broken is not None:
                 return test, broken
+            own = _called_module_functions(tree)
+            if (
+                own
+                and answers
+                and not _test_project_imports(root / test)
+                and _answers_compared(tree, answers, against=own)
+            ):
+                named = ", ".join(own[:4]) + (", …" if len(own) > 4 else "")
+                return test, (
+                    f"checks its own copy of the algorithm, not the code: it defines {named} "
+                    "and imports no module of the project"
+                )
             absent = _absent_case_lookup(tree, labels, keys) if labels else None
             if absent is not None:
                 return test, f'looks up case "{absent}", which {data} does not hold'
@@ -7405,21 +7478,38 @@ def _check_imports_code(command: str, root: Path) -> bool:
 
 
 def _cases_test_close_note(test: str, data: str, scope: list[str], root: Path) -> str:
-    """What the close requires of the cases test: `test` when it reads `data`, else
-    the other test in scope; empty when there is none."""
+    """What the close requires of the cases test: `test` when it reads `data` and is
+    not the data test, else the scope's other test; empty when there is none.
+
+    Run R40: the check's tests/test_case_data.py, which imports no project module,
+    was named the cases test. A test reading `data` that imports none is the data
+    test whenever the scope has room for another test; the other test is named, one
+    importing the code first, or the cases test is said to be still to be written.
+    """
     name = Path(data).name
-    if (root / test).is_file() and _cases_test_reads(root / test, name):
-        cases = test
-    else:
-        entries = [e.rstrip("/") for e in scope]
-        others = [e for e in entries if e.endswith(".py") and _is_test_path(e)] + [
-            p.relative_to(root).as_posix()
-            for e in entries
-            if (root / e).is_dir()
-            for p in sorted((root / e).rglob("*.py"))
-            if _is_test_path(p.relative_to(root).as_posix()) and _cases_test_reads(p, name)
-        ]
-        cases = next((o for o in others if o != test), "")
+    entries = [e.rstrip("/") for e in scope]
+    others = [e for e in entries if e.endswith(".py") and _is_test_path(e)] + [
+        p.relative_to(root).as_posix()
+        for e in entries
+        if (root / e).is_dir()
+        for p in sorted((root / e).rglob("*.py"))
+        if _is_test_path(p.relative_to(root).as_posix()) and _cases_test_reads(p, name)
+    ]
+    others = sorted(
+        (o for o in dict.fromkeys(others) if o != test),
+        key=lambda o: (root / o).is_file() and not _test_project_imports(root / o),
+    )
+    reads = (root / test).is_file() and _cases_test_reads(root / test, name)
+    data_test = reads and not _test_project_imports(root / test)
+    room = bool(others) or any((root / e).is_dir() for e in entries)
+    cases = test if reads and not (data_test and room) else next(iter(others), "")
+    if not cases and data_test:
+        return (
+            f"{test} is not the cases test: it imports none of the code. The cases test "
+            "is still to be written: whether or not this check runs it, the close requires "
+            f"a test that imports the code, loads {data} and runs every case in it against "
+            "the code, with no hand-written asserts of its own. "
+        )
     if not cases:
         return ""
     return (

@@ -3898,6 +3898,50 @@ def test_cases_test_problem_names_unimported_module_name(tmp_path: Path) -> None
     assert module._cases_test_problem(tmp_path, _write_cases(tmp_path, imported)) is None
 
 
+#: Run R40 W1's tests/test_cases.py shape: its own split_id/fork, no project import.
+R40_IN_FILE_CASES_TEST = (
+    "import json\n\n\n"
+    "def split_id(i):\n    return [i, i]\n\n\n"
+    "def fork(stamp):\n    return split_id(stamp)\n\n\n"
+    "def test_cases():\n"
+    '    for case in json.load(open("tests/cases.json"))["cases"]:\n'
+    '        assert fork(case["input"]) == case["expected"]\n'
+)
+
+
+def test_cases_test_problem_flags_in_file_implementation(tmp_path: Path) -> None:
+    # R40 W1: tests/test_cases.py defined split_id and fork, imported no project
+    # module, and passed as the cases test.
+    module = _module()
+    entries = _write_cases(tmp_path, R40_IN_FILE_CASES_TEST)
+    data_test = (
+        "import json\n\n\ndef _valid(value):\n    return isinstance(value, str)\n\n\n"
+        "def test_shape():\n"
+        '    for case in json.load(open("tests/cases.json"))["cases"]:\n'
+        '        assert _valid(case["expected"])\n'
+    )
+    (tmp_path / "tests" / "test_case_data.py").write_text(data_test)
+    entries = ["tests/cases.json", "tests/test_case_data.py", *entries[1:]]
+
+    found = module._cases_test_problem(tmp_path, entries)
+
+    assert found == (
+        "tests/test_cases.py",
+        "checks its own copy of the algorithm, not the code: it defines split_id, fork and "
+        "imports no module of the project",
+    )
+    closing = module._cases_close_problem(tmp_path, entries)
+    assert closing is not None and "delete the functions it defines" in closing[1]
+    # The same test importing the code is judged as before.
+    imported = "import codec\n" + R40_IN_FILE_CASES_TEST
+    assert module._cases_test_problem(tmp_path, _write_cases(tmp_path, imported)) is None
+    # A data test whose helper is given the answers checks no copy of anything.
+    assert (
+        module._cases_test_problem(tmp_path, ["tests/cases.json", "tests/test_case_data.py"])
+        is None
+    )
+
+
 ITC_REFERENCE = (
     "Interval Tree Clocks\n\n4\n\n"
     "fork(i) = (i1, i2), where (i1, i2) = split(i)\n"
@@ -17647,6 +17691,37 @@ def test_known_answers_brief_states_cases_test_must_load_data(tmp_path: Path) ->
     note = module._known_answers_note(R28_FIX_CHECK, R28_FIX_SCOPE, on_disk)
     assert note.startswith("tests/test_cases.py is the check")
     assert required in note
+
+
+def test_cases_test_close_note_never_names_the_data_test(tmp_path: Path) -> None:
+    # R40 W2-W13: the brief called tests/test_case_data.py, the check that imports
+    # none of the code, "the cases test".
+    module = _module()
+    project = _pursuit_project(tmp_path)
+    tests = project / "tests"
+    tests.mkdir()
+    (tests / "cases.json").write_text(R22_CASES)
+    (tests / "test_case_data.py").write_text(CASES_DATA_TEST)
+    named = "tests/test_cases.py is the cases test, whether or not this check runs it"
+
+    note = module._known_answers_note(R32_CHECK, R32_SCOPE, project)
+    assert "tests/test_case_data.py is the cases test" not in note
+    assert named in note
+
+    (tests / "test_cases.py").write_text(R40_IN_FILE_CASES_TEST)
+    note = module._known_answers_note(R32_CHECK, R32_SCOPE, project)
+    assert "tests/test_case_data.py is the cases test" not in note
+    assert named in note
+
+    (tests / "test_cases.py").unlink()
+    note = module._cases_test_close_note(
+        "tests/test_case_data.py", "tests/cases.json", ["tests/cases.json", "tests/"], project
+    )
+    assert note.startswith(
+        "tests/test_case_data.py is not the cases test: it imports none of the code. The "
+        "cases test is still to be written"
+    )
+    assert "tests/test_case_data.py is the cases test" not in note
 
 
 def _judge_only_escalated(
