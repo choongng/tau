@@ -18259,6 +18259,139 @@ async def test_known_answers_unsourced_result_names_reference_result_lines(
     assert not (project / ".beagle" / "locked").exists()
 
 
+async def _source_judge_escalated(
+    tmp_path: Path, fake_beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> tuple[Any, Path, dict[str, Any]]:
+    """R40 T0002: only the close's source judge kept the task open, its check passing,
+    for JUDGE_NOTES_UNTIL steps; a scope of more than one file, so a split exists."""
+    result, project = await _unsourced_result_step(tmp_path, fake_beagle, monkeypatch)
+    assert "the check passes, but the task stays open" in result.text
+    module = _loaded_module()
+    module._NOT_DONE[(str(project), "T0002")] = module.JUDGE_NOTES_UNTIL
+    record = {"id": "T0002", "status": "open", "criteria": "c", "scope": CASES_SCOPE}
+    return module, project, record | {"done_when": "grep -q out tests/cases.json"}
+
+
+@pytest.mark.anyio
+async def test_judge_only_escalation_offers_no_split(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # R40 L27, L31: only the source judge held T0002, and the escalation offered a
+    # split by file; its first part opened already passing, three times.
+    module, project, record = await _source_judge_escalated(tmp_path, fake_beagle, monkeypatch)
+    count = module.JUDGE_NOTES_UNTIL
+    assert module._split_call("T0002", record)
+    same_route = {"task": "T0002", "new_route": True, "notes": "again"}
+
+    unchanged = module._unchanged_route_escalation("T0002", count, record, "No new route.", project)
+    refused = module._escalation("T0002", count, same_route, record, project, False, False)
+    still = module._still_open_escalation("T0002", count, project)
+
+    rerun = 'call instead: pursuit_step task="T0002", notes='
+    assert _quoted_head(unchanged).startswith(f"pursuit_step: T0002 not run — {rerun}")
+    assert _quoted_head(refused).startswith(f"pursuit_step: T0002 not run — {rerun}")
+    assert _quoted_head(still).startswith(f"T0002 is still open — {rerun}")
+    for text in (unchanged, refused, still):
+        assert "pursuit_plan" not in text and "split it" not in text
+        assert "new_route=true" not in text and "done_when=" not in text
+        assert "- stop, and tell the user what blocks it." in text
+    # The offered call is taken past JUDGE_NOTES_UNTIL, not refused again.
+    taken = {"task": "T0002", "notes": "replace the case"}
+    assert module._judge_notes_rerun("T0002", taken, record, project)
+    # A task whose check failed keeps the split offer.
+    module._LAST_CHECK_EXIT[(str(project), "T0002")] = 1
+    failed = module._unchanged_route_escalation("T0002", count, record, "No new route.", project)
+    split = module._split_call("T0002", record)
+    assert _quoted_head(failed) == f"pursuit_step: T0002 not run — call instead: {split}"
+    assert 'pursuit_step task="T0002", notes=' not in failed
+    assert not module._judge_notes_rerun("T0002", taken, record, project)
+
+
+@pytest.mark.anyio
+async def test_judge_only_escalation_names_cases_and_result_lines(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # R40: workers re-quoted rule lines for cases no reference answers; the
+    # escalation's rerun must carry the cases, "replace the case" and the lines.
+    module, project, record = await _source_judge_escalated(tmp_path, fake_beagle, monkeypatch)
+    count = module.JUDGE_NOTES_UNTIL
+
+    text = module._unchanged_route_escalation("T0002", count, record, "No new route.", project)
+
+    assert module._NOT_DONE_CASES[(str(project), "T0002")] == (
+        "tests/cases.json",
+        ("nested_twist",),
+    )
+    notes = (
+        "The close keeps T0002 open on its cases' sources alone: case nested_twist in "
+        "tests/cases.json cites no line giving the expected result. Quote the line that "
+        "gives each result and make the expected value match it. "
+        + module._unanswered_case_note(project)
+    )
+    call = f'pursuit_step task="T0002", notes={json.dumps(notes, ensure_ascii=False)}'
+    assert f"The call that works, whole: {call}" in text
+    assert f"- {call}, a sub-agent at those cases" in text
+    assert "replace the case with one whose input and result the reference both gives" in notes
+    lines = 'rules.txt:5 "(2, 1)"; rules.txt:6 "twist((1, 2)) = (3, 1)"'
+    assert lines in notes and json.dumps(lines, ensure_ascii=False)[1:-1] in text
+    assert "only the close's source check keeps it open, on case nested_twist" in text
+    assert "unit_twist" not in text  # its source gives its result
+
+
+@pytest.mark.anyio
+async def test_judge_only_escalation_stops_offering_reruns_after_cap(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # R40 follow-up: unlimited notes-only reruns would be the loop the split was;
+    # after SOURCE_JUDGE_RERUNS, the escalation offers the close or a stop.
+    module, project, record = await _source_judge_escalated(tmp_path, fake_beagle, monkeypatch)
+    key = (str(project), "T0002")
+    assert module.SOURCE_JUDGE_RERUNS == 3
+    cap = module.JUDGE_NOTES_UNTIL + module.SOURCE_JUDGE_RERUNS
+    taken = {"task": "T0002", "notes": "replace the case"}
+    module._NOT_DONE[key] = cap - 1
+    assert module._judge_notes_rerun("T0002", taken, record, project)
+
+    module._NOT_DONE[key] = cap
+    refused = module._escalation("T0002", cap, taken, record, project, False, False)
+    unchanged = module._unchanged_route_escalation("T0002", cap, record, "No new route.", project)
+    still = module._still_open_escalation("T0002", cap, project)
+
+    assert not module._judge_notes_rerun("T0002", taken, record, project)
+    why = "no line of references/*.txt gives the result of case nested_twist in tests/cases.json"
+    close = f'pursuit_step task="T0002", abandon="infeasible: {why}"'
+    assert _quoted_head(refused) == f"pursuit_step: T0002 not run — call instead: {close}"
+    assert _quoted_head(still) == f"T0002 is still open — call instead: {close}"
+    said = (
+        "The cases the references do not answer, case nested_twist in tests/cases.json, "
+        "cannot close T0002"
+    )
+    for text in (refused, unchanged, still):
+        assert said in text
+        assert f"- {close}, closing it infeasible on those cases;" in text
+        assert "- stop, and tell the user what blocks it." in text
+        assert "pursuit_plan" not in text and "notes=" not in text
+        assert "new_route=true" not in text
+    # The offered close is taken below beagle's spawn limit.
+    (fake_beagle / "close.out").write_text("T0002 infeasible\n")
+    nodes = [{"id": "T0001"}, {"id": "T0002", "parent": "T0001", "status": "open"}]
+    closed = module._close_infeasible("T0002", why, nodes, ["T0001"], project, project / "goal")
+    assert "not closed infeasible" not in closed
+    assert len(_pursuit_calls(fake_beagle, "close")) == 1
+
+
 #: R35's references/Consistent_Overhead_Byte_Stuffing.txt, lines 31-33, 45-47 and 66-88.
 R35_REFERENCE = (
     "COBS transforms an arbitrary string of bytes in the range [0,255] into bytes in the "
