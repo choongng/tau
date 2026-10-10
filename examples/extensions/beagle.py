@@ -7547,9 +7547,11 @@ def _cases_test_close_note(test: str, data: str, scope: list[str], root: Path) -
     not the data test, else the scope's other test; empty when there is none.
 
     Run R40: the check's tests/test_case_data.py, which imports no project module,
-    was named the cases test. A test reading `data` that imports none is the data
-    test whenever the scope has room for another test; the other test is named, one
-    importing the code first, or the cases test is said to be still to be written.
+    was named the cases test. A `test` reading `data` that imports none is the data
+    test whatever the scope, and is never named the cases test: the scope's other
+    test is named, one importing the code first, or, with no other test in scope and
+    no directory, the cases test is said to be still to be written. A test that
+    imports the code and reads `data` is still named.
     """
     name = Path(data).name
     entries = [e.rstrip("/") for e in scope]
@@ -7566,8 +7568,7 @@ def _cases_test_close_note(test: str, data: str, scope: list[str], root: Path) -
     )
     reads = (root / test).is_file() and _cases_test_reads(root / test, name)
     data_test = reads and not _test_project_imports(root / test)
-    room = bool(others) or any((root / e).is_dir() for e in entries)
-    cases = test if reads and not (data_test and room) else next(iter(others), "")
+    cases = test if reads and not data_test else next(iter(others), "")
     if not cases and data_test:
         return (
             f"{test} is not the cases test: it imports none of the code. The cases test "

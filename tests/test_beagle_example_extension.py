@@ -17887,8 +17887,20 @@ def test_known_answers_brief_states_cases_test_must_load_data(tmp_path: Path) ->
 
     assert required in module._known_answers_note(R32_CHECK, R32_SCOPE, project)
 
-    # A check that runs the cases test names it as both.
+    # A check whose test imports none of the code is the data test: with no other
+    # test in scope, the cases test that loads the data is still to be written.
     on_disk = _known_answers_project(tmp_path / "disk", "")
+    note = module._known_answers_note(R28_FIX_CHECK, R28_FIX_SCOPE, on_disk)
+    assert note.startswith("tests/test_cases.py is the check")
+    assert "tests/test_cases.py is the cases test" not in note
+    assert (
+        "The cases test is still to be written: whether or not this check runs it, the "
+        "close requires a test that imports the code, loads tests/cases.json and runs "
+        "every case in it against the code"
+    ) in note
+
+    # A check whose test imports the code and reads the data names it as both.
+    on_disk = _known_answers_project(tmp_path / "code", "from src.itc import Clock")
     note = module._known_answers_note(R28_FIX_CHECK, R28_FIX_SCOPE, on_disk)
     assert note.startswith("tests/test_cases.py is the check")
     assert required in note
@@ -17923,6 +17935,33 @@ def test_cases_test_close_note_never_names_the_data_test(tmp_path: Path) -> None
         "cases test is still to be written"
     )
     assert "tests/test_case_data.py is the cases test" not in note
+
+
+def test_cases_test_close_note_never_names_the_data_test_without_room(tmp_path: Path) -> None:
+    # Audit 13: with a scope of only the data test and no directory, the data test
+    # was still named the cases test.
+    module = _module()
+    project = _pursuit_project(tmp_path)
+    tests = project / "tests"
+    tests.mkdir()
+    (tests / "cases.json").write_text(R22_CASES)
+    (tests / "test_case_data.py").write_text(CASES_DATA_TEST)
+
+    note = module._cases_test_close_note(
+        "tests/test_case_data.py", "tests/cases.json", ["tests/test_case_data.py"], project
+    )
+    assert "tests/test_case_data.py is the cases test" not in note
+    assert note.startswith(
+        "tests/test_case_data.py is not the cases test: it imports none of the code. The "
+        "cases test is still to be written"
+    )
+
+    # A test that imports the code and reads the data is still named.
+    (tests / "test_case_data.py").write_text(R22_CASES_TEST)
+    note = module._cases_test_close_note(
+        "tests/test_case_data.py", "tests/cases.json", ["tests/test_case_data.py"], project
+    )
+    assert note.startswith("tests/test_case_data.py is the cases test, whether or not")
 
 
 def _judge_only_escalated(
