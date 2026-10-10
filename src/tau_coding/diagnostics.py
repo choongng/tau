@@ -93,6 +93,19 @@ class AgentCallDiagnosticLogger:
         self._append(entry)
         return self.path
 
+    def log_warning(
+        self,
+        *,
+        context: AgentCallDiagnosticContext,
+        phase: str,
+        message: str,
+    ) -> Path:
+        """Log a non-fatal condition that changes how the session's requests go."""
+        entry = _base_entry(context, phase=phase, kind="warning")
+        entry["warning"] = {"message": message}
+        self._append(entry)
+        return self.path
+
     def _append(self, entry: dict[str, Any]) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self.path.open("a", encoding="utf-8") as file:

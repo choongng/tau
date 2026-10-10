@@ -787,8 +787,11 @@ class CodingSession:
         self._next_request_thinking_off = False
         #: The latest output-limit nudge queued, until the loop sends it.
         self._queued_nudge: UserMessage | None = None
-        #: The thinking-off twin of a provider, built for nudged requests.
-        self._thinking_off_twin: tuple[ModelProvider, ModelProvider] | None = None
+        #: The thinking-off twin of a provider, built for nudged requests, or
+        #: None beside the provider when building it failed.
+        self._thinking_off_twin: tuple[ModelProvider, ModelProvider | None] | None = None
+        #: Whether the session has warned that it cannot build that twin.
+        self._thinking_off_twin_warned = False
         #: The latest tool calls that ran, each with a digest of its result.
         self._recent_calls: deque[tuple[str, int]] = deque(maxlen=REPEATED_CALL_WINDOW)
         #: The first line of the latest result of each call in `_recent_calls`.
@@ -2189,6 +2192,12 @@ class CodingSession:
 
         Built as a thinking change would build it, but only used for one
         request: the session's thinking level stays as it is.
+
+        A twin that cannot be built is not tried again for the same provider,
+        and the session warns once, naming the cause. In R38
+        (dev-notes/itc-runs/R38.md, class 3) a tau-subagents child session had
+        no runtime provider config, the build failed on every nudge, and each
+        nudged request went out with thinking on with nothing to say so.
         """
         if self._thinking_level == "off" or "off" not in self.available_thinking_levels:
             return None
@@ -2199,11 +2208,35 @@ class CodingSession:
             off, _ = self._build_runtime_provider(
                 inference_provider=self._inference_provider, thinking_level="off"
             )
-        except ProviderConfigError:
+        except ProviderConfigError as exc:
+            self._thinking_off_twin = (provider, None)
+            self._warn_no_thinking_off_twin(exc)
             return None
         self._owned_providers.append(off)
         self._thinking_off_twin = (provider, off)
         return off
+
+    def _warn_no_thinking_off_twin(self, exc: ProviderConfigError) -> None:
+        """Say, once per session, that output-limit nudges keep thinking on."""
+        if self._thinking_off_twin_warned:
+            return
+        self._thinking_off_twin_warned = True
+        cause = (
+            "the session has no runtime provider config"
+            if self._runtime_provider_config is None
+            else str(exc)
+        )
+        message = (
+            f"Output-limit nudges keep thinking on for {self.provider_name}:{self.model}: "
+            f"tau cannot build its thinking-off provider ({cause})"
+        )
+        self._extension_runtime.ui.notify(message, "warning")
+        with suppress(OSError):
+            self._diagnostic_logger.log_warning(
+                context=self._diagnostic_context(),
+                phase="output_limit_nudge",
+                message=message,
+            )
 
     def _run_continues_after(self, event: TurnEndEvent) -> bool:
         """Whether the loop will send another request in this run."""

@@ -239,3 +239,17 @@ Nothing else for beagle: the event-tree loss is tau's ordering and checks
   driver had no pursuit_step argument to reach it for an open task, and
   beagle's refusal advice (`--draft-on`, "mark it infeasible") named verbs
   tau does not expose. That is tau's class, not beagle's.
+
+## R38
+
+- **tau-subagents: child sessions get `runtime_provider_config`.** A local
+  commit on ~/.tau/extensions/tau-subagents choong-dev (0236dfe, not
+  pushed). The `agent` tool loaded its child CodingSession with no runtime
+  provider config, so tau could not build the thinking-off twin, and every
+  output-limit nudge in the child went out with thinking on (R38.md, third
+  tau class). With the config tau builds the twin for those nudges. It is
+  set on the session after load rather than passed in CodingSessionConfig:
+  tau rebuilds a provider it does not own from that config at load, at the
+  session's thinking level, which would replace the one the extension made
+  at the agent's level. tau now also warns once when the twin cannot be
+  built.
