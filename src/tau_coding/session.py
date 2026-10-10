@@ -230,6 +230,15 @@ TEMPLATE_TOOL_CALL_TOKEN = re.compile(
     r"<\|tool_call>|<tool_call\|>|<\|channel>|<channel\|>"
     r"|</?tool_call>\s*(?:<function=|\{\s*\"name\"\s*:)"
 )
+#: How the sent call closed just before a leaked template tail: a string's end
+#: quote (bare, escaped, or gemma's `<|"|>`) and the call's closing brace.
+TEMPLATE_LEAK_CALL_CLOSE = re.compile(r'(?:\\*"|<\|"\|>)\s*\}+\s*$')
+#: Arguments that only label a call. tau's bash requires `description` so the
+#: TUI can name the command, but the command does not depend on it, so a
+#: template tail leaked into one is cut like one in an optional argument.
+LABEL_ARGUMENTS = frozenset({"description"})
+#: Characters a template-leak refusal quotes from each end of the clean value.
+TEMPLATE_LEAK_QUOTE = 60
 #: Characters a compaction summary is held to. The cut reserves this much for
 #: the summary before it is written, so a long summary cannot push the
 #: compacted context past the headroom the cut left.
@@ -798,6 +807,8 @@ class CodingSession:
         self._recent_heads: dict[str, str] = {}
         self._refused_in_a_row = 0
         self._refused_call_ids: set[str] = set()
+        #: The note each call whose leaked template tail was cut adds to its result.
+        self._template_cut_notes: dict[str, str] = {}
         self._message_origins: dict[int, tuple[AgentMessage, MessageDelivery, MessageSource]] = {}
         self._attach_persistence_listener()
         self._stop_observing_queued_requests = observe_queued_requests(self._report_queued_request)
@@ -1660,8 +1671,9 @@ class CodingSession:
         refusals in a row the run is stopped: a model that ignores the note
         that many times will not take it.
         """
+        leak = self._cut_template_tail(call)
         problem = (
-            _template_tokens_in_arguments(call)
+            (leak.problem() if leak is not None else None)
             or self._tool_run_as_command(call)
             or self._repeated_call(call)
         )
@@ -1676,9 +1688,59 @@ class CodingSession:
                 f"Not run, and the run is stopped: {self._refused_in_a_row} tool calls in "
                 "a row were refused."
             )
+        resend = f" {leak.resend()}" if leak is not None else ""
         return True, (
             f"Not run: {problem} {REPEATED_CALL_STOP - self._refused_in_a_row} more refused "
-            "calls in a row stop the run."
+            f"calls in a row stop the run.{resend}"
+        )
+
+    def _cut_template_tail(self, call: ToolCall) -> _TemplateLeak | None:
+        """Cut leaked template tails from arguments the call can run without, or
+        return the leak that refuses it.
+
+        Run R39's gemma workers sent bash calls with a whole `command` and a
+        `description` ending `…"}<tool_call|><|channel>thought…`: the reply's
+        next call, run into this one's last string. Refusing the call whole
+        had them resend it until the run was stopped. Where every leak is a
+        top-level argument the tool's schema declares and does not require
+        (or one that only labels the call), each is cut at its token and the
+        call runs; the result says what was dropped. A leak in a required or
+        nested value, or in a call whose schema does not declare it, is
+        refused, since its clean prefix may not be what the model meant.
+        """
+        leaks = _template_tokens_in_arguments(call)
+        if not leaks:
+            return None
+        cuttable = self._cuttable_arguments(call.name)
+        for leak in leaks:
+            if leak.nested or leak.path not in cuttable:
+                return leak
+        for leak in leaks:
+            call.arguments[leak.path] = leak.clean
+        dropped = ", ".join(f"`{leak.token}` in `{leak.path}`" for leak in leaks)
+        self._template_cut_notes[call.id] = (
+            f"Note: the text after the chat template's own tool-call token ({dropped}) was "
+            "the reply's next call run into this one. It was dropped, and the call ran "
+            "without it. Send each call in its own reply."
+        )
+        return None
+
+    def _cuttable_arguments(self, tool_name: str) -> frozenset[str]:
+        """The arguments of `tool_name` its schema declares and a call can run without."""
+        tool = next((t for t in self._harness.config.tools if t.name == tool_name), None)
+        if tool is None:
+            return frozenset()
+        properties = tool.parameters.get("properties")
+        if not isinstance(properties, Mapping):
+            return frozenset()
+        required = tool.parameters.get("required")
+        needed = (
+            {name for name in required if isinstance(name, str)}
+            if isinstance(required, list)
+            else set()
+        )
+        return frozenset(
+            name for name in properties if name not in needed or name in LABEL_ARGUMENTS
         )
 
     def _repeated_call(self, call: ToolCall) -> str | None:
@@ -1731,6 +1793,7 @@ class CodingSession:
     async def _after_tool_call(
         self, call: ToolCall, result: AgentToolResult, is_error: bool
     ) -> tuple[AgentToolResult, bool]:
+        cut_note = self._template_cut_notes.pop(call.id, None)
         if call.id in self._refused_call_ids:
             # Refused, so it did not run: its refusal is not a result.
             self._refused_call_ids.discard(call.id)
@@ -1766,9 +1829,14 @@ class CodingSession:
         for stale in [seen for seen in self._recent_heads if seen not in live]:
             del self._recent_heads[stale]
         first_line, limit = read_request(call.arguments)
-        return self._buffer_result(
+        result = self._buffer_result(
             result, tool_name=call.name, first_line=first_line, limit=limit
-        ), is_error
+        )
+        if cut_note is not None:
+            result = result.model_copy(
+                update={"content": [*result.content, TextContent(text=cut_note)]}
+            )
+        return result, is_error
 
     def _buffer_result(
         self,
@@ -2067,6 +2135,7 @@ class CodingSession:
             self._recent_heads.clear()
             self._refused_in_a_row = 0
             self._refused_call_ids.clear()
+            self._template_cut_notes.clear()
         if (
             isinstance(event, MessageEndEvent)
             and self._queued_nudge is not None
@@ -6202,31 +6271,62 @@ def _call_sentence(text: str, tools: set[str]) -> str | None:
     return None
 
 
-def _template_tokens_in_arguments(call: ToolCall) -> str | None:
-    """Why `call`'s arguments carry a chat template's tool-call tokens, or None.
+@dataclass(frozen=True)
+class _TemplateLeak:
+    """A chat template's tool-call token found in one string of a call's arguments."""
+
+    #: Where the string sits: `description`, or `tasks[0].description`.
+    path: str
+    #: Whether the string is inside a list or object rather than an argument itself.
+    nested: bool
+    token: str
+    #: The string up to the token, without the call close sent just before it.
+    clean: str
+
+    def problem(self) -> str:
+        return (
+            f"its arguments carry the chat template's own tool-call tokens "
+            f"(`{self.token}` in `{self.path}`), so the reply's next call ran into this "
+            "one; send one call per reply, with the text alone."
+        )
+
+    def resend(self) -> str:
+        if not self.clean:
+            return f"The call to send is this same call with `{self.path}` empty."
+        quote = self.clean
+        if len(quote) > 2 * TEMPLATE_LEAK_QUOTE + 1:
+            quote = f"{quote[:TEMPLATE_LEAK_QUOTE]}…{quote[-TEMPLATE_LEAK_QUOTE:]}"
+        return (
+            f"The call to send is this same call with `{self.path}` ending before "
+            f"`{self.token}`, as `{quote}`."
+        )
+
+
+def _template_tokens_in_arguments(call: ToolCall) -> list[_TemplateLeak]:
+    """Each string in `call`'s arguments that carries a chat template's tool-call tokens.
 
     Run R36's gemma driver ended its founding statement with
     `<tool_call|><|channel>thought…<|tool_call>call:bash{command:`: the
     reply's next call and its reasoning ran into this call's last string, and
     were stored as the pursuit's goal.
     """
-    pending: list[tuple[str, JSONValue]] = list(call.arguments.items())
+    leaks: list[_TemplateLeak] = []
+    pending: list[tuple[str, JSONValue, bool]] = [
+        (name, value, False) for name, value in call.arguments.items()
+    ]
     while pending:
-        name, value = pending.pop(0)
+        name, value, nested = pending.pop(0)
         if isinstance(value, str):
             match = TEMPLATE_TOOL_CALL_TOKEN.search(value)
             if match is not None:
                 token = match.group(0).split(">", 1)[0] + ">"
-                return (
-                    f"its arguments carry the chat template's own tool-call tokens "
-                    f"(`{token}` in `{name}`), so the reply's next call ran into this "
-                    "one; send one call per reply, with the text alone."
-                )
+                clean = TEMPLATE_LEAK_CALL_CLOSE.sub("", value[: match.start()]).rstrip()
+                leaks.append(_TemplateLeak(path=name, nested=nested, token=token, clean=clean))
         elif isinstance(value, dict):
-            pending.extend((f"{name}.{key}", item) for key, item in value.items())
+            pending.extend((f"{name}.{key}", item, True) for key, item in value.items())
         elif isinstance(value, list):
-            pending.extend((f"{name}[{i}]", item) for i, item in enumerate(value))
-    return None
+            pending.extend((f"{name}[{i}]", item, True) for i, item in enumerate(value))
+    return leaks
 
 
 def _call_key(call: ToolCall) -> str:

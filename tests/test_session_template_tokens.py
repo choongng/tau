@@ -1,5 +1,6 @@
 """Chat-template tool-call tokens: refused in arguments, followed up in text."""
 
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -19,6 +20,7 @@ from tau_agent.types import JSONValue
 from tau_ai import FakeProvider
 from tau_coding import CodingSession, CodingSessionConfig, TauResourcePaths
 from tau_coding.session import TEXT_TOOL_CALL_NUDGE
+from tau_coding.tools import create_bash_tool
 
 #: Run R36's founding statement, as gemma sent it: the tail is the reply's
 #: next call and its reasoning, run into this call's last string.
@@ -31,6 +33,12 @@ R36_STATEMENT = (
 #: R36's W1 descriptions ended this way, on seven calls.
 R36_DESCRIPTION = (
     'Run the known-answers test.\\"}<tool_call|><|channel>thought\n'
+    "<channel|><|tool_call>call:bash{command:"
+)
+#: Run R39's W5, W7 and W8 sent bash calls whose `description` ended this way,
+#: after a whole `command`.
+R39_DESCRIPTION = (
+    'Writing the marker file."}<tool_call|><|channel>thought\n'
     "<channel|><|tool_call>call:bash{command:"
 )
 #: The qwen form R02 and R15 left at the end of a worker's text.
@@ -164,7 +172,11 @@ def setup(tau):
             name="pursuit_found",
             label="Found",
             description="Found a pursuit.",
-            parameters={{"type": "object", "properties": {{"statement": {{"type": "string"}}}}}},
+            parameters={{
+                "type": "object",
+                "properties": {{"statement": {{"type": "string"}}}},
+                "required": ["statement"],
+            }},
             execute_fn=_run,
         )
     )
@@ -297,3 +309,135 @@ async def test_reply_naming_the_tag_in_prose_is_not_followed_up(tmp_path: Path) 
 
     assert len(provider.calls) == 1
     assert _follow_ups(session) == []
+
+
+def _seen_bash(cwd: Path, seen: list[dict[str, JSONValue]]) -> AgentTool:
+    """tau's own bash, noting the arguments each call runs with."""
+    bash = create_bash_tool(cwd=cwd)
+
+    async def run(
+        tool_call_id: str, arguments: object, signal: object = None, on_update: object = None
+    ) -> AgentToolResult:
+        assert isinstance(arguments, dict)
+        seen.append(dict(arguments))
+        return await bash.execute(tool_call_id, arguments, signal, on_update)  # type: ignore[arg-type]
+
+    return replace(bash, execute_fn=run)
+
+
+async def _run_bash(
+    tmp_path: Path, *arguments: dict[str, JSONValue]
+) -> tuple[list[dict[str, JSONValue]], list[str], FakeProvider]:
+    seen: list[dict[str, JSONValue]] = []
+    provider = FakeProvider(_turns("bash", *arguments))
+    session = await CodingSession.load(
+        CodingSessionConfig(
+            provider=provider,
+            model="fake",
+            system="You are Tau.",
+            storage=JsonlSessionStorage(tmp_path / "session.jsonl"),
+            cwd=tmp_path,
+            tools=[_seen_bash(tmp_path, seen)],
+        )
+    )
+    return seen, await _run(session), provider
+
+
+@pytest.mark.anyio
+async def test_leak_in_optional_argument_runs_the_clean_call(tmp_path: Path) -> None:
+    # bash's schema requires `description`, but only to label the call: a
+    # leak there is cut like one in an optional argument.
+    marker = tmp_path / "marker.txt"
+    first = {"command": f"echo one > {marker}", "description": R39_DESCRIPTION}
+    second = {"command": f"echo two >> {marker}", "description": R36_DESCRIPTION}
+
+    seen, results, provider = await _run_bash(tmp_path, first, second)
+
+    assert marker.read_text() == "one\ntwo\n"
+    assert seen == [
+        {"command": f"echo one > {marker}", "description": "Writing the marker file."},
+        {"command": f"echo two >> {marker}", "description": "Run the known-answers test."},
+    ]
+    assert not any(result.startswith("Not run") for result in results)
+    for result in results:
+        assert result.endswith(
+            "Note: the text after the chat template's own tool-call token (`<tool_call|>` in "
+            "`description`) was the reply's next call run into this one. It was dropped, and "
+            "the call ran without it. Send each call in its own reply."
+        )
+    # The next request carries the call as it ran, not as it was sent.
+    sent = [
+        block.arguments
+        for message in provider.calls[1][2]
+        if isinstance(message, AssistantMessage)
+        for block in message.content
+        if isinstance(block, ToolCall)
+    ]
+    assert sent == [seen[0]]
+
+
+@pytest.mark.anyio
+async def test_leak_inside_required_argument_still_refused(tmp_path: Path) -> None:
+    marker = tmp_path / "marker.txt"
+    in_command = {
+        "command": f'echo one > {marker}"}}<tool_call|><|channel>thought\n<channel|>',
+        "description": "Writing the marker file.",
+    }
+    # A leak in `description` too does not let the command's leak through.
+    in_both = {**in_command, "description": R39_DESCRIPTION}
+
+    seen, results, _ = await _run_bash(tmp_path, in_command, in_both)
+
+    assert seen == []
+    assert not marker.exists()
+    assert results[0].startswith(
+        "Not run: its arguments carry the chat template's own tool-call tokens "
+        "(`<tool_call|>` in `command`)"
+    )
+    assert "(`<tool_call|>` in `command`)" in results[1]
+    assert "6 more refused calls in a row" in results[1]
+
+
+@pytest.mark.anyio
+async def test_refusal_names_the_clean_prefix(tmp_path: Path) -> None:
+    marker = tmp_path / "marker.txt"
+    command = f'echo one > {marker}"}}<tool_call|><|channel>thought\n<channel|>'
+
+    _, results, _ = await _run_bash(tmp_path, {"command": command, "description": "Writing."})
+
+    assert results[0].endswith(
+        "stop the run. The call to send is this same call with `command` ending before "
+        f"`<tool_call|>`, as `echo one > {marker}`."
+    )
+
+    # A long value is quoted by its two ends. R36's statement absorbed its
+    # sibling arguments, so its clean prefix keeps them: the model sees what it sent.
+    ran: list[object] = []
+    note = replace(
+        _recording_tool(ran),
+        name="found",
+        parameters={
+            "type": "object",
+            "properties": {"statement": {"type": "string"}},
+            "required": ["statement"],
+        },
+    )
+    (tmp_path / "found").mkdir()
+    session = await CodingSession.load(
+        CodingSessionConfig(
+            provider=FakeProvider(_turns("found", {"statement": R36_STATEMENT})),
+            model="fake",
+            system="You are Tau.",
+            storage=JsonlSessionStorage(tmp_path / "found" / "session.jsonl"),
+            cwd=tmp_path / "found",
+            tools=[note],
+        )
+    )
+    results = await _run(session)
+
+    assert ran == []
+    assert results[0].endswith(
+        "The call to send is this same call with `statement` ending before `<tool_call|>`, "
+        "as `Implement interval tree clocks in Python; the fork/event/joi… where it varies."
+        '",user_confirmed:false,user_delegated:true}`.'
+    )
