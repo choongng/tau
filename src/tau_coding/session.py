@@ -785,6 +785,8 @@ class CodingSession:
         self._awaiting_nudge_reply = False
         #: Whether the next loop request is a nudge's, sent with thinking off.
         self._next_request_thinking_off = False
+        #: The latest output-limit nudge queued, until the loop sends it.
+        self._queued_nudge: UserMessage | None = None
         #: The thinking-off twin of a provider, built for nudged requests.
         self._thinking_off_twin: tuple[ModelProvider, ModelProvider] | None = None
         #: The latest tool calls that ran, each with a digest of its result.
@@ -2056,10 +2058,21 @@ class CodingSession:
             self._length_continuations = self._run_length_continuations = 0
             self._text_tool_call_follow_ups = self._run_text_tool_call_follow_ups = 0
             self._awaiting_nudge_reply = self._next_request_thinking_off = False
+            if not self._nudge_queued():
+                self._queued_nudge = None
             self._recent_calls.clear()
             self._recent_heads.clear()
             self._refused_in_a_row = 0
             self._refused_call_ids.clear()
+        if (
+            isinstance(event, MessageEndEvent)
+            and self._queued_nudge is not None
+            and event.message is self._queued_nudge
+        ):
+            # The loop sends the nudge now: the request it makes next is the
+            # nudge's, and so is the turn that ends next.
+            self._queued_nudge = None
+            self._awaiting_nudge_reply = self._next_request_thinking_off = True
         if isinstance(event, TurnEndEvent):
             self._continue_after_output_limit(event)
             self._continue_after_text_tool_call(event)
@@ -2079,6 +2092,15 @@ class CodingSession:
         Bounded in a row, so a model that never acts does stop, and per run
         over the nudges whose reply made no tool call, so a model that keeps
         thinking itself out of room, acting just enough in between, stops too.
+
+        The nudge's reply is the turn after the loop sends it, not the next to
+        end: a steering message queued beside the nudge goes first. R38
+        (dev-notes/itc-runs/R38.md, class 3): tau-subagents steered in its
+        report request beside a nudge, its reply took the nudge's thinking-off
+        request, and each cut-off after queued a nudge behind one still
+        waiting, so four ran in a row. A cut-off while a nudge is still queued
+        queues no other, and a refused nudge leaves the count in a row as it
+        is, so a cut-off after one that is not a nudge's reply is refused too.
         """
         message = event.message
         if not isinstance(message, AssistantMessage):
@@ -2091,17 +2113,23 @@ class CodingSession:
             self._length_continuations = 0
             return
         if (
-            self._length_continuations >= MAX_OUTPUT_LIMIT_CONTINUATIONS
+            self._nudge_queued()
+            or self._length_continuations >= MAX_OUTPUT_LIMIT_CONTINUATIONS
             or self._run_length_continuations >= MAX_OUTPUT_LIMIT_CONTINUATIONS_PER_RUN
         ):
-            self._length_continuations = 0
             return
         self._length_continuations += 1
-        self._awaiting_nudge_reply = True
-        self._next_request_thinking_off = True
         nudge = UserMessage(content=OUTPUT_LIMIT_NUDGE)
+        self._queued_nudge = nudge
         self._record_message_origin(nudge, delivery="follow_up", source="extension")
         self._harness.follow_up_message(nudge)
+
+    def _nudge_queued(self) -> bool:
+        """Whether an output-limit nudge waits in the follow-up queue."""
+        nudge = self._queued_nudge
+        return nudge is not None and any(
+            message is nudge for message in self._harness.queued_messages.follow_up
+        )
 
     def _continue_after_text_tool_call(self, event: TurnEndEvent) -> None:
         """Ask again when a reply wrote its tool call as text instead of making it.
