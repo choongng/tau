@@ -2530,6 +2530,38 @@ QUOTED_SOURCE_NOTE = (
     f"{REFERENCES_DIR}/*.txt keeps the task open."
 )
 
+#: A made-up, domain-free reference for the worked example: a rule line, then
+#: the line that gives a result. Runs R34-R40: workers quoted the case's input
+#: line or a rule line as the source, and invented the expected value.
+WORKED_EXAMPLE_RULE = "shift moves the first n letters to the end."
+WORKED_EXAMPLE_LINE = 'Example 2: shift("abc", 1) gives "bca".'
+WORKED_EXAMPLE_LINES = (WORKED_EXAMPLE_RULE, WORKED_EXAMPLE_LINE)
+#: Input and expected copied from WORKED_EXAMPLE_LINE, its source quoting it.
+WORKED_EXAMPLE_CASE = {
+    "name": "shift_one",
+    "input": {"text": "abc", "n": 1},
+    "expected": "bca",
+    "source": WORKED_EXAMPLE_LINE,
+}
+#: The commonest wrong shape: a rule line quoted for a result it does not give.
+WORKED_COUNTER_CASE = {
+    "name": "shift_two",
+    "input": {"text": "abc", "n": 2},
+    "expected": "cab",
+    "source": WORKED_EXAMPLE_RULE,
+}
+
+
+def _worked_example_note() -> str:
+    """One right cases.json entry and one wrong one, from the made-up reference lines."""
+    lines = "\n".join(f"  {line}" for line in WORKED_EXAMPLE_LINES)
+    return (
+        f"Example. Reference lines:\n{lines}\n"
+        f"Right (copied from the line that gives the result): {json.dumps(WORKED_EXAMPLE_CASE)}\n"
+        f'Wrong (that rule line does not give "{WORKED_COUNTER_CASE["expected"]}"): '
+        f"{json.dumps(WORKED_COUNTER_CASE)}"
+    )
+
 
 def _reference_search(words: str = "<words>") -> str:
     """The shell command that finds the lines of references/*.txt holding `words`.
@@ -2588,6 +2620,7 @@ def _references_brief(root: Path, context_only: bool = False) -> str:
         parts.append(f"{lead}:\n<<<\n{request}\n>>>")
     if context_only and fetched:
         parts.append(f"{QUOTED_SOURCE_NOTE} {_reference_search_note()}")
+        parts.append(_worked_example_note())
         parts.append(
             "A case needs only the lines it cites: read those by line range "
             "(offset and limit), not the whole file."

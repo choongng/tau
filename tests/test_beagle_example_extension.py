@@ -4770,6 +4770,56 @@ def test_references_brief_says_how_to_search_references(
     assert "tilth" not in fallback
 
 
+def test_known_answers_brief_has_worked_example(tmp_path: Path) -> None:
+    # R34-R40: workers quoted the input or a rule line and invented expected values.
+    module = _module()
+    refs = tmp_path / "references"
+    refs.mkdir()
+    (refs / "paper.txt").write_text("the value is 42\n")
+    (refs / "index.json").write_text(
+        json.dumps({"request": "x", "fetched": {"paper.txt": "https://e.org/p"}})
+    )
+    example = module._worked_example_note()
+    brief = module._references_brief(tmp_path, context_only=True)
+    assert example in brief
+    assert brief.index(module.QUOTED_SOURCE_NOTE) < brief.index(example)
+    for line in module.WORKED_EXAMPLE_LINES:
+        assert line in example
+    right = json.dumps(module.WORKED_EXAMPLE_CASE)
+    assert f"Right (copied from the line that gives the result): {right}" in example
+    wrong = json.dumps(module.WORKED_COUNTER_CASE)
+    assert f'Wrong (that rule line does not give "cab"): {wrong}' in example
+    assert example not in module._references_brief(tmp_path)
+
+    failed = {"request": "x", "failed": {"https://e.org/p": "404"}}
+    (refs / "index.json").write_text(json.dumps(failed))
+    unfetched = module._references_brief(tmp_path, context_only=True)
+    assert "could not fetch https://e.org/p: 404" in unfetched
+    assert example not in unfetched
+
+
+def test_worked_example_agrees_with_the_source_judge(tmp_path: Path) -> None:
+    module = _module()
+    refs = tmp_path / "references"
+    refs.mkdir()
+    (refs / "guide.txt").write_text("\n".join(module.WORKED_EXAMPLE_LINES) + "\n")
+    tests = tmp_path / "tests"
+    tests.mkdir()
+    cases = tests / "cases.json"
+    example = module.WORKED_EXAMPLE_CASE
+    assert example["source"] in module.WORKED_EXAMPLE_LINES
+    assert example["source"] != module.WORKED_COUNTER_CASE["source"]
+
+    cases.write_text(json.dumps([example]))
+    assert module._unquoted_cases(tmp_path, ["tests/cases.json"]) is None
+
+    cases.write_text(json.dumps([module.WORKED_COUNTER_CASE]))
+    flagged = module._unquoted_cases(tmp_path, ["tests/cases.json"])
+    assert flagged is not None
+    assert flagged[4] is True
+    assert flagged[3] == [module.WORKED_COUNTER_CASE["name"]]
+
+
 def test_a_witness_block_is_read_from_the_end_of_a_report() -> None:
     witness = _module()._witness
     assert witness(WITNESSED_REPORT) == ("src/clock.py", "    return a + b", "    return a - b")
