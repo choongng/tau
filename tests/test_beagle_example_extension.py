@@ -18158,6 +18158,107 @@ async def test_known_answer_source_must_hold_expected_result(
     assert module._unquoted_cases(project, ["tests/cases.json"]) is None
 
 
+#: A reference defining an operation by rules, with only a few worked results (R40).
+RULES_REFERENCE = (
+    "The twist of a pair swaps its halves and adds one to the first.\n"
+    "twist((a, b)) = (b + 1, a), where a and b are any values\n"
+    "\n"
+    "For example, a twist of the unit pair gives:\n"
+    "(2, 1)\n"
+    "twist((1, 2)) = (3, 1)\n"
+    "twist((0, 5)) → (6, 0)\n"
+    "twist((7, 7)) ∼ (8, 7)\n"
+    "twist((4, 4)) = (5, 4)\n"
+    "twist((x, y)) is not defined for a nested pair\n"
+    "12\n"
+)
+
+
+async def _unsourced_result_step(
+    tmp_path: Path, fake_beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> tuple[Any, Path]:
+    """A close whose cases quote the reference's rule prose, for results it never gives."""
+    cases = [
+        {
+            "name": "nested_twist",
+            "in": [1, 2, 3, 4],
+            "out": [9, 1, 3, 9],
+            "source": "The twist of a pair swaps its halves and adds one to the first.",
+        },
+        {
+            "name": "unit_twist",
+            "in": [1, 2],
+            "out": [3, 1],
+            "source": "twist((1, 2)) = (3, 1)",
+        },
+    ]
+    project = _cases_task(tmp_path, fake_beagle, monkeypatch, CASES_DATA_TEST)
+    (project / "references").mkdir()
+    (project / "references" / "rules.txt").write_text(RULES_REFERENCE)
+    writes = json.loads(os.environ["FAKE_TAU_WRITES"])
+    writes["tests/cases.json"] = json.dumps(cases)
+    monkeypatch.setenv("FAKE_TAU_WRITES", json.dumps(writes))
+    return await _step_cases(tmp_path, locks=CASES_SCOPE), project
+
+
+@pytest.mark.anyio
+async def test_known_answers_unsourced_result_says_replace_the_case(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # R40: three of four cases asked for results no reference line gives; the
+    # verdict only asked for a quote of the line giving them, and workers kept
+    # the cases, re-quoting rule lines, for steps on end.
+    result, project = await _unsourced_result_step(tmp_path, fake_beagle, monkeypatch)
+
+    assert "stays open" in result.text and "nothing is locked" in result.text
+    assert "1 of 2 cases in tests/cases.json have a source that does not give" in result.text
+    assert (
+        "If no line of references/*.txt gives a case's result, no quote can source it: "
+        "replace the case with one whose input and result the reference both gives, "
+        "rather than quote a rule or prose line again." in result.text
+    )
+    verdict, _, next_step = result.text.partition("Next: pursuit_step")
+    assert "replace the case" in verdict
+    assert (
+        "or, where no line of the references gives it, replace the case with one whose "
+        "input and result the reference both gives." in next_step
+    )
+    assert not (project / ".beagle" / "locked").exists()
+    assert _pursuit_calls(fake_beagle, "close") == []
+
+
+@pytest.mark.anyio
+async def test_known_answers_unsourced_result_names_reference_result_lines(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # R40: the references gave concrete results on a few lines, among many rule
+    # lines; the verdict named none, so workers re-read whole references.
+    result, project = await _unsourced_result_step(tmp_path, fake_beagle, monkeypatch)
+    module = _module()
+
+    verdict = result.text.partition("Next: pursuit_step")[0]
+    named = (
+        'Lines of references/*.txt that give a concrete result: rules.txt:5 "(2, 1)"; '
+        'rules.txt:6 "twist((1, 2)) = (3, 1)"; rules.txt:7 "twist((0, 5)) → (6, 0)"; '
+        'rules.txt:8 "twist((7, 7)) ∼ (8, 7)".'
+    )
+    assert named in verdict
+    assert len(module._result_lines(project)) == module.RESULT_LINES_MAX
+    assert "rules.txt:9" not in verdict  # past the cap
+    assert "rules.txt:2" not in verdict  # a rule, with variables on its right
+    assert "rules.txt:10" not in verdict  # prose
+    assert "rules.txt:11" not in verdict  # a bare number, with no lead-in
+    assert not (project / ".beagle" / "locked").exists()
+
+
 #: R35's references/Consistent_Overhead_Byte_Stuffing.txt, lines 31-33, 45-47 and 66-88.
 R35_REFERENCE = (
     "COBS transforms an arbitrary string of bytes in the range [0,255] into bytes in the "

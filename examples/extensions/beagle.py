@@ -6039,6 +6039,81 @@ def _value_lines(root: Path, data: str, named: list[str]) -> str:
     return " ".join(sentence for sentence in sentences if sentence)
 
 
+#: Lines of the references `_result_lines` names, at most.
+RESULT_LINES_MAX = 4
+#: Chars of a reference line `_result_lines` quotes.
+RESULT_LINE_CHARS = 80
+#: A relation between an expression and its value: `=`, `≡`, `∼`, `→`, `->`, `=>`.
+_RESULT_RELATION = re.compile(r"(?<![<>!=])(?:->|=>|==|⇒|→|↦|≡|∼|~|=)")
+
+
+def _concrete(text: str) -> bool:
+    """Whether `text` is a value alone: a digit, and no letter or variable name."""
+    return any(ch.isdigit() for ch in text) and not any(ch.isalpha() for ch in text)
+
+
+def _result_line(text: str, lead: str) -> bool:
+    """Whether a reference line gives a concrete result.
+
+    Either a relation whose right side is a value alone (`split(1) = ((1, 0), (0, 1))`,
+    not the rule `split((0, i)) = ((0, i1), (0, i2))`), or a worked example: a line
+    of values alone after a prose line ending in a colon.
+    """
+    relation = _RESULT_RELATION.search(text)
+    if relation and text[: relation.start()].strip():
+        return _concrete(text[relation.end() :])
+    return _concrete(text) and lead.rstrip().endswith(":") and any(ch.isalpha() for ch in lead)
+
+
+def _result_lines(root: Path) -> list[str]:
+    """Lines of references/*.txt that give a concrete result, as `file:line "quote"`.
+
+    Run R40: three of four cases asked for results no reference gives, and the
+    verdict only asked for a quote of the line giving them, so workers re-quoted
+    rule lines. These are the lines a replacement case can come from, taken from
+    each reference in turn, bracketed values first, RESULT_LINES_MAX at most.
+    """
+    refs = root / REFERENCES_DIR
+    found: list[list[str]] = []
+    for path in sorted(refs.glob("*.txt")) if refs.is_dir() else []:
+        try:
+            raw = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        lead = ""
+        lines: list[str] = []
+        for number, line in enumerate(raw.splitlines(), 1):
+            text = " ".join(line.split())
+            if not text:
+                continue
+            if _result_line(text, lead):
+                if len(text) > RESULT_LINE_CHARS:
+                    text = text[:RESULT_LINE_CHARS] + "…"
+                lines.append(f'{path.name}:{number} "{text}"')
+            lead = text
+        # A bracketed value is more often a worked result than a bare definition.
+        found.append(sorted(lines, key=lambda line: not any(ch in line for ch in "([{")))
+    taken = [line for row in itertools.zip_longest(*found) for line in row if line]
+    return taken[:RESULT_LINES_MAX]
+
+
+def _unanswered_case_note(root: Path) -> str:
+    """The known-answers verdict's sentence for a case no reference line answers."""
+    note = (
+        f"If no line of {REFERENCES_DIR}/*.txt gives a case's result, no quote can source "
+        "it: replace the case with one whose input and result the reference both gives, "
+        "rather than quote a rule or prose line again."
+    )
+    candidates = _result_lines(root)
+    if candidates:
+        note += (
+            f" Lines of {REFERENCES_DIR}/*.txt that give a concrete result: "
+            + "; ".join(candidates)
+            + "."
+        )
+    return note
+
+
 def _reads_locked_data(root: Path, test: str, data: list[str]) -> bool:
     """Whether `test` reads one of the `data` files and imports a project module.
 
@@ -12932,6 +13007,7 @@ def make_step_tool() -> Any:
         if unquoted and unquoted[4]:
             state = "stays blocked" if retrying else "stays open"
             data, missing, total, named, _, _ = unquoted
+            unanswered = _unanswered_case_note(root)
             return _not_done(
                 root,
                 task,
@@ -12940,17 +13016,20 @@ def make_step_tool() -> Any:
                 f"and nothing is locked: {missing} of {total} cases in {data} have a source "
                 "that does not give the case's expected result, so a wrong answer would be "
                 f"locked as known: case {named[0]}'s source quotes its input or prose, not "
-                "its expected result: quote the line that gives the result"
+                "its expected result: quote the line that gives the result, where the "
+                "reference has one"
                 + (f" (also {', '.join(named[1:])})" if named[1:] else "")
-                + f". A source holds the result when it, or the line of {REFERENCES_DIR}/*.txt "
-                "after the one it quotes, gives every value of it, as decimal, hex bytes or "
-                "the string; a long sequence may be elided with `...` between its head "
-                "and tail. Where the reference gives a different result, the case's "
-                "expected value is wrong: change it to the reference's."
+                + f". {unanswered} A source holds the result when it, or the line of "
+                f"{REFERENCES_DIR}/*.txt after the one it quotes, gives every value of it, "
+                "as decimal, hex bytes or the string; a long sequence may be elided with "
+                "`...` between its head and tail. Where the reference gives a different "
+                "result, the case's expected value is wrong: change it to the reference's."
                 f"\n\nLast report:\n{shown}\n\n"
                 f'Next: pursuit_step with task="{task}" and notes saying case {named[0]}\'s '
                 f"source in {data} quotes its input, not its expected result: quote the line "
-                "that gives the result, and make the expected value match it.",
+                "that gives the result and make the expected value match it, or, where no "
+                "line of the references gives it, replace the case with one whose input and "
+                "result the reference both gives.",
             )
         if unquoted:
             state = "stays blocked" if retrying else "stays open"
