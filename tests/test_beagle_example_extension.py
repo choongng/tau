@@ -4323,7 +4323,8 @@ async def test_unquoted_verdict_points_at_the_lines_holding_case_values(
     assert "3 of 4 cases in tests/cases.json have no source quoting" in verdict
     assert (
         "Case #1's values are on Consistent_Overhead_Byte_Stuffing.txt:69-70: "
-        '"1 | 00" / "| 1 | 01 01 00"; copy one of those lines as its source.'
+        '"1 | 00" / "| 1 | 01 01 00"; copy the two joined, "1 | 00 | 1 | 01 01 00", as its '
+        "source."
     ) in verdict
     assert 'Consistent_Overhead_Byte_Stuffing.txt:72-73: "2 | 00 00" / "| 2 | 01 01 01 00"' in (
         verdict
@@ -4363,6 +4364,101 @@ async def test_unquoted_verdict_says_when_no_line_holds_the_values(
         "Case #3's values are on Consistent_Overhead_Byte_Stuffing.txt:81-82: "
         '"5 | 11 22 33 44" / "| 4 | 05 11 22 33 44 00"'
     ) in verdict
+
+
+@pytest.mark.anyio
+async def test_source_hold_offers_only_quotes_that_pass_the_rule(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Run R43: the hold offered "1 | 00" to copy as a source, three words against
+    the rule's four; every line it offers must pass the rule it holds the case to."""
+    module = _module()
+    cases = [
+        {"inputs": "00", "result": "01 01 00", "source": "Example 1 encodes 00"},
+        {"inputs": "00 00", "result": "01 01 01 00", "source": "Example 2 encodes"},
+        {"inputs": "11 22 33 44", "result": "05 11 22 33 44 00", "source": "Example 5"},
+    ]
+    _cases_with_cobs_reference(tmp_path, fake_beagle, monkeypatch, cases)
+
+    result = await _step_cases(tmp_path, locks=CASES_SCOPE, done_when=R37_CHECK)
+
+    verdict = result.text.split("Last report")[0]
+    reference = module._normalised(R37_REFERENCE)
+    offers = re.findall(r'(?:values are on \S+: )("[^"]*"(?: / "[^"]*")?); ([^.]*)', verdict)
+    assert len(offers) == 3
+    for lines, route in offers:
+        if route.startswith("copy one of those lines"):
+            offered = re.findall(r'"([^"]*)"', lines)
+        else:
+            offered = re.findall(r'"([^"]*)"', route)
+        assert offered, route
+        for quote in offered:
+            assert module._quotes_reference(quote, reference), quote
+    assert '"1 | 00 | 1 | 01 01 00", as its source' in verdict
+    assert "copy one of those lines" in verdict.split("Case #2's values")[1]
+    # A row the rule refuses alone is never offered alone.
+    assert not module._quotes_reference("1 | 00", reference)
+    assert '"1 | 00"; copy it' not in verdict
+    assert '"1 | 00" / "| 1 | 01 01 00"; copy one of those lines' not in verdict
+
+
+@pytest.mark.anyio
+async def test_source_hold_names_the_cases_already_sourced(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Run R43: each hold named only the failing cases, and W8 changed sources an
+    earlier close had accepted; the hold names the cases to keep."""
+    module = _module()
+    sourced = [
+        {
+            "name": "one_zero",
+            "inputs": "00",
+            "result": "01 01 00",
+            "source": "1 | 00 | 1 | 01 01 00",
+        },
+        {
+            "name": "two_zeros",
+            "inputs": "00 00",
+            "result": "01 01 01 00",
+            "source": "2 | 00 00 | 2 | 01 01 01 00",
+        },
+    ]
+    cases = [
+        *sourced,
+        {"name": "mid", "inputs": "00 11 00", "result": "01 02 11 01 00", "source": "Example 3"},
+        {"name": "split", "inputs": "11 22 00 33", "result": "03 11 22 02 33 00", "source": "Ex 4"},
+        {"name": "none", "inputs": "11 22 33 44", "result": "05 11 22 33 44 00", "source": "5"},
+    ]
+    project = _cases_with_cobs_reference(tmp_path, fake_beagle, monkeypatch, cases)
+
+    result = await _step_cases(tmp_path, locks=CASES_SCOPE, done_when=R37_CHECK)
+
+    verdict, _, rest = result.text.partition("Last report")
+    keep = "Already sourced, keep unchanged: one_zero, two_zeros."
+    assert "3 of 5 cases in tests/cases.json have no source quoting" in verdict
+    assert keep in verdict
+    assert keep in rest.split("Next: ")[1]
+    assert not (project / ".beagle" / "locked").exists()
+
+    # A case whose source quotes the reference but not its result is held, not kept.
+    wrong = {**sourced[1], "result": "01 01 02 00"}
+    (project / "tests" / "cases.json").write_text(json.dumps([sourced[0], wrong]))
+    found = module._unquoted_cases(project, ["tests/cases.json"])
+    assert found is not None and found[3:5] == (["two_zeros"], True)
+    assert found[6] == ["one_zero"]
+    assert "keep unchanged: one_zero." in module._keep_sourced(found[6])
+
+    # Cases that all quote the reference close as before.
+    (project / "tests" / "cases.json").write_text(json.dumps(sourced))
+    assert module._unquoted_cases(project, ["tests/cases.json"]) is None
 
 
 @pytest.mark.anyio
@@ -4587,6 +4683,7 @@ def test_bare_file_line_source_still_flagged_unquoted(tmp_path: Path) -> None:
             ("#2", "interval-tree-clocks.txt:115"),
             ("#3", "interval-tree-clocks.txt:116"),
         ],
+        [],
     )
 
 

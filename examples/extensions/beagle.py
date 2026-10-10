@@ -5998,9 +5998,10 @@ def _result_unquoted(case: object, references: list[list[str]]) -> bool:
 
 def _unquoted_cases(
     root: Path, entries: list[str]
-) -> tuple[str, int, int, list[str], bool, list[tuple[str, str]]] | None:
-    """(data file, unfound, total, up to 3 names, whether by result, each named one's source)
-    for cases whose source does not tie them to references/*.txt.
+) -> tuple[str, int, int, list[str], bool, list[tuple[str, str]], list[str]] | None:
+    """(data file, unfound, total, up to 3 names, whether by result, each named one's
+    source, the cases already sourced) for cases whose source does not tie them to
+    references/*.txt.
 
     Runs R12 and R14: cases cited bare URLs, nothing, or `itc2008.txt:221`,
     a line that held a page number. A source counts as found when at least
@@ -6016,6 +6017,10 @@ def _unquoted_cases(
     Run R36: the verdict named the cases, not what was searched in them, so a
     driver could not see that the check missed quotes in parentheses. The last
     element is the first flagged case's source strings, joined, or "".
+
+    Run R43: the hold named only the failing cases, and later workers changed
+    sources an earlier close had accepted. The last element names the cases
+    that pass both rules, for the hold to say to keep.
     """
     refs = root / REFERENCES_DIR
     texts = []
@@ -6045,21 +6050,37 @@ def _unquoted_cases(
             for i, case in enumerate(cases)
             if not any(_quotes_reference(s, text) for s in _source_strings(case) for text in texts)
         ]
+        wrong = [(i, case) for i, case in enumerate(cases) if _result_unquoted(case, references)]
+        held = {i for i, _ in unfound} | {i for i, _ in wrong}
+        sourced = [_case_label(case, i) for i, case in enumerate(cases) if i not in held]
         if cases and 2 * len(unfound) > len(cases):
             names = [_case_label(case, i) for i, case in unfound[:3]]
             sources = [
                 (name, _flagged_source(case))
                 for name, (_, case) in zip(names, unfound, strict=False)
             ]
-            return rel, len(unfound), len(cases), names, False, sources
-        wrong = [(i, case) for i, case in enumerate(cases) if _result_unquoted(case, references)]
+            return rel, len(unfound), len(cases), names, False, sources, sourced
         if wrong:
             names = [_case_label(case, i) for i, case in wrong[:3]]
             sources = [
                 (name, _flagged_source(case)) for name, (_, case) in zip(names, wrong, strict=False)
             ]
-            return rel, len(wrong), len(cases), names, True, sources
+            return rel, len(wrong), len(cases), names, True, sources, sourced
     return None
+
+
+#: Names of already-sourced cases a source hold lists, at most.
+SOURCED_NAMES_MAX = 8
+
+
+def _keep_sourced(sourced: list[str]) -> str:
+    """The hold's sentence naming the cases that already pass, for the next worker to keep."""
+    if not sourced:
+        return ""
+    shown = ", ".join(sourced[:SOURCED_NAMES_MAX])
+    more = len(sourced) - SOURCED_NAMES_MAX
+    shown += f" and {more} more" if more > 0 else ""
+    return f"Already sourced, keep unchanged: {shown}."
 
 
 #: Chars of a flagged case's source a verdict quotes.
@@ -6155,6 +6176,9 @@ def _value_line(
     input is a run of VALUE_RUN_MIN_TOKENS or more tokens, which a line holds
     by chance rarely; else nothing is said, rather than point at a random
     line, unless no line holds the inputs at all.
+
+    A line is offered to copy only when it passes `_quotes_reference` on its
+    own; else the two lines are offered joined when that passes, else none.
     """
     inputs = _case_inputs(case)
     if not inputs:
@@ -6200,14 +6224,25 @@ def _value_line(
             text = text[:VALUE_LINE_CHARS] + "…"
         return f'"{text}"'
 
+    reference = _normalised(" ".join(text for _, text in lines))
+
+    def quotable(text: str) -> bool:
+        return _quotes_reference(text.strip('"'), reference)
+
     first, last = lines[at][0], lines[after][0]
     if after == at:
+        if not quotable(quoted(at)):
+            return f"Case {label}'s values are on {name}:{first}: {quoted(at)}."
         return f"Case {label}'s values are on {name}:{first}: {quoted(at)}; copy it as its source."
     span = f"{first}-{last}" if last == first + 1 else f"{first},{last}"
-    return (
-        f"Case {label}'s values are on {name}:{span}: {quoted(at)} / {quoted(after)}; "
-        "copy one of those lines as its source."
-    )
+    where = f"Case {label}'s values are on {name}:{span}: {quoted(at)} / {quoted(after)}"
+    if quotable(quoted(at)) and quotable(quoted(after)):
+        return f"{where}; copy one of those lines as its source."
+    # Run R43: "1 | 00" was offered alone, three words, and the rule refused it.
+    joined = lines[at][1].strip() + " " + lines[after][1].strip()
+    if quotable(joined):
+        return f'{where}; copy the two joined, "{joined}", as its source.'
+    return f"{where}."
 
 
 def _value_lines(root: Path, data: str, named: list[str]) -> str:
@@ -13932,8 +13967,9 @@ def make_step_tool() -> Any:
         unquoted = _unquoted_cases(root, locks) if locks else None
         if unquoted and unquoted[4]:
             state = "stays blocked" if retrying else "stays open"
-            data, missing, total, named, _, _ = unquoted
+            data, missing, total, named, _, _, sourced = unquoted
             unanswered = _unanswered_case_note(root)
+            keep = _keep_sourced(sourced)
             return _not_done(
                 root,
                 task,
@@ -13950,19 +13986,21 @@ def make_step_tool() -> Any:
                 "as decimal, hex bytes or the string; a long sequence may be elided with "
                 "`...` between its head and tail. Where the reference gives a different "
                 "result, the case's expected value is wrong: change it to the reference's."
-                f"\n\nLast report:\n{shown}\n\n"
+                + (f" {keep}" if keep else "")
+                + f"\n\nLast report:\n{shown}\n\n"
                 f'Next: pursuit_step with task="{task}" and notes saying case {named[0]}\'s '
                 f"source in {data} quotes its input, not its expected result: quote the line "
                 "that gives the result and make the expected value match it, or, where no "
                 "line of the references gives it, replace the case with one whose input and "
-                "result the reference both gives.",
+                "result the reference both gives." + (f" {keep}" if keep else ""),
                 cases=(data, named),
             )
         if unquoted:
             state = "stays blocked" if retrying else "stays open"
-            data, missing, total, named, _, sources = unquoted
+            data, missing, total, named, _, sources, sourced = unquoted
             located = _value_lines(root, data, named)
             located = f"{located} " if located else ""
+            keep = _keep_sourced(sourced)
             return _not_done(
                 root,
                 task,
@@ -13975,11 +14013,10 @@ def make_step_tool() -> Any:
                 "The sub-agent must give each case a `source` that "
                 f"copies, verbatim, at least {SOURCE_QUOTE_MIN_WORDS} words of a line of "
                 f"{REFERENCES_DIR}/*.txt it comes from. A bare file:line, page number or URL "
-                "is not a source."
-                f"\n\nLast report:\n{shown}\n\n"
+                "is not a source." + (f" {keep}" if keep else "") + f"\n\nLast report:\n{shown}\n\n"
                 f'Next: pursuit_step with task="{task}" and notes saying each case in {data} '
                 f"must quote, verbatim, the line of {REFERENCES_DIR}/*.txt it comes from, "
-                f"starting with {named[0]}.",
+                f"starting with {named[0]}." + (f" {keep}" if keep else ""),
                 cases=(data, named),
             )
         # Committed while the task is still open, as beagle has a worker do:
