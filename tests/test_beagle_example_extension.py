@@ -3397,6 +3397,53 @@ R22_CASES_TEST = (
 )
 
 
+@pytest.mark.anyio
+async def test_known_answers_close_refuses_cases_test_copying_data_test(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Run R39: tests/test_cases.py was the data test again, importing no code,
+    # and the known-answers task closed done with both locked.
+    project = _cases_task(tmp_path, fake_beagle, monkeypatch, CASES_DATA_TEST)
+    writes = json.loads(os.environ["FAKE_TAU_WRITES"])
+    writes["tests/test_cases.py"] = (
+        '"""The cases."""\nimport json  # data\n\n\ndef test_cases():\n'
+        '    assert json.load(open("tests/cases.json"))\n'
+    )
+    monkeypatch.setenv("FAKE_TAU_WRITES", json.dumps(writes))
+
+    text = await _refused_r20(tmp_path, fake_beagle, project)
+
+    assert (
+        "tests/test_cases.py is a copy of tests/test_case_data.py and imports none of the "
+        "code, so the known answers could never judge the code: the sub-agent must make it "
+        "import the code under test and compare each case's answer"
+    ) in text
+
+    module = _module()
+    entries = ["tests/cases.json", "tests/test_case_data.py", "tests/test_cases.py"]
+    assert module._cases_test_problem(project, entries) is not None
+    # A data test beside a cases test that imports the code is no copy.
+    (project / "tests" / "test_cases.py").write_text(
+        "import json\n\nimport codec\n\n\ndef test_cases():\n"
+        '    for case in json.load(open("tests/cases.json")):\n'
+        '        assert codec.run(case["in"]) == case["out"]\n'
+    )
+    assert module._cases_test_problem(project, entries) is None
+    # Two shape tests that differ more than a copy are not refused as one.
+    (project / "tests" / "test_cases.py").write_text(
+        "import json\n\n\ndef test_each_case_has_in_and_out():\n"
+        '    cases = json.load(open("tests/cases.json"))\n'
+        "    assert isinstance(cases, list) and cases\n"
+        "    for case in cases:\n"
+        '        assert set(case) >= {"in", "out"}, case\n'
+    )
+    assert module._cases_test_problem(project, entries) is None
+
+
 def test_cases_test_indexing_the_top_level_key_is_not_an_absent_case(tmp_path: Path) -> None:
     # R22 E12/E22: `cases["cases"]` was refused as looking up case "cases".
     module = _module()
@@ -3594,6 +3641,55 @@ def test_cases_first_never_plans_known_answers_over_locked_data(
     assert module._cases_first_problem(carried, "T0003", "Codec", goal, R22_NODES, locks) is None
     # Asking to lock a test the scope does not hold is no route past it.
     assert module._cases_first_problem(["cobs.py"], "T0003", "Codec", goal, R22_NODES, locks)
+
+
+def test_cases_first_offers_existing_uncommitted_cases_test(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Run R39: tests/test_cobs_cases.py was on disk, uncommitted, and Cases first
+    # skipped it for tests/test_cobs_known_answers.py, a third test file.
+    project = _r22_committed(tmp_path, monkeypatch, test=False)
+    copy = "import json\n\n\ndef test_cases():\n    assert json.load(open('tests/cases.json'))\n"
+    (project / "tests" / "test_cases.py").write_text(copy)
+    _git(project, "add", "tests/test_cases.py")
+    _git(project, "commit", "-q", "-m", "T0002: cases test")
+    _store_lock(project / ".beagle", "tests/test_cases.py", copy)
+    started = project / "tests" / "test_cobs_cases.py"
+    started.write_text(
+        "import json\n\n\ndef test_cases():\n"
+        '    for case in json.load(open("tests/cases.json"))["cases"]:\n'
+        '        assert case["expected"]\n'
+    )
+    module = _module()
+    goal = project / ".beagle" / "pursuit.toml"
+
+    found = module._cases_first_problem(["cobs.py"], "T0003", "Codec", goal, R22_NODES)
+
+    assert found is not None
+    assert (
+        "tests/test_cobs_cases.py is on disk, uncommitted and unlocked, and reads "
+        "tests/cases.json: put tests/test_cobs_cases.py in scope and make it import the code"
+    ) in found
+    assert (
+        'scope=["cobs.py", "tests/test_cobs_cases.py"] '
+        'done_when="python3 -m pytest -q tests/test_cobs_cases.py" '
+        'locks=["tests/test_cobs_cases.py"]'
+    ) in found
+    assert "test_cobs_known_answers" not in found
+
+    # One on disk that does not read the cases is no start: a fresh name, as before.
+    started.write_text("def test_nothing():\n    assert True\n")
+    fresh = module._cases_first_problem(["cobs.py"], "T0003", "Codec", goal, R22_NODES)
+    assert fresh is not None and "tests/test_cobs_known_answers.py" in fresh
+    assert "is on disk" not in fresh
+
+    # Committed, it is someone's work: skipped for a fresh name, as before.
+    started.write_text(copy)
+    _git(project, "add", "tests/test_cobs_cases.py")
+    _git(project, "commit", "-q", "-m", "T0004: another")
+    committed = module._cases_first_problem(["cobs.py"], "T0003", "Codec", goal, R22_NODES)
+    assert committed is not None and "tests/test_cobs_known_answers.py" in committed
+    assert "is on disk" not in committed
 
 
 @pytest.mark.anyio

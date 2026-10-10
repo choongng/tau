@@ -5210,6 +5210,11 @@ def _cases_problem_fix(root: Path, test: str, problem: str) -> str:
             if names
             else "add a test_ function that runs the cases"
         )
+    elif problem.startswith("is a copy of "):
+        fix = (
+            "make it import the code under test and compare each case's answer with "
+            "the code's result"
+        )
     elif problem.startswith("uses ") and " without importing " in problem:
         fix = f"import {problem.rpartition(' without importing ')[2]} in it"
     else:
@@ -5280,6 +5285,66 @@ def _test_structure_problem(tree: ast.Module) -> str | None:
     return None
 
 
+#: Token Jaccard at or above which two test files count as copies of each other.
+TEST_COPY_JACCARD = 0.9
+
+
+def _test_copy_score(left: Path, right: Path) -> float:
+    """How alike two Python test files are, 0.0 to 1.0, comments and layout aside.
+
+    Each file is parsed and unparsed, with docstrings dropped, so formatting,
+    quoting and comments do not count; the score is the Jaccard index of the
+    two token multisets (each token paired with its occurrence count).
+    """
+    bags: list[set[tuple[str, int]]] = []
+    for path in (left, right):
+        try:
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+        except (OSError, SyntaxError, ValueError):
+            return 0.0
+        for node in ast.walk(tree):
+            body = getattr(node, "body", None)
+            if isinstance(body, list):
+                node.body = [  # type: ignore[attr-defined]
+                    stmt
+                    for stmt in body
+                    if not (
+                        isinstance(stmt, ast.Expr)
+                        and isinstance(stmt.value, ast.Constant)
+                        and isinstance(stmt.value.value, str)
+                    )
+                ] or [ast.Pass()]
+        seen: dict[str, int] = {}
+        bag: set[tuple[str, int]] = set()
+        for token in re.findall(r"\w+|[^\w\s]", ast.unparse(tree)):
+            seen[token] = seen.get(token, 0) + 1
+            bag.add((token, seen[token]))
+        bags.append(bag)
+    union = bags[0] | bags[1]
+    return len(bags[0] & bags[1]) / len(union) if union else 1.0
+
+
+def _copied_cases_test(root: Path, tests: list[str], data: str) -> tuple[str, str] | None:
+    """(copy, original) when no test reading `data` imports the project and two of
+    them are near-copies, so the would-be cases test only repeats the data test.
+
+    Run R39 locked tests/test_cases.py identical to tests/test_case_data.py:
+    both read cases.json and checked its shape, neither imported the code. Of
+    the pair, the one whose name does not say "data" is named as the copy.
+    """
+    readers = [rel for rel in tests if _cases_test_reads(root / rel, Path(data).name)]
+    if any(_test_project_imports(root / rel) for rel in readers):
+        return None
+    for index, first in enumerate(readers):
+        for second in readers[index + 1 :]:
+            if _test_copy_score(root / first, root / second) < TEST_COPY_JACCARD:
+                continue
+            if "data" in Path(second).stem and "data" not in Path(first).stem:
+                return first, second
+            return second, first
+    return None
+
+
 def _cases_test_problem(root: Path, entries: list[str]) -> tuple[str, str] | None:
     """(test, what is wrong) when a locked test reading cases data could never judge it.
 
@@ -5287,7 +5352,8 @@ def _cases_test_problem(root: Path, entries: list[str]) -> tuple[str, str] | Non
     did not hold, never read a case's "expected", and used `.event` both as a
     method and as a number. Read from each test's AST; nothing is run. The
     unread-answers check applies only to tests importing the project, as the
-    data's own shape test reads no answers.
+    data's own shape test reads no answers. Run R39: a cases test copying the
+    data test, with no test importing the project, is refused too.
     """
     files = []
     for entry in entries:
@@ -5304,6 +5370,9 @@ def _cases_test_problem(root: Path, entries: list[str]) -> tuple[str, str] | Non
         keys = {str(key) for key in raw} if isinstance(raw, dict) else set()
         labels = _case_labels(cases)
         answers = _answer_keys(cases)
+        copied = _copied_cases_test(root, tests, data)
+        if copied is not None:
+            return copied[0], f"is a copy of {copied[1]} and imports none of the code"
         for test in tests:
             if not _cases_test_reads(root / test, Path(data).name):
                 continue
@@ -6255,6 +6324,7 @@ def _locked_data_route(
     committed: list[tuple[str, str]],
     module: str,
     root: Path,
+    locked: list[str] | tuple[str, ...] = (),
 ) -> str:
     """The Cases first refusal when the known answers are locked but no test of them is.
 
@@ -6262,6 +6332,10 @@ def _locked_data_route(
     tests/cases.json, and that part's work was refused as locked. With a done
     task's cases test committed, the route locks it on this step; else this
     task writes the test and its close locks it.
+
+    Run R39: a candidate test on disk was skipped for the next fresh name, so
+    each refusal named a new file. A candidate on disk, neither committed nor
+    in `locked`, that reads the data is offered for this task to finish.
     """
     listed = ", ".join(data)
     head = (
@@ -6285,11 +6359,29 @@ def _locked_data_route(
         f"tests/test_{stem}_cases.py",
         f"tests/test_{stem}_known_answers.py",
     ]
-    test = next((rel for rel in candidates if not (root / rel).exists()), candidates[-1])
+    on_disk = [rel for rel in candidates if (root / rel).is_file()]
+    held = (_head_files(root) or set()) | set(locked) if on_disk else set()
+    names = {Path(rel).name for rel in data}
+    started = next(
+        (
+            rel
+            for rel in on_disk
+            if rel not in held and any(_cases_test_reads(root / rel, name) for name in names)
+        ),
+        None,
+    )
+    test = started or next((rel for rel in candidates if not (root / rel).exists()), candidates[-1])
     scoped = ", ".join(f'"{e}"' for e in [*scope, test])
+    write = (
+        f"{test} is on disk, uncommitted and unlocked, and reads {listed}: put {test} in "
+        f"scope and make it import the code, {named}, in this task, then lock it at its "
+        "close"
+        if started
+        else "Write that test in this task and lock it at its close"
+    )
     return (
-        f"{head} No test that reads them imports {named} yet. Write that test in this "
-        f'task and lock it at its close: pursuit_step task="{task}" scope=[{scoped}] '
+        f"{head} No test that reads them imports {named} yet. {write}: "
+        f'pursuit_step task="{task}" scope=[{scoped}] '
         f'done_when="python3 -m pytest -q {test}" locks=["{test}"]. The test must load '
         f"{listed} and run every case against {named}, with no asserts of its own."
     )
@@ -6452,7 +6544,7 @@ def _cases_first_problem(
     )
     if locked_data:
         return _locked_data_route(
-            task, scope, named, unjudged_text, locked_data, committed, module, root
+            task, scope, named, unjudged_text, locked_data, committed, module, root, _locked(goal)
         )
     on_disk = _known_answers_on_disk(root)
     siblings = _known_answers_siblings(task, nodes or [])
