@@ -12461,6 +12461,86 @@ async def test_driver_refusals_do_not_name_the_override_env(
     assert (await write.execute("c5", {"path": "src/app.py", "content": "x"})).text == "ran"
 
 
+@pytest.mark.anyio
+async def test_driver_edit_refusal_names_the_step_for_the_ready_task(
+    tmp_path: Path, beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # T0365: a refused driver is one turn from the call that does the work.
+    project = _pursuit_project(tmp_path)
+    monkeypatch.chdir(project)
+    runtime, session = _bound(tmp_path)
+    write, bash = _tool_with_hooks(runtime, "write"), _tool_with_hooks(runtime, "bash")
+    agent = _tool_with_hooks(runtime, "agent")
+    await runtime.emit_session_start("startup")
+    module = _loaded_module()
+    offered = {"open": [{"id": "T0002"}], "ready": [{"id": "T0003"}, {"id": "T0004"}]}
+    monkeypatch.setattr(module, "_next_ready", lambda root: (0, offered, ""))
+
+    refused = [
+        await write.execute("c1", {"path": "src/app.py", "content": "x"}),
+        await bash.execute("c2", {"command": "echo x > src/app.py"}),
+        await agent.execute("c3", {"prompt": "write src/app.py"}),
+    ]
+    offered = {"open": [], "ready": ["T0003", "T0004"]}
+    ready_only = await write.execute("c4", {"path": "src/app.py", "content": "x"})
+    dispatch = module._founded_dispatch_refusal(project)
+    session.session_id = "subagent-session"
+    worker = await write.execute("c5", {"path": "src/app.py", "content": "x"})
+    session.session_id = "session-1"
+    monkeypatch.setenv("BEAGLE_TAU_DRIVER_EDITS", "1")
+    opted_out = await write.execute("c6", {"path": "src/app.py", "content": "x"})
+
+    for result in refused:
+        assert "Call pursuit_step with task=T0002, with what you meant to change in its notes" in (
+            result.text
+        ), result.text
+        assert "a sub-agent does it" in result.text
+    assert "Call pursuit_step with task=T0003," in ready_only.text
+    assert dispatch is not None and "Call pursuit_step with task=T0003: it opens T0003" in dispatch
+    assert [worker.text, opted_out.text] == ["ran"] * 2
+
+
+@pytest.mark.anyio
+async def test_driver_edit_refusal_without_a_ready_task_names_bare_step(
+    tmp_path: Path, beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # T0365: with no task on offer, or `next` failing, the call names no task.
+    project = _pursuit_project(tmp_path)
+    monkeypatch.chdir(project)
+    runtime, _ = _bound(tmp_path)
+    write = _tool_with_hooks(runtime, "write")
+    await runtime.emit_session_start("startup")
+    module = _loaded_module()
+    replies: list[tuple[int, Any, str]] = [
+        (0, {"open": [], "ready": []}, ""),
+        (1, {"open": [{"id": "T0002"}]}, "error"),
+        (0, None, "not json"),
+    ]
+
+    for i, reply in enumerate(replies):
+        monkeypatch.setattr(module, "_next_ready", lambda root, reply=reply: reply)
+        refused = await write.execute(f"c{i}", {"path": "src/app.py", "content": "x"})
+        assert "Call pursuit_step with no arguments: it shows the next ready task" in (
+            refused.text
+        ), refused.text
+        assert "with what you meant to change in its notes" in refused.text
+        assert "task=" not in refused.text
+
+    def broken(root: Path) -> tuple[int, Any, str]:
+        raise OSError("beagle missing")
+
+    monkeypatch.setattr(module, "_next_ready", broken)
+    refused = await write.execute("c9", {"path": "src/app.py", "content": "x"})
+    assert "Call pursuit_step with no arguments" in refused.text
+    module._KILLED_NOT_OPENED[str(project.resolve())] = ("T0002", 'pursuit_step with task="T0002"')
+    try:
+        killed = await write.execute("c10", {"path": "src/app.py", "content": "x"})
+    finally:
+        module._KILLED_NOT_OPENED.clear()
+    assert "T0002 was last refused on a killed check" in killed.text
+    assert 'call pursuit_step with task="T0002"; a sub-agent does it' in killed.text
+
+
 def test_lock_before_a_commit_fills_in_the_commit_once_one_holds_it(tmp_path: Path) -> None:
     module = _module()
     project = _pursuit_project(tmp_path)

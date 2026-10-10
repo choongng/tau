@@ -1892,6 +1892,19 @@ def _unreported_runs(runs: list[tuple[int, _WorkerRun, list[str]]], total: int) 
     return "".join(lines)
 
 
+def _offered_task(root: Path) -> str:
+    """The task `beagle pursuit next` offers: the open one, else the first ready.
+
+    Empty when it offers neither or fails; a refusal that names it stands
+    without it.
+    """
+    with contextlib.suppress(Exception):
+        rc, ready, _raw = _next_ready(root)
+        if rc in (0, 3) and isinstance(ready, dict):
+            return (_ids(ready.get("open")) + _ids(ready.get("ready")) or [""])[0]
+    return ""
+
+
 def _founded_dispatch_refusal(cwd: Path) -> str | None:
     """Why the driver of a founded pursuit may not dispatch, or None.
 
@@ -1904,11 +1917,7 @@ def _founded_dispatch_refusal(cwd: Path) -> str | None:
     goal = _find_goal(cwd)
     if goal is None:
         return None
-    task = ""
-    with contextlib.suppress(Exception):  # the refusal stands without a task id
-        rc, ready, _raw = _next_ready(goal.parent.parent)
-        if rc in (0, 3) and isinstance(ready, dict):
-            task = (_ids(ready.get("open")) + _ids(ready.get("ready")) or [""])[0]
+    task = _offered_task(goal.parent.parent)
     then = (
         f"Call pursuit_step with task={task}: it opens {task}, has a sub-agent do it, runs "
         "its check and closes it."
@@ -13661,7 +13670,8 @@ def make_driver_edit_guard() -> Any:
     In run 10, with those refused, it had the `agent` tool's sub-agent write
     the file: that sub-agent's session is its own, so only refusing the
     spawn keeps it out. Its `.beagle/` store is left to `make_record_guard`.
-    `BEAGLE_TAU_DRIVER_EDITS=1` lets it edit.
+    The refusal names the pursuit_step call for the task beagle offers, so a
+    refused driver is one turn from it. `BEAGLE_TAU_DRIVER_EDITS=1` lets it edit.
     """
 
     async def guard(event: Any, context: ExtensionContext) -> ToolCallHookResult | None:
@@ -13697,12 +13707,18 @@ def make_driver_edit_guard() -> Any:
             refused = _KILLED_NOT_OPENED.get(str(store.parent))
         except Exception:  # noqa: BLE001 - fail open, never block on a guard bug
             return None
-        call = (
-            "Call pursuit_step, with what you meant to change in its notes"
-            if refused is None
-            else f"{refused[0]} was last refused on a killed check, and the same call is "
-            f"refused again; call {refused[1]}"
-        )
+        if refused is not None:
+            call = (
+                f"{refused[0]} was last refused on a killed check, and the same call is "
+                f"refused again; call {refused[1]}"
+            )
+        elif task := _offered_task(store.parent):
+            call = f"Call pursuit_step with task={task}, with what you meant to change in its notes"
+        else:
+            call = (
+                "Call pursuit_step with no arguments: it shows the next ready task; then call "
+                "it with that task, with what you meant to change in its notes"
+            )
         return ToolCallHookResult(
             block=True,
             reason=(
