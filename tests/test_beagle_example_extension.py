@@ -1424,7 +1424,10 @@ print(json.dumps({"type": "message_end", "message": {"role": "user", "content": 
 if attempt >= int(os.environ.get("FAKE_TAU_HANGS_ON") or 99):
     # A worker the wall kills, after turns cut off at the output limit.
     for _ in range(int(os.environ.get("FAKE_TAU_LENGTH_STOPS", "0"))):
-        cut = {"role": "assistant", "content": [], "stopReason": "length"}
+        # R41: with FAKE_TAU_THINKS, each cut-off turn is reasoning only.
+        thought = [{"type": "thinking", "thinking": "Example 1 encodes"}]
+        content = thought if os.environ.get("FAKE_TAU_THINKS") else []
+        cut = {"role": "assistant", "content": content, "stopReason": "length"}
         print(json.dumps({"type": "message_end", "message": cut}), flush=True)
         if os.environ.get("FAKE_TAU_SPACED"):  # R33: a normal turn after each cut-off
             turn = {"role": "assistant", "content": [], "stopReason": "toolUse"}
@@ -9747,6 +9750,119 @@ def test_worker_events_count_cut_offs_over_run() -> None:
         events.feed(line)
     assert events.length_stops == 0
     assert events.cut_offs == 2
+
+
+def _worker_module(monkeypatch: pytest.MonkeyPatch) -> Any:
+    """The extension module set up to run the fake `tau`: the layout and binary
+    it reads at `setup` and import, from this test's beagle checkout and fixture."""
+    module = _module()
+    monkeypatch.setattr(module, "_LAYOUT", module.resolve_layout(Path(os.environ["BEAGLE_ROOT"])))
+    monkeypatch.setattr(module, "TAU_BIN", os.environ["TAU_BIN"])
+    return module
+
+
+def test_worker_events_count_reasoning_only_cut_offs() -> None:
+    def end(content: list[dict[str, Any]], stop: str = "length") -> bytes:
+        message = {"role": "assistant", "content": content, "stopReason": stop}
+        return json.dumps({"type": "message_end", "message": message}).encode()
+
+    thought = {"type": "thinking", "thinking": "Example 1 encodes"}
+    call = {"type": "toolCall", "id": "t1", "name": "write", "arguments": {}}
+    events = _module()._WorkerEvents()
+    events.feed(end([thought]))
+    events.feed(end([thought, {"type": "text", "text": "Writing it."}]))
+    events.feed(end([thought, call]))
+    events.feed(end([]))
+    events.feed(end([thought], stop="stop"))
+    assert (events.cut_offs, events.reasoning_cut_offs) == (4, 1)
+
+
+@pytest.mark.anyio
+async def test_reasoning_only_cut_off_named_in_worker_note(
+    tmp_path: Path, beagle: Path, fake_tau: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Run R41: W1-W6 spent two 8192-token turns each on reasoning alone and were
+    # told to split the task or write in parts, though no write had been cut off.
+    project = _git_project(tmp_path, monkeypatch)
+    monkeypatch.setenv("BEAGLE_TAU_DISPATCH_THINKING", "medium")
+    monkeypatch.setenv("FAKE_TAU_HANGS_ON", "1")
+    monkeypatch.setenv("FAKE_TAU_LENGTH_STOPS", "2")
+    monkeypatch.setenv("FAKE_TAU_THINKS", "1")
+    run_worker = _worker_module(monkeypatch)._run_worker
+
+    run = await run_worker("Write cases", project, "", "", 30, None, "T0002", ["a.txt"])
+
+    assert "the sub-agent was ended: cut off twice at the output limit" in run.report
+    assert "its reasoning filled the output limit before any reply or call" in run.report
+    assert "the next sub-agent on T0002 runs thinking-off" in run.report
+    assert "write in parts" not in run.report
+
+    # Cut-offs with no reasoning keep the old note and leave the next run's level.
+    monkeypatch.delenv("FAKE_TAU_THINKS")
+    run = await run_worker("Write cases", project, "", "", 30, None, "T0003", ["a.txt"])
+    assert "Split the task or have the notes say to write in parts." in run.report
+    assert "reasoning filled" not in run.report
+    monkeypatch.setenv("FAKE_TAU_HANGS_ON", "99")
+    run = await run_worker("Write cases", project, "", "", 30, None, "T0003", ["a.txt"])
+    argv = _runs(fake_tau)[-1]["argv"]
+    assert argv[argv.index("--thinking") + 1] == "medium"
+    assert "thinking-off" not in run.report
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("level", ["off", "default"])
+async def test_reasoning_cut_off_kill_leaves_thinking_off_and_omit_runs(
+    tmp_path: Path, beagle: Path, fake_tau: Path, monkeypatch: pytest.MonkeyPatch, level: str
+) -> None:
+    project = _git_project(tmp_path, monkeypatch)
+    monkeypatch.setenv("BEAGLE_TAU_DISPATCH_THINKING", level)
+    monkeypatch.setenv("FAKE_TAU_HANGS_ON", "1")
+    monkeypatch.setenv("FAKE_TAU_LENGTH_STOPS", "2")
+    monkeypatch.setenv("FAKE_TAU_THINKS", "1")
+    run_worker = _worker_module(monkeypatch)._run_worker
+
+    run = await run_worker("Write cases", project, "", "", 30, None, "T0002", ["a.txt"])
+    assert "its reasoning filled the output limit" in run.report
+    assert "thinking-off" not in run.report
+    monkeypatch.setenv("FAKE_TAU_HANGS_ON", "99")
+    run = await run_worker("Write cases", project, "", "", 30, None, "T0002", ["a.txt"])
+
+    flags = [
+        argv[argv.index("--thinking") :][:2] if "--thinking" in argv else []
+        for argv in (r["argv"] for r in _runs(fake_tau))
+    ]
+    expected = [] if level == "default" else ["--thinking", "off"]
+    assert flags == [expected, expected]
+    assert "thinking-off" not in run.report
+
+
+@pytest.mark.anyio
+async def test_next_attempt_runs_thinking_off_after_reasoning_cut_offs(
+    tmp_path: Path, beagle: Path, fake_tau: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Owner 2026-10-10, "off on retry": worker thinking stays on, but the attempt
+    # after a reasoning-only kill is a fresh worker with thinking off, once.
+    project = _git_project(tmp_path, monkeypatch)
+    monkeypatch.setenv("BEAGLE_TAU_DISPATCH_THINKING", "medium")
+    monkeypatch.setenv("FAKE_TAU_HANGS_ON", "1")
+    monkeypatch.setenv("FAKE_TAU_LENGTH_STOPS", "2")
+    monkeypatch.setenv("FAKE_TAU_THINKS", "1")
+    run_worker = _worker_module(monkeypatch)._run_worker
+    await run_worker("Write cases", project, "", "", 30, None, "T0002", ["a.txt"])
+    monkeypatch.setenv("FAKE_TAU_HANGS_ON", "99")
+
+    other = await run_worker("Write cases", project, "", "", 30, None, "T0005", ["a.txt"])
+    retry = await run_worker("Write cases", project, "", "", 30, None, "T0002", ["a.txt"])
+    again = await run_worker("Write cases", project, "", "", 30, None, "T0002", ["a.txt"])
+
+    levels = [r["argv"][r["argv"].index("--thinking") + 1] for r in _runs(fake_tau)]
+    assert levels == ["medium", "medium", "off", "medium"]
+    assert "thinking-off" not in other.report and "thinking-off" not in again.report
+    assert retry.report.startswith("attempt 3: wrote done.txt")
+    assert retry.report.endswith(
+        "(this sub-agent ran thinking-off: the one before it on T0002 was ended because "
+        "its reasoning filled the output limit before any reply or call.)"
+    )
 
 
 @pytest.mark.anyio

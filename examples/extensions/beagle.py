@@ -1455,6 +1455,12 @@ CUT_OFF_REFUSAL = "This call's arguments were cut off"
 #: The turns over a run cut off at the output limit that end the worker.
 WORKER_CUT_OFFS = 2
 CUT_OFF_TWICE = "cut off twice at the output limit"
+#: How a kill note and the next worker's note say reasoning alone filled the limit.
+REASONING_FILLED = "its reasoning filled the output limit before any reply or call"
+#: The task whose last worker was ended on reasoning-only cut-offs, by project
+#: root: its next worker runs thinking-off, once. Run R41: W1-W6 each spent two
+#: 8192-token turns reasoning and were ended with nothing to report.
+_THINKING_OFF_NEXT: dict[str, str] = {}
 #: How tau words the tool result of a call an extension blocked.
 _BLOCKED = "Tool call blocked: "
 #: The countdown sentence tau appends to each refusal's problem.
@@ -1487,6 +1493,8 @@ class _WorkerEvents:
     #: How many turns over the whole run ended at the output limit, in a row or
     #: not. Run R33: W2 was cut off three times, each followed by a normal turn.
     cut_offs: int = 0
+    #: How many of those turns were reasoning only: no text and no tool call (R41).
+    reasoning_cut_offs: int = 0
     #: The count before the last turn, and whether that turn was counted as cut off.
     _before_turn: int = 0
     _turn_cut: bool = False
@@ -1539,6 +1547,7 @@ class _WorkerEvents:
         self._turn_cut = stop == "length"
         self.length_stops = self._before_turn + 1 if self._turn_cut else 0
         self.cut_offs += self._turn_cut
+        self.reasoning_cut_offs += self._turn_cut and bool(self.thinking) and not (text or calls)
         error = message.get("errorMessage")
         self.error = str(error) if stop == "error" and error else None
 
@@ -1763,6 +1772,16 @@ async def _run_worker(
         cmd += ["--model", model]
     cmd += ["--max-turns", str(_worker_max_turns())]
     thinking = os.environ.get(WORKER_THINKING_ENV, "").strip() or "off"
+    root_key = str(_resolved(cwd))
+    can_turn_off = bool(task) and thinking not in ("off", WORKER_THINKING_OMIT)
+    thinking_off_note = ""
+    if can_turn_off and _THINKING_OFF_NEXT.get(root_key) == task:
+        del _THINKING_OFF_NEXT[root_key]
+        thinking = "off"
+        thinking_off_note = (
+            f"(this sub-agent ran thinking-off: the one before it on {task} was ended "
+            f"because {REASONING_FILLED}.)"
+        )
     if thinking != WORKER_THINKING_OMIT:
         cmd += ["--thinking", thinking]
 
@@ -1805,9 +1824,15 @@ async def _run_worker(
                 f"(the sub-agent was ended: {CUT_OFF_TWICE}. Split the task or have the "
                 "notes say to write in parts.)"
             )
+            if events.reasoning_cut_offs:
+                retry = ""
+                if can_turn_off and not thinking_off_note:
+                    _THINKING_OFF_NEXT[root_key] = task
+                    retry = f"; the next sub-agent on {task} runs thinking-off"
+                ended = f"(the sub-agent was ended: {CUT_OFF_TWICE}: {REASONING_FILLED}{retry}.)"
             return _WorkerRun(
                 returncode=proc.returncode,
-                report=f"{events.report}\n\n{ended}".strip(),
+                report=f"{events.report}\n\n{ended}\n\n{thinking_off_note}".strip(),
                 spent=events.spent,
                 transcript=transcript,
                 stop_reason="length",
@@ -1832,6 +1857,7 @@ async def _run_worker(
             proc.kill()
         with contextlib.suppress(Exception):
             await talk
+        problem = f"{problem} {thinking_off_note}".strip()
         return _WorkerRun(returncode=proc.returncode, problem=problem, transcript=transcript)
 
     stderr = talk.result()
@@ -1844,6 +1870,8 @@ async def _run_worker(
         report = events.final_report(f"{stderr}\n{note}".strip() if note else stderr)
     if note and note not in report:
         report = f"{report}\n\n{note}".strip()
+    if thinking_off_note:
+        report = f"{report}\n\n{thinking_off_note}".strip()
     return _WorkerRun(
         returncode=proc.returncode,
         report=report,
