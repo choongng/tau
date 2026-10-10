@@ -2037,6 +2037,16 @@ DRIVER_EDITS_ENV = "BEAGLE_TAU_DRIVER_EDITS"
 FOUNDING_BUDGET_TOKENS = 100_000
 #: Worker attempts `pursuit_step` makes before handing a failing check back.
 DEFAULT_STEP_ATTEMPTS = 2
+#: One `pursuit_step` call's wall-clock budget across its attempts, as a multiple
+#: of the step's worker timeout. Run R39: W8 (7.4 min), its check and W9 (10.5 min)
+#: each had a full timeout, and the call ate the last 19 min of a 60-min run. The
+#: first attempt keeps its whole timeout; later ones get what remains of this.
+STEP_BUDGET_FACTOR = 1.5
+#: A later attempt left less than this many seconds of the step budget (or less
+#: than the worker timeout, if that is shorter) is not run.
+STEP_ATTEMPT_FLOOR = 180.0
+#: The clock the step budget is measured on; tests replace it.
+_step_clock: Callable[[], float] = time.monotonic
 #: Cap on a done close's `--body`, which beagle refuses past 4000 characters.
 CLOSE_BODY_CHARS = 3_900
 #: How much of a failing check's output goes back to the next attempt.
@@ -11533,6 +11543,7 @@ def make_step_tool() -> Any:
         on_update: ToolUpdateCallback | None = None,
     ) -> AgentToolResult:
         del tool_call_id
+        step_started = _step_clock()
         root, goal = _project_root()
         if goal is None:
             return _step_result("pursuit_step: no pursuit here yet; call pursuit_found first.")
@@ -12430,6 +12441,9 @@ def make_step_tool() -> Any:
                 retry_note = "\n\n" + ON_DISK_WITNESS_NOTE
         worker_ran = False
         unreported: list[tuple[int, _WorkerRun, list[str]]] = []
+        # Run R39: one step is bounded by one budget, not a full timeout per attempt.
+        step_budget = timeout * STEP_BUDGET_FACTOR
+        budget_spent = ""
         for attempt in range(1, attempts + 1):
             if (
                 verdict[0] == 0
@@ -12437,11 +12451,24 @@ def make_step_tool() -> Any:
                 and not _absent_locks(locks, root)
             ):
                 break
+            attempt_timeout = timeout
+            if attempt > 1:
+                left = step_budget - (_step_clock() - step_started)
+                if left < min(STEP_ATTEMPT_FLOOR, timeout):
+                    budget_spent = (
+                        f"This step's time is spent ({attempt - 1} of {attempts} sub-agent "
+                        f"attempts ran in its {step_budget:.0f}s budget), so the task "
+                        + ("stays blocked" if retrying else "stays open")
+                        + f': call pursuit_step with task="{task}" again, with notes '
+                        "saying what to fix.\n\n"
+                    )
+                    break
+                attempt_timeout = min(timeout, left)
             if on_update is not None:
                 with contextlib.suppress(Exception):
                     on_update(_step_result(f"{task}: sub-agent attempt {attempt} of {attempts}"))
             run = await _run_worker(
-                brief + retry_note, root, model, provider, timeout, signal, task, scope
+                brief + retry_note, root, model, provider, attempt_timeout, signal, task, scope
             )
             worker_ran = True
             undone = _restore_locked(goal, root, fixing)
@@ -12542,6 +12569,8 @@ def make_step_tool() -> Any:
                     + ("\n[... cut]" if len(cut) < len(notes) else "")
                     + "\nStart from these rather than reading the references again."
                 )
+        if budget_spent:
+            attempt -= 1
         undid = (
             f"The sub-agent changed locked files ({', '.join(sorted(restored))}); they "
             "were put back before the check.\n\n"
@@ -12627,7 +12656,8 @@ def make_step_tool() -> Any:
                 root,
                 task,
                 scope,
-                (f"{no_tests}\n\n" if no_tests else "")
+                budget_spent
+                + (f"{no_tests}\n\n" if no_tests else "")
                 + unpassable
                 + _cwd_relative_data_lead(verdict[1], scope, root)
                 + collection
@@ -12675,7 +12705,8 @@ def make_step_tool() -> Any:
                 root,
                 task,
                 scope,
-                f"{route}{undid}{task} — {title}: the check passes, but {why}; the task "
+                f"{budget_spent}{route}{undid}{task} — {title}: the check passes, but "
+                f"{why}; the task "
                 f"{state}, since a done close needs a check shown to refuse.\n\n"
                 f"`prove` said:\n{proof.text}\n\n"
                 + _implementation_in_tests_lead(root, scope, check)

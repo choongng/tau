@@ -9560,6 +9560,88 @@ async def test_step_result_names_earlier_worker_without_report(
     assert text.index("Run 1 of 2") < text.index("Last report:\nattempt 2: the check fails")
 
 
+def _timed_step(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, worker_seconds: float
+) -> tuple[Any, list[float]]:
+    """A bound pursuit_step whose clock advances `worker_seconds` per worker run,
+    and the timeouts each `_run_worker` call was given."""
+    monkeypatch.chdir(_pursuit_project(tmp_path))
+    monkeypatch.setenv("FAKE_TAU_SUCCEEDS_ON", "99")
+    runtime, _ = _bound(tmp_path)
+    module = _loaded_module()
+    now = [1000.0]
+    timeouts: list[float] = []
+    real_run_worker = module._run_worker
+
+    async def timed_run_worker(*args: Any, **kwargs: Any) -> Any:
+        timeouts.append(args[4])
+        run = await real_run_worker(*args, **kwargs)
+        now[0] += worker_seconds
+        return run
+
+    monkeypatch.setattr(module, "_step_clock", lambda: now[0])
+    monkeypatch.setattr(module, "_run_worker", timed_run_worker)
+    return _tool(runtime, "pursuit_step"), timeouts
+
+
+_TIMED_STEP_ARGS = {
+    "task": "T0002",
+    "criteria": "done.txt exists",
+    "done_when": "grep -q done done.txt",
+    "scope": ["done.txt"],
+}
+
+
+@pytest.mark.anyio
+async def test_second_attempt_gets_remaining_step_budget(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Run R39: W8 and W9 each had the full 900s in one step.
+    _ready_task(fake_beagle)
+    step, timeouts = _timed_step(tmp_path, monkeypatch, worker_seconds=1000)
+    module = _loaded_module()
+
+    text = (await step.execute("c1", _TIMED_STEP_ARGS)).text
+
+    budget = module.DEFAULT_DISPATCH_TIMEOUT * module.STEP_BUDGET_FACTOR
+    assert timeouts == [module.DEFAULT_DISPATCH_TIMEOUT, budget - 1000]
+    assert len(_runs(fake_tau)) == 2
+    assert "the check still fails after 2 sub-agent run(s)" in text
+    assert "time is spent" not in text
+
+
+@pytest.mark.anyio
+async def test_second_attempt_skipped_when_step_budget_spent(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _ready_task(fake_beagle)
+    module = _module()
+    worker_seconds = (
+        module.DEFAULT_DISPATCH_TIMEOUT * module.STEP_BUDGET_FACTOR - module.STEP_ATTEMPT_FLOOR + 1
+    )
+    step, timeouts = _timed_step(tmp_path, monkeypatch, worker_seconds=worker_seconds)
+
+    text = (await step.execute("c1", _TIMED_STEP_ARGS)).text
+
+    assert timeouts == [module.DEFAULT_DISPATCH_TIMEOUT]
+    assert len(_runs(fake_tau)) == 1
+    assert text.startswith(
+        "This step's time is spent (1 of 2 sub-agent attempts ran in its 1350s budget), "
+        'so the task stays open: call pursuit_step with task="T0002" again, with notes '
+        "saying what to fix.\n\n"
+    )
+    assert "the check still fails after 1 sub-agent run(s)" in text
+    assert "`grep -q done done.txt` exit 2" in text
+
+
 def _cut_off_events() -> tuple[bytes, bytes, bytes]:
     def end(message: dict[str, Any]) -> bytes:
         return json.dumps({"type": "message_end", "message": message}).encode()
