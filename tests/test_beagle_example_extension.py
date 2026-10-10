@@ -15107,7 +15107,10 @@ async def test_data_test_route_is_not_offered_when_the_data_test_already_passes(
     assert "it is taken as this task's new route" not in result.text
     if committed:
         assert f"`{R16_DATA_CHECK}` already passes on the committed tree" in result.text
-        assert 'abandon="done by <that task>"' in result.text
+        # R42 class 2: the step opened T0002, and an open task does not close on
+        # abandon="done by …".
+        assert "abandon=" not in result.text
+        assert "If work is left, name a new data test file" in result.text
     else:
         assert "on the known-answers work on disk, uncommitted in this scope" in result.text
         assert f'pursuit_step task="T0002", done_when="{R16_DATA_CHECK}"' in result.text
@@ -18079,6 +18082,87 @@ async def test_data_route_refusal_leads_with_its_call(
         assert text.startswith(f'Send pursuit_step task="T0002", done_when="{data_check}"')
         assert "closes on that work" in text
 
+
+
+R42_OWN_TEST = (
+    "import json\nimport os\nimport unittest\n"
+    "from interval_tree_clocks.clock import Clock\n\n\n"
+    "class TestNotes(unittest.TestCase):\n"
+    "    def test_notes_exist(self):\n"
+    "        self.assertTrue(os.path.exists('docs/notes.md'))\n\n"
+    "    def test_cases(self):\n"
+    "        self.assertTrue(Clock and json)\n"
+)
+R42_CHECK = "python3 -m pytest -q tests/test_notes_check.py"
+
+
+@pytest.mark.anyio
+async def test_open_task_whose_check_imports_unwritten_module_runs_with_drop_import_brief(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # R42 class 2: open T0007's own test gained an import of unwritten code; the data
+    # test passed on the committed tree, and every step was refused before a worker.
+    project = _git_project(tmp_path, monkeypatch)
+    monkeypatch.chdir(project)
+    _case_data_test(project)
+    (project / "tests" / "cases.json").write_text('[{"name": "seed", "result": 1}]\n')
+    _commit(project, *R18_DATA_SCOPE)
+    (project / "docs").mkdir()
+    (project / "docs" / "notes.md").write_text("notes\n")
+    (project / "tests" / "test_notes_check.py").write_text(R42_OWN_TEST)
+    monkeypatch.setenv("FAKE_TAU_SUCCEEDS_ON", "99")
+    _open_task_in_scope(fake_beagle, ["docs/", "tests/"], R42_CHECK)
+    runtime, _ = _bound(tmp_path)
+
+    result = await _tool(runtime, "pursuit_step").execute(
+        "c1", {"task": "T0002", "notes": "drop the import", "attempts": 1}
+    )
+
+    assert "not run" not in result.text
+    [run] = _runs(fake_tau)
+    assert (
+        "tests/test_notes_check.py, which this task's check runs, imports "
+        "interval_tree_clocks.clock, which neither the project tree nor the installed "
+        "packages provide" in run["stdin"]
+    )
+    assert "checks this task's own files only: remove `from interval_tree_clocks.clock " \
+        "import Clock` and every use of interval_tree_clocks.clock" in run["stdin"]
+    assert _pursuit_calls(fake_beagle, "amend") == []
+
+
+@pytest.mark.anyio
+async def test_open_task_not_run_offers_no_abandon_done_by(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # R42 class 2: the refusal's abandon="done by …" was refused for open T0007 five
+    # times; only a pending task closes that way.
+    project = _git_project(tmp_path, monkeypatch)
+    monkeypatch.chdir(project)
+    _case_data_test(project)
+    (project / "tests" / "cases.json").write_text('[{"name": "seed", "result": 1}]\n')
+    (project / "tests" / "test_cases.py").write_text(R16_CASES_TEST)
+    _commit(project, *R18_DATA_SCOPE)
+    monkeypatch.setenv("FAKE_TAU_SUCCEEDS_ON", "99")
+    _open_task_in_scope(fake_beagle, R18_DATA_SCOPE, R16_CHECK)
+    runtime, _ = _bound(tmp_path)
+
+    result = await _tool(runtime, "pursuit_step").execute("c1", {"task": "T0002"})
+
+    assert result.text.startswith("pursuit_step: T0002 not run — If work is left, name a new")
+    assert "abandon=" not in result.text
+    assert f"`{R16_DATA_CHECK}` already passes on the committed tree" in result.text
+    assert _runs(fake_tau) == []
+    route = _module()._data_test_route(R16_CHECK, R18_DATA_SCOPE, project)
+    pending = await _module()._data_route_on_disk("T0002", route, project)
+    assert 'abandon="done by <that task>"' in pending
 
 R32_STAYS_OPEN = (
     "T0002 — Cases: the check passes, but the task stays open and nothing is locked: "

@@ -10716,13 +10716,54 @@ async def _data_route_on_disk(
             f"Send pursuit_step task={json.dumps(task)}{rebind}: {opens}. {why}: {task} "
             f"closes on that work.{leave}"
         )
+    # Run R42 class 2: only a pending task closes on abandon="done by …"; offered to
+    # open T0007, it was refused five times.
+    done_by = (
+        ""
+        if is_open
+        else f"If a done task already did this work, call pursuit_step task={json.dumps(task)} "
+        f'abandon="done by <that task>" done_when="{data_check}"; if '
+    )
     return (
-        f"If a done task already did this work, call pursuit_step task={json.dumps(task)} "
-        f'abandon="done by <that task>" done_when="{data_check}"; if work is left, name a '
-        "new data test file for it that fails now, put it in scope, and say in the notes "
+        f"{done_by or 'If '}work is left, name a new data test file for it that fails now, put "
+        "it in scope, and say in the notes "
         f"what it should test. {test} imports {module}, which a later task writes, and the "
         f"data test `{data_check}` already passes on the committed tree, so neither check "
         f"can tell {task}'s work from none."
+    )
+
+
+async def _data_check_passes_committed(
+    data_check: str, scopes: list[list[str]], root: Path
+) -> bool:
+    """Whether `data_check` passes on the committed tree, uncommitted work in `scopes`
+    aside: binding it then closes on no work."""
+    if (await _run_check(data_check, root, DEFAULT_CHECK_TIMEOUT))[0] != 0:
+        return False
+    return not await _passes_only_by_uncommitted(data_check, scopes, root)
+
+
+def _own_test_import_note(command: str, scope: list[str], root: Path) -> str:
+    """The worker note for a check whose own in-scope test imports, itself or through
+    a sibling test, a module the tree and the installed packages do not provide and
+    no scope path creates; or "".
+
+    Run R42 class 2: tests/test_analysis_check.py, T0007's own test, gained an
+    import of the unwritten module, and every step was refused before a worker ran.
+    """
+    found = _imports_unwritten(command, scope, root)
+    if found is None or not _in_scope(found[0], scope, root):
+        return ""
+    test, module, via = found
+    imported = Path(via[0]).stem if via else module
+    line = _import_line(root / test, imported)
+    named = f"`{line}`" if line else f"its import of {imported}"
+    return (
+        f"{test}, which this task's check runs, imports {module}, which neither the "
+        "project tree nor the installed packages provide and no path in this scope "
+        f"creates, so the check cannot pass. {test} checks this task's own files only: "
+        f"remove {named} and every use of {imported}, and keep the tests of this task's "
+        "own files."
     )
 
 
@@ -12349,6 +12390,7 @@ def make_step_tool() -> Any:
         passed_on_disk: tuple[int, str] | None = None
         killed_run: tuple[int, str] | None = None
         hang = ""
+        drop_import = ""
         status = record.get("status")
         new_route = arguments.get("new_route") is True
         bound_check = str(record.get("done_when") or "").strip()
@@ -12891,23 +12933,33 @@ def make_step_tool() -> Any:
                 bound_check, scope or _strings(record.get("scope")), root
             )
             data_check = data_route[2]
-            on_disk = await _data_route_on_disk(
-                task,
-                data_route,
-                root,
-                _predecessor_scope(record, root),
-                bound=bound_check,
-                locks=_pending_locks(goal, task) + _strings(arguments.get("locks")),
-                is_open=True,
+            # Run R42 class 2: the data test passed on the committed tree, so binding it
+            # judged no work, and the import in the check's own test was never dropped.
+            own_import = _own_test_import_note(
+                bound_check, scope or _strings(record.get("scope")), root
             )
-            if on_disk is not None:
-                return _step_result(f"pursuit_step: {task} not run — {on_disk}")
-            return _step_result(
-                f"pursuit_step: {task} not run — its bound check `{bound_check}` cannot pass: "
-                f"{problem}"
-                f' Sent as pursuit_step task="{task}", done_when="{data_check}", it is taken '
-                "as this task's new route."
-            )
+            if own_import and await _data_check_passes_committed(
+                data_check, [data_route[3], _predecessor_scope(record, root)], root
+            ):
+                drop_import = own_import
+            else:
+                on_disk = await _data_route_on_disk(
+                    task,
+                    data_route,
+                    root,
+                    _predecessor_scope(record, root),
+                    bound=bound_check,
+                    locks=_pending_locks(goal, task) + _strings(arguments.get("locks")),
+                    is_open=True,
+                )
+                if on_disk is not None:
+                    return _step_result(f"pursuit_step: {task} not run — {on_disk}")
+                return _step_result(
+                    f"pursuit_step: {task} not run — its bound check `{bound_check}` cannot "
+                    f"pass: {problem}"
+                    f' Sent as pursuit_step task="{task}", done_when="{data_check}", it is '
+                    "taken as this task's new route."
+                )
         check = str(record.get("done_when") or done_when).strip()
         prose = _check_problem(check) if check else None
         if prose is not None:
@@ -12974,6 +13026,8 @@ def make_step_tool() -> Any:
             brief += f"\n\n{DATA_CHECK_IMPORT_DEFECT}"
         if notes:
             brief = f"{brief}\n\nFrom the driver (who has not read the reference):\n{notes}"
+        if drop_import:
+            brief = f"{brief}\n\n{drop_import}"
         if hang:
             brief = f"{brief}\n\n{hang.rstrip()}"
         brief += "\n\n" + NO_BEAGLE_NOTE + "\n\n" + _turn_cap_note()
