@@ -1427,6 +1427,14 @@ if attempt >= int(os.environ.get("FAKE_TAU_HANGS_ON") or 99):
         # R41: with FAKE_TAU_THINKS, each cut-off turn is reasoning only.
         thought = [{"type": "thinking", "thinking": "Example 1 encodes"}]
         content = thought if os.environ.get("FAKE_TAU_THINKS") else []
+        # R43: FAKE_TAU_CUT_FILL adds the reply text or call that filled the turn.
+        fill = os.environ.get("FAKE_TAU_CUT_FILL")
+        if fill == "text":
+            content = content + [{"type": "text", "text": "Tracing example 1: " * 500}]
+        elif fill == "call":
+            args = {"path": "a.txt", "content": "x" * 10_000}
+            call = {"type": "toolCall", "id": "t1", "name": "write", "arguments": args}
+            content = content + [call]
         cut = {"role": "assistant", "content": content, "stopReason": "length"}
         print(json.dumps({"type": "message_end", "message": cut}), flush=True)
         if os.environ.get("FAKE_TAU_SPACED"):  # R33: a normal turn after each cut-off
@@ -9910,6 +9918,7 @@ async def test_worker_ended_on_second_output_cap_cutoff_over_run(
     # Run R33: W2 was cut off three times, each followed by a normal turn, and
     # ran to the 900 s wall.
     monkeypatch.setenv("FAKE_TAU_SPACED", "1")
+    monkeypatch.setenv("FAKE_TAU_CUT_FILL", "call")
     text = await _hung_second_worker(tmp_path, fake_beagle, monkeypatch, 2, timeout=30)
 
     assert "wall-clock" not in text
@@ -9973,8 +9982,9 @@ async def test_reasoning_only_cut_off_named_in_worker_note(
     assert "the next sub-agent on T0002 runs thinking-off" in run.report
     assert "write in parts" not in run.report
 
-    # Cut-offs with no reasoning keep the old note and leave the next run's level.
+    # Cut-off calls keep the old note and leave the next run's level.
     monkeypatch.delenv("FAKE_TAU_THINKS")
+    monkeypatch.setenv("FAKE_TAU_CUT_FILL", "call")
     run = await run_worker("Write cases", project, "", "", 30, None, "T0003", ["a.txt"])
     assert "Split the task or have the notes say to write in parts." in run.report
     assert "reasoning filled" not in run.report
@@ -9983,6 +9993,68 @@ async def test_reasoning_only_cut_off_named_in_worker_note(
     argv = _runs(fake_tau)[-1]["argv"]
     assert argv[argv.index("--thinking") + 1] == "medium"
     assert "thinking-off" not in run.report
+
+
+@pytest.mark.anyio
+async def test_cut_off_kill_note_names_reply_text_reasoning(
+    tmp_path: Path, beagle: Path, fake_tau: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Run R43: W13, the thinking-off retry, spent two turns on reply text with no
+    # call and was told to write in parts, which the driver passed to W14's notes.
+    project = _git_project(tmp_path, monkeypatch)
+    monkeypatch.setenv("BEAGLE_TAU_DISPATCH_THINKING", "medium")
+    monkeypatch.setenv("FAKE_TAU_HANGS_ON", "1")
+    monkeypatch.setenv("FAKE_TAU_LENGTH_STOPS", "2")
+    monkeypatch.setenv("FAKE_TAU_THINKS", "1")
+    run_worker = _worker_module(monkeypatch)._run_worker
+    await run_worker("Write cases", project, "", "", 30, None, "T0002", ["a.txt"])
+    monkeypatch.delenv("FAKE_TAU_THINKS")
+    monkeypatch.setenv("FAKE_TAU_CUT_FILL", "text")
+
+    retry = await run_worker("Write cases", project, "", "", 30, None, "T0002", ["a.txt"])
+
+    assert "the sub-agent was ended: cut off twice at the output limit" in retry.report
+    assert "its reply text filled the output limit before any call" in retry.report
+    assert "reasoning in prose without acting" in retry.report
+    assert "the next notes should say what to do first" in retry.report
+    assert "write in parts" not in retry.report and "Split the task" not in retry.report
+    assert "the next sub-agent on T0002 runs thinking-off" not in retry.report
+    monkeypatch.setenv("FAKE_TAU_HANGS_ON", "99")
+    await run_worker("Write cases", project, "", "", 30, None, "T0002", ["a.txt"])
+    levels = [r["argv"][r["argv"].index("--thinking") + 1] for r in _runs(fake_tau)]
+    assert levels == ["medium", "off", "medium"]
+
+
+@pytest.mark.anyio
+async def test_cut_off_kill_note_says_write_in_parts_only_for_a_call_argument(
+    tmp_path: Path, beagle: Path, fake_tau: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project = _git_project(tmp_path, monkeypatch)
+    monkeypatch.setenv("FAKE_TAU_HANGS_ON", "1")
+    run_worker = _worker_module(monkeypatch)._run_worker
+    notes = {}
+    for name, fill, length_stops, refusals in (
+        ("call", "call", "2", "0"),
+        ("refused call", "", "0", "2"),
+        ("call and text", "text", "1", "1"),
+        ("text", "text", "2", "0"),
+        ("thinking", "", "2", "0"),
+    ):
+        monkeypatch.setenv("FAKE_TAU_CUT_FILL", fill)
+        monkeypatch.setenv("FAKE_TAU_LENGTH_STOPS", length_stops)
+        monkeypatch.setenv("FAKE_TAU_CUT_OFFS", refusals)
+        monkeypatch.setenv("FAKE_TAU_THINKS", "1" if name == "thinking" else "")
+        run = await run_worker("Write cases", project, "", "", 30, None, "T0002", ["a.txt"])
+        assert "the sub-agent was ended: cut off twice at the output limit" in run.report
+        notes[name] = run.report
+
+    for name in ("call", "refused call", "call and text"):
+        assert "a call was cut off mid-argument" in notes[name], name
+        assert "Split the task or have the notes say to write in parts." in notes[name], name
+    for name in ("text", "thinking"):
+        assert "write in parts" not in notes[name] and "Split the task" not in notes[name], name
+        assert "reasoning in prose without acting" in notes[name], name
+    assert "its reasoning filled the output limit" in notes["thinking"]
 
 
 @pytest.mark.anyio

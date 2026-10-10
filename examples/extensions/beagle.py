@@ -141,7 +141,7 @@ import urllib.parse
 import urllib.request
 import uuid
 from collections.abc import Callable, Collection, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -1457,6 +1457,18 @@ WORKER_CUT_OFFS = 2
 CUT_OFF_TWICE = "cut off twice at the output limit"
 #: How a kill note and the next worker's note say reasoning alone filled the limit.
 REASONING_FILLED = "its reasoning filled the output limit before any reply or call"
+#: What filled a cut-off turn: reasoning with no reply or call, reply text with no
+#: call, or a call's arguments.
+CUT_THINKING, CUT_REPLY, CUT_CALL = "thinking", "reply", "call"
+REPLY_FILLED = "its reply text filled the output limit before any call"
+NOTHING_FILLED = "the output limit came before any reply or call"
+#: The kill note's advice when no call was cut off. Run R43: W13 spent two turns
+#: on reply text with no call and was told to write in parts, which the driver
+#: passed on to the next worker's notes.
+NO_CALL_CUT = (
+    "It spent its turns reasoning in prose without acting: the next notes should say "
+    "what to do first. No call was cut off, so writing in smaller pieces would not help."
+)
 #: The task whose last worker was ended on reasoning-only cut-offs, by project
 #: root: its next worker runs thinking-off, once. Run R41: W1-W6 each spent two
 #: 8192-token turns reasoning and were ended with nothing to report.
@@ -1495,6 +1507,8 @@ class _WorkerEvents:
     cut_offs: int = 0
     #: How many of those turns were reasoning only: no text and no tool call (R41).
     reasoning_cut_offs: int = 0
+    #: What filled each cut-off turn, in order: CUT_THINKING, CUT_REPLY or CUT_CALL.
+    cut_fills: list[str] = field(default_factory=list)
     #: The count before the last turn, and whether that turn was counted as cut off.
     _before_turn: int = 0
     _turn_cut: bool = False
@@ -1548,6 +1562,8 @@ class _WorkerEvents:
         self.length_stops = self._before_turn + 1 if self._turn_cut else 0
         self.cut_offs += self._turn_cut
         self.reasoning_cut_offs += self._turn_cut and bool(self.thinking) and not (text or calls)
+        if self._turn_cut:
+            self.cut_fills.append(CUT_CALL if calls else CUT_REPLY if text else CUT_THINKING)
         error = message.get("errorMessage")
         self.error = str(error) if stop == "error" and error else None
 
@@ -1564,10 +1580,14 @@ class _WorkerEvents:
         else:
             return
         text = text.strip()
-        if text.removeprefix(_BLOCKED).startswith(CUT_OFF_REFUSAL) and not self._turn_cut:
-            self._turn_cut = True
-            self.length_stops = self._before_turn + 1
-            self.cut_offs += 1
+        if text.removeprefix(_BLOCKED).startswith(CUT_OFF_REFUSAL):
+            if self._turn_cut:
+                self.cut_fills[-1:] = [CUT_CALL]
+            else:
+                self._turn_cut = True
+                self.length_stops = self._before_turn + 1
+                self.cut_offs += 1
+                self.cut_fills.append(CUT_CALL)
         if text.startswith(_BREAKER_STOP):
             self.stopped = True
         elif text.startswith(_REFUSED):
@@ -1820,16 +1840,21 @@ async def _run_worker(
                 proc.kill()
             with contextlib.suppress(Exception):
                 await talk
-            ended = (
-                f"(the sub-agent was ended: {CUT_OFF_TWICE}. Split the task or have the "
-                "notes say to write in parts.)"
+            retry = ""
+            if events.reasoning_cut_offs and can_turn_off and not thinking_off_note:
+                _THINKING_OFF_NEXT[root_key] = task
+                retry = f"; the next sub-agent on {task} runs thinking-off"
+            fills = events.cut_fills
+            filled = ["a call was cut off mid-argument"] if CUT_CALL in fills else []
+            filled += [REPLY_FILLED] if CUT_REPLY in fills else []
+            filled += [REASONING_FILLED] if events.reasoning_cut_offs else []
+            advice = (
+                "Split the task or have the notes say to write in parts."
+                if CUT_CALL in fills
+                else NO_CALL_CUT
             )
-            if events.reasoning_cut_offs:
-                retry = ""
-                if can_turn_off and not thinking_off_note:
-                    _THINKING_OFF_NEXT[root_key] = task
-                    retry = f"; the next sub-agent on {task} runs thinking-off"
-                ended = f"(the sub-agent was ended: {CUT_OFF_TWICE}: {REASONING_FILLED}{retry}.)"
+            cause = "; ".join(filled) or NOTHING_FILLED
+            ended = f"(the sub-agent was ended: {CUT_OFF_TWICE}: {cause}{retry}. {advice})"
             return _WorkerRun(
                 returncode=proc.returncode,
                 report=f"{events.report}\n\n{ended}\n\n{thinking_off_note}".strip(),
