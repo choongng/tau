@@ -2684,6 +2684,14 @@ def _capped(argv: list[str], limit: str | None) -> list[str]:
 #: The longest a worker's own command runs, and its share of the worker's wall clock.
 COMMAND_TIMEOUT = 540
 COMMAND_TIMEOUT_SHARE = 0.6
+#: Seconds the command's `timeout` ends before the worker's bash timeout would (R39).
+COMMAND_BASH_MARGIN = 10
+#: What exit 124 means, said wherever a worker meets it (R30, R34, R39).
+HANG_MEANING = (
+    "the code under test likely loops (a loop that never advances), so run one case "
+    "under a short `timeout` (e.g. `timeout 10`) to find where, rather than re-running "
+    "the whole check."
+)
 _MEMORY_SIZE = re.compile(r"(\d+(?:\.\d+)?)\s*([KMGT]?)B?", re.IGNORECASE)
 
 
@@ -2705,7 +2713,7 @@ def _half_memory(limit: str | None) -> str | None:
     return f"{mebibytes}M" if mebibytes > 0 else None
 
 
-def _command_bound(limit: str | None, timeout: float) -> str:
+def _command_bound(limit: str | None, timeout: float, bash: float | None = None) -> str:
     """The prefix a worker's own command runs under: half its memory cap, under its wall.
 
     Run R30: W4-W7 ran `timeout 540 python3 -m pytest …` inside their own capped
@@ -2713,8 +2721,18 @@ def _command_bound(limit: str | None, timeout: float) -> str:
     back. A `systemd-run --user --scope` started by the worker is a scope of its
     own, so the command's memory is not the worker's and an over-cap command
     dies alone, exit 137, with the worker left to report it.
+
+    Run R39: the bound was `timeout 540` while the worker's bash timeout was
+    120 s, so a looping check reached W8 and W9 only as the bash tool's "timed
+    out after 120 seconds", with an empty log, and W9 ran it 7 times. The bound
+    sits COMMAND_BASH_MARGIN below `bash` (the worker's bash timeout, default
+    `_worker_bash_timeout()`), so `timeout` ends it first: exit 124 and the log
+    so far.
     """
-    seconds = max(1, int(min(COMMAND_TIMEOUT, timeout * COMMAND_TIMEOUT_SHARE)))
+    if bash is None:
+        bash = _worker_bash_timeout()
+    below_bash = bash - min(COMMAND_BASH_MARGIN, bash / 2)
+    seconds = max(1, int(min(COMMAND_TIMEOUT, below_bash, timeout * COMMAND_TIMEOUT_SHARE)))
     return " ".join(_capped(["timeout", str(seconds)], _half_memory(limit)))
 
 
@@ -9548,7 +9566,7 @@ _HABIT_LOG = re.compile(r">\s*(\S+\.log)\b")
 _SHOW_ASIDE = re.compile(r"[;,]?\s*`beagle pursuit show[^`]*` has the whole record")
 
 
-def _without_beagle_habits(brief: str, bound: str = f"timeout {COMMAND_TIMEOUT}") -> str:
+def _without_beagle_habits(brief: str, bound: str | None = None) -> str:
     """beagle's brief without the lines that tell a worker to run `beagle`.
 
     The worker guard refuses every `beagle` command. Run R06: W2 and W4 ran the
@@ -9556,8 +9574,11 @@ def _without_beagle_habits(brief: str, bound: str = f"timeout {COMMAND_TIMEOUT}"
     -- …` and were refused. That line is said again with a plain capped,
     redirected command; the standing-checks line (`beagle pursuit recheck`) is
     dropped, and the `beagle pursuit show` aside is cut. `bound` is the
-    command's prefix, from `_command_bound`.
+    command's prefix, from `_command_bound` (by default for no memory cap and
+    the default dispatch timeout). Run R39: the line says what exit 124 means.
     """
+    if bound is None:
+        bound = _command_bound(None, DEFAULT_DISPATCH_TIMEOUT)
     lines: list[str] = []
     for line in brief.splitlines(keepends=True):
         if "beagle contain run" in line:
@@ -9575,7 +9596,8 @@ def _without_beagle_habits(brief: str, bound: str = f"timeout {COMMAND_TIMEOUT}"
                 f"{bullet}Run every test, build and check capped and redirected, as a plain "
                 f'command: `{bound} <cmd> > {log} 2>&1; echo "exit $?"` (e.g. '
                 f"`{bound} python3 -m pytest -q tests/ > {log} 2>&1; "
-                f'echo "exit $?"`), then read the tail of {log}.{alone}{ending}'
+                f'echo "exit $?"`), then read the tail of {log}. Exit 124 means the command '
+                f"did not finish: {HANG_MEANING}{alone}{ending}"
             )
         elif "beagle pursuit recheck" in line:
             continue
@@ -12488,6 +12510,9 @@ def make_step_tool() -> Any:
             if cannot_pass is not None:
                 # Run R16 sent W4, W6, W8, W10 and W12 after this was already known.
                 break
+            if verdict[0] == 124:
+                # Run R39: told only "the check timed out after 60s", W9 re-ran the hang.
+                retry_note += f"Exit 124 means the check did not finish: {HANG_MEANING} "
             retry_note = _self_import_note(check, scope, root) + retry_note
             no_tests = _pytest_collected_none(verdict[0], check)
             if no_tests is not None:

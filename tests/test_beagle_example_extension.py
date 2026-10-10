@@ -11127,6 +11127,7 @@ async def test_worker_brief_drops_beagle_contain_run(
         "- Read files by the range you need.\n"
     )
     monkeypatch.chdir(_pursuit_project(tmp_path))
+    monkeypatch.delenv(_module().WORKER_BASH_TIMEOUT_ENV, raising=False)
     _ready_task(fake_beagle)
     (fake_beagle / "brief.out").write_text(beagle_brief)
     runtime, _ = _bound(tmp_path)
@@ -11146,7 +11147,7 @@ async def test_worker_brief_drops_beagle_contain_run(
     assert "beagle contain" not in told and "RUN_CONTAINED" not in told
     assert "beagle pursuit" not in told
     assert "- Run every test, build and check capped and redirected, as a plain command: " in told
-    assert re.search(rf"`(systemd-run [^`]*-- )?timeout 540 <cmd> > {re.escape(log)} 2>&1", told)
+    assert re.search(rf"`(systemd-run [^`]*-- )?timeout 110 <cmd> > {re.escape(log)} 2>&1", told)
     assert "- Read files by the range you need." in told
     assert "(context, not a contract):" in told
     assert re.search(r"\bbeagle\s+\w", told) is None
@@ -16863,10 +16864,13 @@ async def test_killed_note_names_non_finishing_code_when_earlier_run_was_fast(
     assert "Find the loop or growth in src/hog.py" in note
 
 
-def test_worker_habit_bounds_command_memory_below_worker_cap() -> None:
+def test_worker_habit_bounds_command_memory_below_worker_cap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     # R30: W4-W7's `timeout 540 python3 -m pytest` shared the worker's 4G scope and
     # was OOM-killed with it; the habit bounded time but not memory.
     ext = _module()
+    monkeypatch.delenv(ext.WORKER_BASH_TIMEOUT_ENV, raising=False)
     brief = (
         "Working habits:\n- Run every test contained: `RUN_CONTAINED_FOREGROUND=1 beagle "
         "contain run heavy -- timeout 540 <cmd> > /r/.git/beagle/logs/T1.log 2>&1; "
@@ -16876,20 +16880,104 @@ def test_worker_habit_bounds_command_memory_below_worker_cap() -> None:
     bound = ext._command_bound("4G", 900.0)
     assert bound.split() == [
         "systemd-run", "--user", "--scope", "-q", "-p", "MemoryMax=2048M",
-        "-p", "MemorySwapMax=0", "--", "timeout", "540",
+        "-p", "MemorySwapMax=0", "--", "timeout", "110",
     ]  # fmt: skip
     told = ext._without_beagle_habits(brief, bound)
     assert f"`{bound} <cmd> > /r/.git/beagle/logs/T1.log 2>&1" in told
     assert "exit 137" in told and "beagle" not in told.replace("/beagle/logs", "")
 
-    assert ext._command_bound("4G", 300.0).endswith("-- timeout 180")
+    assert ext._command_bound("4G", 300.0, bash=600.0).endswith("-- timeout 180")
     assert ext._half_memory("1.5G") == "768M"
     assert ext._half_memory("50%") == "25%"
     assert ext._half_memory("lots") is None
-    assert ext._command_bound(None, 900.0) == "timeout 540"
+    assert ext._command_bound(None, 900.0) == "timeout 110"
     unbounded = ext._without_beagle_habits(brief, ext._command_bound(None, 900.0))
-    assert "`timeout 540 <cmd> > /r/.git/beagle/logs/T1.log" in unbounded
+    assert "`timeout 110 <cmd> > /r/.git/beagle/logs/T1.log" in unbounded
     assert "exit 137" not in unbounded
+
+
+def test_command_bound_is_below_worker_bash_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
+    # R39: `timeout 540` outlasted the worker's 120 s bash default, so a looping
+    # check reached W8/W9 only as the bash tool's timeout, with an empty log.
+    ext = _module()
+    monkeypatch.delenv(ext.WORKER_BASH_TIMEOUT_ENV, raising=False)
+
+    def seconds(bound: str) -> int:
+        return int(bound.split()[-1])
+
+    default = ext.DEFAULT_WORKER_BASH_TIMEOUT
+    for dispatch in (60.0, 300.0, ext.DEFAULT_DISPATCH_TIMEOUT):
+        for limit in (None, "4G"):
+            assert seconds(ext._command_bound(limit, dispatch)) < default
+    assert seconds(ext._command_bound(None, ext.DEFAULT_DISPATCH_TIMEOUT)) == (
+        default - ext.COMMAND_BASH_MARGIN
+    )
+    monkeypatch.setenv(ext.WORKER_BASH_TIMEOUT_ENV, "45")
+    assert ext._command_bound(None, ext.DEFAULT_DISPATCH_TIMEOUT) == "timeout 35"
+    monkeypatch.setenv(ext.WORKER_BASH_TIMEOUT_ENV, "4")
+    assert ext._command_bound(None, ext.DEFAULT_DISPATCH_TIMEOUT) == "timeout 2"
+    assert ext._command_bound(None, 100.0, bash=1000.0) == "timeout 60"
+    assert ext._command_bound(None, 2000.0, bash=1000.0) == f"timeout {ext.COMMAND_TIMEOUT}"
+
+
+def test_habit_line_explains_exit_124_as_a_hang(monkeypatch: pytest.MonkeyPatch) -> None:
+    # R39: W9 met exit 124 and re-ran the whole hanging check seven times.
+    ext = _module()
+    monkeypatch.delenv(ext.WORKER_BASH_TIMEOUT_ENV, raising=False)
+    brief = (
+        "Working habits:\n- Run every test contained: `RUN_CONTAINED_FOREGROUND=1 beagle "
+        "contain run heavy -- timeout 540 <cmd> > /r/.git/beagle/logs/T1.log 2>&1; "
+        'echo "exit $?"`\n'
+    )
+
+    for told in (
+        ext._without_beagle_habits(brief),
+        ext._without_beagle_habits(brief, ext._command_bound("4G", 900.0)),
+    ):
+        assert "Exit 124 means the command did not finish" in told
+        assert "a loop that never advances" in told
+        assert "run one case under a short `timeout`" in told
+        assert "rather than re-running the whole check" in told
+        assert "timeout 540" not in told
+    assert "`timeout 110 <cmd>" in ext._without_beagle_habits(brief)
+
+
+@pytest.mark.anyio
+async def test_retry_note_after_check_timeout_names_a_hang(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # R39: W9's retry note said only "the check timed out after 60s".
+    project = _pursuit_project(tmp_path)
+    monkeypatch.chdir(project)
+    monkeypatch.setenv("FAKE_TAU_SUCCEEDS_ON", "2")
+    (project / "hang.py").write_text(
+        "import time\nfrom pathlib import Path\n"
+        "if not Path('done.txt').exists():\n    time.sleep(30)\n"
+    )
+    check = f"timeout 1 {sys.executable} hang.py"
+    _ready_task(fake_beagle, check)
+    runtime, _ = _bound(tmp_path)
+
+    await _tool(runtime, "pursuit_step").execute(
+        "c1",
+        {
+            "task": "T0002",
+            "criteria": "done.txt exists",
+            "done_when": check,
+            "scope": ["done.txt"],
+        },
+    )
+
+    first, second = _runs(fake_tau)
+    assert "the check still fails (exit 124)" in second["stdin"]
+    assert "Exit 124 means the check did not finish" in second["stdin"]
+    assert "a loop that never advances" in second["stdin"]
+    assert "rather than re-running the whole check" in second["stdin"]
+    assert "Exit 124 means the check did not finish" not in first["stdin"]
 
 
 def test_unreported_run_names_kill_during_own_command() -> None:
