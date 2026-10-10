@@ -7565,6 +7565,88 @@ def _data_test_import_said(
     )
 
 
+def _import_guard(test_path: Path, name: str) -> str:
+    """The guard around `test_path`'s import of module `name`: the first handler of the
+    try that holds it (`except ImportError`) or the with that does (`with
+    contextlib.suppress(ImportError)`); "" when neither holds it."""
+    try:
+        tree = ast.parse(test_path.read_text(encoding="utf-8"))
+    except (OSError, SyntaxError, ValueError):
+        return ""
+
+    def imports(stmts: list[ast.stmt]) -> bool:
+        for stmt in stmts:
+            for node in ast.walk(stmt):
+                if isinstance(node, ast.Import):
+                    names = [alias.name for alias in node.names]
+                elif isinstance(node, ast.ImportFrom) and node.module and not node.level:
+                    names = [node.module]
+                else:
+                    continue
+                if any(n == name or n.startswith(f"{name}.") for n in names):
+                    return True
+        return False
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Try | ast.TryStar) and node.handlers and imports(node.body):
+            caught = node.handlers[0].type
+            return f"except {ast.unparse(caught)}" if caught is not None else "except"
+        if isinstance(node, ast.With) and imports(node.body):
+            return f"with {', '.join(ast.unparse(item.context_expr) for item in node.items)}"
+    return ""
+
+
+def _guarded_import_said(test: str, module: str, imported: str, root: Path) -> str:
+    """That `test` imports `module`, which the tree does not provide, and passes anyway."""
+    line = _import_line(root / test, imported)
+    guard = _import_guard(root / test, imported)
+    at = f" (`{line}`{f', under `{guard}`' if guard else ''})" if line else ""
+    return (
+        f"{test} imports {module}{at}, which the project tree does not provide, and still "
+        f"passes: its import is guarded, so its cases judge nothing until {module} exists."
+    )
+
+
+async def _cases_test_passing_without_code(
+    root: Path, entries: list[str]
+) -> tuple[str, str, str] | None:
+    """(test, module, imported) for a cases test in `entries`, one that reads a cases
+    data file there, which imports, itself or through a sibling test, a module the tree
+    and the installed packages do not provide, and passes when run; or None.
+
+    Run R43: the locked tests/test_case_data.py imported the code under try/except
+    ImportError: return, so it passed with no code, and the next task's open was
+    told both to bind it and that it already passes.
+    """
+    data = [Path(rel).name for rel in entries if _is_cases_data(rel)]
+    for rel in entries:
+        test = root / rel
+        if not (rel.endswith(".py") and _is_test_path(rel) and test.is_file()):
+            continue
+        if not any(_cases_test_reads(test, name) for name in data):
+            continue
+        found = _unwritten_import(test, [], root, set())
+        if found is None:
+            continue
+        run = f"python3 -m pytest -q {shlex.quote(rel)}"
+        if (await _run_check(run, root, DEFAULT_CHECK_TIMEOUT))[0] == 0:
+            module, via = found
+            return rel, module, Path(via[0]).stem if via else module
+    return None
+
+
+def _locked_test_without_its_module(command: str, goal: Path, root: Path) -> tuple[str, str] | None:
+    """(locked test, module) when `command` runs a locked test that imports a module
+    the tree and the installed packages do not provide, ignoring the scope that would
+    write it; or None. With the check passing, that test passes without the module."""
+    for module, test in _locked_test_imports(goal).items():
+        if _runs_test_file(command, test) and not _module_written(
+            module, root, (root / test).parent, []
+        ):
+            return test, module
+    return None
+
+
 def _self_import(
     command: str, scope: list[str], root: Path | None
 ) -> tuple[str, str, tuple[str, ...]] | None:
@@ -12738,6 +12820,19 @@ def make_step_tool() -> Any:
             ):
                 route += _on_disk_note(done_when, task)
                 passed_on_disk = (pre_rc, pre_out)
+            elif pre_rc == 0 and (
+                unjudged := _locked_test_without_its_module(done_when, goal, root)
+            ):
+                # Run R43: binding the locked test was refused as already passing,
+                # and a new test file as not running the locked test, for 22 calls.
+                test, module = unjudged
+                return _step_result(
+                    f"pursuit_step: {task} not opened — `{done_when}` already passes, "
+                    f"before any work: {_guarded_import_said(test, module, module, root)} "
+                    "No check that runs it can fail now, and one that does not run it is "
+                    "refused, so the locked test is what is wrong. "
+                    + _known_answers_fix_route(test, goal, task, title, _tree_nodes(root))
+                )
             elif pre_rc == 0:
                 now = _tree_nodes(root)
                 paths = scope or _check_targets(done_when, root)
@@ -13604,6 +13699,24 @@ def make_step_tool() -> Any:
                 f"\n\nLast report:\n{shown}\n\n"
                 f'Next: pursuit_step with task="{task}" and notes saying {test} must load '
                 f"{data} and run every case against the code.",
+            )
+        guarded = await _cases_test_passing_without_code(root, judged) if locks else None
+        if guarded:
+            state = "stays blocked" if retrying else "stays open"
+            test, module, imported = guarded
+            return _not_done(
+                root,
+                task,
+                scope,
+                f"{route}{undid}{task} — {title}: the check passes, but the task {state} "
+                f"and nothing is locked: {_guarded_import_said(test, module, imported, root)} "
+                f"Let the import fail the test: import {imported} unguarded, in a cases test "
+                f"this task's check does not run (the task that writes {module} runs it); "
+                "the test this check runs loads the data only."
+                f"\n\nLast report:\n{shown}\n\n"
+                f'Next: pursuit_step with task="{task}" and notes saying {test} must not '
+                f"guard its import of {imported}: the cases test imports it unguarded, and "
+                "this task's check runs only the data's own test.",
             )
         flawed = _cases_test_problem(root, judged) if locks else None
         if flawed:

@@ -3817,6 +3817,109 @@ async def test_close_does_not_lock_docs_and_test_of_a_task_that_wrote_no_cases(
     assert not (store / "tests" / "test_analysis_check.py").exists()
 
 
+#: R43's tests/test_case_data.py: reads the cases, imports the code under a guard.
+R43_GUARDED_CASES_TEST = (
+    "import json\n\n\ndef test_round_trip():\n    try:\n"
+    "        from codec import encode\n    except ImportError:\n        return\n"
+    "    for case in json.load(open('tests/cases.json')):\n"
+    "        assert encode(case['in']) == case['out']\n"
+)
+
+
+@pytest.mark.anyio
+async def test_known_answers_close_holds_a_cases_test_that_passes_without_the_code(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # R43 class 1: T0005 locked a cases test that passed with no code written.
+    project = _cases_task(tmp_path, fake_beagle, monkeypatch, R43_GUARDED_CASES_TEST)
+
+    result = await _step_cases(tmp_path)
+
+    assert "stays open" in result.text and "nothing is locked" in result.text, result.text
+    assert "tests/test_case_data.py imports codec (`from codec import encode`" in result.text
+    assert "under `except ImportError`" in result.text
+    assert "Let the import fail the test" in result.text
+    assert _pursuit_calls(fake_beagle, "close") == []
+    assert not (project / ".beagle" / "locked" / "tests" / "test_case_data.py").exists()
+
+    module = _module()
+    entries = ["tests/cases.json", "tests/test_case_data.py"]
+    held = await module._cases_test_passing_without_code(project, entries)
+    assert held == ("tests/test_case_data.py", "codec", "codec")
+    # A cases test whose import fails it, one importing no code, or one whose
+    # import resolves, is not held.
+    test = project / "tests" / "test_case_data.py"
+    test.write_text(
+        "import json\n\nfrom codec import encode\n\n\ndef test_cases():\n"
+        "    assert json.load(open('tests/cases.json'))\n"
+    )
+    assert await module._cases_test_passing_without_code(project, entries) is None
+    test.write_text(CASES_DATA_TEST)
+    assert await module._cases_test_passing_without_code(project, entries) is None
+    test.write_text(R43_GUARDED_CASES_TEST)
+    (project / "codec.py").write_text("def encode(value):\n    return value + 1\n")
+    assert await module._cases_test_passing_without_code(project, entries) is None
+
+
+@pytest.mark.anyio
+async def test_open_on_a_locked_test_passing_without_its_module_offers_the_fix_split(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # R43 E19-E57: bind the locked test (it judges the code) and it already
+    # passes (name a new test file) refused each other for 22 calls.
+    project = _git_project(tmp_path, monkeypatch)
+    monkeypatch.chdir(project)
+    cases = '[{"in": 1, "out": 2}]'
+    (project / "tests").mkdir()
+    (project / "tests" / "cases.json").write_text(cases)
+    (project / "tests" / "test_case_data.py").write_text(R43_GUARDED_CASES_TEST)
+    _git(project, "add", "tests")
+    _git(project, "commit", "-q", "-m", "T0005: Known answers")
+    _store_lock(project / ".beagle", "tests/cases.json", cases)
+    _store_lock(project / ".beagle", "tests/test_case_data.py", R43_GUARDED_CASES_TEST)
+    check = "python3 -m pytest -q tests/test_case_data.py"
+    _ready_task(fake_beagle, check)
+    runtime, _ = _bound(tmp_path)
+
+    result = await _tool(runtime, "pursuit_step").execute(
+        "c1",
+        {
+            "task": "T0002",
+            "criteria": "the codec passes",
+            "done_when": check,
+            "scope": ["codec.py"],
+        },
+    )
+
+    assert "T0002 not opened" in result.text and "already passes" in result.text, result.text
+    assert "tests/test_case_data.py imports codec (`from codec import encode`" in result.text
+    assert "under `except ImportError`" in result.text
+    assert "Known answers: fix tests/test_case_data.py::<what is wrong in it>" in result.text
+    assert "name a new test file" not in result.text
+    assert _pursuit_calls(fake_beagle, "open") == [] and _runs(fake_tau) == []
+
+    # With the module written, the same check passing is refused as before.
+    (project / "codec.py").write_text("def encode(value):\n    return value + 1\n")
+    passing = await _tool(runtime, "pursuit_step").execute(
+        "c2",
+        {
+            "task": "T0002",
+            "criteria": "the codec passes",
+            "done_when": check,
+            "scope": ["codec.py"],
+        },
+    )
+    assert "already passes" in passing.text and "Known answers: fix" not in passing.text
+
+
 def test_unread_cases_skips_a_test_importing_no_project_code_for_earlier_locked_data(
     tmp_path: Path,
 ) -> None:
@@ -18083,7 +18186,6 @@ async def test_data_route_refusal_leads_with_its_call(
         assert "closes on that work" in text
 
 
-
 R42_OWN_TEST = (
     "import json\nimport os\nimport unittest\n"
     "from interval_tree_clocks.clock import Clock\n\n\n"
@@ -18129,8 +18231,10 @@ async def test_open_task_whose_check_imports_unwritten_module_runs_with_drop_imp
         "interval_tree_clocks.clock, which neither the project tree nor the installed "
         "packages provide" in run["stdin"]
     )
-    assert "checks this task's own files only: remove `from interval_tree_clocks.clock " \
+    assert (
+        "checks this task's own files only: remove `from interval_tree_clocks.clock "
         "import Clock` and every use of interval_tree_clocks.clock" in run["stdin"]
+    )
     assert _pursuit_calls(fake_beagle, "amend") == []
 
 
@@ -18163,6 +18267,7 @@ async def test_open_task_not_run_offers_no_abandon_done_by(
     route = _module()._data_test_route(R16_CHECK, R18_DATA_SCOPE, project)
     pending = await _module()._data_route_on_disk("T0002", route, project)
     assert 'abandon="done by <that task>"' in pending
+
 
 R32_STAYS_OPEN = (
     "T0002 — Cases: the check passes, but the task stays open and nothing is locked: "
