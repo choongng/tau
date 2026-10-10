@@ -5052,13 +5052,19 @@ def _test_project_imports(test_path: Path) -> list[str]:
     return found
 
 
-def _unread_cases(root: Path, entries: list[str]) -> tuple[str, str] | None:
+def _unread_cases(
+    root: Path, entries: list[str], earlier: Collection[str] = ()
+) -> tuple[str, str] | None:
     """(test, data file) when the locks hold a cases data file the code's tests never read.
 
     Run R14 locked a data-shape test that loaded cases.json beside a test that
     imported the code and never read it. When a locked test imports the code,
     one such test must read each data file; a test importing nothing of the
     project does not count.
+
+    Run R42: an analysis task's test, importing nothing of the project, was held
+    to the cases data an earlier task locked. `earlier` data is read only by a
+    test that imports the code; a task with none is not judged against it.
     """
     files = []
     for entry in entries:
@@ -5070,8 +5076,9 @@ def _unread_cases(root: Path, entries: list[str]) -> tuple[str, str] | None:
     readers = judges or tests
     for data in (rel for rel in files if _is_cases_data(rel)):
         name = Path(data).name
-        if readers and not any(_cases_test_reads(root / test, name) for test in readers):
-            return readers[0], data
+        held = judges if data in earlier else readers
+        if held and not any(_cases_test_reads(root / test, name) for test in held):
+            return held[0], data
     return None
 
 
@@ -13519,15 +13526,16 @@ def make_step_tool() -> Any:
                 "whose scope holds it) or delete them.",
                 ran=worker_ran,
             )
-        if not locks and _only_data_and_tests(changed):
+        if not locks and _only_data_and_tests(changed) and any(map(_is_cases_data, changed)):
             # Run R04: the driver passed no locks for its known-answers task.
+            # Run R42: a task that wrote no cases data is no known-answers task.
             locks = changed
         if locks:
             locks = [*locks, *_cases_tests_beside_locks(root, goal, changed, locks)]
         # The data locked earlier counts: a cases test locked now must read it.
-        judged = [*locks, *(rel for rel in _locked(goal) if _is_cases_data(rel))]
-        judged = list(dict.fromkeys(judged))
-        unread = _unread_cases(root, judged) if locks else None
+        earlier = [rel for rel in _locked(goal) if _is_cases_data(rel) and rel not in locks]
+        judged = list(dict.fromkeys([*locks, *earlier]))
+        unread = _unread_cases(root, judged, earlier) if locks else None
         if unread:
             state = "stays blocked" if retrying else "stays open"
             test, data = unread

@@ -3772,6 +3772,79 @@ def test_locked_test_imports_skips_a_test_that_reads_no_locked_data(tmp_path: Pa
     assert _module()._locked_test_imports(goal) == {"clocks": "tests/test_case_data.py"}
 
 
+#: R42 T0007's analysis test: it checks a docs file and imports no project code.
+R42_ANALYSIS_TEST = (
+    "import os\nimport unittest\n\n\nclass TestAnalysis(unittest.TestCase):\n"
+    "    def test_exists(self):\n"
+    "        self.assertTrue(os.path.exists('docs/analysis.md'))\n"
+)
+
+
+@pytest.mark.anyio
+async def test_close_does_not_lock_docs_and_test_of_a_task_that_wrote_no_cases(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # R42 L61: T0007 wrote docs/analysis.md and a test of it, passed no locks, and
+    # was held to T0002's locked tests/cases.json as if it were the cases test.
+    project = _r22_committed(tmp_path, monkeypatch, test=True)
+    monkeypatch.chdir(project)
+    writes = {"docs/analysis.md": "# Analysis\n", "tests/test_analysis_check.py": R42_ANALYSIS_TEST}
+    monkeypatch.setenv("FAKE_TAU_WRITES", json.dumps(writes))
+    check = "python3 -m pytest -q tests/test_analysis_check.py"
+    _ready_task(fake_beagle, check)
+    (fake_beagle / "prove.out").write_text("T0002: PROVEN — refuses with the files gone\n")
+    runtime, _ = _bound(tmp_path)
+
+    result = await _tool(runtime, "pursuit_step").execute(
+        "c1",
+        {
+            "task": "T0002",
+            "criteria": "the analysis is written",
+            "done_when": check,
+            "scope": ["docs/analysis.md", "tests/test_analysis_check.py"],
+        },
+    )
+
+    assert "does not read" not in result.text, result.text
+    assert "Locked:" not in result.text
+    assert _pursuit_calls(fake_beagle, "close")[0][:3] == ["T0002", "--outcome", "done"]
+    store = project / ".beagle" / "locked"
+    assert not (store / "docs" / "analysis.md").exists()
+    assert not (store / "tests" / "test_analysis_check.py").exists()
+
+
+def test_unread_cases_skips_a_test_importing_no_project_code_for_earlier_locked_data(
+    tmp_path: Path,
+) -> None:
+    module = _module()
+    tests = tmp_path / "tests"
+    tests.mkdir()
+    (tests / "cases.json").write_text('[{"in": 1, "out": 2}]')
+    (tests / "test_analysis_check.py").write_text(R42_ANALYSIS_TEST)
+    (tests / "test_codec.py").write_text(
+        "import codec\n\n\ndef test_codec():\n    assert codec.run(1) == 2\n"
+    )
+    earlier = ["tests/cases.json"]
+
+    analysis = ["tests/test_analysis_check.py", *earlier]
+    assert module._unread_cases(tmp_path, analysis, earlier=earlier) is None
+    # A test that imports the code is still held to the earlier-locked data.
+    judge = ["tests/test_codec.py", *earlier]
+    assert module._unread_cases(tmp_path, judge, earlier=earlier) == (
+        "tests/test_codec.py",
+        "tests/cases.json",
+    )
+    # Data this task locks itself is read by its tests, as before.
+    assert module._unread_cases(tmp_path, analysis) == (
+        "tests/test_analysis_check.py",
+        "tests/cases.json",
+    )
+
+
 def test_cases_test_reads_requires_the_read_to_name_the_file(tmp_path: Path) -> None:
     shapes = {
         "message string beside a bare Path(__file__)": (
