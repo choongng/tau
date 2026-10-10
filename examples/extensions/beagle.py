@@ -14778,6 +14778,10 @@ def make_found_first_gate() -> Any:
     the reference, thought itself out of output room and then began building
     the project in the driver. Once steered, the driver gets a few calls for
     setup; after them only the pursuit tools run until the goal exists.
+
+    Run R38: setup call 6 was `agent`, whose sub-agent ran 57 minutes outside
+    the pursuit, with no scope, check or time limit. Before founding, `agent`
+    is refused whatever the count, and does not spend it.
     """
 
     async def gate(event: Any, context: ExtensionContext) -> ToolCallHookResult | None:
@@ -14791,6 +14795,17 @@ def make_found_first_gate() -> Any:
                 return None
         except Exception:  # noqa: BLE001 - fail open, never block on a guard bug
             return None
+        if event.tool_name == "agent":
+            return ToolCallHookResult(
+                block=True,
+                reason=(
+                    "refusing agent: the pursuit is not founded, and a sub-agent started "
+                    "now works outside it, with no scope, no check and no time limit. "
+                    "Reading the references and writing the known answers is "
+                    "pursuit_step's first milestone. Call pursuit_found now (again, "
+                    "fixing what its refusal named, if it was refused)."
+                ),
+            )
         _SETUP_CALLS += 1
         if _SETUP_CALLS <= FOUND_FIRST_SETUP_CALLS:
             return None

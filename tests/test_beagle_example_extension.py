@@ -1645,6 +1645,58 @@ async def test_a_request_to_set_beagle_up_is_steered_to_found_first(
 
 
 @pytest.mark.anyio
+async def test_found_first_gate_refuses_agent_before_founding(
+    tmp_path: Path, beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # R38 E07: setup call 6 was `agent`, and its sub-agent ran 57 minutes
+    # outside the pursuit, with no scope, check or time limit.
+    runtime, session = _bound(tmp_path)
+    monkeypatch.chdir(tmp_path / "project")
+    session.is_running = True
+    await runtime.emit_session_start("startup")
+    agent = _tool_with_hooks(runtime, "agent")
+    bash = _tool_with_hooks(runtime, "bash")
+    await runtime.run_input_hooks("set this project up for beagle pursuit, then build it")
+    await runtime.emit_event(AgentStartEvent())
+
+    refused = await agent.execute("c1", {"prompt": "read the references, write cases.json"})
+    setup = [await bash.execute(f"c{i}", {"command": "beagle doctor"}) for i in range(2, 8)]
+    again = await agent.execute("c8", {"prompt": "read the references, write cases.json"})
+
+    assert "refusing agent" in refused.text and "Call pursuit_found now" in refused.text
+    assert "no scope, no check and no time limit" in refused.text
+    # Refused agent calls spend none of the setup allowance.
+    assert [r.text for r in setup] == ["ran"] * 6
+    assert "refusing agent" in again.text
+
+
+@pytest.mark.anyio
+async def test_found_first_gate_allows_agent_once_founded(
+    tmp_path: Path, beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from types import SimpleNamespace
+
+    runtime, session = _bound(tmp_path)
+    monkeypatch.chdir(tmp_path / "project")
+    session.is_running = True
+    await runtime.emit_session_start("startup")
+    await runtime.run_input_hooks("set this project up for beagle pursuit, then build it")
+    await runtime.emit_event(AgentStartEvent())
+    module = _loaded_module()
+    gate = module.make_found_first_gate()
+    event = SimpleNamespace(tool_name="agent")
+    context = SimpleNamespace(session_id=session.session_id, cwd=str(tmp_path / "project"))
+
+    before = await gate(event, context)
+    project = _pursuit_project(tmp_path)
+    after = await gate(event, SimpleNamespace(session_id=session.session_id, cwd=str(project)))
+
+    assert before is not None and before.block
+    # Founded, the found-first gate is done; make_driver_edit_guard holds `agent` then.
+    assert after is None
+
+
+@pytest.mark.anyio
 async def test_an_unrelated_prompt_is_not_steered_to_found(
     tmp_path: Path, beagle: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
