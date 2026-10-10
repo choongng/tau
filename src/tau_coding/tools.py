@@ -71,6 +71,34 @@ class ToolInputError(ValueError):
     """Raised when a tool receives invalid structured arguments."""
 
 
+def _cut_off_arguments_error(name: str, text: str) -> str:
+    """Why a call whose arguments are only unparsed text did not run.
+
+    Providers hand a call whose argument text is not valid JSON to the tool as
+    `{"_raw_arguments": text}`. Run R38: a sub-agent's `write` calls of 20-26K
+    characters were cut off at the output limit, and the write tool answered
+    "path must be a string" twelve times while nothing was written. The error
+    names the cut-off and how to send less in one call instead.
+    """
+    try:
+        json.loads(text)
+    except ValueError as exc:
+        error = str(exc)
+    else:
+        error = "not an object of named arguments"
+    outcome = f"the {name} tool did not run"
+    if name == "write":
+        outcome += " and nothing was written"
+    return (
+        f"The {name} call's arguments are not valid JSON after {len(text)} characters "
+        f"({error}), so {outcome}. This is how a reply cut off at the output limit "
+        "ends. Send less in one call: write a long file in parts (write the first "
+        "part, then add the rest with edit or by appending through bash, since a "
+        "second write replaces the file), or generate patterned "
+        "data with a short script through bash."
+    )
+
+
 @dataclass(slots=True)
 class ImageSupportState:
     """Mutable active-model image capability shared with built-in tools."""
@@ -144,6 +172,10 @@ class ToolDefinition:
             on_update: ToolUpdateCallback | None = None,
         ) -> AgentToolResult:
             del tool_call_id, on_update
+            if set(arguments) == {"_raw_arguments"}:
+                raise ToolInputError(
+                    _cut_off_arguments_error(self.name, str(arguments["_raw_arguments"]))
+                )
             return await self.executor(arguments, signal)
 
         return AgentTool(
