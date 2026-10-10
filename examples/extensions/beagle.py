@@ -8878,7 +8878,8 @@ def _module_under_tests_problem(
     if refusal is not None:
         return f"{lead} With it at that path, the step is still refused: {refusal}"
     return (
-        f"{lead} Call pursuit_step task={json.dumps(task)}, done_when={json.dumps(done_when)}, "
+        f"{lead} Call pursuit_step task={json.dumps(task)}, "
+        f"done_when={json.dumps(_suggested_check(done_when, root))}, "
         f"scope={json.dumps(fixed)}, with the same criteria."
     )
 
@@ -8896,12 +8897,162 @@ def _missing_scoped_test(rc: int, output: str, scope: list[str], root: Path) -> 
     return None
 
 
-def _pytest_collected_none(rc: int, check: str) -> str | None:
+def _pytest_selection(check: str) -> str:
+    """The `-k` or `-m` selection a pytest check passes, as `-k 'expr'`, or ''.
+
+    Only words after the pytest word count, so `python3 -m pytest` is no selection.
+    """
+    words = _check_words(check)
+    start = next(
+        (i + 1 for i, word in enumerate(words) if Path(word).name in ("pytest", "py.test")),
+        None,
+    )
+    if start is None:
+        return ""
+    for i in range(start, len(words)):
+        word = words[i]
+        for flag in ("-k", "-m"):
+            if word == flag and i + 1 < len(words):
+                return f"{flag} {shlex.quote(words[i + 1])}"
+            if word.startswith(flag) and len(word) > len(flag):
+                return f"{flag} {shlex.quote(word[len(flag) :].removeprefix('='))}"
+    return ""
+
+
+def _selected_none(rc: int, output: str, check: str) -> str:
+    """The selection of a pytest check that ran no test because the selection
+    deselected every test it collected (exit 5 with an `N deselected` count), or ''."""
+    if rc != 5 or not re.search(r"\b\d+ deselected\b", output):
+        return ""
+    return _pytest_selection(check)
+
+
+#: A `-k` expression's words: parentheses, the boolean operators, and name parts.
+_K_TOKEN = re.compile(r"\s*(\(|\)|[^\s()]+)")
+
+
+def _k_matches_none(check: str, root: Path) -> str:
+    """The `-k` selection of a pytest check that no test in the files it runs can
+    match, read from their source, or '' when one may (or it cannot be told).
+
+    pytest matches each name in the expression, case-blind, as a substring of a
+    test's own name, its class's, its file's and its directories'; decorator names
+    count too, so a marker or keyword match is never ruled out.
+    """
+    selection = _pytest_selection(check)
+    if not selection.startswith("-k "):
+        return ""
+    expr = shlex.split(selection)[1]
+    tokens = _K_TOKEN.findall(expr)
+    if not tokens or any("[" in tok for tok in tokens):
+        return ""
+    items: list[set[str]] = []
+    for rel in _check_test_files(check, root):
+        try:
+            tree = ast.parse((root / rel).read_text(encoding="utf-8"))
+        except (OSError, SyntaxError, ValueError):
+            return ""
+        base = {*Path(rel).parts, Path(rel).stem}
+        for node in tree.body:
+            funcs = ast.FunctionDef | ast.AsyncFunctionDef
+            found: list[tuple[ast.FunctionDef | ast.AsyncFunctionDef, ast.ClassDef | None]] = (
+                [(node, None)] if isinstance(node, funcs) else []
+            )
+            if isinstance(node, ast.ClassDef) and node.name.startswith("Test"):
+                found = [(sub, node) for sub in node.body if isinstance(sub, funcs)]
+            for func, cls in found:
+                if not func.name.startswith("test"):
+                    continue
+                marks = [
+                    n.id if isinstance(n, ast.Name) else n.attr
+                    for owner in (func, cls)
+                    if owner is not None
+                    for deco in owner.decorator_list
+                    for n in ast.walk(deco)
+                    if isinstance(n, ast.Name | ast.Attribute)
+                ]
+                items.append({func.name, *([cls.name] if cls else []), *base, *marks})
+    if not items:
+        return ""
+    for names in items:
+        folded = [name.lower() for name in names]
+        parts = [
+            tok
+            if tok in ("(", ")", "and", "or", "not")
+            else str(any(tok.lower() in name for name in folded))
+            for tok in tokens
+        ]
+        try:
+            if _truth(ast.parse(" ".join(parts), mode="eval").body):
+                return ""
+        except (SyntaxError, ValueError):
+            return ""
+    return selection
+
+
+def _truth(node: ast.expr) -> bool:
+    """The value of an expression of True, False, `and`, `or` and `not` only."""
+    if isinstance(node, ast.Constant) and isinstance(node.value, bool):
+        return node.value
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.Not):
+        return not _truth(node.operand)
+    if isinstance(node, ast.BoolOp):
+        values = [_truth(value) for value in node.values]
+        return all(values) if isinstance(node.op, ast.And) else any(values)
+    raise ValueError(ast.dump(node))
+
+
+def _without_selection(check: str, selection: str) -> str:
+    """`check` with its `selection` (`-k 'expr'` or `-m 'expr'`) cut from its words,
+    or '' when the selection is not one of its top-level words."""
+    flag, expr = shlex.split(selection)
+    try:
+        words = shlex.split(check)
+    except ValueError:
+        return ""
+    for i, word in enumerate(words):
+        if word == flag and i + 1 < len(words) and words[i + 1] == expr:
+            return shlex.join(words[:i] + words[i + 2 :])
+        if word in (f"{flag}{expr}", f"{flag}={expr}"):
+            return shlex.join(words[:i] + words[i + 1 :])
+    return ""
+
+
+def _suggested_check(check: str, root: Path) -> str:
+    """`check` as a refusal echoes it in a call it suggests: without a `-k` that
+    matches no test in the files it runs, when that can be cut from its words.
+
+    Run R43: a scope refusal echoed `-k "test_cobs_impl"` back, the open bound it,
+    and it deselected all five tests of the file.
+    """
+    selection = _k_matches_none(check, root)
+    return (_without_selection(check, selection) if selection else "") or check
+
+
+def _selected_none_refusal(check: str, selection: str, task: str) -> str:
+    """Why an open refuses a check whose selection deselected every test it collected."""
+    without = _without_selection(check, selection)
+    call = (
+        f" Without it: pursuit_step task={json.dumps(task)}, done_when={json.dumps(without)}."
+        if without
+        else ""
+    )
+    return (
+        f"`{check}` exits 5 before any work because `{selection}` deselected every test "
+        "it collected, so no test ran: it fails for its selection, not for want of "
+        f"{task}'s work. Bind a check that runs the tests: without `{selection}`, or "
+        f"with a selection naming a test the file defines.{call}"
+    )
+
+
+def _pytest_collected_none(rc: int, check: str, output: str = "") -> str | None:
     """The lead for a pytest check that exited 5 (no tests collected), or None.
 
     Run R17 showed T0009's `exit 5: no tests ran` raw, beside "Fix the work, not
     the check", to the driver and to three workers. Exit 5 is pytest's own code
-    for an empty collection, so the test files the check names are not written yet.
+    for an empty collection, so the test files the check names are not written yet;
+    unless its `output` counts tests deselected: then its selection matched none
+    (run R43 was told the file defined no test_ function when it defined five).
     """
     if rc != 5:
         return None
@@ -8928,6 +9079,13 @@ def _pytest_collected_none(rc: int, check: str) -> str | None:
         if rel.endswith(".py") and not rel.startswith("-") and rel not in files:
             files.append(rel)
     named = ", ".join(files) if files else "the paths it was given"
+    selection = _selected_none(rc, output, check)
+    if selection:
+        return (
+            f"pytest ran no test from {named}: it collected tests, and `{selection}` "
+            "deselected every one. The check runs only a test that selection matches; "
+            "with none, it runs nothing."
+        )
     return (
         f"pytest collected no tests from {named}: it defines no test_ function; adding "
         "them is the work, not a different check."
@@ -9986,7 +10144,7 @@ def _known_answers_fix_route(
     if rest:
         call = f'pursuit_step task="{task}", scope={json.dumps(rest)}'
         if done_when:
-            call += f", done_when={json.dumps(done_when)}"
+            call += f", done_when={json.dumps(_suggested_check(done_when, goal.parent.parent))}"
         head += (
             f"Send the same call without the locked files: {call}, the rest as it was. "
             "The locked files stay readable to the worker and judge its work. "
@@ -10420,7 +10578,7 @@ def _last_failure_note(key: tuple[str, str], check: str) -> str:
     if last is None or not check or last[0] != check:
         return ""
     _, rc, tail = last
-    no_tests = _pytest_collected_none(rc, check)
+    no_tests = _pytest_collected_none(rc, check, tail)
     return (
         (f"\n\n{no_tests}" if no_tests else "")
         + f"\n\nThe check failed last step (exit {rc}). Its output ends:\n{tail}\n"
@@ -12847,6 +13005,14 @@ def make_step_tool() -> Any:
                     f"pursuit_step: {task} not opened — the check could not run: `{broke}` "
                     f"(exit {pre_rc}). Correct the command and call pursuit_step again."
                 )
+            unselected = _selected_none(pre_rc, pre_out, done_when)
+            if unselected:
+                # Run R43: a -k that matched none of the file's five tests exited 5
+                # and was taken as failing now.
+                return _step_result(
+                    f"pursuit_step: {task} not opened — "
+                    + _selected_none_refusal(done_when, unselected, task)
+                )
             stopped = _check_stopped(done_when, root) if pre_rc != 0 else None
             own_hang = (
                 _uncommitted_reach(done_when, [scope, _predecessor_scope(record, root)], root)
@@ -12982,6 +13148,10 @@ def make_step_tool() -> Any:
                             f"the check could not run: `{broke}` (exit {pre_rc}).",
                             " Correct the command and call pursuit_step again.",
                         )
+                    elif rejected is None and (
+                        unselected := _selected_none(pre_rc, pre_out, done_when)
+                    ):
+                        rejected = (_selected_none_refusal(done_when, unselected, task), "")
             if rejected is not None:
                 reason, advice = rejected
                 kept_note = _kept_bound_note(bound_check, notes, reason, own_scope, root)
@@ -13399,7 +13569,7 @@ def make_step_tool() -> Any:
                 # Run R39: told only "the check timed out after 60s", W9 re-ran the hang.
                 retry_note += f"Exit 124 means the check did not finish: {HANG_MEANING} "
             retry_note = _self_import_note(check, scope, root) + retry_note
-            no_tests = _pytest_collected_none(verdict[0], check)
+            no_tests = _pytest_collected_none(verdict[0], check, verdict[1])
             if no_tests is not None:
                 retry_note = f"\n\n{no_tests}" + retry_note
             retry_note += "Fix the work, not the check."
@@ -13483,7 +13653,7 @@ def make_step_tool() -> Any:
                     f"The check names {missing_lock}: it is locked for this task and not "
                     "written, so that is the work, not a wrong check. "
                 )
-            no_tests = _pytest_collected_none(verdict[0], check)
+            no_tests = _pytest_collected_none(verdict[0], check, verdict[1])
             if no_tests is not None:
                 if_line = ""
             unpassable = ""

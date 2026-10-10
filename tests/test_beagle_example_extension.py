@@ -13658,6 +13658,64 @@ async def test_not_done_explains_pytest_exit_5_no_tests_collected(
 
 
 @pytest.mark.anyio
+async def test_open_refuses_a_check_whose_selection_deselects_every_test(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # R43 t=40.6: `-k "test_cobs_impl"` deselected all five tests of the file, the
+    # open took exit 5 as failing now, and a scope refusal had echoed the -k back.
+    project = _git_project(tmp_path, monkeypatch)
+    monkeypatch.chdir(project)
+    (project / "tests").mkdir()
+    (project / "tests" / "test_cases.py").write_text(
+        "def test_round_trip():\n    assert False\n\n\ndef test_case_data():\n    assert False\n"
+    )
+    check = 'python3 -m pytest -q tests/test_cases.py -k "test_impl"'
+    _ready_task(fake_beagle, check)
+    runtime, _ = _bound(tmp_path)
+
+    result = await _tool(runtime, "pursuit_step").execute(
+        "c1",
+        {"task": "T0002", "criteria": "cases", "done_when": check, "scope": ["src/"]},
+    )
+
+    assert result.text.startswith("pursuit_step: T0002 not opened — ")
+    assert "`-k test_impl` deselected every test it collected" in result.text
+    assert 'done_when="python3 -m pytest -q tests/test_cases.py"' in result.text
+    assert not [c for c in _calls(fake_beagle) if c["argv"][1:2] == ["open"]]
+    assert _runs(fake_tau) == []
+
+    module = _module()
+    assert module._suggested_check(check, project) == "python3 -m pytest -q tests/test_cases.py"
+    for kept in ("round", "trip and not data", "cases", "test_case_data or nothing"):
+        sel = check.replace("test_impl", kept)
+        assert module._suggested_check(sel, project) == sel
+    assert module._pytest_selection("python3 -m pytest -q tests/test_cases.py") == ""
+    assert module._selected_none(5, "no tests ran in 0.01s", check) == ""
+    assert module._selected_none(1, "1 failed, 1 deselected", check) == ""
+
+
+@pytest.mark.anyio
+async def test_collected_none_note_names_a_k_that_matched_nothing() -> None:
+    # R43: the close said tests/test_case_data.py "defines no test_ function"; it
+    # defined five, and the bound -k matched none of them.
+    module = _module()
+    check = 'python3 -m pytest -q tests/test_case_data.py -k "test_cobs_impl"'
+    note = module._pytest_collected_none(5, check, "5 deselected in 0.01s\n")
+    assert note is not None and "-k test_cobs_impl" in note
+    assert "deselected every one" in note and "defines no test_ function" not in note
+    empty = module._pytest_collected_none(5, check, "no tests ran in 0.01s\n")
+    assert empty is not None and "defines no test_ function" in empty
+    marked = module._pytest_collected_none(
+        5, "pytest tests/test_case_data.py -m slow", "3 deselected in 0.01s"
+    )
+    assert marked is not None and "`-m slow` deselected every one" in marked
+
+
+@pytest.mark.anyio
 async def test_retry_note_explains_pytest_exit_5(
     tmp_path: Path,
     beagle: Path,
