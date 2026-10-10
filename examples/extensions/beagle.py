@@ -10770,8 +10770,12 @@ _NOT_DONE_DEMAND: dict[tuple[str, str], str] = {}
 #: the escalation offered a split by file, which cannot change a case.
 _NOT_DONE_CASES: dict[tuple[str, str], tuple[str, tuple[str, ...]]] = {}
 #: Tasks a not-done step left with their check failing, by (project root, task),
-#: with the not-done count at the first such step.
+#: with the not-done count at the first such step since the check last passed.
 _NOT_DONE_CHECK_FAILED: dict[tuple[str, str], int] = {}
+#: Tasks whose `_NOT_DONE_CHECK_FAILED` record a later step's passing check
+#: cleared, by (project root, task). Run R44: T0002's step-1 failure stood after
+#: two passing steps, so the reruns keyed on a passing check were never offered.
+_CHECK_FAILED_BEFORE: set[tuple[str, str]] = set()
 #: Tasks that have had the one notes-only rerun a broken check earns past the cap
 #: (see `_broken_check`), by (project root, task).
 _BROKEN_RERUN_SPENT: set[tuple[str, str]] = set()
@@ -11708,6 +11712,9 @@ _MORE_SUBAGENTS = (
     "another sub-agent on it, however its scope or notes are put, would only add one more"
 )
 _JUDGE_ONLY = "its check passes each time, and only the close keeps it open"
+#: The option an escalation gives to stop; the stop gate lets through a stop the
+#: last pursuit tool result offered with it.
+STOP_OPTION = "- stop, and tell the user what blocks it."
 
 
 def _escalation_options(
@@ -11733,20 +11740,26 @@ def _escalation_options(
     )
     return (
         f"{head}\n{task} has had {count} steps without a pass, and {why}. Choose one:\n"
-        f"{plan}{rerun}"
-        "- stop, and tell the user what blocks it."
+        f"{plan}{rerun}{STOP_OPTION}"
     )
 
 
 def _judge_kept_open(task: str, root: Path | None) -> str:
-    """The close judge's reason, when every not-done step on `task` passed its check
-    and only that judge kept the task open; else ""."""
+    """The close judge's reason, when every not-done step on `task` since its check
+    last failed passed it and only that judge kept the task open; else ""."""
     if root is None:
         return ""
     key = (str(root), task)
     if key in _NOT_DONE_CHECK_FAILED or _LAST_CHECK_EXIT.get(key, 0) != 0:
         return ""
     return _NOT_DONE_DEMAND.get(key, "")
+
+
+def _steps_passing(task: str, root: Path | None) -> str:
+    """How the not-done steps on `task`, held by the close alone, did on its check."""
+    if root is not None and (str(root), task) in _CHECK_FAILED_BEFORE:
+        return "the last with its check passing"
+    return "each with its check passing"
 
 
 def _notes_only_call(task: str, notes: str) -> str:
@@ -11756,7 +11769,8 @@ def _notes_only_call(task: str, notes: str) -> str:
 
 def _source_judge_cases(task: str, root: Path | None) -> tuple[str, tuple[str, ...]] | None:
     """The data file and cases the close's source judge named, when only that judge
-    kept `task` open and every not-done step on it passed its check; else None."""
+    kept `task` open and every not-done step on it since its check last failed
+    passed it; else None."""
     if root is None or not _judge_kept_open(task, root):
         return None
     return _NOT_DONE_CASES.get((str(root), task))
@@ -11790,7 +11804,7 @@ def _source_judge_escalation(
     listed = ("case " if one else "cases ") + ", ".join(cases)
     lead = (lead or f"pursuit_step: {task} not run — ") + "call instead: "
     if count >= JUDGE_NOTES_UNTIL + SOURCE_JUDGE_RERUNS:
-        return _source_judge_spent(task, count, data, listed, said, lead)
+        return _source_judge_spent(task, count, data, listed, said, lead, root)
     notes = (
         f"The close keeps {task} open on its cases' sources alone: {listed} in {data} "
         f"{'cites' if one else 'cite'} no line giving the expected result. Quote the line "
@@ -11803,16 +11817,19 @@ def _source_judge_escalation(
         short = _notes_only_call(task, "…")
     head = f"{lead}{short}\n" + (f"{said}\n" if said else "")
     head += (
-        f"{count} steps on it have left it not done, each with its check passing: only "
+        f"{count} steps on it have left it not done, {_steps_passing(task, root)}: only "
         f"the close's source check keeps it open, on {listed}. A split by file cannot "
         "change a case, so none is offered; keep the bound check (leave done_when and "
         f"new_route out).\nThe call that works, whole: {call}"
     )
     rerun = f"- {call}, a sub-agent at those cases, with the bound check kept;\n"
-    return _escalation_options(task, count, head, _JUDGE_ONLY, rerun=rerun, split=False)
+    why = _last_check_said(task, root)
+    return _escalation_options(task, count, head, why, rerun=rerun, split=False)
 
 
-def _source_judge_spent(task: str, count: int, data: str, listed: str, said: str, lead: str) -> str:
+def _source_judge_spent(
+    task: str, count: int, data: str, listed: str, said: str, lead: str, root: Path
+) -> str:
     """The escalation of a task the source judge alone held through its
     SOURCE_JUDGE_RERUNS: no rerun and no split, but its infeasible close, or stopping."""
     why = f"no line of {REFERENCES_DIR}/*.txt gives the result of {listed} in {data}"
@@ -11825,17 +11842,23 @@ def _source_judge_spent(task: str, count: int, data: str, listed: str, said: str
     head = f"{lead}{short}\n" + (f"{said}\n" if said else "")
     head += (
         f"The cases the references do not answer, {listed} in {data}, cannot close {task}: "
-        f"{count} steps on it have left it not done, each with its check passing, and its "
+        f"{count} steps on it have left it not done, {_steps_passing(task, root)}, and its "
         f"{SOURCE_JUDGE_RERUNS} notes-only reruns past {JUDGE_NOTES_UNTIL} steps are spent. "
         "No rerun and no split is offered: a split by file cannot change a case.\n"
         f"The call that works, whole: {close}"
     )
     closing = f"- {close}, closing it infeasible on those cases;\n"
-    return _escalation_options(task, count, head, _JUDGE_ONLY, rerun=closing, split=False)
+    why = _last_check_said(task, root)
+    return _escalation_options(task, count, head, why, rerun=closing, split=False)
 
 
 def _judge_escalation(
-    task: str, count: int, demand: str, lead: str = "", root: Path | None = None
+    task: str,
+    count: int,
+    demand: str,
+    lead: str = "",
+    root: Path | None = None,
+    said: str = "",
 ) -> str:
     """The escalation of a task only the close's own judge kept open.
 
@@ -11849,17 +11872,18 @@ def _judge_escalation(
     """
     held = _source_judge_cases(task, root)
     if held and root is not None:
-        return _source_judge_escalation(task, count, root, held, lead=lead)
+        return _source_judge_escalation(task, count, root, held, said=said, lead=lead)
     lead = lead or f"pursuit_step: {task} not run — "
     reason = demand.rstrip(".")
-    said = (
-        f"\n{count} steps on it have left it not done, each with its check passing: the "
+    why = _last_check_said(task, root)
+    said = (f"\n{said}" if said else "") + (
+        f"\n{count} steps on it have left it not done, {_steps_passing(task, root)}: the "
         f"close kept it open because {reason}. A new done_when would not change that, so "
         "keep the bound one (leave done_when and new_route out)."
     )
     if count >= JUDGE_NOTES_UNTIL:
         head = f"{lead}split it or stop.{said}"
-        return _escalation_options(task, count, head, _JUDGE_ONLY, rerun="")
+        return _escalation_options(task, count, head, why, rerun="")
     call = _notes_only_call(task, reason)
     lead += "call instead: "
     short = call
@@ -11867,7 +11891,7 @@ def _judge_escalation(
         short = _notes_only_call(task, "…")
     head = f"{lead}{short}{said}\nThe call that works, whole: {call}"
     rerun = f"- {call}, a sub-agent at what the close refused, with the bound check kept;\n"
-    return _escalation_options(task, count, head, _JUDGE_ONLY, rerun=rerun)
+    return _escalation_options(task, count, head, why, rerun=rerun)
 
 
 def _check_error_line(tail: str) -> str:
@@ -11901,7 +11925,7 @@ def _last_check_said(task: str, root: Path | None) -> str:
     key = (str(root), task)
     if _LAST_CHECK_EXIT.get(key, 0) != 0:
         return f"the last step's check failed: {_last_error_line(key)}"
-    if key in _NOT_DONE_CHECK_FAILED:
+    if key in _NOT_DONE_CHECK_FAILED or key in _CHECK_FAILED_BEFORE:
         return "its last check passed, and only the close keeps it open"
     return _JUDGE_ONLY
 
@@ -11922,6 +11946,7 @@ def _broken_check(task: str, root: Path | None) -> str:
     if (
         count < 2
         or key in _BROKEN_RERUN_SPENT
+        or key in _CHECK_FAILED_BEFORE
         or _NOT_DONE_CHECK_FAILED.get(key) != count
         or _LAST_CHECK_EXIT.get(key, 0) == 0
     ):
@@ -12143,13 +12168,15 @@ def _unchanged_route_escalation(
     """The escalation of a task whose only new route keeps its check and scope:
     `said` says why, then the split of its files one per part, or stopping; or,
     when its last step broke a passing check, the one rerun that earns; or, when
-    only the source judge held it, the notes-only rerun at its cases."""
+    only the close's judge held it, the notes-only rerun with that check kept.
+
+    Run R44: T0002's check passed, and this offered only a split or a stop."""
     failure = _broken_check(task, root)
     if failure:
         return _broken_check_escalation(task, count, failure, said)
-    held = _source_judge_cases(task, root)
-    if held and root is not None:
-        return _source_judge_escalation(task, count, root, held, said=said)
+    demand = _judge_kept_open(task, root)
+    if demand:
+        return _judge_escalation(task, count, demand, root=root, said=said)
     split = _split_call(task, record)
     lead = f"pursuit_step: {task} not run — "
     if split and len(lead) + len("call instead: ") + len(split) <= ESCALATION_HEAD_CHARS:
@@ -12331,6 +12358,8 @@ def _carry_not_done(root: Path, task: str, successor: str) -> None:
         _NOT_DONE_CHECK_FAILED[new] = _NOT_DONE_CHECK_FAILED[old]
     if old in _BROKEN_RERUN_SPENT:
         _BROKEN_RERUN_SPENT.add(new)
+    if old in _CHECK_FAILED_BEFORE:
+        _CHECK_FAILED_BEFORE.add(new)
 
 
 def _forget_task(root: Path, task: str) -> None:
@@ -12344,6 +12373,7 @@ def _forget_task(root: Path, task: str) -> None:
     _NOT_DONE_DEMAND.pop(key, None)
     _NOT_DONE_CASES.pop(key, None)
     _NOT_DONE_CHECK_FAILED.pop(key, None)
+    _CHECK_FAILED_BEFORE.discard(key)
     _BROKEN_RERUN_SPENT.discard(key)
 
 
@@ -12397,6 +12427,9 @@ def _not_done(
         _NOT_DONE[key] = count
     if scope:
         _NOT_DONE_SCOPE[key] = tuple(scope)
+    if ran and _LAST_CHECK_EXIT.get(key, 0) == 0 and key in _NOT_DONE_CHECK_FAILED:
+        del _NOT_DONE_CHECK_FAILED[key]
+        _CHECK_FAILED_BEFORE.add(key)
     demand = _close_demand(text)
     if demand:
         _NOT_DONE_DEMAND[key] = demand
@@ -16231,12 +16264,27 @@ def make_driver_seat_gate() -> Any:
 #: Follow-ups the stop gate queues in one run before it lets the driver stop.
 MAX_STOP_GATE_FOLLOWUPS = 2
 _STOP_GATE_SENT = 0
+#: Whether the last pursuit tool result in this run offered STOP_OPTION.
+_STOP_OFFERED = False
 
 
 def _reset_stop_gate(event: Any, context: ExtensionContext) -> None:
-    global _STOP_GATE_SENT
+    global _STOP_GATE_SENT, _STOP_OFFERED
     del event, context
     _STOP_GATE_SENT = 0
+    _STOP_OFFERED = False
+
+
+def _note_stop_offer(results: Any) -> None:
+    """Remember whether the last pursuit tool result of a turn offered a stop."""
+    global _STOP_OFFERED
+    for result in reversed(list(results or ())):
+        if str(getattr(result, "tool_name", "")).startswith("pursuit_"):
+            text = "".join(
+                str(getattr(part, "text", "") or "") for part in getattr(result, "content", ())
+            )
+            _STOP_OFFERED = STOP_OPTION in text
+            return
 
 
 def make_stop_gate(tau: ExtensionAPI) -> Any:
@@ -16248,16 +16296,22 @@ def make_stop_gate(tau: ExtensionAPI) -> Any:
     queued, so this queues a follow-up naming what is not done, as the
     session's output-limit nudge does; the loop sends it in print mode too.
     At most `MAX_STOP_GATE_FOLLOWUPS` a run, then the stop is let through.
+
+    Run R44: an escalation offered T0002's driver a stop, the driver took it,
+    and this refused it. A stop the last pursuit tool result offered goes through.
     """
 
     async def gate(event: Any, context: ExtensionContext) -> None:
         global _STOP_GATE_SENT, _FOUND_AWAITS_USER
         message = getattr(event, "message", None)
+        if getattr(message, "tool_calls", None):
+            _note_stop_offer(getattr(event, "tool_results", None))
         if (
             getattr(message, "role", None) != "assistant"
             or getattr(message, "tool_calls", None)
             or getattr(message, "stop_reason", None) in ("error", "aborted", "length")
             or _STOP_GATE_SENT >= MAX_STOP_GATE_FOLLOWUPS
+            or _STOP_OFFERED
         ):
             return
         goal = _find_goal(Path(context.cwd))

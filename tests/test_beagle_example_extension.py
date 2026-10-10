@@ -12807,6 +12807,54 @@ def test_stop_gate_founded_session_gets_no_unfounded_followup(
     assert not any("Nothing is founded" in s for s in sent)
 
 
+def test_stop_gate_accepts_a_stop_the_step_cap_offered(
+    tmp_path: Path, beagle: Path, fake_beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # R44 L69-L73: the step cap offered T0002's driver a stop; it took it after a
+    # refused read, and the stop gate refused the stop.
+    from types import SimpleNamespace
+
+    module = _module()
+    project = _pursuit_project(tmp_path)
+    root = {"id": "T0001", "parent": "", "status": "pending", "container": True}
+    leaf = {"id": "T0002", "parent": "T0001", "status": "open"}
+    (fake_beagle / "tree.out").write_text(json.dumps({"nodes": [root, leaf]}))
+    monkeypatch.setattr(module, "_STOP_GATE_SENT", 0)
+    monkeypatch.setattr(module, "_STOP_OFFERED", False)
+    sent: list[str] = []
+    gate = module.make_stop_gate(SimpleNamespace(send_user_message=sent.append))
+    context = SimpleNamespace(cwd=str(project), has_ui=False)
+
+    def turn(*results: tuple[str, str]) -> None:
+        calls = [SimpleNamespace(name=name) for name, _ in results]
+        message = SimpleNamespace(role="assistant", tool_calls=calls, stop_reason="toolUse")
+        tool_results = [
+            SimpleNamespace(tool_name=name, content=[SimpleNamespace(type="text", text=text)])
+            for name, text in results
+        ]
+        asyncio.run(gate(SimpleNamespace(message=message, tool_results=tool_results), context))
+
+    def stop() -> None:
+        message = SimpleNamespace(role="assistant", tool_calls=[], stop_reason="stop")
+        asyncio.run(gate(SimpleNamespace(message=message, tool_results=[]), context))
+
+    offer = module._escalation_options("T0002", 3, "pursuit_step: T0002 not run — x", "y")
+    assert offer.endswith("\n" + module.STOP_OPTION)
+    turn(("pursuit_step", offer))
+    turn(("read", "Tool call blocked: refusing to read tests/cases.json"))
+    stop()
+    assert sent == []
+    # A pursuit result that offered no stop leaves the gate as it was.
+    turn(("pursuit_step", 'pursuit_step: T0002 not run — call instead: pursuit_step task="T0002"'))
+    stop()
+    assert len(sent) == 1 and sent[0].startswith("[beagle] The pursuit is not done")
+    # A new run starts with no stop offered.
+    turn(("pursuit_step", offer))
+    module._reset_stop_gate(None, context)
+    stop()
+    assert len(sent) == 2
+
+
 def _event_line(message: dict[str, Any]) -> bytes:
     return json.dumps({"type": "message_end", "message": message}).encode()
 
@@ -18825,14 +18873,15 @@ def test_escalation_after_judge_only_stays_open_offers_notes_only_call(
     taken = {"task": "T0006", "notes": R32_DEMAND}
     assert module._judge_notes_rerun("T0006", taken, record, project)
     assert not module._judge_notes_rerun("T0006", {**taken, "new_route": True}, record, project)
-    # Once its check failed, a step was not the judge's alone: the new route stays.
+    # Run R44: a check that failed at step 1 and passed since leaves the task the
+    # judge's alone, so the notes-only call is offered and taken.
     failed, f_project, f_record, _ = _judge_only_escalated(
         tmp_path / "failed", monkeypatch, check_failed=True
     )
-    assert failed._judge_kept_open("T0006", f_project) == ""
+    assert failed._judge_kept_open("T0006", f_project).startswith(R32_DEMAND)
     other = failed._escalation("T0006", 3, call, f_record, f_project, False, False)
-    assert "rewritten done_when" in other
-    assert not failed._judge_notes_rerun("T0006", taken, f_record, f_project)
+    assert "rewritten done_when" not in other and notes_call in other
+    assert failed._judge_notes_rerun("T0006", taken, f_record, f_project)
 
 
 def test_escalation_does_not_offer_check_rewritten_to_bound(
@@ -18923,12 +18972,12 @@ def test_not_done_escalation_offers_notes_rerun_when_only_close_kept_open(
         late = module._not_done(project, "T0006", R32_SCOPE, R32_STAYS_OPEN)
     assert "T0006 is still open — split it or stop." in late.text
     assert "notes=" not in late.text and "rewritten done_when" not in late.text
-    # A task its check kept open keeps the escalation it had.
+    # Run R44: a check that failed only at step 1 no longer keeps the escalation off.
     _, _, failed = _judge_only_results(
         tmp_path / "failed", monkeypatch, ESCALATE_STEPS, check_failed=True
     )
-    assert "The next step on it runs no sub-agent: " in failed[-1]
-    assert "rewritten done_when" in failed[-1]
+    assert f"T0006 is still open — call instead: {notes_call}" in failed[-1]
+    assert "rewritten done_when" not in failed[-1]
 
 
 def test_escalated_calls_offers_notes_rerun_when_only_close_kept_open(
@@ -18948,11 +18997,85 @@ def test_escalated_calls_offers_notes_rerun_when_only_close_kept_open(
     record = {"id": "T0006", "status": "open", "criteria": "c", "done_when": _r32_tree(project)}
     taken = {"task": "T0006", "notes": R32_DEMAND.rstrip(".")}
     assert module._judge_notes_rerun("T0006", taken, record | {"scope": R32_SCOPE}, project)
-    # A task its check kept open still runs only by a new route.
+    # Run R44: a check that failed only at step 1 and passed since gets the rerun too.
     failed, f_project, _ = _judge_only_results(
         tmp_path / "failed", monkeypatch, ESCALATE_STEPS, check_failed=True
     )
-    assert "runs only by a new route" in failed._escalated_calls(["T0006"], f_project)
+    assert "runs only by a new route" not in failed._escalated_calls(["T0006"], f_project)
+
+
+def _early_failure_then_source_held(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> tuple[Any, Path, dict[str, Any], list[str]]:
+    """R44 T0002: step 1's check failed; steps 2 and 3 passed it, and the close's
+    source judge alone kept the task open, on one case."""
+    project = _git_project(tmp_path, monkeypatch)
+    data_check = _r32_tree(project)
+    module = _module()
+    key = (str(project), "T0006")
+    texts = []
+    for n in range(ESCALATE_STEPS):
+        module._LAST_CHECK_EXIT[key] = 1 if n == 0 else 0
+        text = "T0006 — Cases: the check still fails" if n == 0 else R32_STAYS_OPEN
+        cases = None if n == 0 else ("tests/cases.json", ["case_a"])
+        texts.append(module._not_done(project, "T0006", R32_SCOPE, text, cases=cases).text)
+        if n == 0:
+            assert module._NOT_DONE_CHECK_FAILED[key] == 1
+    record = {"id": "T0006", "status": "open", "criteria": "c", "done_when": data_check}
+    return module, project, record | {"scope": R32_SCOPE}, texts
+
+
+def test_source_judge_escalation_after_an_early_failed_check(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # R44 L65: T0002's step-1 failure stayed recorded after two passing steps, so
+    # the notes-only source rerun was never offered.
+    module, project, _, texts = _early_failure_then_source_held(tmp_path, monkeypatch)
+    key = (str(project), "T0006")
+
+    assert key not in module._NOT_DONE_CHECK_FAILED
+    assert module._source_judge_cases("T0006", project) == ("tests/cases.json", ("case_a",))
+    tail = texts[-1].removeprefix(R32_STAYS_OPEN)
+    assert tail.lstrip().startswith('T0006 is still open — call instead: pursuit_step task="T0006"')
+    assert "only the close's source check keeps it open, on case case_a" in tail
+    assert "rewritten done_when" not in tail and "new_route=true" not in tail
+    # It does not say every step passed: the first did not.
+    assert "the last with its check passing" in tail
+    assert "its last check passed, and only the close keeps it open" in tail
+    assert "each with its check passing" not in tail and "passes each time" not in tail
+    # A later failure is not a check broken after passing steps.
+    module._LAST_CHECK_EXIT[key] = 1
+    module._not_done(project, "T0006", R32_SCOPE, "T0006 — the check fails")
+    assert module._broken_check("T0006", project) == ""
+
+
+def test_step_cap_keeps_a_passing_bound_check(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # R44 L69, L75: T0002's bound check passed, yet the cap offered a split or a
+    # stop, then asked for a rewritten done_when.
+    module, project, record, _ = _early_failure_then_source_held(tmp_path, monkeypatch)
+    said = "No new route for T0006."
+    same = {"task": "T0006", "new_route": True, "done_when": record["done_when"], "notes": "x"}
+
+    unchanged = module._unchanged_route_escalation("T0006", 3, record, said, project)
+    refused = [
+        module._escalation("T0006", 3, call, record, project, False, False) for call in ({}, same)
+    ]
+    rerun = 'not run — call instead: pursuit_step task="T0006", notes='
+    for text in (unchanged, *refused):
+        assert rerun in text.splitlines()[0]
+        assert "rewritten done_when" not in text and "Add to it: done_when" not in text
+        assert "keep the bound check (leave done_when and new_route out)" in text
+    assert unchanged.splitlines()[1] == said
+    assert "runs only by a new route" not in module._escalated_calls(["T0006"], project)
+    # Held by the close's judge on a reason other than sources, it keeps the check too.
+    judged, j_project, j_record, _ = _judge_only_escalated(tmp_path / "judged", monkeypatch)
+    kept = judged._unchanged_route_escalation("T0006", 3, j_record, said, j_project)
+    notes_call = f'pursuit_step task="T0006", notes={json.dumps(R32_DEMAND.rstrip("."))}'
+    assert kept.startswith(f"pursuit_step: T0006 not run — call instead: {notes_call}\n{said}")
+    assert "keep the bound one (leave done_when and new_route out)" in kept
+    assert "pursuit_plan" not in kept.splitlines()[0]
 
 
 @pytest.mark.parametrize("steps", [ESCALATE_STEPS, 4, 6])
