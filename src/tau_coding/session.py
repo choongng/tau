@@ -799,6 +799,8 @@ class CodingSession:
         self._next_request_thinking_off = False
         #: The latest output-limit nudge queued, until the loop sends it.
         self._queued_nudge: UserMessage | None = None
+        #: Whether the queued nudge's request goes thinking-off: not after a loop cut.
+        self._queued_nudge_thinking_off = False
         #: The thinking-off twin of a provider, built for nudged requests, or
         #: None beside the provider when building it failed.
         self._thinking_off_twin: tuple[ModelProvider, ModelProvider | None] | None = None
@@ -2162,7 +2164,8 @@ class CodingSession:
             # The loop sends the nudge now: the request it makes next is the
             # nudge's, and so is the turn that ends next.
             self._queued_nudge = None
-            self._awaiting_nudge_reply = self._next_request_thinking_off = True
+            self._awaiting_nudge_reply = True
+            self._next_request_thinking_off = self._queued_nudge_thinking_off
         if isinstance(event, TurnEndEvent):
             self._continue_after_output_limit(event)
             self._continue_after_text_tool_call(event)
@@ -2177,8 +2180,17 @@ class CodingSession:
         with no reply and no tool call; the loop would end the run there, and
         an unattended run would sit idle. The nudge goes in as a follow-up, so
         the loop sends one more request (the truncated reasoning is left out
-        of it), and the between-turn compaction still applies. That request
-        goes with thinking off: the reasoning it would redo is what ran out.
+        of it), and the between-turn compaction still applies. After a turn
+        that reached the real output limit, that request goes with thinking
+        off via the twin: the reasoning it would redo is what ran out. On a
+        template that switches thinking in the prompt prefix, not only in the
+        generation prompt, that costs a full re-prefill for the nudge and
+        another for the request after it. R42 (dev-notes/itc-runs/R42.md,
+        class 4, gemma): each twin request and each return from one
+        reprocessed the whole prompt, 32,877-42,815 input tokens, 661 s over
+        20 turns. A turn tau cut for looping in its reasoning (its
+        `reasoning_loop_cut` diagnostic) is nudged at the session's own
+        thinking level instead, so the prefix stays as it was on any template.
         Bounded in a row, so a model that never acts does stop, and per run
         over the nudges whose reply made no tool call, so a model that keeps
         thinking itself out of room, acting just enough in between, stops too.
@@ -2211,6 +2223,9 @@ class CodingSession:
         self._length_continuations += 1
         nudge = UserMessage(content=OUTPUT_LIMIT_NUDGE)
         self._queued_nudge = nudge
+        self._queued_nudge_thinking_off = not any(
+            diagnostic.type == "reasoning_loop_cut" for diagnostic in message.diagnostics or []
+        )
         self._record_message_origin(nudge, delivery="follow_up", source="extension")
         self._harness.follow_up_message(nudge)
 
@@ -2268,7 +2283,7 @@ class CodingSession:
             self._harness.config.provider = provider.inner
 
     def _request_provider(self, provider: ModelProvider) -> ModelProvider:
-        """The provider one loop request goes to: thinking off for a nudge's."""
+        """The provider one loop request goes to: thinking off for an output-limit nudge's."""
         if not self._next_request_thinking_off:
             return provider
         self._next_request_thinking_off = False

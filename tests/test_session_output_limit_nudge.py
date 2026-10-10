@@ -12,11 +12,20 @@ from pathlib import Path
 import pytest
 
 from conftest import isolate_home
+from tau_agent import AssistantMessage
 from tau_ai import FakeProvider
 from tau_coding import CodingSession, OpenAICompatibleProviderConfig, ProviderSettings
 from tau_coding import session as coding_session_module
 from tau_coding.session import MAX_OUTPUT_LIMIT_CONTINUATIONS, OUTPUT_LIMIT_NUDGE
-from test_session_output_limit import _answers, _nudges, _session, _truncated
+from test_session_output_limit import (
+    R36_OPENING,
+    R36_ROUND,
+    _answers,
+    _nudges,
+    _session,
+    _streamed_reasoning,
+    _truncated,
+)
 
 REPORT_REQUEST = "Your last message was empty. Reply now with your final report."
 
@@ -79,5 +88,79 @@ async def test_thinking_off_request_is_the_nudges_not_a_steering_reply(
     # The report request's reply goes with the session's thinking level; the
     # nudge's own request, sent after it, is the one with thinking off.
     assert [call[2][-1].text for call in main.calls] == ["Design it.", REPORT_REQUEST]
+    assert [call[2][-1].text for call in off.calls] == [OUTPUT_LIMIT_NUDGE]
+    assert session.messages[-1].text == "Acted on the nudge."
+
+
+async def _twin_session(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, main: FakeProvider, off: FakeProvider
+) -> CodingSession:
+    """A session on `main` at thinking medium whose thinking-off twin is `off`."""
+    isolate_home(monkeypatch, tmp_path)
+    provider_config = OpenAICompatibleProviderConfig(
+        name="local",
+        models=("fake",),
+        default_model="fake",
+        thinking_levels=("off", "low", "medium"),
+        thinking_models=("fake",),
+        thinking_default="medium",
+        thinking_parameter="reasoning_effort",
+    )
+
+    def create(*args: object, thinking_level: object, **kwargs: object) -> FakeProvider:
+        return off if thinking_level == "off" else main
+
+    monkeypatch.setattr(coding_session_module, "_create_runtime_provider", create)
+    return await _session(
+        tmp_path,
+        main,
+        provider_name="local",
+        provider_settings=ProviderSettings(providers=(provider_config,)),
+        runtime_provider_config=provider_config,
+    )
+
+
+@pytest.mark.anyio
+async def test_loop_cut_nudge_keeps_the_session_provider(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # R42 (dev-notes/itc-runs/R42.md, class 4): a nudge after a loop cut went
+    # thinking-off, and on gemma's template that re-prefilled the prompt twice.
+    looping = R36_OPENING + R36_ROUND * 40
+    never_reached = AssistantMessage(content="The loop ran to its end.")
+    main = FakeProvider(
+        [_streamed_reasoning(looping, then=never_reached), _answers("Acted on the nudge.")]
+    )
+    off = FakeProvider([_answers("Thinking-off reply.")])
+    session = await _twin_session(monkeypatch, tmp_path, main, off)
+
+    async for _event in session.prompt("Design it."):
+        pass
+
+    cut = session.messages[1]
+    assert isinstance(cut, AssistantMessage)
+    assert [diagnostic.type for diagnostic in cut.diagnostics or []] == ["reasoning_loop_cut"]
+    assert [call[2][-1].text for call in main.calls] == ["Design it.", OUTPUT_LIMIT_NUDGE]
+    assert off.calls == []
+    assert session.messages[-1].text == "Acted on the nudge."
+    assert session.thinking_level == "medium"
+
+
+@pytest.mark.anyio
+async def test_output_limit_cut_nudge_still_uses_the_thinking_off_twin(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    main = FakeProvider([_truncated(), _answers("Session-level reply.")])
+    off = FakeProvider([_answers("Acted on the nudge.")])
+    session = await _twin_session(monkeypatch, tmp_path, main, off)
+
+    async for _event in session.prompt("Design it."):
+        pass
+
+    cut = session.messages[1]
+    assert isinstance(cut, AssistantMessage)
+    assert cut.stop_reason == "length"
+    assert not cut.diagnostics
+    assert [call[2][-1].text for call in main.calls] == ["Design it."]
     assert [call[2][-1].text for call in off.calls] == [OUTPUT_LIMIT_NUDGE]
     assert session.messages[-1].text == "Acted on the nudge."
