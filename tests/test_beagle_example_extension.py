@@ -12536,6 +12536,84 @@ async def test_known_answers_open_binds_data_test_when_the_cases_test_is_not_on_
     assert _module()._absent_test_route(both, [*scope, "clocks.py"], project) is None
 
 
+@pytest.mark.anyio
+async def test_absent_test_kept_when_data_test_already_passes(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # R40 class 3: the data-only bind cut the absent tests/test_cases_source.py from
+    # the check, and the data test left already passed, so the open was refused four
+    # times for not naming the new test the call had named.
+    project = _pursuit_project(tmp_path)
+    monkeypatch.chdir(project)
+    data_check = _case_data_test(project)
+    (project / "tests" / "cases.json").write_text('[{"name": "seed", "result": 1}]\n')
+    scope = ["tests/cases.json", "tests/test_cases.py", "tests/test_case_data.py"]
+    both = "python3 -m pytest -q tests/test_case_data.py tests/test_cases.py"
+    _ready_task(fake_beagle)
+    runtime, _ = _bound(tmp_path)
+
+    result = await _tool(runtime, "pursuit_step").execute(
+        "c1", {"task": "T0002", "criteria": "cases", "done_when": both, "scope": scope}
+    )
+
+    assert "not opened" not in result.text
+    [opened] = _pursuit_calls(fake_beagle, "open")
+    assert opened[opened.index("--done-when") + 1] == both
+    assert opened[opened.index("--scope") + 1 :][:3] == scope
+    assert f"Kept done_when `{both}`: `{data_check}` alone already passes" in result.text
+    assert "tests/test_cases.py, in scope and not on disk yet, is the work" in result.text
+    assert "Bound the data test only" not in result.text
+
+
+@pytest.mark.anyio
+async def test_already_passes_refusal_names_the_rewritten_check(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # R40 class 3: the refusal named only the rewritten command, and the rewrite was
+    # said in the route, which a refusal does not show. Here the data test fails when
+    # the bind tries it and passes by the pre-run, as a parallel task's work can make it.
+    project = _pursuit_project(tmp_path)
+    monkeypatch.chdir(project)
+    data_check = _case_data_test(project)
+    (project / "tests" / "cases.json").write_text('[{"name": "seed", "result": 1}]\n')
+    tried = tmp_path / "tried"
+    (project / "tests" / "test_case_data.py").write_text(
+        "import json\nfrom pathlib import Path\n\n\n"
+        "def test_cases():\n"
+        f"    tried = Path({str(tried)!r})\n"
+        "    first = not tried.exists()\n"
+        "    tried.touch()\n"
+        "    assert not first\n"
+        "    assert json.loads(Path(__file__).with_name('cases.json').read_text())\n"
+    )
+    scope = ["tests/cases.json", "tests/test_cases.py", "tests/test_case_data.py"]
+    both = "python3 -m pytest -q tests/test_case_data.py tests/test_cases.py"
+    _ready_task(fake_beagle)
+    runtime, _ = _bound(tmp_path)
+
+    result = await _tool(runtime, "pursuit_step").execute(
+        "c1", {"task": "T0002", "criteria": "cases", "done_when": both, "scope": scope}
+    )
+
+    assert "T0002 not opened" in result.text
+    assert f"`{both}`, as sent, was rewritten to `{data_check}`:" in result.text
+    assert "tests/test_cases.py is in scope but not on disk yet" in result.text
+    assert f"`{data_check}` already passes, before any work" in result.text
+    assert _pursuit_calls(fake_beagle, "open") == []
+
+    # Without a rewrite, the refusal is as it was.
+    plain = _module()._already_passes(data_check, rewritten_from=(data_check, "unused"))
+    assert plain == _module()._already_passes(data_check)
+
+
 async def _open_then_resend(
     tmp_path: Path, fake_beagle: Path, first: str, resend: str, scope: list[str], between: Any
 ) -> tuple[str, str]:

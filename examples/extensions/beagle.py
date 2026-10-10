@@ -7529,6 +7529,18 @@ def _absent_test_route(
     return absent, f"python3 -m pytest -q {' '.join(data)}", needs
 
 
+def _absent_test_kept_note(command: str, data_check: str, scope: list[str], root: Path) -> str:
+    """The note on keeping `command` when `_absent_test_route`'s data test already passes."""
+    route = _absent_test_route(command, scope, root)
+    absent = route[0] if route is not None else []
+    named = ", ".join(absent) or "the test it names that is not on disk yet"
+    return (
+        f"Kept done_when `{command}`: `{data_check}` alone already passes, before any "
+        f"work, so {named}, in scope and not on disk yet, is the work; the check fails "
+        "until it is written.\n\n"
+    )
+
+
 def _scope_note(needs: list[str], scope: list[str]) -> str:
     """What to send as scope when the data test is outside `scope`, or nothing."""
     if needs == scope:
@@ -10110,7 +10122,12 @@ def _carried_criteria(predecessor: str, root: Path) -> str:
 
 
 def _already_passes(
-    check: str, task: str = "", nodes: list[dict[str, Any]] | None = None, done_by: str = ""
+    check: str,
+    task: str = "",
+    nodes: list[dict[str, Any]] | None = None,
+    done_by: str = "",
+    *,
+    rewritten_from: tuple[str, str] | None = None,
 ) -> str:
     """Why a check that passes before any work is not bound.
 
@@ -10120,7 +10137,15 @@ def _already_passes(
     With `done_by`, a done task whose commit is in the scope's history, the
     done-by abandon is offered: run R14 was told to bind the goal's test,
     which was the same passing check.
+    With `rewritten_from`, the command as sent and why it became `check`, the
+    refusal names both: run R40 class 3 was told to put a new test in scope, which
+    its call had done, four times, while the rewrite was said only in the route.
     """
+    if rewritten_from is not None and rewritten_from[0].split() != check.split():
+        sent, why = rewritten_from
+        return f"`{sent}`, as sent, was rewritten to `{check}`: {why} " + _already_passes(
+            check, task, nodes, done_by
+        )
     if done_by:
         return (
             f"`{check}` already passes, before any work, so it cannot tell this task's "
@@ -12247,12 +12272,27 @@ def make_step_tool() -> Any:
                 return _step_result(f"pursuit_step: {task} not opened — {prose}")
             route += _bound_note(done_when, chained)
             done_when = chained
+            rewritten_from: tuple[str, str] | None = None
             data_only = _data_only_bind(done_when, scope, root)
             if data_only is not None:
-                # Run R24 #4: the cases test, not yet written, later imported a
-                # module no path in this scope could hold.
-                done_when, scope, data_note = data_only
-                route += data_note
+                data_check, data_scope, data_note = data_only
+                probe = await _run_check(data_check, root, DEFAULT_CHECK_TIMEOUT)
+                if probe[0] == 0 and not await _passes_only_by_uncommitted(
+                    data_check, [data_scope, _predecessor_scope(record, root)], root
+                ):
+                    # Run R40 class 3: the data test alone already passed, so the
+                    # rewrite was refused as no work, four times; the absent test
+                    # in scope is the work, and it fails until written.
+                    route += _absent_test_kept_note(done_when, data_check, scope, root)
+                else:
+                    # Run R24 #4: the cases test, not yet written, later imported a
+                    # module no path in this scope could hold.
+                    if probe[0] != 0 and _check_stopped(data_check, root) is not None:
+                        killed_run = probe
+                    why = data_note.removeprefix(f"Bound the data test only: `{data_check}`.")
+                    rewritten_from = (done_when, " ".join(why.split()))
+                    done_when, scope = data_check, data_scope
+                    route += data_note
             if not scope and record.get("sibling_of"):
                 # Run R18 #56: T0008, spawned with no scope, was refused "no scope given".
                 scope = _predecessor_scope(record, root)
@@ -12313,7 +12353,7 @@ def make_step_tool() -> Any:
                 done_by = _done_task_in_log(paths, task, now, root)
                 return _step_result(
                     f"pursuit_step: {task} not opened — "
-                    + _already_passes(done_when, task, now, done_by)
+                    + _already_passes(done_when, task, now, done_by, rewritten_from=rewritten_from)
                 )
             broke = _check_broke(pre_rc, pre_out)
             if broke is not None:
