@@ -6,8 +6,8 @@ lines), with the same model, the same 60-min cap and 8G memory limit as the
 pursuit runs, and driver thinking medium (sent). Each is set beside every
 pursuit run of the same model and prompt: qwen cobs, mimo itc and gemma cobs.
 Rows are picked by `model` and `task` in each run's meta.json, not by run
-number. R41 (mimo cobs) was still running when this was written, is not graded,
-and is left out.
+number. R41 (mimo cobs) ran to the cap and graded 0/44, but has no baseline
+pair (no mimo cobs baseline was run), so it is left out.
 
 ## Sources and what is missing
 
@@ -119,7 +119,7 @@ bottleneck.
 Across models. The baselines do not say the pursuit is uniformly a cost or a
 gain. It turns gemma's one-shot finish into an hour of work and points qwen at
 the spec, while for mimo it mostly absorbs the hour. In every cell, the grade
-ceiling (5-7 of 42-44) sits far below complete, with or without the pursuit.
+ceiling (4-7 of 42-44) sits far below complete, with or without the pursuit.
 The thinking confound cuts against the pursuit: its workers wrote code
 thinking-off through R40, and its best mimo and qwen rows (R17, R34) predate the
 thinking fix, so by the catalog finding their drivers ran thinking-off too.
