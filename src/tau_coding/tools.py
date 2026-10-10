@@ -1065,7 +1065,19 @@ def _truncate_string_to_bytes_from_end(text: str, max_bytes: int) -> str:
 
 
 def _str_arg(arguments: Mapping[str, JSONValue], name: str) -> str:
-    value = arguments.get(name)
+    """`arguments[name]` as a string; an absent one is named as missing.
+
+    Run R39: gemma's write and edit calls arrived without `path`, and "path must
+    be a string" read as a type error on a value the call never had; one worker
+    resent the same call five times.
+    """
+    if name not in arguments:
+        carried = ", ".join(f"`{key}`" for key in arguments) or "no arguments"
+        raise ToolInputError(
+            f"`{name}` is missing: the call carried {carried}, and this tool needs "
+            f"`{name}` too; nothing was run. Send the call again with `{name}`."
+        )
+    value = arguments[name]
     if not isinstance(value, str):
         raise ToolInputError(f"{name} must be a string")
     return value
