@@ -17497,6 +17497,52 @@ def test_cases_first_does_not_send_to_open_unprovable_holder(tmp_path: Path) -> 
     assert "Open T0011 first" in pending
 
 
+def test_cases_first_offers_the_infeasible_close_for_a_holder_at_the_spawn_limit_not_open(
+    tmp_path: Path,
+) -> None:
+    # R26: "Open T0011 first … pursuit_step task="T0011"" for a holder whose retry
+    # chain (T0007, T0009, T0010, T0011) was at the limit; sent with new_route=true,
+    # beagle refused it as attempted too many times.
+    module = _module()
+    _r21_tree(tmp_path)
+    on_disk = ["tests/cases.json", "tests/test_case_data.py"]
+    args = ("T0012", "Cobs", "`cobs`", "Scope names new source cobs/__init__.py.", on_disk)
+
+    pending = module._cases_on_disk_route(*args, "T0011", "", _r26_chain("pending"), tmp_path)
+    blocked = module._cases_on_disk_route(*args, "T0011", "", _r26_chain("blocked"), tmp_path)
+
+    for text in (pending, blocked):
+        assert "new_route" not in text
+        assert "T0007, T0009, T0010, T0011" in text and "beagle's limit of 3" in text
+        assert 'pursuit_plan task="T0002", parts=["Known answers::by a route other ' in text
+        assert "T0012 opens once its cases are locked" in text
+    # A pending holder opens without a spawn, then closes infeasible once open:
+    # _close_infeasible refuses a task that is not open.
+    assert 'Open T0011 first, with no new route: pursuit_step task="T0011". ' in pending
+    assert 'pursuit_step task="T0011", abandon="infeasible: ' in pending
+    assert pending.index('pursuit_step task="T0011".') < pending.index("abandon=")
+    # A blocked holder is closed already in beagle: only the parent's re-plan is left.
+    assert "Open T0011" not in blocked and "abandon=" not in blocked
+    assert "T0011 is blocked" in blocked
+
+
+def test_cases_first_still_offers_opening_a_holder_under_the_limit(tmp_path: Path) -> None:
+    module = _module()
+    _r21_tree(tmp_path)
+    on_disk = ["tests/cases.json", "tests/test_case_data.py"]
+    args = ("T0012", "Cobs", "`cobs`", "Scope names new source cobs/__init__.py.", on_disk)
+    chain = _r26_chain("blocked")
+    under = chain[:3] + chain[4:]
+    assert not module._at_spawn_limit("T0011", under)
+
+    text = module._cases_on_disk_route(*args, "T0011", "", under, tmp_path)
+
+    assert 'Open T0011 first, with scope tests/cases.json, tests/test_case_data.py; ' in text
+    assert 'done_when="python3 -m pytest -q tests/test_case_data.py"' in text
+    assert ': pursuit_step task="T0011". ' in text
+    assert "abandon=" not in text and "pursuit_plan" not in text
+
+
 @pytest.mark.anyio
 async def test_abandon_infeasible_closes_open_task_at_attempt_limit(
     tmp_path: Path, beagle: Path, fake_beagle: Path, monkeypatch: pytest.MonkeyPatch

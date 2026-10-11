@@ -6711,6 +6711,33 @@ def _cases_on_disk_route(
         f"Cases first: {unjudged_text} The known answers are on disk already, "
         f"uncommitted: {listed}."
     )
+    if existing and holder is not None and _at_spawn_limit(existing, nodes):
+        # Run R26: "Open T0011 first" for a holder whose retry chain was at the
+        # limit; the driver sent it with new_route=true, and beagle refused it.
+        status = str(holder.get("status") or "")
+        held = _strings(holder.get("scope")) or scope
+        if status == "pending":
+            settle = (
+                f'Open {existing} first, with no new route: pursuit_step task="{existing}". '
+                f"If its check then cannot be proven: "
+                + _spawn_limit_offer(existing, str(holder.get("done_when") or ""), held, nodes)
+            )
+        else:
+            replan = _replan_parent_call(existing, nodes or [])
+            chain = ", ".join(sorted(_retry_chain(existing, nodes or [])))
+            settle = (
+                f"{existing} is {status or 'closed'}, and its retry chain ({chain}) is at "
+                f"beagle's limit of {SPAWN_LIMIT} attempts, so beagle refuses a new route "
+                + (
+                    f"for it. Re-plan its parent instead: {replan}."
+                    if replan
+                    else "for it, and it has no parent to re-plan: stop and ask the user."
+                )
+            )
+        return (
+            f"{head} {existing} holds them: do not split {task}. {unwait}{settle} {task} "
+            f"opens once its cases are locked, its test importing {named} by name."
+        )
     if existing:
         return (
             f"{head} {existing} holds them: do not split {task}. {unwait}Open {existing} first, "
