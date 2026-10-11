@@ -661,6 +661,7 @@ def _split_heredocs(command: str) -> tuple[str, list[tuple[str, str]]]:
     kept: list[str] = []
     bodies: list[tuple[str, str]] = []
     pending: list[tuple[str, bool, str, list[str]]] = []
+    quote = ""
     for line in command.split("\n"):
         if pending:
             delimiter, dash, opener, body = pending[0]
@@ -671,13 +672,52 @@ def _split_heredocs(command: str) -> tuple[str, list[tuple[str, str]]]:
                 body.append(line)
             continue
         kept.append(line)
-        pending += [(m.group(3), bool(m.group(1)), line, []) for m in _HEREDOC.finditer(line)]
+        openers, quote = _heredoc_openers(line, quote)
+        pending += [(m.group(3), bool(m.group(1)), line, []) for m in openers]
     return "\n".join(kept), bodies
+
+
+def _heredoc_openers(line: str, quote: str) -> tuple[list[re.Match[str]], str]:
+    """The `<<WORD` openers in `line` that stand outside quotes, and the quote
+    still open at its end; `quote` is the one open at its start.
+
+    Run R28: in a `bash -c 'cat > f << "EOF"` whose script goes on for more
+    lines, the `<<` is inside the script's quotes, so those lines are still the
+    script, not a body: dropping them left the quote unclosed and the command
+    unreadable.
+    """
+    found: list[re.Match[str]] = []
+    i = 0
+    while i < len(line):
+        c = line[i]
+        if quote:
+            if c == "\\" and quote == '"':
+                i += 1
+            elif c == quote:
+                quote = ""
+        elif c == "\\":
+            i += 1
+        elif c in "'\"":
+            quote = c
+        elif c == "#" and (i == 0 or line[i - 1] in " \t;&|("):
+            break  # a comment runs to the end of the line
+        elif (m := _HEREDOC.match(line, i)) is not None:
+            found.append(m)
+            i = m.end()
+            continue
+        i += 1
+    return found, quote
 
 
 def _shell_tokens(command: str) -> list[str] | None:
     """Shell words and operators, heredoc bodies dropped; None if unparseable."""
-    text = _strip_heredocs(command).replace("\\\n", " ").replace("\n", " ; ")
+    # A newline ends a command only outside quotes: inside a `bash -c '...'`
+    # script it is the script's own, and its heredocs need it kept.
+    lines = _strip_heredocs(command).replace("\\\n", " ").split("\n")
+    text, quote = lines[0], _heredoc_openers(lines[0], "")[1]
+    for line in lines[1:]:
+        text += ("\n" if quote else " ; ") + line
+        quote = _heredoc_openers(line, quote)[1]
     lexer = shlex.shlex(text, posix=True, punctuation_chars=True)
     lexer.whitespace_split = True
     try:
@@ -16261,15 +16301,14 @@ def _bash_writes_dot_beagle(command: str) -> bool:
         return True
     if _PYTHON_INLINE.search(command) and re.search(r"open\(|write|toml", command):
         return True
-    for segment in re.split(r"&&|\|\||[;|\n]", command):
+    for segment in re.split(r"&&|\|\||[;|\n]", _strip_heredocs(command)):
         try:
             words = shlex.split(segment)
         except ValueError:
             words = segment.split()
-        if words and words[0] in ("cp", "mv"):
-            operands = [w for w in words[1:] if not w.startswith("-")]
-            if len(operands) >= 2 and ".beagle" in operands[-1]:
-                return True
+        # Run R22: `touch` and `ln -sf /dev/null` into `.beagle/locked/` went through.
+        if any(".beagle" in target for target in _command_targets(words, Path.cwd())):
+            return True
     return False
 
 

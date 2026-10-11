@@ -12999,6 +12999,99 @@ async def test_driver_guard_reads_bash_c_behind_env_assignments(
     assert allowed.text == "ran"
 
 
+def _guard_root(tmp_path: Path) -> Path:
+    root = tmp_path / "root"
+    for sub in (".beagle", "tests", "cobs"):
+        (root / sub).mkdir(parents=True)
+    return root
+
+
+def test_driver_bash_change_sees_a_bash_c_heredoc_write(tmp_path: Path) -> None:
+    # R28 L142: `cd /home/choong/itc && bash -c 'cat > tests/test_cases.py << "EOF"...'`
+    # and R22's `BEAGLE_TAU_DRIVER_EDITS=1 bash -c '...'`: the `<<` inside the
+    # quoted script was taken for the outer command's, and the rest went unread.
+    module = _module()
+    root = _guard_root(tmp_path)
+    cases = {
+        "BEAGLE_TAU_DRIVER_EDITS=1 bash -c 'cat > cobs/__init__.py << \"EOF\"\nx = 1\nEOF'": (
+            "change cobs/__init__.py"
+        ),
+        "bash -c 'cat > tests/test_cases.py << \"EOF\"\nimport json\nEOF'": (
+            "change tests/test_cases.py"
+        ),
+        f"cd {root} && bash -c 'cat > tests/test_cases.py << \"EOF\"\nimport json\nEOF'": (
+            "change tests/test_cases.py"
+        ),
+        "bash -c \"cat <<-'EOF' > cobs/x.py\n\tit's\n\tEOF\"": "change cobs/x.py",
+        "bash -c 'cat > cobs/a.py << EOF\nEOF\ncat > cobs/b.py << EOF\nEOF'": "change cobs/a.py",
+    }
+    for command, change in cases.items():
+        assert module._driver_bash_change(command, root, root, root / ".beagle") == change
+    assert module._bash_write_targets(
+        "bash -c 'cat > cobs/a.py << EOF\nEOF\ncat > cobs/b.py << EOF\nEOF'", root
+    ) == [root / "cobs" / "a.py", root / "cobs" / "b.py"]
+    # A heredoc outside quotes is still a body: what it mentions is not written.
+    body = "cat > notes.md << 'EOF'\nbash -c 'echo x > cobs/y.py'\nEOF"
+    assert module._bash_write_targets(body, root) == [root / "notes.md"]
+
+
+@pytest.mark.anyio
+async def test_driver_bash_change_lets_a_tmp_heredoc_run(
+    tmp_path: Path, beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = _module()
+    root = _guard_root(tmp_path)
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+    commands = [
+        f"bash -c 'cat > {scratch}/probe.py << \"EOF\"\nprint(1)\nEOF'",
+        f"cd {scratch} && bash -c 'cat > probe.py << \"EOF\"\nprint(1)\nEOF'",
+    ]
+    for command in commands:
+        assert module._driver_bash_change(command, root, root, root / ".beagle") is None
+
+    monkeypatch.chdir(_pursuit_project(tmp_path))
+    runtime, _ = _bound(tmp_path)
+    bash = _tool_with_hooks(runtime, "bash")
+    await runtime.emit_session_start("startup")
+    for i, command in enumerate(commands):
+        assert (await bash.execute(f"c{i}", {"command": command})).text == "ran"
+
+
+@pytest.mark.anyio
+async def test_bash_writes_dot_beagle_sees_touch_and_ln(
+    tmp_path: Path, beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # R22 L190 and L210, R28 L842: the driver touched and symlinked over files
+    # in .beagle/locked/, which only the record guard caught.
+    module = _module()
+    writes = [
+        "touch .beagle/locked/tests/test_cases.py",
+        "ln -sf /dev/null .beagle/locked/tests/test_cases.py",
+        "ln -s /tmp/cases.py .beagle/locked/tests/",
+        "cd /x && touch -d yesterday .beagle/locked/tests/test_cases.py",
+    ]
+    reads = [
+        "cat .beagle/locked/tests/test_cases.py",
+        "ls -la .beagle/locked/tests",
+        "ln -s .beagle/locked/tests/test_cases.py /tmp/cases.py",
+        "touch -r .beagle/pursuit.toml /tmp/stamp",
+        "cat > /tmp/notes.md << 'EOF'\ntouch .beagle/locked/x\nEOF",
+    ]
+    for command in writes:
+        assert module._bash_writes_dot_beagle(command), command
+    for command in reads:
+        assert not module._bash_writes_dot_beagle(command), command
+
+    monkeypatch.chdir(_pursuit_project(tmp_path))
+    runtime, _ = _bound(tmp_path)
+    bash = _tool_with_hooks(runtime, "bash")
+    await runtime.emit_session_start("startup")
+    for i, command in enumerate(writes[:2]):
+        refused = await bash.execute(f"c{i}", {"command": command})
+        assert "the pursuit tools own .beagle/" in refused.text, command
+
+
 @pytest.mark.anyio
 async def test_driver_refusals_do_not_name_the_override_env(
     tmp_path: Path, beagle: Path, monkeypatch: pytest.MonkeyPatch
