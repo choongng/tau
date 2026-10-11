@@ -4170,6 +4170,59 @@ def test_cases_test_problem_flags_in_file_implementation(tmp_path: Path) -> None
     )
 
 
+#: q35 10-11's tests/test_case_data.py shape: a loader, then shape asserts on each case.
+Q35_LOADER_DATA_TEST = (
+    "import json\nimport pathlib\n\n\n"
+    "def _load_cases():\n"
+    '    return json.loads(pathlib.Path(__file__).with_name("cases.json").read_text())["cases"]\n'
+    "\n\n"
+    "def test_cases_shape():\n"
+    "    for case in _load_cases():\n"
+    '        assert "expected" in case\n'
+    '        assert isinstance(case["expected"], str) and case["expected"]\n'
+    '        assert case["name"]\n'
+)
+
+
+def test_cases_test_with_only_a_data_loader_is_not_an_own_copy(tmp_path: Path) -> None:
+    # q35 10-11: test_case_data.py defined _load_cases(), imported no project
+    # module, and `for case in _load_cases(): assert "result" in case` got
+    # "checks its own copy of the algorithm" three closes running.
+    module = _module()
+    entries = _write_cases(tmp_path, Q35_LOADER_DATA_TEST)
+
+    assert module._cases_test_problem(tmp_path, entries) is None
+    # Iterating the loaded cases through a second helper computes nothing either.
+    iterated = (
+        Q35_LOADER_DATA_TEST.replace(
+            "for case in _load_cases():", "for case in _each(_load_cases()):"
+        )
+        + "\n\ndef _each(cases):\n    yield from cases\n"
+    )
+    assert module._cases_test_problem(tmp_path, _write_cases(tmp_path, iterated)) is None
+
+
+def test_cases_test_computing_results_with_own_function_is_still_an_own_copy(
+    tmp_path: Path,
+) -> None:
+    # R40 W1 with q35's loader: the loader is not what makes it a copy; fork,
+    # given each case's input, still is.
+    module = _module()
+    source = Q35_LOADER_DATA_TEST + (
+        "\n\ndef fork(stamp):\n    return [stamp, stamp]\n\n\n"
+        "def test_cases():\n"
+        "    for case in _load_cases():\n"
+        '        got = fork(case["input"])\n'
+        '        assert got == case["expected"]\n'
+    )
+    found = module._cases_test_problem(tmp_path, _write_cases(tmp_path, source))
+    assert found is not None and found[1].startswith("checks its own copy of the algorithm")
+    # A whole case handed to the test's own function is computed from too.
+    whole = R40_IN_FILE_CASES_TEST.replace('fork(case["input"])', "fork(case)")
+    found = module._cases_test_problem(tmp_path, _write_cases(tmp_path, whole))
+    assert found is not None and found[1].startswith("checks its own copy of the algorithm")
+
+
 ITC_REFERENCE = (
     "Interval Tree Clocks\n\n4\n\n"
     "fork(i) = (i1, i2), where (i1, i2) = split(i)\n"
