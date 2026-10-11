@@ -170,6 +170,11 @@ from tau_coding.extensions import (
     ToolResultHookResult,
 )
 from tau_coding.paths import TauPaths
+from tau_coding.provider_config import (
+    load_provider_settings,
+    provider_model_max_tokens,
+    resolve_provider_selection,
+)
 from tau_coding.resources import parse_markdown_resource
 from tau_coding.skills import Skill, format_skill_invocation
 from tau_coding.tool_buffers import WINDOW_LINES
@@ -217,6 +222,18 @@ PLUGIN_ROOT_VAR = "${CLAUDE_PLUGIN_ROOT}"
 GOAL_BASENAME = "pursuit.toml"
 
 DEFAULT_DISPATCH_TIMEOUT = 900.0
+#: Maximal turns (the model's max_tokens each) the worker wall holds at the decode
+#: rate measured on earlier workers, when that is longer than the default. q38fn
+#: 10-11: at ~20 tok/s and max_tokens 16384 one turn took 650-850 s, and 5 of 9
+#: workers were killed at 900 s.
+WALL_MAXIMAL_TURNS = 3
+#: Output tokens measured before a decode rate sizes the wall.
+DECODE_MIN_TOKENS = 1000
+#: How the tool descriptions say the wall grows past the default.
+WALL_DESCRIPTION = (
+    f"or longer once earlier sub-agents measured the model's decode rate: {WALL_MAXIMAL_TURNS} "
+    "turns at its output limit"
+)
 
 #: Pin the worker's model/provider for every dispatch without editing code.
 #: Left unset, the project's `.beagle/dispatch.toml` entry for the role decides
@@ -1506,25 +1523,69 @@ def _worker_bash_timeout() -> float:
     return value if value > 0 else DEFAULT_WORKER_BASH_TIMEOUT
 
 
-def _worker_timeout(raw: Any) -> tuple[float, str]:
-    """A model-supplied worker timeout, clamped to DEFAULT_DISPATCH_TIMEOUT.
+def _worker_timeout(raw: Any, wall: float = DEFAULT_DISPATCH_TIMEOUT) -> tuple[float, str]:
+    """A model-supplied worker timeout, clamped to `wall` (`_worker_wall`), its default.
 
     Returns the timeout and a note for the tool result, empty unless clamped.
     A longer wall clock bought R01 only a longer spiral; the turn cap is what
     ends a worker with a report.
     """
     try:
-        asked = float(raw or DEFAULT_DISPATCH_TIMEOUT)
+        asked = float(raw or wall)
     except (TypeError, ValueError):
-        return DEFAULT_DISPATCH_TIMEOUT, ""
+        return wall, ""
     if asked <= 0:
-        return DEFAULT_DISPATCH_TIMEOUT, ""
-    if asked > DEFAULT_DISPATCH_TIMEOUT:
-        return DEFAULT_DISPATCH_TIMEOUT, (
-            f"(timeout {asked:.0f}s was clamped to {DEFAULT_DISPATCH_TIMEOUT:.0f}s, the most a "
+        return wall, ""
+    if asked > wall:
+        return wall, (
+            f"(timeout {asked:.0f}s was clamped to {wall:.0f}s, the most a "
             "worker gets; split a task that needs longer.)"
         )
     return asked, ""
+
+
+#: Worker decode measured this session, by (project root, provider, model): output
+#: tokens and the milliseconds after each turn's first output, so a long prompt
+#: read does not count as slow decoding.
+_DECODE: dict[tuple[str, str, str], tuple[int, int]] = {}
+
+
+def _decode_key(root: Path, model: str, provider: str) -> tuple[str, str, str]:
+    return str(_resolved(root)), provider, model
+
+
+def _model_max_tokens(model: str, provider: str) -> int | None:
+    """The catalog's output limit for the worker's model, or None when tau has none."""
+    try:
+        selection = resolve_provider_selection(
+            load_provider_settings(), provider_name=provider or None, model=model or None
+        )
+        return provider_model_max_tokens(selection.provider, selection.model)
+    except Exception:  # noqa: BLE001 - an unknown model or unreadable settings: no limit known
+        return None
+
+
+def _decode_rate(root: Path, model: str, provider: str) -> float | None:
+    """Output tokens per second measured on earlier workers, once there are enough."""
+    tokens, ms = _DECODE.get(_decode_key(root, model, provider), (0, 0))
+    if tokens < DECODE_MIN_TOKENS or ms <= 0:
+        return None
+    return tokens * 1000 / ms
+
+
+def _worker_wall(root: Path, model: str, provider: str) -> float:
+    """A worker's default and largest wall clock: DEFAULT_DISPATCH_TIMEOUT, or
+    WALL_MAXIMAL_TURNS turns of the model's max_tokens at the measured decode
+    rate when that is longer.
+
+    q38fn 10-11: 5 of 9 workers were killed at 900 s at ~20 tok/s with
+    max_tokens 16384, one of them in a single 818 s turn.
+    """
+    rate = _decode_rate(root, model, provider)
+    max_tokens = _model_max_tokens(model, provider) if rate else None
+    if not rate or not max_tokens:
+        return DEFAULT_DISPATCH_TIMEOUT
+    return max(DEFAULT_DISPATCH_TIMEOUT, float(math.ceil(WALL_MAXIMAL_TURNS * max_tokens / rate)))
 
 
 def _with_note(result: AgentToolResult, note: str) -> AgentToolResult:
@@ -1682,6 +1743,20 @@ _BLOCKED = "Tool call blocked: "
 _REFUSAL_COUNTDOWN = re.compile(r"\s*\d+ more refused calls? in a row stop the run\.\s*$")
 
 
+def _blocks(message: Mapping[str, Any]) -> list[dict[str, Any]]:
+    content = message.get("content")
+    return [b for b in content if isinstance(b, dict)] if isinstance(content, list) else []
+
+
+def _said(blocks: list[dict[str, Any]]) -> tuple[str, str]:
+    """A message's text and its thinking, each joined and stripped."""
+
+    def joined(kind: str) -> str:
+        return "\n".join(str(b.get(kind, "")) for b in blocks if b.get("type") == kind).strip()
+
+    return joined("text"), joined("thinking")
+
+
 @dataclass
 class _WorkerEvents:
     """What a `--mode json` run's `message_end` events say, read as they stream."""
@@ -1712,11 +1787,21 @@ class _WorkerEvents:
     reasoning_cut_offs: int = 0
     #: What filled each cut-off turn, in order: CUT_THINKING, CUT_REPLY or CUT_CALL.
     cut_fills: list[str] = field(default_factory=list)
+    #: Output tokens, and the milliseconds after each turn's first output: its decode.
+    decode_tokens: int = 0
+    decode_ms: int = 0
+    #: The last assistant message's text, else its thinking, and which it was.
+    said: tuple[str, str] = ("", "")
     #: The count before the last turn, and whether that turn was counted as cut off.
     _before_turn: int = 0
     _turn_cut: bool = False
+    #: The last `message_update` line since the last message ended: the turn in flight.
+    _in_flight: bytes = b""
 
     def feed(self, line: bytes) -> None:
+        if b'"message_update"' in line[:64]:
+            self._in_flight = line
+            return
         if b'"message_end"' not in line[:64]:
             return
         try:
@@ -1731,6 +1816,7 @@ class _WorkerEvents:
             return
         if not isinstance(message, dict) or message.get("role") != "assistant":
             return
+        self._in_flight = b""
         usage = message.get("usage")
         total = usage.get("totalTokens") if isinstance(usage, dict) else None
         if isinstance(total, int):
@@ -1738,26 +1824,19 @@ class _WorkerEvents:
             # of the run once per turn. The largest request is what the run
             # held at its peak, which is how Claude Code reports a subagent.
             self.spent = max(self.spent or 0, total)
-        content = message.get("content")
-        blocks = (
-            [block for block in content if isinstance(block, dict)]
-            if isinstance(content, list)
-            else []
-        )
-        text = "\n".join(
-            str(block.get("text", "")) for block in blocks if block.get("type") == "text"
-        ).strip()
+        self._note_decode(usage, message.get("timing"))
+        blocks = _blocks(message)
+        text, self.thinking = _said(blocks)
         if text:
             self.report = text
+        if text or self.thinking:
+            self.said = ("reply text", text) if text else ("reasoning", self.thinking)
         calls = [block for block in blocks if block.get("type") == "toolCall"]
         arguments = calls[-1].get("arguments") if calls else None
         command = arguments.get("command") if isinstance(arguments, dict) else None
         self.pending_command = (
             command if isinstance(command, str) else str(calls[-1].get("name", "")) if calls else ""
         )
-        self.thinking = "\n".join(
-            str(block.get("thinking", "")) for block in blocks if block.get("type") == "thinking"
-        ).strip()
         stop = message.get("stopReason")
         self.stop_reason = stop if isinstance(stop, str) else None
         self._before_turn = self.length_stops
@@ -1769,6 +1848,32 @@ class _WorkerEvents:
             self.cut_fills.append(CUT_CALL if calls else CUT_REPLY if text else CUT_THINKING)
         error = message.get("errorMessage")
         self.error = str(error) if stop == "error" and error else None
+
+    def _note_decode(self, usage: object, timing: object) -> None:
+        output = usage.get("output") if isinstance(usage, dict) else None
+        if not isinstance(output, int) or output <= 0 or not isinstance(timing, dict):
+            return
+        total, first = timing.get("totalDurationMs"), timing.get("timeToFirstOutputMs") or 0
+        if isinstance(total, int) and isinstance(first, int) and total > first:
+            self.decode_tokens += output
+            self.decode_ms += total - first
+
+    def last_said(self) -> tuple[str, str]:
+        """What the run said last, as (kind, text): its turn in flight, else its last message.
+
+        q38fn 10-11: a worker killed at the wall lost its turn in flight, ~7 min of
+        reasoning that only its `message_update` events held.
+        """
+        try:
+            event = json.loads(self._in_flight) if self._in_flight else None
+        except ValueError:
+            event = None
+        message = event.get("message") if isinstance(event, dict) else None
+        if isinstance(message, dict):
+            text, thinking = _said(_blocks(message))
+            if text or thinking:
+                return ("reply text", text) if text else ("reasoning", thinking)
+        return self.said
 
     def _note_refusal(self, content: object) -> None:
         """Track tau's refusals: the last one's problem, the breaker's stop, cut-off calls."""
@@ -1948,6 +2053,75 @@ def _scope_changes(cwd: Path, scope: list[str]) -> list[str]:
     return lines
 
 
+def _record_decode(cwd: Path, model: str, provider: str, events: _WorkerEvents) -> None:
+    """Add a worker's measured decode to `_DECODE`, for `_worker_wall`."""
+    if events.decode_tokens <= 0 or events.decode_ms <= 0:
+        return
+    key = _decode_key(cwd, model, provider)
+    tokens, ms = _DECODE.get(key, (0, 0))
+    _DECODE[key] = (tokens + events.decode_tokens, ms + events.decode_ms)
+
+
+#: What a worker killed at its wall left, by (project root, task): the brief
+#: note for the task's next worker (`_killed_progress`), taken by its next step.
+_KILLED_PROGRESS: dict[tuple[str, str], str] = {}
+
+
+def _killed_progress(events: _WorkerEvents, cwd: Path, scope: list[str], timeout: float) -> str:
+    """The next attempt's brief note from a worker killed at its wall: the tail of
+    what it said last and the uncommitted files in its scope; "" when it left neither.
+
+    q38fn 10-11: the driver copied a killed worker's partial reasoning into the
+    notes by hand, and the worker after it finished in 4 min.
+    """
+    kind, said = events.last_said()
+    files = [rel for rel in _changed_files(cwd) if _in_scope(rel, scope, cwd)]
+    if not said and not files:
+        return ""
+    lines = [
+        f"\n\nThe last sub-agent on this task was killed at its {timeout:.0f}s wall before "
+        "it reported. Continue from where it stopped rather than starting over."
+    ]
+    if said:
+        tail = said[-_WORKER_TAIL_CHARS:]
+        cut = "[...] " if len(tail) < len(said) else ""
+        lines.append(f"Its last {kind}, the end of it:\n{cut}{tail}")
+    if files:
+        lines.append("Uncommitted in its scope: " + ", ".join(files))
+    return "\n".join(lines)
+
+
+def _wall_problem(
+    timeout: float, events: _WorkerEvents, task: str, cwd: Path, model: str, provider: str
+) -> str:
+    """Why a worker killed at its wall came back, and what its next run gets.
+
+    q38fn 10-11: the result said "Split the task, or lower its turn cap", but the
+    workers ran out of wall in long turns at ~20 tok/s, not in many turns.
+    """
+    problem = f"the step-executor exceeded its wall-clock budget of {timeout:.0f}s and was killed"
+    if events.length_stops:
+        problem += (
+            f": its last {events.length_stops} turn(s) ended at the output limit, writing "
+            "more than one reply holds. Split the task, or say in the notes to write files "
+            "in smaller pieces."
+        )
+    else:
+        problem += "."
+    wall, rate = _worker_wall(cwd, model, provider), _decode_rate(cwd, model, provider)
+    if rate and wall > timeout:
+        problem += (
+            f" At the {rate:.0f} tok/s measured, the next sub-agent's wall is {wall:.0f}s "
+            f"({WALL_MAXIMAL_TURNS} turns at the model's output limit)."
+        )
+    if task:
+        problem += (
+            f" What it said last and the files it changed go into the next brief on {task}, "
+            "to continue from."
+        )
+    return problem
+
+
 async def _run_worker(
     brief: str,
     cwd: Path,
@@ -2043,6 +2217,7 @@ async def _run_worker(
     loop = asyncio.get_running_loop()
     deadline = loop.time() + timeout
     problem: str | None = None
+    walled = False
     while not talk.done():
         if events.cut_offs >= WORKER_CUT_OFFS:
             # Run R33: W2 was cut off three times, not in a row, and ran to the wall.
@@ -2050,6 +2225,7 @@ async def _run_worker(
                 proc.kill()
             with contextlib.suppress(Exception):
                 await talk
+            _record_decode(cwd, model, provider, events)
             retry = ""
             if events.reasoning_cut_offs and can_turn_off and not thinking_off_note:
                 _THINKING_OFF_NEXT[root_key] = task
@@ -2078,24 +2254,25 @@ async def _run_worker(
             break
         remaining = deadline - loop.time()
         if remaining <= 0:
-            problem = f"the step-executor exceeded its wall-clock budget of {timeout:.0f}s and " + (
-                f"was killed: its last {events.length_stops} turn(s) ended at the output limit, "
-                "writing more than one reply holds. Split the task, or say in the notes "
-                "to write files in smaller pieces."
-                if events.length_stops
-                else f"was killed. Split the task, or lower its turn cap ({WORKER_MAX_TURNS_ENV})."
-            )
+            walled = True
             break
         await asyncio.wait({talk}, timeout=min(_WORKER_POLL_SECONDS, remaining))
-    if problem is not None:
+    if problem is not None or walled:
         with contextlib.suppress(ProcessLookupError):
             proc.kill()
         with contextlib.suppress(Exception):
             await talk
+        _record_decode(cwd, model, provider, events)
+        if walled:
+            kept = _killed_progress(events, cwd, scope or [], timeout) if task else ""
+            if kept:
+                _KILLED_PROGRESS[(root_key, task)] = kept
+            problem = _wall_problem(timeout, events, task if kept else "", cwd, model, provider)
         problem = f"{problem} {thinking_off_note}".strip()
         return _WorkerRun(returncode=proc.returncode, problem=problem, transcript=transcript)
 
     stderr = talk.result()
+    _record_decode(cwd, model, provider, events)
     note = _killed_note(proc.returncode, limit)
     if note and events.stop_reason == "toolUse" and events.pending_command:
         note += f" It was killed while its own command `{events.pending_command}` was running."
@@ -2246,7 +2423,9 @@ def make_dispatch() -> Any:
         pin = _dispatch_pin(EXECUTOR_ROLE, cwd)
         model, provider = _worker_target(arguments.get("model"), arguments.get("provider"), pin)
         thinking = _worker_thinking(model, provider, arguments.get("thinking"), pin)
-        timeout, clamped = _worker_timeout(arguments.get("timeout"))
+        timeout, clamped = _worker_timeout(
+            arguments.get("timeout"), _worker_wall(cwd, model, provider)
+        )
 
         run = await _run_worker(brief, cwd, model, provider, timeout, signal, thinking=thinking)
         if run.problem is not None:
@@ -2303,7 +2482,7 @@ DISPATCH_PARAMETERS = {
             "type": "number",
             "description": (
                 "Wall-clock seconds before the worker is killed. "
-                f"Default and maximum: {DEFAULT_DISPATCH_TIMEOUT:.0f}."
+                f"Default and maximum: {DEFAULT_DISPATCH_TIMEOUT:.0f}, {WALL_DESCRIPTION}."
             ),
         },
     },
@@ -4431,7 +4610,7 @@ STEP_PARAMETERS: dict[str, Any] = {
             "type": "number",
             "description": (
                 "Wall-clock seconds per sub-agent run. Default and maximum "
-                f"{DEFAULT_DISPATCH_TIMEOUT:.0f}."
+                f"{DEFAULT_DISPATCH_TIMEOUT:.0f}, {WALL_DESCRIPTION}."
             ),
         },
     },
@@ -10938,7 +11117,7 @@ async def _audit(
         root,
         model,
         provider,
-        DEFAULT_DISPATCH_TIMEOUT,
+        _worker_wall(root, model, provider),
         signal,
         thinking=_worker_thinking(model, provider, pin=pin),
     )
@@ -13128,6 +13307,8 @@ def make_step_tool() -> Any:
     kept_lead: list[str] = []
     #: This call's dispatch.toml pin, once a worker is about to be chosen.
     pinned: list[_DispatchPin] = []
+    #: This call's worker wall (`_worker_wall`), once its model is chosen.
+    walls: list[float] = []
 
     async def _execute(
         tool_call_id: str,
@@ -14016,7 +14197,6 @@ def make_step_tool() -> Any:
             attempts = max(1, int(arguments.get("attempts") or DEFAULT_STEP_ATTEMPTS))
         except (TypeError, ValueError):
             attempts = DEFAULT_STEP_ATTEMPTS
-        timeout = _worker_timeout(arguments.get("timeout"))[0]
         check_timeout = float(record.get("check_timeout") or DEFAULT_CHECK_TIMEOUT)
 
         spent: int | None = None
@@ -14029,7 +14209,11 @@ def make_step_tool() -> Any:
         pinned[:] = [pin]
         model, provider = _worker_target(arguments.get("model"), arguments.get("provider"), pin)
         thinking = _worker_thinking(model, provider, arguments.get("thinking"), pin)
+        walls[:] = [_worker_wall(root, model, provider)]
+        timeout = _worker_timeout(arguments.get("timeout"), walls[0])[0]
         retry_note = _last_failure_note((str(root), task), check) if status == "open" else ""
+        progress_key = (str(_resolved(root)), task)
+        retry_note = _KILLED_PROGRESS.get(progress_key, "") + retry_note
         restored: set[str] = set()
         attempt = 0
         proof: _Proof | None = None
@@ -14162,6 +14346,7 @@ def make_step_tool() -> Any:
                 attempts = 1
                 retry_note = "\n\n" + ON_DISK_WITNESS_NOTE
         worker_ran = False
+        _KILLED_PROGRESS.pop(progress_key, None)
         unreported: list[tuple[int, _WorkerRun, list[str]]] = []
         # Run R39: one step is bounded by one budget, not a full timeout per attempt.
         step_budget = timeout * STEP_BUDGET_FACTOR
@@ -14727,6 +14912,7 @@ def make_step_tool() -> Any:
         lead.clear()
         kept_lead.clear()
         pinned.clear()
+        walls.clear()
         result = await _execute(tool_call_id, arguments, signal, on_update)
         refusal = "".join(getattr(c, "text", "") for c in result.content)
         if lead and refusal.startswith("pursuit_step:"):
@@ -14738,7 +14924,8 @@ def make_step_tool() -> Any:
             result = _step_result("".join(kept_lead) + text)
         if spawns:
             result = _with_spawn_notice(result, *spawns[0])
-        result = _with_note(result, _worker_timeout(arguments.get("timeout"))[1])
+        if walls:
+            result = _with_note(result, _worker_timeout(arguments.get("timeout"), walls[0])[1])
         if pinned and pinned[0].rules:
             # After the result: run R23's breaker quotes only a result's first line.
             text = "".join(getattr(c, "text", "") for c in result.content)

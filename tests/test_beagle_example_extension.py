@@ -1431,6 +1431,11 @@ message = {
     "usage": {"totalTokens": 1000},
     "stopReason": "stop",
 }
+decode = os.environ.get("FAKE_TAU_DECODE")
+if decode:  # q38fn: "output tokens,decode ms" of the turn, as tau times it
+    tokens, ms = map(int, decode.split(","))
+    message["usage"]["output"] = tokens
+    message["timing"] = {"timeToFirstOutputMs": 4000, "totalDurationMs": 4000 + ms}
 if str(attempt) == os.environ.get("FAKE_TAU_SILENT_ON"):
     # R27 W7: the session ends on a tool call, with no result and no report.
     message = {
@@ -1482,6 +1487,10 @@ if attempt >= int(os.environ.get("FAKE_TAU_HANGS_ON") or 99):
         refused = "Tool call blocked: This call's arguments were cut off after 10053 characters"
         result = {"role": "toolResult", "content": [{"type": "text", "text": refused}]}
         print(json.dumps({"type": "message_end", "message": result}), flush=True)
+    midturn = os.environ.get("FAKE_TAU_MIDTURN")
+    if midturn:  # q38fn: the turn in flight at the kill, only in its update events
+        partial = {"role": "assistant", "content": [{"type": "thinking", "thinking": midturn}]}
+        print(json.dumps({"type": "message_update", "message": partial}), flush=True)
     import time
     time.sleep(60)
 print(json.dumps({"type": "message_end", "message": message}))
@@ -8521,6 +8530,101 @@ async def test_step_and_dispatch_timeout_clamped(
     assert "clamped" not in unclamped.text
 
 
+#: A builtin catalog model with a known max_tokens (64000).
+_HAIKU = {"model": "claude-haiku-4-5", "provider": "anthropic"}
+
+
+@pytest.mark.anyio
+async def test_worker_wall_scales_with_max_tokens_and_measured_rate(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # q38fn 10-11: 5 of 9 workers were killed at 900 s at ~20 tok/s with max_tokens 16384.
+    project = tmp_path / "project"
+    project.mkdir()
+    monkeypatch.chdir(project)
+    runtime, _ = _bound(tmp_path)
+    module = _loaded_module()
+    assert module._model_max_tokens(**_HAIKU) == 64000
+    dispatch = _tool(runtime, "pursuit_dispatch")
+    monkeypatch.setenv("FAKE_TAU_DECODE", "2000,100000")  # 20 tok/s after the first output
+    await dispatch.execute("c1", {"brief": "Write notes", **_HAIKU})
+
+    assert module._decode_rate(project, **_HAIKU) == 20.0
+    assert module._worker_wall(project, **_HAIKU) == 3 * 64000 / 20 == 9600
+    assert module._worker_wall(project, "gpt-4o", "openai") == 900  # nothing measured on it
+    asked = {"brief": "Write notes", **_HAIKU}
+    clamped = await dispatch.execute("c2", {**asked, "timeout": 99999})
+    assert clamped.text.startswith("(timeout 99999s was clamped to 9600s")
+    unclamped = await dispatch.execute("c3", {**asked, "timeout": 5000})
+    assert "clamped" not in unclamped.text
+
+    _pursuit_project(tmp_path)
+    _ready_task(fake_beagle)
+    (project / "done.txt").unlink()  # the dispatches' fake worker wrote it
+    timeouts: list[float] = []
+    real_run_worker = module._run_worker
+
+    async def recording_run_worker(*args: Any, **kwargs: Any) -> Any:
+        timeouts.append(args[4])
+        return await real_run_worker(*args, **kwargs)
+
+    monkeypatch.setattr(module, "_run_worker", recording_run_worker)
+    step = _tool(runtime, "pursuit_step")
+    stepped = await step.execute(
+        "c4",
+        {
+            "task": "T0002",
+            "criteria": "c",
+            "done_when": "grep -q done done.txt",
+            "timeout": 99999,
+            **_HAIKU,
+        },
+    )
+    assert timeouts == [9600]
+    assert stepped.text.startswith("(timeout 99999s was clamped to 9600s")
+    assert "closed done" in stepped.text
+
+
+@pytest.mark.anyio
+async def test_worker_wall_default_unchanged_without_a_measured_rate(
+    tmp_path: Path, beagle: Path, fake_tau: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    monkeypatch.chdir(project)
+    runtime, _ = _bound(tmp_path)
+    module = _loaded_module()
+    dispatch = _tool(runtime, "pursuit_dispatch")
+    assert module._worker_wall(project, **_HAIKU) == module.DEFAULT_DISPATCH_TIMEOUT == 900.0
+
+    # Turns with no timing measure no rate.
+    await dispatch.execute("c1", {"brief": "Write notes", **_HAIKU})
+    assert module._decode_rate(project, **_HAIKU) is None
+    clamped = await dispatch.execute("c2", {"brief": "Write notes", "timeout": 1800, **_HAIKU})
+    assert clamped.text.startswith("(timeout 1800s was clamped to 900s")
+
+    # A rate on a model tau knows no max_tokens for keeps the default.
+    monkeypatch.setenv("FAKE_TAU_DECODE", "2000,100000")
+    unknown = {"model": "no-such-model", "provider": "anthropic"}
+    await dispatch.execute("c3", {"brief": "Write notes", **unknown})
+    assert module._decode_rate(project, **unknown) == 20.0
+    assert module._model_max_tokens(**unknown) is None
+    assert module._worker_wall(project, **unknown) == 900.0
+
+    # Too few tokens measured is no rate yet; a fast model's wall stays at the floor.
+    monkeypatch.setenv("FAKE_TAU_DECODE", "500,100000")
+    await dispatch.execute("c4", {"brief": "Write notes", **_HAIKU})
+    assert module._decode_rate(project, **_HAIKU) is None
+    monkeypatch.setenv("FAKE_TAU_DECODE", "100000,1000")
+    await dispatch.execute("c5", {"brief": "Write notes", **_HAIKU})
+    assert module._decode_rate(project, **_HAIKU) == 100500 * 1000 / 101000
+    assert module._worker_wall(project, **_HAIKU) == 900.0
+
+
 # --------------------------------------------------------------------------- #
 # run R02: an unprovable task re-stepped, milestones abandoned, a stalled stop
 # --------------------------------------------------------------------------- #
@@ -10402,8 +10506,54 @@ async def test_second_worker_timeout_keeps_the_first_attempts_report_and_check(
     assert "The attempt before it reported:\nattempt 1: wrote tests/test_x.py" in text
     assert "exit 2 after that attempt:\ngrep: done.txt: No such file" in text
     assert "Changed or new in its scope: tests/test_x.py" in text
-    assert _module().WORKER_MAX_TURNS_ENV in text and "output limit" not in text
+    assert "turn cap" not in text and "output limit" not in text
+    assert "the files it changed go into the next brief on T0002" in text
     assert _pursuit_calls(fake_beagle, "close") == []
+
+
+@pytest.mark.anyio
+async def test_killed_worker_progress_reaches_the_next_attempts_notes(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # q38fn 10-11: a4f69dee was killed at 900 s with ~7 min of reasoning in flight;
+    # only the driver's hand-copied notes carried such reasoning to the next worker.
+    project = _git_project(tmp_path, monkeypatch)
+    monkeypatch.chdir(project)
+    monkeypatch.setenv("FAKE_TAU_SUCCEEDS_ON", "99")
+    monkeypatch.setenv("FAKE_TAU_HANGS_ON", "1")
+    monkeypatch.setenv("FAKE_TAU_MIDTURN", "x" * 5000 + " so case 3 encodes as (1, 0)")
+    monkeypatch.setenv("FAKE_TAU_WRITES", json.dumps({"tests/test_x.py": "def test_x(): ...\n"}))
+    _ready_task(fake_beagle)
+    runtime, _ = _bound(tmp_path)
+    step = _tool(runtime, "pursuit_step")
+    args = {
+        "task": "T0002",
+        "criteria": "c",
+        "done_when": "grep -q done done.txt",
+        "scope": ["done.txt", "tests/test_x.py"],
+    }
+
+    killed = (await step.execute("c1", {**args, "timeout": 3})).text
+    assert "exceeded its wall-clock budget of 3s and was killed." in killed
+    assert "turn cap" not in killed and "Split the task" not in killed
+    assert "What it said last and the files it changed go into the next brief on T0002" in killed
+
+    monkeypatch.setenv("FAKE_TAU_HANGS_ON", "99")
+    await step.execute("c2", args)
+    first, second, third = _runs(fake_tau)
+    note = second["stdin"]
+    assert "killed at its 3s wall before it reported" not in first["stdin"]
+    assert "The last sub-agent on this task was killed at its 3s wall before it reported" in note
+    assert "Its last reasoning, the end of it:\n[...] xxx" in note
+    assert note.count("x") < 2100 and "so case 3 encodes as (1, 0)" in note
+    assert "Uncommitted in its scope: tests/test_x.py" in note
+    # Taken once: the step's second attempt has the first's report instead.
+    assert "so case 3 encodes" not in third["stdin"]
+    assert _loaded_module()._KILLED_PROGRESS == {}
 
 
 @pytest.mark.anyio
