@@ -15337,13 +15337,17 @@ def make_worker_scope_guard() -> Any:
     source outside tests/ (run R36). A link in the project is
     judged by its own path, and one an inline script makes may not point out
     of the project. A worker with no scope is not held. Any worker sent on a
-    task is kept from reading the trees beside its project. Fails open.
+    task is kept from reading the trees beside its project. A path refused
+    again in the session is told how often, and to write in the scope or end
+    the turn with its report (mining: 210 of 400 scope refusals repeated one).
+    Fails open.
     """
 
     cut_offs = 0
     calls = 0
     wrote = False
     reads: dict[Path, int] = {}
+    refusals: dict[Path, int] = {}
 
     async def guard(event: Any, context: ExtensionContext) -> ToolCallHookResult | None:
         nonlocal cut_offs, calls, wrote
@@ -15459,12 +15463,28 @@ def make_worker_scope_guard() -> Any:
             if rel.suffix == ".py" and not _is_test_path(rel.as_posix())
             else ""
         )
+        scopes = ", ".join(scope)
+        refusals[rel] = refusals.get(rel, 0) + 1
+        times = refusals[rel]
+        again = (
+            # Run R21: W5 was refused itc/__init__.py and itc/clock.py 12 times, to the breaker.
+            f"refusing to write {rel}: it is outside {task}'s scope ({scopes}), refused "
+            f"again, {times} times now. No write outside the scope will be taken: write "
+            f"only under {scopes}, or end the turn now with your report"
+            if times > 1
+            else ""
+        )
         if _scratch_like(rel):
+            if again:
+                return ToolCallHookResult(
+                    block=True,
+                    reason=f"{again} naming {rel} as follow-up. Scratch files go in /tmp.",
+                )
             return ToolCallHookResult(
                 block=True,
                 reason=(
                     f"refusing to write {rel}: it is outside {task}'s scope "
-                    f"({', '.join(scope)}); name it in your report as follow-up. Scratch "
+                    f"({scopes}); name it in your report as follow-up. Scratch "
                     "files go in /tmp."
                 ),
             )
@@ -15483,11 +15503,14 @@ def make_worker_scope_guard() -> Any:
                     f" {task}'s check imports {rel}, so the check cannot pass while it is "
                     "outside the scope: say so in your report."
                 )
+        if again:
+            named = f" naming {rel} as needed." if needed != "." else "."
+            return ToolCallHookResult(block=True, reason=f"{again}{named}{imported}{source}")
         return ToolCallHookResult(
             block=True,
             reason=(
                 f"refusing to write {rel}: it is outside {task}'s scope "
-                f"({', '.join(scope)}). Work written outside {task}'s scope is not its work "
+                f"({scopes}). Work written outside {task}'s scope is not its work "
                 f"and is lost when the step ends: do what the scope holds{needed}"
                 f"{imported}{source}"
             ),

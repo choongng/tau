@@ -9694,7 +9694,7 @@ async def test_worker_write_outside_scope_refused(
     tmp_path: Path, beagle: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # Run R02: a worker wrote `tests/` over .gitignore with two turns left.
-    runtime = _scoped_worker(tmp_path, monkeypatch)
+    _scoped_worker(tmp_path, monkeypatch)
     calls = [
         ("write", {"path": ".gitignore", "content": "tests/\n"}),
         ("edit", {"path": "src/clock.py", "old": "a", "new": "b"}),
@@ -9703,7 +9703,9 @@ async def test_worker_write_outside_scope_refused(
     ]
 
     for tool, arguments in calls:
-        result = await _tool_with_hooks(runtime, tool).execute("c1", arguments)
+        # A session of its own per call: a path refused before in one gets the repeat text.
+        session, _ = _bound(tmp_path)
+        result = await _tool_with_hooks(session, tool).execute("c1", arguments)
 
         assert "outside T0003's scope (tests/x.py)" in result.text, (tool, arguments)
         assert "is lost when the step ends: do what the scope holds, and report that" in (
@@ -12328,6 +12330,78 @@ async def test_scope_refusal_of_project_code_does_not_point_to_tmp(
     for refused in (log, scratch):
         assert "Scratch files go in /tmp." in refused.text
         assert "is lost when the step ends" not in refused.text
+
+
+@pytest.mark.anyio
+async def test_scope_refusal_of_a_path_refused_before_counts_and_sends_to_report(
+    tmp_path: Path, beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # R21: W5 was refused itc/__init__.py and itc/clock.py 12 times, to the breaker.
+    runtime = _scoped_worker(tmp_path, monkeypatch, scope="tests/")
+    write = _tool_with_hooks(runtime, "write")
+
+    first = await write.execute("c1", {"path": "itc/core.py", "content": "class Stamp: ...\n"})
+    second = await write.execute("c2", {"path": "itc/core.py", "content": "class Stamp: ...\n"})
+    third = await write.execute("c3", {"path": "itc/core.py", "content": "x = 1\n"})
+    notes = [await write.execute(f"n{i}", {"path": "run.log", "content": "x\n"}) for i in (1, 2)]
+
+    assert "again" not in first.text
+    assert (
+        "refusing to write itc/core.py: it is outside T0003's scope (tests/), refused "
+        "again, 2 times now. No write outside the scope will be taken: write only under "
+        "tests/, or end the turn now with your report naming itc/core.py as needed."
+    ) in second.text
+    assert "The implementation does not go under tests/ either" in second.text
+    assert "is lost when the step ends" not in second.text
+    assert "refused again, 3 times now" in third.text
+    assert not (tmp_path / "itc" / "core.py").exists()
+    assert "again" not in notes[0].text
+    assert (
+        "refusing to write run.log: it is outside T0003's scope (tests/), refused again, 2 "
+        "times now. No write outside the scope will be taken: write only under tests/, or end "
+        "the turn now with your report naming run.log as follow-up. Scratch files go in /tmp."
+    ) in notes[1].text
+
+
+@pytest.mark.anyio
+async def test_scope_refusal_first_time_is_unchanged(
+    tmp_path: Path, beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runtime = _scoped_worker(tmp_path, monkeypatch, scope="tests/")
+    write = _tool_with_hooks(runtime, "write")
+
+    code = await write.execute("c1", {"path": "itc/core.py", "content": "class Stamp: ...\n"})
+    log = await write.execute("c2", {"path": "run.log", "content": "x\n"})
+
+    assert code.text.endswith(
+        "refusing to write itc/core.py: it is outside T0003's scope (tests/). Work written "
+        "outside T0003's scope is not its work and is lost when the step ends: do what the "
+        "scope holds, and report that itc/core.py is needed. The implementation does not go "
+        "under tests/ either: it is a later task's work, so report it instead."
+    )
+    assert log.text.endswith(
+        "refusing to write run.log: it is outside T0003's scope (tests/); name it in your "
+        "report as follow-up. Scratch files go in /tmp."
+    )
+
+
+@pytest.mark.anyio
+async def test_scope_refusal_counts_each_path_apart(
+    tmp_path: Path, beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runtime = _scoped_worker(tmp_path, monkeypatch, scope="tests/")
+    write = _tool_with_hooks(runtime, "write")
+
+    core = await write.execute("c1", {"path": "itc/core.py", "content": "x = 1\n"})
+    init = await write.execute("c2", {"path": "itc/__init__.py", "content": "x = 1\n"})
+    core_again = await write.execute("c3", {"path": "itc/core.py", "content": "x = 1\n"})
+    init_again = await write.execute("c4", {"path": "itc/__init__.py", "content": "x = 1\n"})
+
+    assert "again" not in core.text
+    assert "refusing to write itc/__init__.py: it is outside T0003's scope" in init.text
+    assert "again" not in init.text
+    for path, again in (("itc/core.py", core_again), ("itc/__init__.py", init_again)):
+        assert f"{path}: it is outside T0003's scope (tests/), refused again, 2 " in again.text
 
 
 @pytest.mark.anyio
