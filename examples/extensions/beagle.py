@@ -73,12 +73,16 @@ because a specific part of that model has no Tau equivalent:
   next session start (`beagle loop stop`), and the next `/pursuit-run` is
   told where the cancelled worker's partial work is. Each session records
   its pid under the Tau home, since beagle trusts no Tau pid.
-- **orientation** — when the project is a pursuit, its goal and criteria are
-  added to the system prompt at load, so the driver re-reads the goal every
-  session without anything triggering a turn. It is a frame, not an order.
-  Beagle's `loop-report` SessionStart hook output rides along with it. A
-  project with no pursuit yet gets a few lines instead: the CLI is already on
-  PATH, and founding one goes through `pursuit_found`.
+- **orientation** — the driver's system prompt holds how to work a pursuit,
+  fixed at load: a project with no pursuit yet also gets how to found one
+  (the CLI is already on PATH, founding goes through `pursuit_found`). It
+  holds no pursuit state, so it stays true when a pursuit is founded
+  mid-session, and the prompt prefix never changes. The state (goal,
+  criteria, task tree, ready tasks) comes from beagle as a message: in
+  `pursuit_found`'s result, at the first run of each session (with Beagle's
+  `loop-report` SessionStart hook output), and after each compaction. A
+  worker's prompt carries the goal and criteria: its session never outlives
+  the pursuit's founding.
 - **`/pursuit-run`** — the uncounted loop around `/pursuit`, which needs three
   things Claude Code gives it: a session id beagle records as the run's driver
   (exported as `CLAUDE_CODE_SESSION_ID`), a way to arm the next turn
@@ -335,6 +339,10 @@ _STARTED_SESSION: str | None = None
 #: What the next `/pursuit-run` turn is told about a run stopped because its
 #: Tau driver had ended, until one is sent.
 _ENDED_RUN_NOTE: str | None = None
+#: What `beagle hook loop-report` said at load, for each session's state note.
+_LOOP_REPORT = ""
+#: Sessions already told where the pursuit stands, at their start or founding.
+_STATE_NOTED: set[str] = set()
 
 
 # --------------------------------------------------------------------------- #
@@ -3682,6 +3690,7 @@ def make_found_tool(
             return _step_result(
                 f"pursuit_found: founded {goal} with root task {root_task}, but the "
                 f"milestone split failed (exit {rc}):\n{out}\n\nAdd them with pursuit_plan."
+                f"\n\n{_goal_text(goal) or ''}"
             )
         notes = []
         if initialized:
@@ -3715,7 +3724,8 @@ def make_found_tool(
             )
         noted = "".join(f"{note}\n\n" for note in [*repairs, *notes])
         return _step_result(
-            f"Founded the pursuit in {goal}, root task {root_task}.\n\n{_tree(root)}\n\n"
+            f"Founded the pursuit in {goal}, root task {root_task}.\n\n"
+            f"{_goal_text(goal) or ''}\n\n{_tree(root)}\n\n"
             f"{noted}{DRIVER_STEERS_NOTE}\n\n{CASES_FIRST_NOTE}\n\n"
             "Next: call pursuit_step with no arguments to see the first ready task. A "
             "milestone too big for one sub-agent's sitting: split it into steps with "
@@ -16413,22 +16423,16 @@ def make_found_first_steer(tau: ExtensionAPI) -> Any:
     return steer
 
 
-def _pin_founded(tau: ExtensionAPI) -> Callable[[Path], None]:
-    """Swap the not-yet-founded orientation for the pursuit's own, once founded.
+def _note_founded(goal: Path) -> None:
+    """Count founding's result as this session's state note.
 
-    The prompt sections are set at load, so a pursuit founded mid-session
-    kept "nothing founded yet" for the rest of it. Every tool result that
-    said how to work the pursuit was compacted away in time, and run 10's
-    driver was left with only a summary's account of the loop.
+    It carries the goal, criteria and tree, so the next run's start sends no
+    second one. Run 10 founded mid-session and kept only the not-yet-founded
+    orientation; the system prompt now says how to work a founded pursuit
+    from load, and this result and the note after each compaction say which.
     """
-
-    def pin(goal: Path) -> None:
-        section = _goal_section(goal)
-        if section:
-            tau.set_prompt_section("Beagle pursuit", section)
-            tau.set_prompt_section("Beagle", None)
-
-    return pin
+    del goal
+    _STATE_NOTED.add(_STARTED_SESSION or "")
 
 
 #: Focus for the summarizer when this session drives a pursuit. Run 10's
@@ -16446,6 +16450,35 @@ PURSUIT_COMPACTION_FOCUS = (
 )
 
 
+def _pursuit_state(root: Path, goal: Path) -> str:
+    """Where the pursuit stands, from beagle and the goal file.
+
+    The goal and criteria, `beagle pursuit tree`, the ready (or open) tasks,
+    and the last `pursuit_step` result on each of them.
+    """
+    rc, ready, _raw = _next_ready(root)
+    nodes = _tree_nodes(root)
+    ready_ids = _steppable(_ids(ready.get("ready")) if isinstance(ready, dict) else [], nodes)
+    open_ids = _steppable(_ids(ready.get("open")) if isinstance(ready, dict) else [], nodes)
+    if ready_ids:
+        now = f"Ready now: {', '.join(ready_ids)}."
+    elif open_ids:
+        now = f"Open now: {', '.join(open_ids)}."
+    else:
+        now = "Nothing is ready now."
+    last = ""
+    for task in ready_ids + open_ids:
+        if task in _LAST_STEP_RESULT:
+            last += f"\n\nLast pursuit_step on {task} said:\n{_LAST_STEP_RESULT[task]}"
+    parts = [
+        _goal_text(goal),
+        _tree(root),
+        f"{now} Next: call pursuit_step with no arguments. Work no task covers goes in "
+        f"with pursuit_plan; this session does not do it itself.{last}",
+    ]
+    return "\n\n".join(part for part in parts if part)
+
+
 def make_state_after_compaction(tau: ExtensionAPI) -> Any:
     """After a compaction, tell the driver where the pursuit stands, from beagle.
 
@@ -16461,26 +16494,43 @@ def make_state_after_compaction(tau: ExtensionAPI) -> Any:
         root, goal = _project_root()
         if goal is None:
             return
-        rc, ready, _raw = _next_ready(root)
-        nodes = _tree_nodes(root)
-        ready_ids = _steppable(_ids(ready.get("ready")) if isinstance(ready, dict) else [], nodes)
-        open_ids = _steppable(_ids(ready.get("open")) if isinstance(ready, dict) else [], nodes)
-        if ready_ids:
-            now = f"Ready now: {', '.join(ready_ids)}."
-        elif open_ids:
-            now = f"Open now: {', '.join(open_ids)}."
-        else:
-            now = "Nothing is ready now."
-        tree = _tree(root)
-        last = ""
-        for task in ready_ids + open_ids:
-            if task in _LAST_STEP_RESULT:
-                last += f"\n\nLast pursuit_step on {task} said:\n{_LAST_STEP_RESULT[task]}"
         tau.send_custom_message(
             "The conversation was just compacted. Where the pursuit stands, from beagle "
-            f"itself (trust this over the summary):\n\n{tree}\n\n{now} Next: call "
-            "pursuit_step with no arguments. Work no task covers goes in with "
-            f"pursuit_plan; this session does not do it itself.{last}",
+            f"itself (trust this over the summary):\n\n{_pursuit_state(root, goal)}",
+            custom_type="beagle",
+            deliver_as="steer",
+        )
+
+    return note
+
+
+def make_state_at_session_start(tau: ExtensionAPI) -> Any:
+    """At a session's first run, tell the driver where the pursuit stands.
+
+    The state used to be a system prompt section, which a pursuit founded
+    mid-session had to swap in, re-prefilling the whole context. As a message
+    after the user's request it changes no prefix. Only the host's session
+    gets it, once: founding's result and the note after a compaction carry
+    the same state later.
+    """
+
+    async def note(event: Any, context: ExtensionContext) -> None:
+        del event
+        session = context.session_id or ""
+        if session in _STATE_NOTED or session != (_STARTED_SESSION or ""):
+            return
+        root, goal = _project_root()
+        if goal is None:
+            return
+        _STATE_NOTED.add(session)
+        state = await asyncio.to_thread(_pursuit_state, root, goal)
+        report = (
+            f"\n\nAt session start, `beagle hook loop-report` said:\n\n{_LOOP_REPORT}"
+            if _LOOP_REPORT
+            else ""
+        )
+        tau.send_custom_message(
+            f"Where the pursuit stands as this session starts, from beagle:\n\n{state}{report}",
             custom_type="beagle",
             deliver_as="steer",
         )
@@ -17454,14 +17504,13 @@ PIECE_BY_PIECE_NOTE = (
 )
 
 
-def _goal_section(goal_file: Path, *, worker: bool = False) -> str | None:
-    """A compact orientation block from `pursuit.toml`, or None if unreadable.
+def _goal_text(goal_file: Path) -> str | None:
+    """The goal's statement and criteria from `pursuit.toml`, or None if unreadable.
 
     Read straight from the goal file rather than shelling out to `beagle`, so
     loading never depends on `beagle` being on PATH or paying a subprocess at
     setup. The counts and ready set live behind `/pursuit-view` and
-    `beagle pursuit next`; this only pins the goal and its criteria — the part
-    the driver must not lose — and points at the tools.
+    `beagle pursuit next`; this is the part the driver must not lose.
     """
     try:
         data = tomllib.loads(goal_file.read_text(encoding="utf-8"))
@@ -17474,47 +17523,82 @@ def _goal_section(goal_file: Path, *, worker: bool = False) -> str | None:
     if not isinstance(statement, str) or not statement.strip():
         return None
     criteria = goal.get("criteria")
-    lines = [f"This project is a **pursuit**: {statement.strip()}", ""]
+    lines = [f"This project is a **pursuit**: {statement.strip()}"]
     if isinstance(criteria, list) and criteria:
-        lines.append("Acceptance criteria (the user's; do not edit them to fit the work):")
+        lines += ["", "Acceptance criteria (the user's; do not edit them to fit the work):"]
         lines += [f"  - {str(c).strip()}" for c in criteria if str(c).strip()]
-    if worker:
-        lines += ["", "You are a sub-agent doing one task of it; your brief says which.", ""]
-        return "\n".join([*lines, PIECE_BY_PIECE_NOTE, GIT_IDENTITY_NOTE])
-    lines += [
-        "",
-        "How to work it — this session steers, sub-agents do the work:",
-        "1. `pursuit_step` with no arguments shows the next ready task.",
-        "2. `pursuit_step` again with that task, its `criteria`, a `done_when` (one "
-        "command, no shell operators, that exits 0 only when the task is done, such as "
-        "`python3 -m pytest -q tests/test_x.py`), and its `scope`: a sub-agent does the "
-        "work, the check runs, and the task closes when it passes.",
-        "3. Repeat until nothing is ready. A task too big for one sub-agent: split it "
-        "into steps with `pursuit_plan` first.",
-        "Do not edit project files in this session; put what you want changed in the "
-        "step's `notes`.",
-        DRIVER_STEERS_NOTE,
-        CASES_FIRST_NOTE,
-        GIT_IDENTITY_NOTE,
-        "",
-        # No slash commands here: run 11c's driver read `/pursuit-run` in this
-        # line as something to run, and ran it through bash.
-        "For the rarer moves — spawning another route, binding a container's check, "
-        "gates — call the `pursuit_driver` tool.",
-    ]
     return "\n".join(lines)
 
 
+def _worker_section(goal_file: Path) -> str | None:
+    """A worker's orientation: the goal and criteria, then how to take on its task.
+
+    A worker's session starts after founding and ends with its task, so the
+    goal can sit in its system prompt: it never changes there.
+    """
+    goal = _goal_text(goal_file)
+    if goal is None:
+        return None
+    return "\n".join(
+        [
+            goal,
+            "",
+            "You are a sub-agent doing one task of it; your brief says which.",
+            "",
+            PIECE_BY_PIECE_NOTE,
+            GIT_IDENTITY_NOTE,
+        ]
+    )
+
+
+#: How the driver works a founded pursuit. In the system prompt from load,
+#: whether or not the pursuit is founded yet, so founding changes no prefix.
+DRIVER_PROCEDURE = [
+    "How to work a founded pursuit — this session steers, sub-agents do the work:",
+    "1. `pursuit_step` with no arguments shows the next ready task.",
+    "2. `pursuit_step` again with that task, its `criteria`, a `done_when` (one "
+    "command, no shell operators, that exits 0 only when the task is done, such as "
+    "`python3 -m pytest -q tests/test_x.py`), and its `scope`: a sub-agent does the "
+    "work, the check runs, and the task closes when it passes.",
+    "3. Repeat until nothing is ready. A task too big for one sub-agent: split it "
+    "into steps with `pursuit_plan` first.",
+    "Do not edit project files in this session; put what you want changed in the step's `notes`.",
+    DRIVER_STEERS_NOTE,
+    CASES_FIRST_NOTE,
+    GIT_IDENTITY_NOTE,
+    "",
+    # No slash commands here: run 11c's driver read `/pursuit-run` in this
+    # line as something to run, and ran it through bash.
+    "For the rarer moves — spawning another route, binding a container's check, "
+    "gates — call the `pursuit_driver` tool.",
+]
+
+
+def _founded_section() -> str:
+    """The driver's orientation in a project founded before load."""
+    return "\n".join(
+        [
+            "This project is a beagle pursuit. Its goal, criteria and tasks come from "
+            "beagle in this conversation: at the start of each session and after each "
+            "compaction. Its goal file (`pursuit.toml` in `.beagle`) is the user's; never edit it.",
+            "",
+            *DRIVER_PROCEDURE,
+        ]
+    )
+
+
 def _unfounded_section(root: Path) -> str | None:
-    """Orientation for a project with no pursuit yet, or None with no driver.
+    """Orientation for a project with no pursuit at load, or None with no driver.
 
     Without it a model asked to set beagle up gets no frame at all until the
     goal file exists — and the setup skill, written for Claude Code, has it
-    hunt for a CLI shim and look for a `/pursuit` it cannot type.
+    hunt for a CLI shim and look for a `/pursuit` it cannot type. It also
+    says how to work a founded pursuit: founding mid-session leaves it in
+    place, and it stays true.
     """
     if _driver_file(PURSUIT_COMMAND) is None:
         return None
-    lines = ["This project is not a beagle pursuit yet."]
+    lines = ["Until this project is a beagle pursuit (no `pursuit.toml` in `.beagle` yet):"]
     if (root / BIN_REL).exists():
         lines.append(
             f"- `beagle` on PATH is already this checkout's CLI ({root / BIN_REL}); skip "
@@ -17534,15 +17618,13 @@ def _unfounded_section(root: Path) -> str | None:
         "('use your judgement', 'without further discussion'). Then draft the criteria "
         "from their request and set `user_delegated`.",
         "- It runs `git init` if the project is not a repository yet.",
-        "- Then work it with `pursuit_step`, which runs each task in a sub-agent. A "
-        "reference the work needs (a URL, a paper) goes in the step's notes, or is "
+        "- A reference the work needs (a URL, a paper) goes in a step's notes, or is "
         "saved inside the project; a sub-agent cannot see your context.",
-        f"- {DRIVER_STEERS_NOTE}",
-        f"- {CASES_FIRST_NOTE}",
-        f"- {GIT_IDENTITY_NOTE}",
-        "- The `pursuit_driver` tool loads the full written procedure, for what these "
-        "tools do not cover.",
         "- `beagle init` places templates; read one when you need it, not all of them.",
+        "",
+        "Once `pursuit_found` has founded it, its result says where the pursuit stands.",
+        "",
+        *DRIVER_PROCEDURE,
     ]
     return "\n".join(lines)
 
@@ -17731,7 +17813,7 @@ def _bridge_session_start_hooks(tau: ExtensionAPI, cwd: Path) -> None:
 
 
 def setup(tau: ExtensionAPI) -> None:
-    global _SEEN_CWD, _PLUGIN_ROOT, _LAYOUT, _DRIVERS_DIR, _ENDED_RUN_NOTE
+    global _SEEN_CWD, _PLUGIN_ROOT, _LAYOUT, _DRIVERS_DIR, _ENDED_RUN_NOTE, _LOOP_REPORT
     # Every beagle this process starts, hooks and the bash tool's alike,
     # inherits this, so beagle can tell it is not under Claude Code.
     os.environ[HOST_ENV] = "tau"
@@ -17846,7 +17928,7 @@ def setup(tau: ExtensionAPI) -> None:
                 ),
                 parameters=FOUND_PARAMETERS,
                 execute_fn=make_found_tool(
-                    on_founded=_pin_founded(tau), interactive=lambda: tau.context.has_ui
+                    on_founded=_note_founded, interactive=lambda: tau.context.has_ui
                 ),
                 prompt_snippet="Found a pursuit: goal, criteria, milestones.",
                 prompt_guidelines=(
@@ -17946,6 +18028,7 @@ def setup(tau: ExtensionAPI) -> None:
         )
         tau.on("input", _note_prompt)
         tau.on("agent_start", make_found_first_steer(tau))
+        tau.on("agent_start", make_state_at_session_start(tau))
         tau.on("compaction_end", make_state_after_compaction(tau))
         tau.add_compaction_instructions(PURSUIT_COMPACTION_FOCUS)
         tau.on("tool_call", make_found_first_gate())
@@ -17986,23 +18069,21 @@ def setup(tau: ExtensionAPI) -> None:
     if not _is_worker():
         _bridge_session_start_hooks(tau, cwd)
     goal = _find_goal(cwd)
-    if goal is not None:
-        section = _goal_section(goal, worker=_is_worker())
-        # loop-report is the SessionStart hook: what a run left in flight, and
-        # the driver's core while one is. The system prompt outlives
-        # compaction, so this also covers what the hook re-prints after one.
-        report = ""
-        if not _is_worker():
-            # Before loop-report, so it does not tell this session to stand
-            # down for a driver that has ended.
-            _ENDED_RUN_NOTE = _retire_gone_driver(goal.parent.parent)
-            if _ENDED_RUN_NOTE is not None:
-                tau.on("session_start", _notify_retired_once())
-            report = _session_start_report("loop-report", goal.parent.parent)
-        if section and report:
-            section = f"{section}\n\nAt session start, `beagle hook loop-report` said:\n\n{report}"
+    if goal is not None and _is_worker():
+        section = _worker_section(goal)
         if section:
             tau.add_prompt_section("Beagle pursuit", section)
+    elif goal is not None:
+        # Before loop-report, so it does not tell this session to stand
+        # down for a driver that has ended.
+        _ENDED_RUN_NOTE = _retire_gone_driver(goal.parent.parent)
+        if _ENDED_RUN_NOTE is not None:
+            tau.on("session_start", _notify_retired_once())
+        # loop-report is the SessionStart hook: what a run left in flight, and
+        # the driver's core while one is. It rides with each session's first
+        # state note.
+        _LOOP_REPORT = _session_start_report("loop-report", goal.parent.parent)
+        tau.add_prompt_section("Beagle", _founded_section())
     elif _PLUGIN_ROOT is not None and not _is_worker():
         section = _unfounded_section(_PLUGIN_ROOT)
         if section:

@@ -460,22 +460,28 @@ def test_unfounded_project_is_told_how_to_found_one(tmp_path: Path, beagle: Path
     runtime = _load(tmp_path)
 
     [section] = [s for s in runtime.prompt_sections if s.title == "Beagle"]
-    assert "not a beagle pursuit yet" in section.body
+    assert "Until this project is a beagle pursuit" in section.body
+    # It also says how to work one, so founding mid-session leaves it true.
+    assert "How to work a founded pursuit" in section.body
     assert "`pursuit_driver`" in section.body
     assert str(tmp_path / "home-tau" / "beagle-plugin" / "bin" / "beagle") in section.body
     assert "~/.claude/plugins/cache" in section.body
     assert not [s for s in runtime.prompt_sections if s.title == "Beagle pursuit"]
 
 
-def test_founded_project_gets_no_unfounded_section(
+def test_founded_project_gets_the_procedure_but_no_state_in_its_prompt(
     tmp_path: Path, beagle: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.chdir(_pursuit_project(tmp_path))
 
     runtime = _load(tmp_path)
 
-    titles = [s.title for s in runtime.prompt_sections]
-    assert "Beagle pursuit" in titles and "Beagle" not in titles
+    [section] = [s for s in runtime.prompt_sections if s.title == "Beagle"]
+    assert "How to work a founded pursuit" in section.body
+    assert "Until this project is a beagle pursuit" not in section.body
+    # The goal is state: it comes as a message, never in the prompt prefix.
+    assert "Ship it" not in section.body and "it ships" not in section.body
+    assert not [s for s in runtime.prompt_sections if s.title == "Beagle pursuit"]
 
 
 def test_missing_checkout_registers_no_skills(
@@ -989,21 +995,45 @@ def test_beagle_subprocesses_are_told_the_host_is_tau(tmp_path: Path, beagle: Pa
     assert "`commit-trailer` when `beagle hooks install` has put them" in note
 
 
-def test_loop_report_joins_the_pursuit_section(
+@pytest.mark.anyio
+async def test_session_start_note_carries_the_state_and_loop_report(
     tmp_path: Path, beagle: Path, fake_beagle: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     project = _pursuit_project(tmp_path)
     (fake_beagle / "loop-report.out").write_text("beagle: a run is still open here\n")
+    (fake_beagle / "tree.out").write_text("T0001 Ship it\n  T0002 Parser  pending\n")
     monkeypatch.chdir(project)
-
-    runtime = _load(tmp_path)
-
-    [section] = [s for s in runtime.prompt_sections if s.title == "Beagle pursuit"]
-    assert "This project is a **pursuit**: Ship it" in section.body
-    assert section.body.endswith("beagle: a run is still open here")
+    runtime, session = _bound(tmp_path)
     [call] = _calls(fake_beagle)
     assert call["argv"] == ["hook", "loop-report"]
     assert json.loads(call["stdin"])["hook_event_name"] == "SessionStart"
+    session.is_running = True
+
+    await runtime.emit_session_start("startup")
+    await runtime.emit_event(AgentStartEvent())
+    await runtime.emit_event(AgentStartEvent())
+
+    # Once per session, at its first run: a message, not a prompt section.
+    [note] = session.steered
+    assert note.startswith("Where the pursuit stands as this session starts")
+    assert "This project is a **pursuit**: Ship it" in note and "  - it ships" in note
+    assert "T0002 Parser  pending" in note and "call pursuit_step" in note
+    assert note.endswith("beagle: a run is still open here")
+    assert not [s for s in runtime.prompt_sections if "Ship it" in s.body]
+
+
+@pytest.mark.anyio
+async def test_session_start_note_skips_a_session_that_is_not_the_hosts(
+    tmp_path: Path, beagle: Path, fake_beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(_pursuit_project(tmp_path))
+    runtime, session = _bound(tmp_path)
+    session.is_running = True
+
+    # No session_start seen: the run is an in-process subagent's, not the host's.
+    await runtime.emit_event(AgentStartEvent())
+
+    assert session.steered == []
 
 
 def test_driver_is_told_to_steer_and_a_worker_to_go_piece_by_piece(
@@ -1012,13 +1042,14 @@ def test_driver_is_told_to_steer_and_a_worker_to_go_piece_by_piece(
     project = _pursuit_project(tmp_path)
     monkeypatch.chdir(project)
 
-    [driver] = [s for s in _load(tmp_path).prompt_sections if s.title == "Beagle pursuit"]
+    [driver] = [s for s in _load(tmp_path).prompt_sections if s.title == "Beagle"]
     monkeypatch.setenv("BEAGLE_TAU_WORKER", "1")
     [worker] = [s for s in _load(tmp_path).prompt_sections if s.title == "Beagle pursuit"]
 
     assert "Do not fetch or read the reference" in driver.body
     assert "one piece per turn" not in driver.body
     assert "Ship it" in worker.body and "Write the concrete cases first" in worker.body
+    assert "Ship it" not in driver.body
     assert "this session steers" not in worker.body
     assert "Cases first" in driver.body and "Cases first" not in worker.body
     assert "Never set a git identity" in driver.body
@@ -1521,20 +1552,24 @@ async def test_pursuit_found_waits_for_the_user_then_roots_and_splits(
 
 
 @pytest.mark.anyio
-async def test_founding_mid_session_swaps_in_the_pursuit_prompt(
+async def test_founding_mid_session_keeps_the_prompt_and_reports_the_state(
     tmp_path: Path, beagle: Path, fake_beagle: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # Run 10 founded in the session it ran in, and kept the "nothing founded
-    # yet" orientation all along: after each compaction nothing said how to
-    # work the pursuit.
+    # yet" orientation all along. Swapping the section in fixed that at the
+    # cost of re-prefilling the whole context; the prompt now says how to
+    # work a founded pursuit from load, and founding's result says which.
     project = tmp_path / "project"
     project.mkdir()
     monkeypatch.chdir(project)
     (fake_beagle / "add.out").write_text("T0001  Ship it\n")
     runtime, session = _bound(tmp_path)
-    assert [s.title for s in runtime.prompt_sections if s.title == "Beagle"] == ["Beagle"]
+    before = [(s.title, s.body) for s in runtime.prompt_sections]
+    assert "How to work a founded pursuit" in dict(before)["Beagle"]
+    session.is_running = True
+    await runtime.emit_session_start("startup")
 
-    await _tool(runtime, "pursuit_found").execute(
+    result = await _tool(runtime, "pursuit_found").execute(
         "c1",
         {
             "statement": "Ship it",
@@ -1543,12 +1578,14 @@ async def test_founding_mid_session_swaps_in_the_pursuit_prompt(
             "user_confirmed": True,
         },
     )
+    await runtime.emit_event(AgentStartEvent())
 
-    sections = {s.title: s.body for s in runtime.prompt_sections}
-    assert "Beagle" not in sections
-    assert "**pursuit**: Ship it" in sections["Beagle pursuit"]
-    assert "How to work it" in sections["Beagle pursuit"]
-    assert session.prompt_refreshes == 2
+    assert [(s.title, s.body) for s in runtime.prompt_sections] == before
+    assert session.prompt_refreshes == 0
+    assert "This project is a **pursuit**: Ship it" in result.text
+    assert "  - `make test` exits 0" in result.text
+    # Founding's result was this session's state note: the next run sends none.
+    assert session.steered == []
 
 
 @pytest.mark.anyio
@@ -8912,7 +8949,7 @@ async def test_done_by_close_of_a_lower_ranked_task_is_not_refused_by_rank(
         json.dumps({"open": [], "ready": ready, "ready_total": 2})
     )
     (fake_beagle / "open-ranked-below.out").write_text(
-        'T0004 ranks below 1 ready task: T0005 Clock tick. If this one should go first, '
+        "T0004 ranks below 1 ready task: T0005 Clock tick. If this one should go first, "
         'say why: `--over "<why>"`.\n'
     )
     runtime, _ = _bound(tmp_path)
@@ -17677,7 +17714,7 @@ def test_cases_first_still_offers_opening_a_holder_under_the_limit(tmp_path: Pat
 
     text = module._cases_on_disk_route(*args, "T0011", "", under, tmp_path)
 
-    assert 'Open T0011 first, with scope tests/cases.json, tests/test_case_data.py; ' in text
+    assert "Open T0011 first, with scope tests/cases.json, tests/test_case_data.py; " in text
     assert 'done_when="python3 -m pytest -q tests/test_case_data.py"' in text
     assert ': pursuit_step task="T0011". ' in text
     assert "abandon=" not in text and "pursuit_plan" not in text
