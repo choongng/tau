@@ -3641,6 +3641,88 @@ def _unfinished(nodes: list[dict[str, Any]]) -> list[str] | None:
     return left or [f"- {roots[0].get('id')} — {roots[0].get('title', '')} (not closed)"]
 
 
+#: How a leaf ends undone for good: beagle spawns a new route only from an open
+#: or blocked task, so a leaf ended so stays undone unless a task holds its work.
+_SEALING = ("infeasible", "abandoned", "superseded")
+
+
+def _sealed(nodes: list[dict[str, Any]]) -> dict[str, list[str]]:
+    """Each container that can never be all-done, with the leaves that seal it.
+
+    beagle's `_accountable_leaves` keeps a leaf that ended undone with no task
+    holding its work (`sibling_of`, followed to the newest attempt), so every
+    container above it stays undone for good: only the owner can re-scope or
+    abandon it. q35 10-11: T0011 closed infeasible at 11:23 and sealed T0002,
+    and 60 min of pursuit_plan parts under T0002 followed, none of which could
+    make it done. A leaf dropped as a duplicate of a done task is left out, as
+    `_unfinished` leaves it out.
+    """
+    by_id = {str(n.get("id")): n for n in nodes}
+    after: dict[str, list[str]] = {}
+    for n in nodes:
+        if n.get("sibling_of"):
+            after.setdefault(str(n.get("sibling_of")), []).append(str(n.get("id")))
+    sealed: dict[str, list[str]] = {}
+    for node in nodes:
+        if node.get("container"):
+            continue
+        end, seen = str(node.get("id")), {str(node.get("id"))}
+        while by_id[end].get("status") in (*_SEALING, "blocked") and after.get(end):
+            end = max(after[end])
+            if end in seen or end not in by_id:
+                break
+            seen.add(end)
+        last = by_id.get(end, {})
+        if last.get("container") or last.get("status") not in _SEALING:
+            continue
+        if last.get("status") == "abandoned":
+            named = _TASK_ID.findall(str(last.get("reason") or ""))
+            if any(by_id.get(t, {}).get("status") == "done" for t in named if t != end):
+                continue
+        up, walked = str(node.get("parent") or ""), set()
+        while up and up not in walked and up in by_id:
+            walked.add(up)
+            if end not in sealed.setdefault(up, []):
+                sealed[up].append(end)
+            up = str(by_id[up].get("parent") or "")
+    return sealed
+
+
+#: What a sealed container's note ends on: the stop gate lets through the stop it offers.
+SEALED_STOP = "Only the owner can re-scope or abandon"
+
+
+def _sealed_text(
+    container: str, leaves: list[str], nodes: list[dict[str, Any]], now: bool = False
+) -> str:
+    """Why `container` can never be all-done, and that the owner decides what next."""
+    by_id = {str(n.get("id")): n for n in nodes}
+    ended = ", ".join(f"{t} ({by_id.get(t, {}).get('status')})" for t in leaves)
+    one = len(leaves) == 1
+    return (
+        f"{container} is {'now ' if now else ''}sealed: {ended} ended undone with no task holding "
+        f"{'its' if one else 'their'} work, and beagle keeps {'it' if one else 'them'} "
+        f"among {container}'s leaves, so {container} can never be all-done, nor can what "
+        f"is above it or waits on it. No part planned under {container} changes that. "
+        f"{SEALED_STOP} {container}: stop, and ask the user which."
+    )
+
+
+def _sealed_note(nodes: list[dict[str, Any]]) -> str:
+    """The sealed containers' notes, the lowest of each chain only; "" when none is."""
+    sealed = _sealed(nodes)
+    by_id = {str(n.get("id")): n for n in nodes}
+    lowest = [
+        c
+        for c, leaves in sealed.items()
+        if any(str(by_id.get(t, {}).get("parent") or "") == c for t in leaves)
+    ]
+    return "\n".join(
+        _sealed_text(c, [t for t in sealed[c] if by_id.get(t, {}).get("parent") == c], nodes)
+        for c in lowest
+    )
+
+
 def _setup_abandonable(task: str, nodes: list[dict[str, Any]]) -> bool:
     """Whether `task` is a setup milestone (by `_setup_milestone`) never opened.
 
@@ -7180,6 +7262,9 @@ def _cases_on_disk_route(
             if stuck and root is not None
             else f'pursuit_step task="{existing}"'
         )
+        sealing = _seal_warning(existing, str(holder.get("parent") or ""))
+        if "abandon=" in settle and sealing:
+            settle += ". " + sealing.rstrip(".")
         return (
             f"Cases first: {unjudged_text} The known answers are on disk already, "
             f"uncommitted, and {existing}, open already, holds them: do not split {task}. "
@@ -10143,7 +10228,7 @@ def _spawn_limit_offer(
     task: str, check: str, scope: list[str], nodes: list[dict[str, Any]], why: str = ""
 ) -> str:
     """What a result says for `task` at beagle's spawn limit: no new route, and the
-    infeasible close with the parent's re-plan to make instead.
+    infeasible close to make instead, said to seal the parent (`_seal_warning`).
 
     _close_infeasible refuses a task that is not open, so a task the tree shows
     closed already (blocked, say) is offered the parent's re-plan alone. A pending
@@ -10151,7 +10236,8 @@ def _spawn_limit_offer(
     """
     chain = ", ".join(sorted(_retry_chain(task, nodes)))
     replan = _replan_parent_call(task, nodes)
-    status = str(next((n for n in nodes if str(n.get("id")) == task), {}).get("status") or "")
+    node = next((n for n in nodes if str(n.get("id")) == task), {})
+    status = str(node.get("status") or "")
     if status not in {"", "open", "pending"}:
         return (
             f"{task} is {status}, and its retry chain ({chain}) is at beagle's limit of "
@@ -10165,8 +10251,26 @@ def _spawn_limit_offer(
     return (
         f"Its retry chain ({chain}) is at beagle's limit of {SPAWN_LIMIT} attempts, so "
         f"beagle refuses a new route. Close it infeasible instead: "
-        f"{_infeasible_call(task, check, scope, why)}"
-        + (f"; then re-plan its parent: {replan}." if replan else ".")
+        f"{_infeasible_call(task, check, scope, why)}. "
+        + _seal_warning(task, str(node.get("parent") or ""))
+    ).rstrip()
+
+
+def _seal_warning(task: str, parent: str) -> str:
+    """What an offer of `task`'s infeasible close says first: it seals `parent`.
+
+    q35 10-11: the offer read as a normal exit, followed by a re-plan of the
+    parent; T0011's close sealed T0002, and every part planned under it after
+    was futile.
+    """
+    if not parent:
+        return ""
+    return (
+        f"That close seals {parent}: {task} would end undone with no task holding its "
+        f"work, and beagle still counts such a leaf in {parent}, so {parent} could never be "
+        f"all-done, nor what waits on it, and no part planned under it would change "
+        f"that; only the owner could then re-scope or abandon {parent}. If {parent}'s "
+        "work still matters, stop instead, and ask the user."
     )
 
 
@@ -11303,15 +11407,17 @@ def _close_infeasible(
     _drop_pending_locks(goal, task)
     _forget_task(root, task)
     parent = str(node.get("parent") or "")
-    replan = (
-        f"Re-plan its parent {parent} with a route the finding does not rule out: "
-        f"{_replan_parent_call(task, nodes)}."
-        if parent
+    # q35 10-11: this said to re-plan T0002 once T0011 closed, and the parts
+    # planned under it could never make it done.
+    closed = [{**n, "status": "infeasible"} if str(n.get("id")) == task else n for n in nodes]
+    next_move = (
+        _sealed_text(parent, [task], closed, now=True)
+        if task in _sealed(closed).get(parent, [])
         else "Next: call pursuit_step with no arguments for the next task."
     )
     return (
         f"{out.splitlines()[0] if out else task + ' closed infeasible'}\n\n"
-        f"{_tree(root)}\n\n{replan}"
+        f"{_tree(root)}\n\n{next_move}"
     )
 
 
@@ -12552,7 +12658,8 @@ def _source_judge_spent(
         f"The cases the references do not answer, {listed} in {data}, cannot close {task}: "
         f"{count} steps on it have left it not done, {_steps_passing(task, root)}, and its "
         f"{SOURCE_JUDGE_RERUNS} notes-only reruns past {JUDGE_NOTES_UNTIL} steps are spent. "
-        "No rerun and no split is offered: a split by file cannot change a case.\n"
+        "No rerun and no split is offered: a split by file cannot change a case. "
+        f"{_seal_warning(task, 'its parent')}\n"
         f"The call that works, whole: {close}"
     )
     closing = f"- {close}, closing it infeasible on those cases;\n"
@@ -13423,13 +13530,19 @@ def make_step_tool() -> Any:
             after = _blocked_routes(blocked)
         elif left:
             # Run R02's driver was offered "tell the user the pursuit is done"
-            # here with the root stalled and four milestones abandoned.
+            # here with the root stalled and four milestones abandoned. q35
+            # 10-11: under a sealed T0002, pursuit_plan was no way on.
+            sealed = _sealed_note(nodes)
             after = (
                 "The pursuit is NOT done: these tasks are not done, and nothing took "
                 "their work on:\n" + "\n".join(left) + "\n\nDo not tell the user it is "
-                "done. A task that waits on another starts once that one is done. Add "
-                "missing work with pursuit_plan, or give a task a new route with "
-                'pursuit_step task="<id>", new_route=true and notes.'
+                "done. "
+                + (
+                    sealed
+                    or "A task that waits on another starts once that one is done. Add "
+                    "missing work with pursuit_plan, or give a task a new route with "
+                    'pursuit_step task="<id>", new_route=true and notes.'
+                )
             )
         else:
             after = (
@@ -16939,11 +17052,17 @@ def _pursuit_state(root: Path, goal: Path) -> str:
     for task in ready_ids + open_ids:
         if task in _LAST_STEP_RESULT:
             last += f"\n\nLast pursuit_step on {task} said:\n{_LAST_STEP_RESULT[task]}"
+    sealed = _sealed_note(nodes)
     parts = [
         _goal_text(goal),
         _tree(root),
-        f"{now} Next: call pursuit_step with no arguments. Work no task covers goes in "
-        f"with pursuit_plan; this session does not do it itself.{last}",
+        f"{now} Next: call pursuit_step with no arguments. "
+        + (
+            f"{sealed}{last}"
+            if sealed
+            else f"Work no task covers goes in with pursuit_plan; this session does not "
+            f"do it itself.{last}"
+        ),
     ]
     return "\n\n".join(part for part in parts if part)
 
@@ -17201,7 +17320,7 @@ def _note_stop_offer(results: Any) -> None:
             text = "".join(
                 str(getattr(part, "text", "") or "") for part in getattr(result, "content", ())
             )
-            _STOP_OFFERED = STOP_OPTION in text
+            _STOP_OFFERED = STOP_OPTION in text or SEALED_STOP in text
             return
 
 
@@ -17220,7 +17339,7 @@ def make_stop_gate(tau: ExtensionAPI) -> Any:
     """
 
     async def gate(event: Any, context: ExtensionContext) -> None:
-        global _STOP_GATE_SENT, _FOUND_AWAITS_USER
+        global _STOP_GATE_SENT, _FOUND_AWAITS_USER, _STOP_OFFERED
         message = getattr(event, "message", None)
         if getattr(message, "tool_calls", None):
             _note_stop_offer(getattr(event, "tool_results", None))
@@ -17251,6 +17370,20 @@ def make_stop_gate(tau: ExtensionAPI) -> Any:
         if not left:
             return
         _STOP_GATE_SENT += 1
+        sealed = _sealed_note(nodes)
+        if sealed:
+            # q35 10-11: this said to add the missing work with pursuit_plan at
+            # 11:56 and 12:18, under a T0002 that T0011's close had sealed at 11:23.
+            _STOP_OFFERED = True
+            tau.send_user_message(
+                "[beagle] The pursuit is not done, and part of it cannot be done without "
+                "the owner. Not done, and nothing took their work on:\n"
+                + "\n".join(left)
+                + f"\n\n{sealed}\n\nCall pursuit_step with no arguments only for work "
+                "that is not under a sealed task and does not wait on one; if there is "
+                "none, stop and ask the user."
+            )
+            return
         # Run R37: both follow-ups said to call pursuit_step, which the step cap
         # refused for T0004; a task at the cap gets its escalation's options.
         root = goal.parent.parent
