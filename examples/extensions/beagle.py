@@ -7011,6 +7011,72 @@ def _python_c_code(argv: list[str]) -> str | None:
     return argv[at] if at < len(argv) else None
 
 
+def _exit_call_name(func: ast.expr) -> str | None:
+    """`SystemExit`, `exit`, `quit` or `sys.exit` when `func` names one, else None."""
+    if isinstance(func, ast.Name) and func.id in ("SystemExit", "exit", "quit"):
+        return func.id
+    if (
+        isinstance(func, ast.Attribute)
+        and func.attr == "exit"
+        and isinstance(func.value, ast.Name)
+        and func.value.id == "sys"
+    ):
+        return "sys.exit"
+    return None
+
+
+def _is_bool_expr(node: ast.expr) -> bool:
+    """Whether `node` is a `not`, a comparison, `bool(...)`, or `and`/`or` of those."""
+    if isinstance(node, ast.BoolOp):
+        return all(_is_bool_expr(value) for value in node.values)
+    return (
+        isinstance(node, ast.Compare)
+        or (isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.Not))
+        or (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "bool"
+        )
+    )
+
+
+def _bool_exit(code: str | None) -> str | None:
+    """The first `exit(<bool expression>)` call in Python `code`, unparsed, or None."""
+    if code is None:
+        return None
+    try:
+        tree = ast.parse(code)
+    except SyntaxError:
+        return None
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call) and len(node.args) == 1 and not node.keywords:
+            name = _exit_call_name(node.func)
+            if name is not None and _is_bool_expr(node.args[0]):
+                return f"{name}({ast.unparse(node.args[0])})"
+    return None
+
+
+def _inverted_exit_problem(command: str) -> str | None:
+    """Why a `python -c` check's exit status is a bool expression, or None.
+
+    Run R44: T0004 opened on `raise SystemExit(not bad and len(c)>=5)`. Python
+    exits 1 for True and 0 for False, so a pass condition given as the exit
+    status fails good work and passes bad; the open's run before any work saw
+    exit 1, which a sound check also gives then. An int exit, or a call's
+    result such as `sys.exit(main())`, is not judged.
+    """
+    call = _bash_find(command, lambda argv: _bool_exit(_python_c_code(argv)))
+    if call is None:
+        return None
+    return (
+        f"`{call}` exits with a bool: 1, a failing check, when the expression is true, "
+        "and 0, a passing one, when it is false, so a pass condition there passes bad "
+        "work and fails good work. Make the exit explicit: `if <a failure is found>: "
+        "raise SystemExit(1)`, or `raise SystemExit(0 if <it passes> else 1)`. Call "
+        "pursuit_step again with that."
+    )
+
+
 def _import_scope_problem(command: str, scope: list[str], root: Path) -> str | None:
     """Why a check imports a project module no task can make importable, or None.
 
@@ -9262,7 +9328,7 @@ def _amend_problem(check: str, bound: str, locks: list[str], root: Path) -> str 
     """
     keep = (
         f" Keep the bound check `{bound}`: leave done_when out to keep it."
-        if bound and _check_problem(bound) is None
+        if _keepable(bound)
         else ""
     )
     if _COLLECT_ONLY.search(check):
@@ -10708,6 +10774,30 @@ def _note_check_run(key: tuple[str, str], check: str, verdict: tuple[int, str]) 
         _LAST_CHECK_FAILURE[key] = (check, verdict[0], verdict[1][-CHECK_TAIL_CHARS:])
 
 
+#: Output that names a failure: a traceback, an error or assertion, a failing test
+#: or case, or a printed non-empty list.
+_FAILURE_NAMED = re.compile(
+    r"traceback|error|exception|assert|fail|mismatch|expected|missing|wrong|invalid|!="
+    r"|\[\s*[^\]\s]",
+    re.IGNORECASE,
+)
+
+
+def _fix_the_work(rc: int, output: str, check: str) -> str:
+    """The retry note's last line for a check that failed with `rc` and `output`.
+
+    Run R44: over "unsourced: []" from an inverted check, W9's brief said "Fix the
+    work, not the check", and no work could have made it pass.
+    """
+    if rc == 124 or _pytest_collected_none(rc, check, output) or _FAILURE_NAMED.search(output):
+        return "Fix the work, not the check."
+    return (
+        "The check fails, but its output names no failing case or test: read what the "
+        "check tests. If the work already meets it, say so in your report, with the "
+        "line of the check that fails it."
+    )
+
+
 def _last_failure_note(key: tuple[str, str], check: str) -> str:
     """The brief note for a step's first worker when the task's check last failed."""
     last = _LAST_CHECK_FAILURE.get(key)
@@ -10718,7 +10808,7 @@ def _last_failure_note(key: tuple[str, str], check: str) -> str:
     return (
         (f"\n\n{no_tests}" if no_tests else "")
         + f"\n\nThe check failed last step (exit {rc}). Its output ends:\n{tail}\n"
-        + "Fix the work, not the check."
+        + _fix_the_work(rc, tail, check)
     )
 
 
@@ -11211,7 +11301,7 @@ def _kept_data_check(done_when: str, scope: list[str], bound: str, root: Path) -
     Run R32 #12: the notes that would have fixed the task were refused together
     with such a done_when.
     """
-    if not bound or _check_problem(bound) is not None:
+    if not _keepable(bound):
         return None
     route = _data_test_route(done_when, scope, root)
     if route is None or not _bound_is_data_check(bound, route[2], root):
@@ -11227,6 +11317,16 @@ def _kept_data_check(done_when: str, scope: list[str], bound: str, root: Path) -
     )
 
 
+def _keepable(bound: str) -> bool:
+    """Whether a task's bound check is one its notes may run on, or a refusal may
+    offer to keep: one valid command whose exit is not a bool expression.
+
+    Run R44: E42's rewrite of T0004's inverted check was refused, and the notes
+    ran on the inverted check.
+    """
+    return bool(bound) and _check_problem(bound) is None and _inverted_exit_problem(bound) is None
+
+
 def _kept_bound_note(
     bound: str, notes: str, reason: str, scope: list[str], root: Path
 ) -> str | None:
@@ -11236,7 +11336,7 @@ def _kept_bound_note(
 
     Audit 10: refusing the call dropped the driver's notes, and the step with them.
     """
-    if not notes or not bound or _check_problem(bound) is not None:
+    if not notes or not _keepable(bound):
         return None
     if _imports_unwritten(bound, scope, root) is not None:
         # Run R35 #10: a bound data test importing unwritten code fails whatever
@@ -12937,6 +13037,7 @@ def make_step_tool() -> Any:
                     or _oracle_with_code_problem(route_scope, goal, task, done_when or old_check)
                     or _locked_test_problem(done_when or old_check, route_scope, goal)
                     or _import_scope_problem(done_when or old_check, route_scope, root)
+                    or _inverted_exit_problem(done_when or old_check)
                     or _absent_check_file_problem(done_when or old_check, route_scope, root)
                     or _pytest_node_missing_problem(done_when or old_check, route_scope, root)
                     or _pytest_node_import_only_problem(done_when or old_check, route_scope, root)
@@ -13114,6 +13215,7 @@ def make_step_tool() -> Any:
                     )
                     or _locked_test_problem(done_when, scope, goal)
                     or _import_scope_problem(done_when, scope, root)
+                    or _inverted_exit_problem(done_when)
                     or _absent_check_file_problem(done_when, scope, root)
                     or _pytest_node_missing_problem(done_when, scope, root)
                     or _pytest_node_import_only_problem(done_when, scope, root)
@@ -13249,12 +13351,7 @@ def make_step_tool() -> Any:
             chained, prose = _and_chain(done_when)
             if prose is not None or chained is None:
                 advice = ""
-                if (
-                    prose is not None
-                    and "has a bare" in prose
-                    and bound_check
-                    and _check_problem(bound_check) is None
-                ):
+                if prose is not None and "has a bare" in prose and _keepable(bound_check):
                     # Run R17 #23-#25 were told to name a new test in scope; the
                     # bound check was one valid command all along.
                     advice = (
@@ -13272,6 +13369,7 @@ def make_step_tool() -> Any:
                         _pending_locks(goal, task) + _strings(arguments.get("locks")),
                         root,
                     )
+                    or _inverted_exit_problem(done_when)
                     or _locked_scope_problem(own_scope, root, title, task, done_when)
                     or _sibling_owned_check_problem(done_when, own_scope, task, nodes, root)
                     or _absent_check_file_problem(done_when, own_scope, root)
@@ -13301,7 +13399,7 @@ def make_step_tool() -> Any:
                         keep = (
                             f" Keep the bound check `{bound_check}`: leave done_when out to "
                             "keep it."
-                            if bound_check and _check_problem(bound_check) is None
+                            if _keepable(bound_check)
                             else ""
                         )
                         rejected = (
@@ -13325,6 +13423,12 @@ def make_step_tool() -> Any:
                 reason, advice = rejected
                 kept_note = _kept_bound_note(bound_check, notes, reason, own_scope, root)
                 if kept_note is None:
+                    inverted = _inverted_exit_problem(bound_check) if bound_check else None
+                    if inverted is not None:
+                        advice += (
+                            f" The bound check `{bound_check}` cannot judge the work either: "
+                            + inverted
+                        )
                     return _step_result(
                         f"pursuit_step: {task}'s check not changed — {reason}{advice}"
                     )
@@ -13741,7 +13845,7 @@ def make_step_tool() -> Any:
             no_tests = _pytest_collected_none(verdict[0], check, verdict[1])
             if no_tests is not None:
                 retry_note = f"\n\n{no_tests}" + retry_note
-            retry_note += "Fix the work, not the check."
+            retry_note += _fix_the_work(verdict[0], verdict[1], check)
             if undone:
                 retry_note += (
                     f" It also changed locked files ({', '.join(undone)}); they were put "

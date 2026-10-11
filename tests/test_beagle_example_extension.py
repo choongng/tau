@@ -20460,3 +20460,123 @@ async def test_brief_scope_line_says_outside_writes_are_refused(
     [run, *_] = _runs(fake_tau)
     assert "Scope: tests/cases.json (writes outside it are refused)" in run["stdin"]
     assert "named at close" not in run["stdin"]
+
+
+R44_INVERTED = 'python3 -c "bad = []; raise SystemExit(not bad and len(bad) >= 0)"'
+
+
+@pytest.mark.anyio
+async def test_open_refuses_a_python_c_check_with_a_bool_exit(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # R44: T0004 opened on `raise SystemExit(not bad and len(c)>=5)`, which exits 1
+    # on good data; its run before any work gave exit 1, read as failing now.
+    monkeypatch.chdir(_pursuit_project(tmp_path))
+    _ready_task(fake_beagle)
+    runtime, _ = _bound(tmp_path)
+    step = _tool(runtime, "pursuit_step")
+    args = {"task": "T0002", "criteria": "it holds"}
+
+    plain = await step.execute("c1", {**args, "done_when": R44_INVERTED})
+    wrapped = await step.execute(
+        "c2", {**args, "done_when": "bash -c 'python3 -c \"import sys; sys.exit(1 == 1)\"'"}
+    )
+
+    assert plain.text.startswith("pursuit_step: T0002 not opened — ")
+    assert "`SystemExit(not bad and len(bad) >= 0)` exits with a bool" in plain.text
+    assert "raise SystemExit(0 if <it passes> else 1)" in plain.text
+    assert "`sys.exit(1 == 1)` exits with a bool" in wrapped.text
+    assert _pursuit_calls(fake_beagle, "open") == [] and _runs(fake_tau) == []
+
+    problem = _module()._inverted_exit_problem
+    for refused in (
+        'python3 -c "exit(not ok)"',
+        'python3 -c "quit(bool(x))"',
+        'python3 -c "import sys; sys.exit(a == 1 or b < 2)"',
+    ):
+        assert problem(refused) is not None, refused
+    for kept in (
+        'python3 -c "raise SystemExit(0 if ok else 1)"',
+        'python3 -c "import sys; sys.exit(int(bad))"',
+        'python3 -c "import sys; sys.exit(main())"',
+        "python3 -c 'import sys; sys.exit(1 and 1)'",
+        'python3 -c "assert not bad"',
+        "python3 -c 'if bad: raise SystemExit(1)'",
+        "grep -q 'exit(not x)' done.txt",
+        "python3 -c 'import (('",
+    ):
+        assert problem(kept) is None, kept
+
+
+@pytest.mark.anyio
+async def test_kept_bound_note_refuses_an_inverted_bound_check(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # R44: E42's rewrite of T0004's inverted check was refused as already passing,
+    # and `_kept_bound_note` ran E42's notes on the inverted check (W8).
+    project = _git_project(tmp_path, monkeypatch)
+    monkeypatch.chdir(project)
+    (project / "x.txt").write_text("x\n")
+    _open_task_in_scope(fake_beagle, ["done.txt"], R44_INVERTED)
+    runtime, _ = _bound(tmp_path)
+    args = {"task": "T0002", "done_when": "grep -q x x.txt", "notes": "Write done.txt"}
+
+    result = await _tool(runtime, "pursuit_step").execute("c1", args)
+
+    assert result.text.startswith("pursuit_step: T0002's check not changed — ")
+    assert "Kept the bound check" not in result.text
+    assert "Keep the bound check" not in result.text
+    assert f"The bound check `{R44_INVERTED}` cannot judge the work either: " in result.text
+    assert _pursuit_calls(fake_beagle, "amend") == [] and _runs(fake_tau) == []
+
+    note = _module()._kept_bound_note
+    assert note(R44_INVERTED, "Write done.txt", "why", ["done.txt"], project) is None
+    assert note("grep -q done done.txt", "Write done.txt", "why", ["done.txt"], project)
+
+
+@pytest.mark.anyio
+async def test_retry_note_omits_fix_the_work_when_the_output_names_no_failure(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # R44: W9's brief said "the check still fails (exit 1). Its output ends:
+    # unsourced: [] Fix the work, not the check." over an inverted check.
+    project = _git_project(tmp_path, monkeypatch)
+    monkeypatch.chdir(project)
+    check = "python3 -c \"bad = []\nprint('unsourced:', bad)\nif not bad: raise SystemExit(1)\""
+    _ready_task(fake_beagle, check)
+    runtime, _ = _bound(tmp_path)
+
+    await _tool(runtime, "pursuit_step").execute(
+        "c1", {"task": "T0002", "criteria": "cases", "done_when": check, "scope": ["done.txt"]}
+    )
+
+    first, second, *_ = _runs(fake_tau)
+    note = second["stdin"].split("check still fails (exit 1). Its output ends:", 1)
+    assert len(note) == 2 and "unsourced: []" in note[1]
+    assert "Fix the work, not the check." not in second["stdin"]
+    assert "its output names no failing case or test" in note[1]
+
+    said = _module()._fix_the_work
+    fix = "Fix the work, not the check."
+    assert said(1, "unsourced: []\n", check) != fix
+    assert said(1, "", check) != fix
+    for output in (
+        "unsourced: ['seed']\n",
+        "Traceback (most recent call last):\nAssertionError\n",
+        "1 failed, 2 passed in 0.01s\n",
+    ):
+        assert said(1, output, check) == fix, output
+    assert said(124, "", check) == fix
+    assert said(5, "no tests ran in 0.01s\n", "python3 -m pytest -q tests/test_x.py") == fix
