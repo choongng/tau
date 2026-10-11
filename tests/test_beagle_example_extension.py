@@ -8279,23 +8279,199 @@ async def test_worker_argv_thinking_level(
     project.mkdir()
     monkeypatch.chdir(project)
     monkeypatch.delenv("BEAGLE_TAU_DISPATCH_THINKING", raising=False)
+    monkeypatch.setenv("BEAGLE_TAU_DISPATCH_MODEL", "small")
     runtime, _ = _bound(tmp_path)
     dispatch = _tool(runtime, "pursuit_dispatch")
 
-    # R01: unset means thinking off, the pursuit's own policy on reasoning
-    # spirals. T01: `default` sends no flag, because tau rejects every level --
-    # off included -- for a model with no thinking modes, and the worker then
-    # dies parsing arguments instead of doing the task.
+    # R01: unset means thinking off on a pinned model, the pursuit's own policy
+    # on reasoning spirals (the session's own model runs the session's level).
+    # T01: `default` passes tau's own catalog-else-server level, the one tau
+    # takes for a model with no thinking modes -- it rejects every other level,
+    # off included, and the worker then dies parsing arguments.
     await dispatch.execute("c1", {"brief": "Write notes"})
     monkeypatch.setenv("BEAGLE_TAU_DISPATCH_THINKING", "low")
     await dispatch.execute("c2", {"brief": "Write notes"})
     monkeypatch.setenv("BEAGLE_TAU_DISPATCH_THINKING", "default")
     await dispatch.execute("c3", {"brief": "Write notes"})
 
-    off, pinned, omitted = (run["argv"] for run in _runs(fake_tau))
+    off, pinned, upstream = (run["argv"] for run in _runs(fake_tau))
     assert off[off.index("--thinking") + 1] == "off"
     assert pinned[pinned.index("--thinking") + 1] == "low"
-    assert "--thinking" not in omitted
+    assert upstream[upstream.index("--thinking") + 1] == "default"
+
+
+@pytest.mark.anyio
+async def test_worker_runs_the_sessions_live_model_and_thinking(
+    tmp_path: Path, beagle: Path, fake_tau: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Run itc-35b-test: the driver /model-switched to the 35B, and its pursuit_step
+    # worker came up on the catalog default -- no `--model` meant tau's default,
+    # not the session's. The switch is read at the dispatch's own tool call.
+    project = tmp_path / "project"
+    project.mkdir()
+    monkeypatch.chdir(project)
+    for env in (
+        "BEAGLE_TAU_DISPATCH_MODEL",
+        "BEAGLE_TAU_DISPATCH_PROVIDER",
+        "BEAGLE_TAU_DISPATCH_THINKING",
+    ):
+        monkeypatch.delenv(env, raising=False)
+    runtime, session = _bound(tmp_path)
+    dispatch = _tool(runtime, "pursuit_dispatch")
+
+    session.provider_name, session.model, session.thinking_level = "krang", "qwen-35b", "high"
+    await dispatch.execute("c1", {"brief": "Write notes"})
+    # tau's catalog-else-server level is one the model lists, so it passes through.
+    session.thinking_level = "default"
+    session.available_thinking_levels = ("default", "off", "low", "medium", "high")
+    await dispatch.execute("c1b", {"brief": "Write notes"})
+    # T01: a model with no thinking modes rejects every level, so none is sent.
+    session.model, session.available_thinking_levels = "flash", ()
+    await dispatch.execute("c2", {"brief": "Write notes"})
+    # A pinned model takes neither the session's provider nor its level.
+    monkeypatch.setenv("BEAGLE_TAU_DISPATCH_MODEL", "small")
+    await dispatch.execute("c3", {"brief": "Write notes"})
+
+    def flags(argv: list[str]) -> tuple[str | None, ...]:
+        return tuple(
+            argv[argv.index(name) + 1] if name in argv else None
+            for name in ("--provider", "--model", "--thinking")
+        )
+
+    live, upstream, plain, pinned = (flags(run["argv"]) for run in _runs(fake_tau))
+    assert live == ("krang", "qwen-35b", "high")
+    assert upstream == ("krang", "qwen-35b", "default")
+    assert plain == ("krang", "flash", None)
+    assert pinned == (None, "small", "off")
+
+
+def _pin_reply(fake_beagle: Path, **answer: Any) -> None:
+    """What `beagle dispatch model --json` says, as the fake prints it."""
+    said = {"inherit": not answer.get("model"), "provider": "", "model": "", "thinking": ""}
+    (fake_beagle / "model.out").write_text(json.dumps({**said, **answer}), encoding="utf-8")
+
+
+@pytest.mark.anyio
+async def test_worker_runs_the_projects_dispatch_toml_pin(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A role's model in .beagle/dispatch.toml beats the session's, and beagle
+    # hands Tau only the entries with a Tau provider; a call's own arguments and
+    # the env still beat the file.
+    project = tmp_path / "project"
+    (project / ".beagle").mkdir(parents=True)
+    (project / ".beagle" / "dispatch.toml").write_text("# read by beagle\n", encoding="utf-8")
+    monkeypatch.chdir(project)
+    for env in (
+        "BEAGLE_TAU_DISPATCH_MODEL",
+        "BEAGLE_TAU_DISPATCH_PROVIDER",
+        "BEAGLE_TAU_DISPATCH_THINKING",
+    ):
+        monkeypatch.delenv(env, raising=False)
+    runtime, session = _bound(tmp_path)
+    session.provider_name, session.model, session.thinking_level = "krang", "qwen-35b", "high"
+    dispatch = _tool(runtime, "pursuit_dispatch")
+    _pin_reply(
+        fake_beagle,
+        provider="ollama",
+        model="qwen3-coder",
+        thinking="low",
+        rules="executor: the 35B for a task touching the parser",
+    )
+
+    pinned = await dispatch.execute("c1", {"brief": "Write notes"})
+    await dispatch.execute(
+        "c2", {"brief": "Write notes", "model": "qwen-35b", "provider": "krang", "thinking": "max"}
+    )
+    monkeypatch.setenv("BEAGLE_TAU_DISPATCH_MODEL", "small")
+    await dispatch.execute("c3", {"brief": "Write notes"})
+    monkeypatch.delenv("BEAGLE_TAU_DISPATCH_MODEL")
+    _pin_reply(fake_beagle)
+    await dispatch.execute("c4", {"brief": "Write notes"})
+    refused = await dispatch.execute("c5", {"brief": "Write notes", "thinking": "lots"})
+
+    def flags(argv: list[str]) -> tuple[str | None, ...]:
+        return tuple(
+            argv[argv.index(name) + 1] if name in argv else None
+            for name in ("--provider", "--model", "--thinking")
+        )
+
+    from_file, explicit, from_env, inherited = (flags(run["argv"]) for run in _runs(fake_tau))
+    assert from_file == ("ollama", "qwen3-coder", "low")
+    assert explicit == ("krang", "qwen-35b", "max")
+    assert from_env == (None, "small", "off")
+    assert inherited == ("krang", "qwen-35b", "high")
+    assert "model rules" in pinned.text
+    assert "executor: the 35B for a task touching the parser" in pinned.text
+    assert "not one of" in refused.text
+    asked = [c["argv"] for c in _calls(fake_beagle) if c["argv"][:1] == ["dispatch"]]
+    assert asked[0] == ["dispatch", "model", "--for", "executor", "--json", "--host", "tau"]
+    assert len(asked) == 4  # the refused call never asked
+
+
+@pytest.mark.anyio
+async def test_no_dispatch_toml_asks_beagle_nothing(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    monkeypatch.chdir(project)
+    monkeypatch.delenv("BEAGLE_TAU_DISPATCH_MODEL", raising=False)
+    runtime, session = _bound(tmp_path)
+    session.provider_name, session.model = "krang", "qwen-35b"
+
+    result = await _tool(runtime, "pursuit_dispatch").execute("c1", {"brief": "Write notes"})
+
+    assert not [c for c in _calls(fake_beagle) if c["argv"][:1] == ["dispatch"]]
+    assert "model rules" not in result.text
+    [run] = _runs(fake_tau)
+    assert run["argv"][run["argv"].index("--model") + 1] == "qwen-35b"
+
+
+@pytest.mark.anyio
+async def test_step_takes_a_model_per_task_and_shows_the_rules(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project = _pursuit_project(tmp_path)
+    (project / ".beagle" / "dispatch.toml").write_text("# read by beagle\n", encoding="utf-8")
+    monkeypatch.chdir(project)
+    monkeypatch.delenv("BEAGLE_TAU_DISPATCH_MODEL", raising=False)
+    monkeypatch.delenv("BEAGLE_TAU_DISPATCH_THINKING", raising=False)
+    _ready_task(fake_beagle)
+    _pin_reply(fake_beagle, rules="executor: the 35B for a task touching the parser")
+    runtime, _ = _bound(tmp_path)
+
+    stepped = await _tool(runtime, "pursuit_step").execute(
+        "c1",
+        {
+            "task": "T0002",
+            "criteria": "done.txt exists",
+            "done_when": "grep -q done done.txt",
+            "scope": ["done.txt"],
+            "model": "qwen-35b",
+            "provider": "krang",
+            "thinking": "default",
+        },
+    )
+
+    assert "closed done" in stepped.text
+    assert stepped.text.rstrip().endswith("executor: the 35B for a task touching the parser")
+    argv = _runs(fake_tau)[0]["argv"]
+    assert argv[argv.index("--model") + 1] == "qwen-35b"
+    assert argv[argv.index("--provider") + 1] == "krang"
+    assert argv[argv.index("--thinking") + 1] == "default"
 
 
 @pytest.mark.anyio
@@ -10414,7 +10590,7 @@ async def test_cut_off_kill_note_says_write_in_parts_only_for_a_call_argument(
 
 @pytest.mark.anyio
 @pytest.mark.parametrize("level", ["off", "default"])
-async def test_reasoning_cut_off_kill_leaves_thinking_off_and_omit_runs(
+async def test_reasoning_cut_off_kill_leaves_thinking_off_and_default_runs(
     tmp_path: Path, beagle: Path, fake_tau: Path, monkeypatch: pytest.MonkeyPatch, level: str
 ) -> None:
     project = _git_project(tmp_path, monkeypatch)
@@ -10434,8 +10610,7 @@ async def test_reasoning_cut_off_kill_leaves_thinking_off_and_omit_runs(
         argv[argv.index("--thinking") :][:2] if "--thinking" in argv else []
         for argv in (r["argv"] for r in _runs(fake_tau))
     ]
-    expected = [] if level == "default" else ["--thinking", "off"]
-    assert flags == [expected, expected]
+    assert flags == [["--thinking", level], ["--thinking", level]]
     assert "thinking-off" not in run.report
 
 

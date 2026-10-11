@@ -36,9 +36,15 @@ because a specific part of that model has no Tau equivalent:
   a stale one a plugin cache left in `~/.local/bin`.
 - **`pursuit_dispatch`** — a headless `step-executor`. Tau has no Task tool, so
   delegation is a nested `tau -p` run: the step-executor persona appended, the
-  target dir set with `--cwd`, and the model inherited from the session unless
-  the caller names a Tau model/provider. Because the worker is Tau too, the
-  ground-truth guard stays live inside it — a sub-agent is not a way around it.
+  target dir set with `--cwd`, and the worker's model chosen in order: the
+  call's model/provider/thinking, the environment, the project's
+  `.beagle/dispatch.toml` entry for the role (beagle hands Tau only entries
+  with a Tau provider, never a Claude Code alias), else the session's live
+  model, provider and thinking level (a `/model` switch mid-session included).
+  The file's `model_rules` follow each result, for the driver to choose by.
+  `pursuit_step` and its audit choose the same way. Because the worker is
+  Tau too, the ground-truth guard stays live inside it — a sub-agent is not a
+  way around it.
   Before a pursuit is founded the driver still runs `pursuit close`; once it
   is, the tool is refused and pursuit_step closes. It only does the work and
   returns the report.
@@ -213,9 +219,13 @@ GOAL_BASENAME = "pursuit.toml"
 DEFAULT_DISPATCH_TIMEOUT = 900.0
 
 #: Pin the worker's model/provider for every dispatch without editing code.
-#: Left unset, the worker inherits the session's configured provider/model —
-#: correct here, where the only reachable model is local (beagle's Claude tier
-#: names like `sonnet` are not Tau catalog ids and would fail validation).
+#: Left unset, the project's `.beagle/dispatch.toml` entry for the role decides
+#: (`_dispatch_pin`), and without one the worker runs the driver session's live
+#: provider/model, read off the context of the session's last tool call — not
+#: tau's configured default, which a `/model` switch does not change (run
+#: itc-35b-test: the driver switched to the 35B, and its workers came up on the
+#: catalog default). Beagle's Claude tier names like `sonnet` are not Tau
+#: catalog ids; beagle hands Tau only the entries with a provider of its own.
 WORKER_MODEL_ENV = "BEAGLE_TAU_DISPATCH_MODEL"
 WORKER_PROVIDER_ENV = "BEAGLE_TAU_DISPATCH_PROVIDER"
 
@@ -236,14 +246,36 @@ DEFAULT_WORKER_OUTPUT_TOKENS = 8192
 WORKER_BASH_TIMEOUT_ENV = "BEAGLE_TAU_WORKER_BASH_TIMEOUT"
 DEFAULT_WORKER_BASH_TIMEOUT = 120.0
 
-#: The worker's thinking level; unset runs it with thinking off, since most of
-#: R01's worker time went to reasoning spirals. `default` sends no `--thinking`
-#: at all and leaves the level to tau: a model with no thinking modes rejects
-#: every level, `off` included, and a worker spawn that passes the flag then
-#: exits 2 before reading a token (trial T01, qwen3.8-flash-next-iq4 with no
-#: thinking metadata).
+#: The worker's thinking level. Unset, a worker on the session's own model runs
+#: the session's level, and one on a pinned model runs thinking off, since most
+#: of R01's worker time went to reasoning spirals. `default` is tau's own level
+#: for "the catalog's thinking_default, else the server's", the one level tau
+#: takes for every model: a model with no thinking modes rejects every other
+#: level, `off` included, and a worker spawn that passes one then exits 2 before
+#: reading a token (trial T01, qwen3.8-flash-next-iq4 with no thinking metadata)
+#: — so an inherited level is sent only when the session's model lists it, and
+#: `default` is never swapped for `off` after a reasoning cut-off.
 WORKER_THINKING_ENV = "BEAGLE_TAU_DISPATCH_THINKING"
-WORKER_THINKING_OMIT = "default"
+WORKER_THINKING_DEFAULT = "default"
+#: `_worker_thinking`'s answer for "send no `--thinking`".
+WORKER_THINKING_OMIT = ""
+#: Every level a worker may be started with: tau's `--thinking` choices.
+WORKER_THINKING_LEVELS = (
+    WORKER_THINKING_DEFAULT,
+    "off",
+    "minimal",
+    "low",
+    "medium",
+    "high",
+    "xhigh",
+    "max",
+)
+
+#: The `.beagle/dispatch.toml` roles a worker runs as: a task's work, and the
+#: audit, which is a review that did not write the work.
+EXECUTOR_ROLE = "executor"
+REVIEWER_ROLE = "reviewer"
+DISPATCH_CONFIG_REL = Path(".beagle") / "dispatch.toml"
 
 #: Escape hatch: `BEAGLE_TAU_ALLOW_PURSUIT_EDIT=1` disables the ground-truth guard.
 GUARD_DISABLE_ENV = "BEAGLE_TAU_ALLOW_PURSUIT_EDIT"
@@ -1030,9 +1062,10 @@ def make_guard() -> Any:
 
     async def guard(event: Any, context: ExtensionContext) -> ToolCallHookResult | None:
         global _SEEN_CWD
-        # Record cwd for the dispatch tool, which receives no context.
+        # Record cwd and model for the dispatch tool, which receives no context.
         with contextlib.suppress(Exception):  # a stale/retired generation, ignore
             _SEEN_CWD = context.cwd
+        _record_session_model(context)
 
         # Fail open on EVERYTHING: a tool_call handler that raises blocks the
         # tool it was only inspecting, turning a guard bug into a hard wedge.
@@ -1089,6 +1122,84 @@ def make_guard() -> Any:
 # --------------------------------------------------------------------------- #
 # driver/worker isolation: the driver keeps out of an awaited worker's scope
 # --------------------------------------------------------------------------- #
+
+
+@dataclass(frozen=True)
+class _SessionModel:
+    """The driver session's live model, for the worker spawns (which get no context)."""
+
+    provider: str
+    model: str
+    thinking: str
+    #: The thinking modes `model` supports; None when this tau cannot say.
+    thinking_levels: tuple[str, ...] | None
+
+
+#: The session model last seen on a context: a `/model` switch is picked up at
+#: the next tool call, which is always before the dispatch that call makes.
+_SEEN_MODEL: _SessionModel | None = None
+
+
+def _record_session_model(context: Any) -> None:
+    """Keep the context's live model for the worker spawns; never raises."""
+    global _SEEN_MODEL
+    try:
+        provider, model = str(context.provider_name), str(context.model)
+        thinking = str(context.thinking_level)
+    except Exception:  # noqa: BLE001 - a retired generation or an unbound runtime
+        return
+    try:
+        levels: tuple[str, ...] | None = tuple(context.available_thinking_levels)
+    except Exception:  # noqa: BLE001 - a tau too old to list them
+        levels = None
+    if provider and model:
+        _SEEN_MODEL = _SessionModel(provider, model, thinking, levels)
+
+
+@dataclass(frozen=True)
+class _DispatchPin:
+    """A role's model in `.beagle/dispatch.toml` for this host, and the project's rules.
+
+    Empty `model` means the file pins nothing Tau can run for the role, so the
+    worker inherits. `rules` is the project's own prose for choosing a model per
+    dispatch, which the driver follows by passing model/provider/thinking.
+    """
+
+    provider: str = ""
+    model: str = ""
+    thinking: str = ""
+    rules: str = ""
+
+
+def _dispatch_pin(role: str, root: Path) -> _DispatchPin:
+    """`beagle dispatch model --for <role> --json` as Tau's host; never raises.
+
+    Beagle filters the entries by host, so a `claude-code` alias like `opus` is
+    never handed to a Tau worker. No file is the default install and costs no
+    subprocess; a beagle too old for `--json`, or a file it refuses, inherits.
+    """
+    if not (root / DISPATCH_CONFIG_REL).is_file():
+        return _DispatchPin()
+    cmd = [BEAGLE_BIN, "dispatch", "model", "--for", role, "--json", "--host", "tau"]
+    rc, out = _run(cmd, root, timeout=30.0)
+    said = _json_reply(out) if rc == 0 else None
+    if not isinstance(said, dict):
+        return _DispatchPin()
+    fields = {key: str(said.get(key) or "").strip() for key in ("provider", "model", "thinking")}
+    if said.get("inherit") or not fields["model"]:
+        fields = {}
+    return _DispatchPin(**fields, rules=str(said.get("rules") or "").strip())
+
+
+def _rules_note(pin: _DispatchPin, tool: str) -> str:
+    """The project's model rules, for a result the driver reads; "" when none."""
+    if not pin.rules:
+        return ""
+    return (
+        f"\n\nThis project's model rules ({DISPATCH_CONFIG_REL}) win over its pinned "
+        f"line when one fits a task: follow one by passing model, provider and thinking "
+        f"to {tool}.\n{pin.rules}"
+    )
 
 
 @dataclass(frozen=True)
@@ -1309,18 +1420,62 @@ def make_stopped_worker_note() -> Any:
 # --------------------------------------------------------------------------- #
 
 
-def _worker_model(explicit: str | None) -> str:
-    """Model id for the worker: explicit arg, else env, else inherit ('')."""
-    if explicit and explicit.strip():
-        return explicit.strip()
-    return os.environ.get(WORKER_MODEL_ENV, "").strip()
+def _worker_target(
+    model: Any = None, provider: Any = None, pin: _DispatchPin | None = None
+) -> tuple[str, str]:
+    """The worker's (model, provider): explicit args, else env, else the project's
+    dispatch.toml pin, else the session's.
+
+    Either one named, by argument or env, keeps the pin's and the session's pair
+    out of it: a provider under another model may not serve it. Nothing named and
+    no session seen gives ('', ''), which leaves both to tau's configured default.
+    """
+
+    def named(explicit: Any, env: str) -> str:
+        if isinstance(explicit, str) and explicit.strip():
+            return explicit.strip()
+        return os.environ.get(env, "").strip()
+
+    model, provider = named(model, WORKER_MODEL_ENV), named(provider, WORKER_PROVIDER_ENV)
+    if model or provider:
+        return model, provider
+    if pin is not None and pin.model:
+        return pin.model, pin.provider
+    if _SEEN_MODEL is None:
+        return model, provider
+    return _SEEN_MODEL.model, _SEEN_MODEL.provider
 
 
-def _worker_provider(explicit: str | None) -> str:
-    """Provider name for the worker: explicit arg, else env, else inherit ('')."""
-    if explicit and explicit.strip():
+def _worker_thinking(
+    model: str, provider: str, explicit: Any = None, pin: _DispatchPin | None = None
+) -> str:
+    """The worker's thinking level, or WORKER_THINKING_OMIT to send no flag.
+
+    An explicit level wins, then the env, then the dispatch.toml pin's when the
+    worker runs the pin's model. Otherwise a worker on the session's own model
+    runs the session's level when that model lists it, and no flag when it lists
+    none (T01); a worker on any other model runs thinking off (R01).
+    """
+    if isinstance(explicit, str) and explicit.strip():
         return explicit.strip()
-    return os.environ.get(WORKER_PROVIDER_ENV, "").strip()
+    pinned = os.environ.get(WORKER_THINKING_ENV, "").strip()
+    if pinned:
+        return pinned
+    if pin is not None and pin.thinking and (model, provider) == (pin.model, pin.provider):
+        return pin.thinking
+    seen = _SEEN_MODEL
+    if seen is None or (model, provider) != (seen.model, seen.provider):
+        return "off"
+    if seen.thinking_levels is not None and seen.thinking in seen.thinking_levels:
+        return seen.thinking
+    return WORKER_THINKING_OMIT
+
+
+def _bad_thinking(raw: Any) -> str:
+    """Why a tool call's thinking level cannot start a worker; "" when it can."""
+    if raw is None or (isinstance(raw, str) and raw.strip() in ("", *WORKER_THINKING_LEVELS)):
+        return ""
+    return f"thinking {raw!r} is not one of {', '.join(WORKER_THINKING_LEVELS)}."
 
 
 def _worker_output_tokens() -> int:
@@ -1802,11 +1957,13 @@ async def _run_worker(
     signal: ToolCancellationToken | None = None,
     task: str = "",
     scope: list[str] | None = None,
+    thinking: str | None = None,
 ) -> _WorkerRun:
     """Run one step-executor as a nested `tau -p --mode json` and read its report.
 
     A task's scope rides in the worker's environment, where its scope guard
-    holds the worker's writes to it.
+    holds the worker's writes to it. `thinking` is a level the caller already
+    chose (`_worker_thinking`); None chooses it here.
 
     The brief rides on stdin (tau prepends it to the prompt); the persona is
     appended to tau's base system prompt, not swapped for it, so the worker
@@ -1839,9 +1996,14 @@ async def _run_worker(
     if model:
         cmd += ["--model", model]
     cmd += ["--max-turns", str(_worker_max_turns())]
-    thinking = os.environ.get(WORKER_THINKING_ENV, "").strip() or "off"
+    if thinking is None:
+        thinking = _worker_thinking(model, provider)
     root_key = str(_resolved(cwd))
-    can_turn_off = bool(task) and thinking not in ("off", WORKER_THINKING_OMIT)
+    can_turn_off = bool(task) and thinking not in (
+        "off",
+        WORKER_THINKING_DEFAULT,
+        WORKER_THINKING_OMIT,
+    )
     thinking_off_note = ""
     if can_turn_off and _THINKING_OFF_NEXT.get(root_key) == task:
         del _THINKING_OFF_NEXT[root_key]
@@ -1850,7 +2012,7 @@ async def _run_worker(
             f"(this sub-agent ran thinking-off: the one before it on {task} was ended "
             f"because {REASONING_FILLED}.)"
         )
-    if thinking != WORKER_THINKING_OMIT:
+    if thinking:
         cmd += ["--thinking", thinking]
 
     limit = _memory_max()
@@ -2078,11 +2240,15 @@ def make_dispatch() -> Any:
         if refusal is not None:
             return _make_dispatch_result(refusal)
 
-        model = _worker_model(arguments.get("model"))
-        provider = _worker_provider(arguments.get("provider"))
+        bad_thinking = _bad_thinking(arguments.get("thinking"))
+        if bad_thinking:
+            return _make_dispatch_result(f"pursuit_dispatch: {bad_thinking}")
+        pin = _dispatch_pin(EXECUTOR_ROLE, cwd)
+        model, provider = _worker_target(arguments.get("model"), arguments.get("provider"), pin)
+        thinking = _worker_thinking(model, provider, arguments.get("thinking"), pin)
         timeout, clamped = _worker_timeout(arguments.get("timeout"))
 
-        run = await _run_worker(brief, cwd, model, provider, timeout, signal)
+        run = await _run_worker(brief, cwd, model, provider, timeout, signal, thinking=thinking)
         if run.problem is not None:
             return _with_note(_make_dispatch_result(f"pursuit_dispatch: {run.problem}"), clamped)
         header = (
@@ -2090,7 +2256,7 @@ def make_dispatch() -> Any:
             f"(model={model or 'inherit'} provider={provider or 'inherit'}) "
             f"cwd={cwd} rc={run.returncode}\n\n"
         )
-        footer = _dispatch_footer(_SEEN_CWD or Path.cwd())
+        footer = _dispatch_footer(_SEEN_CWD or Path.cwd()) + _rules_note(pin, "pursuit_dispatch")
         return _with_note(_make_dispatch_result(header + run.shown_report + footer), clamped)
 
     return execute
@@ -2123,6 +2289,14 @@ DISPATCH_PARAMETERS = {
             "description": (
                 "Tau provider name for the worker. Omit to inherit. "
                 f"Env default: {WORKER_PROVIDER_ENV}."
+            ),
+        },
+        "thinking": {
+            "type": "string",
+            "enum": list(WORKER_THINKING_LEVELS),
+            "description": (
+                "The worker's thinking level; `default` is the catalog's, else the "
+                f"server's. Omit to inherit. Env default: {WORKER_THINKING_ENV}."
             ),
         },
         "timeout": {
@@ -4221,6 +4395,25 @@ STEP_PARAMETERS: dict[str, Any] = {
                 "The task's route resisted: replace it with a new attempt at the same "
                 "criteria, done the way notes says (required). A new done_when may come "
                 "with it. A blocked task with no new_route is reworked on its own check."
+            ),
+        },
+        "model": {
+            "type": "string",
+            "description": (
+                "Tau model id for this task's sub-agent, when the project's model rules "
+                "call for one. Omit for the project's pinned model, else the session's."
+            ),
+        },
+        "provider": {
+            "type": "string",
+            "description": "Tau provider serving that model. Omit with model.",
+        },
+        "thinking": {
+            "type": "string",
+            "enum": list(WORKER_THINKING_LEVELS),
+            "description": (
+                "The sub-agent's thinking level; `default` is the catalog's, else the "
+                "server's. Omit to inherit."
             ),
         },
         "budget": {
@@ -10738,13 +10931,16 @@ async def _audit(
     if on_update is not None:
         with contextlib.suppress(Exception):
             on_update(_step_result("An audit is due: a sub-agent is reading the closes."))
+    pin = _dispatch_pin(REVIEWER_ROLE, root)
+    model, provider = _worker_target(pin=pin)
     run = await _run_worker(
         brief + AUDIT_NOTE,
         root,
-        _worker_model(None),
-        _worker_provider(None),
+        model,
+        provider,
         DEFAULT_DISPATCH_TIMEOUT,
         signal,
+        thinking=_worker_thinking(model, provider, pin=pin),
     )
     if run.problem is not None or run.report.startswith(NO_REPORT):
         why = run.problem or "it wrote no report"
@@ -12930,6 +13126,8 @@ def make_step_tool() -> Any:
     lead: list[str] = []
     #: Leads for every result of this call: the scope and locks it did not keep.
     kept_lead: list[str] = []
+    #: This call's dispatch.toml pin, once a worker is about to be chosen.
+    pinned: list[_DispatchPin] = []
 
     async def _execute(
         tool_call_id: str,
@@ -13824,8 +14022,13 @@ def make_step_tool() -> Any:
         spent: int | None = None
         report = shown = ""
         verdict: tuple[int, str] = (1, "")
-        model = _worker_model(None)
-        provider = _worker_provider(None)
+        bad_thinking = _bad_thinking(arguments.get("thinking"))
+        if bad_thinking:
+            return _step_result(f"pursuit_step: {task} not run — {bad_thinking}")
+        pin = _dispatch_pin(EXECUTOR_ROLE, root)
+        pinned[:] = [pin]
+        model, provider = _worker_target(arguments.get("model"), arguments.get("provider"), pin)
+        thinking = _worker_thinking(model, provider, arguments.get("thinking"), pin)
         retry_note = _last_failure_note((str(root), task), check) if status == "open" else ""
         restored: set[str] = set()
         attempt = 0
@@ -13987,7 +14190,15 @@ def make_step_tool() -> Any:
                 with contextlib.suppress(Exception):
                     on_update(_step_result(f"{task}: sub-agent attempt {attempt} of {attempts}"))
             run = await _run_worker(
-                brief + retry_note, root, model, provider, attempt_timeout, signal, task, scope
+                brief + retry_note,
+                root,
+                model,
+                provider,
+                attempt_timeout,
+                signal,
+                task,
+                scope,
+                thinking=thinking,
             )
             worker_ran = True
             undone = _restore_locked(goal, root, fixing)
@@ -14515,6 +14726,7 @@ def make_step_tool() -> Any:
         spawns.clear()
         lead.clear()
         kept_lead.clear()
+        pinned.clear()
         result = await _execute(tool_call_id, arguments, signal, on_update)
         refusal = "".join(getattr(c, "text", "") for c in result.content)
         if lead and refusal.startswith("pursuit_step:"):
@@ -14527,6 +14739,10 @@ def make_step_tool() -> Any:
         if spawns:
             result = _with_spawn_notice(result, *spawns[0])
         result = _with_note(result, _worker_timeout(arguments.get("timeout"))[1])
+        if pinned and pinned[0].rules:
+            # After the result: run R23's breaker quotes only a result's first line.
+            text = "".join(getattr(c, "text", "") for c in result.content)
+            result = _step_result(text + _rules_note(pinned[0], "pursuit_step"))
         if stepped and stepped[0]:
             text = "".join(getattr(c, "text", "") for c in result.content)
             _LAST_STEP_RESULT[stepped[0]] = text[-LAST_STEP_RESULT_CHARS:]
@@ -16157,6 +16373,7 @@ def _on_session_start(event: Any, context: ExtensionContext) -> None:
     global _SEEN_CWD, _STARTED_SESSION, _OFF_PURSUIT_CALLS, _FOUND_REFUSED_STATEMENT
     del event
     _SEEN_CWD = context.cwd
+    _record_session_model(context)
     _STARTED_SESSION = context.session_id
     _OFF_PURSUIT_CALLS = 0
     _FOUND_REFUSED_STATEMENT = None
