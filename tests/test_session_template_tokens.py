@@ -227,6 +227,26 @@ async def test_tool_args_with_ordinary_angle_brackets_run(tmp_path: Path) -> Non
     assert not any(r.startswith("Not run") for r in results)
 
 
+@pytest.mark.anyio
+async def test_argument_scan_accepts_unopened_call_markup_in_a_write(tmp_path: Path) -> None:
+    # A file about qwen's call syntax (a parser, its docs or tests) holds the
+    # reply-only shapes; only the scan's own tokens refuse a write.
+    unopened = "<function=bash><parameter=command>ls</parameter></function></tool_call>"
+    closing = "</function></tool_call>"
+    writes: list[dict[str, JSONValue]] = [
+        {"path": "parser_test.py", "content": unopened},
+        {"path": "parser_test.py", "content": closing},
+        {"path": "parser_test.py", "content": R44_UNOPENED_CALL},
+        {"path": "parser_test.py", "content": QWEN_SPILL},
+    ]
+
+    ran, results = await _run_note(tmp_path, *writes)
+
+    assert ran == writes[:3]
+    assert not any(r.startswith("Not run") for r in results[:3])
+    assert "(`<tool_call>` in `content`)" in results[3]
+
+
 def _says(text: str) -> list[object]:
     return [
         assistant_start(model="fake"),

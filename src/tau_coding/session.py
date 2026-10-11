@@ -229,12 +229,18 @@ WORKSPACE_CHANGING_TOOLS = frozenset({"pursuit_step", "write", "edit"})
 #: A chat template's tool-call and channel control tokens. Gemma's pipe forms
 #: are never ordinary text; qwen's `<tool_call>` counts only with a function
 #: or JSON call opening after it, so a file that names the tag is left alone.
-#: Without the tag, qwen's call counts by its function opening on a parameter
-#: or its function close on the tag's close, so a bare `<function=x>` does not.
-TEMPLATE_TOOL_CALL_TOKEN = re.compile(
+#: The tool-argument leak scan uses this one: a written file may hold call
+#: markup without the opening tag (a parser of it, its docs or tests).
+TEMPLATE_ARGUMENT_TOKEN = re.compile(
     r"<\|tool_call>|<tool_call\|>|<\|channel>|<channel\|>"
     r"|</?tool_call>\s*(?:<function=|\{\s*\"name\"\s*:)"
-    r"|<function=[\w.-]+>\s*<parameter=|</function>\s*</tool_call>"
+)
+#: The same tokens in a reply's text. Without the tag, qwen's call counts by its
+#: function opening on a parameter or its function close on the tag's close,
+#: so a bare `<function=x>` does not.
+TEMPLATE_TOOL_CALL_TOKEN = re.compile(
+    TEMPLATE_ARGUMENT_TOKEN.pattern
+    + r"|<function=[\w.-]+>\s*<parameter=|</function>\s*</tool_call>"
 )
 #: How the sent call closed just before a leaked template tail: a string's end
 #: quote (bare, escaped, or gemma's `<|"|>`) and the call's closing brace.
@@ -6353,7 +6359,7 @@ def _template_tokens_in_arguments(call: ToolCall) -> list[_TemplateLeak]:
     while pending:
         name, value, nested = pending.pop(0)
         if isinstance(value, str):
-            match = TEMPLATE_TOOL_CALL_TOKEN.search(value)
+            match = TEMPLATE_ARGUMENT_TOKEN.search(value)
             if match is not None:
                 token = match.group(0).split(">", 1)[0] + ">"
                 clean = TEMPLATE_LEAK_CALL_CLOSE.sub("", value[: match.start()]).rstrip()
