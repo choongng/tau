@@ -9980,6 +9980,23 @@ def _replan_parent_call(task: str, nodes: list[dict[str, Any]]) -> str:
     )
 
 
+def _attempts_past_limit(task: str, nodes: list[dict[str, Any]]) -> str:
+    """`task`'s retry chain and how many attempts it holds against beagle's limit.
+
+    q35 10-11: "is at beagle's limit of 3 attempts" was said of a chain of 4, and
+    "holds 3 attempt(s), below beagle's limit of 3" of one of 3; beagle refuses a
+    new route only once a chain holds more than the limit (`_at_spawn_limit`).
+    """
+    chain = sorted(_retry_chain(task, nodes))
+    held = f"{len(chain)} attempt" + ("" if len(chain) == 1 else "s")
+    named = f"retry chain ({', '.join(chain)}) holds {held}"
+    if len(chain) > SPAWN_LIMIT:
+        return f"{named}, past beagle's limit of {SPAWN_LIMIT}"
+    return (
+        f"{named}, and beagle refuses a new route only once a chain holds more than {SPAWN_LIMIT}"
+    )
+
+
 def _spawn_limit_offer(
     task: str, check: str, scope: list[str], nodes: list[dict[str, Any]], why: str = ""
 ) -> str:
@@ -9990,26 +10007,41 @@ def _spawn_limit_offer(
     closed already (blocked, say) is offered the parent's re-plan alone. A pending
     one keeps the close: the tree was read before this step opened it.
     """
-    chain = ", ".join(sorted(_retry_chain(task, nodes)))
+    attempts = _attempts_past_limit(task, nodes)
     replan = _replan_parent_call(task, nodes)
     node = next((n for n in nodes if str(n.get("id")) == task), {})
     status = str(node.get("status") or "")
     if status not in {"", "open", "pending"}:
-        return (
-            f"{task} is {status}, and its retry chain ({chain}) is at beagle's limit of "
-            f"{SPAWN_LIMIT} attempts, so beagle refuses a new route "
-            + (
-                f"for it. Re-plan its parent instead: {replan}."
-                if replan
-                else "for it, and it has no parent to re-plan: stop and ask the user."
-            )
+        return f"{task} is {status}, and its {attempts}, so beagle refuses a new route " + (
+            f"for it. Re-plan its parent instead: {replan}."
+            if replan
+            else "for it, and it has no parent to re-plan: stop and ask the user."
         )
     return (
-        f"Its retry chain ({chain}) is at beagle's limit of {SPAWN_LIMIT} attempts, so "
-        f"beagle refuses a new route. Close it infeasible instead: "
+        f"Its {attempts}, so beagle refuses a new route. Close it infeasible instead: "
         f"{_infeasible_call(task, check, scope, why)}. "
         + _seal_warning(task, str(node.get("parent") or ""))
     ).rstrip()
+
+
+def _pending_route_said(task: str, done_when: str, scope: list[str], criteria: str) -> str:
+    """What a spawn refused for a pending `task` says: a new route is for a route
+    tried, so the call drops new_route and opens it.
+
+    q35 10-11: T0012 was pending, and four new_route calls were each told to say
+    in notes how the route differs, which no notes get past.
+    """
+    call = f"pursuit_step task={json.dumps(task)}"
+    if criteria:
+        call += f", criteria={json.dumps(criteria, ensure_ascii=False)}"
+    if done_when:
+        call += f", done_when={json.dumps(done_when)}"
+    if scope:
+        call += f", scope={json.dumps(scope)}"
+    return (
+        f"{task} is pending, never opened, so it has no route to replace and notes do not "
+        f"change that. Drop new_route and open it with the same values: {call}."
+    )
 
 
 def _seal_warning(task: str, parent: str) -> str:
@@ -11102,6 +11134,22 @@ def _abandon(task: str, why: str, root: Path, goal: Path) -> str:
 _INFEASIBLE = re.compile(r"(?is)^\s*infeasible\s*:\s*(.*)$")
 
 
+def _open_pending_said(task: str, node: Mapping[str, Any]) -> str:
+    """How an infeasible close refused for pending `task` says to open it.
+
+    q35 10-11: T0024's open was refused at 12:17:31 as already passing, and at
+    12:17:47 this said "Work it first: pursuit_step task=T0024", the same call.
+    """
+    bound = " ".join(str(node.get("done_when") or "").split())
+    passing = f", so if its bound `{bound}` passes now, give another" if bound else ""
+    return (
+        f' Open it first with pursuit_step task="{task}" and a done_when that fails now: '
+        f"an open on a check that already passes is refused{passing}. If a done task's "
+        f'commit did its work, pursuit_step task="{task}", abandon="done by Tnnnn" and '
+        "done_when, naming that task, closes it done on that commit instead."
+    )
+
+
 def _close_infeasible(
     task: str,
     evidence: str,
@@ -11132,20 +11180,15 @@ def _close_infeasible(
             f"pursuit_step: {task} not closed infeasible — it is "
             f"{node.get('status') or 'not in the tree'}; only an open task closes this "
             "way, as beagle refuses an infeasible close on a task not yet worked."
-            + (
-                f' Work it first: pursuit_step task="{task}".'
-                if node.get("status") == "pending"
-                else ""
-            )
+            + (_open_pending_said(task, node) if node.get("status") == "pending" else "")
         )
     if not _at_spawn_limit(task, nodes) and not _source_reruns_spent(task, root):
         # Run R40: a task the source judge alone held past its reruns is offered
         # this close, whatever its retry chain.
-        chain = ", ".join(sorted(_retry_chain(task, nodes)))
         return (
-            f"pursuit_step: {task} not closed infeasible — its retry chain ({chain}) "
-            f"holds {len(_retry_chain(task, nodes))} attempt(s), below beagle's limit of "
-            f"{SPAWN_LIMIT}, so a hard task is not yet shown infeasible. Call instead: "
+            f"pursuit_step: {task} not closed infeasible — its "
+            f"{_attempts_past_limit(task, nodes)}, so a hard task is not yet shown "
+            "infeasible. Call instead: "
             f'pursuit_step task="{task}", new_route=true and notes saying how the new '
             f'route differs, or pursuit_step task="{task}" with notes saying what to fix.'
         )
@@ -12316,10 +12359,17 @@ def _escalation_options(
 
 def _judge_kept_open(task: str, root: Path | None) -> str:
     """The close judge's reason, when every not-done step on `task` since its check
-    last failed passed it and only that judge kept the task open; else ""."""
+    last failed passed it and only that judge kept the task open; else "".
+
+    An unproven task gets "": its notes-only rerun runs no sub-agent. q35 10-11
+    (11:19:02): the unproven refusal offered new_route=true, and this put "leave
+    done_when and new_route out" and that rerun under it.
+    """
     if root is None:
         return ""
     key = (str(root), task)
+    if key in _UNPROVEN:
+        return ""
     if key in _NOT_DONE_CHECK_FAILED or _LAST_CHECK_EXIT.get(key, 0) != 0:
         return ""
     return _NOT_DONE_DEMAND.get(key, "")
@@ -12710,6 +12760,8 @@ def _unchanged_route(
 
     Run R35 E18, E26, E34 offered such a route three times; each spawned an heir
     with the same check and scope, and each heir was left not done the same way.
+    q35 10-11 (11:19:02): an unproven data route adding no data file, the data
+    already in scope, was offered as one that changes something.
     """
     bound_check = " ".join(str(record.get("done_when") or "").split())
     check, needs, unproven = _working_route(
@@ -12717,7 +12769,7 @@ def _unchanged_route(
     )
     return (
         bool(bound_check)
-        and unproven is None
+        and not unproven
         and check == bound_check
         and sorted(needs) == sorted(_strings(record.get("scope")))
     )
@@ -13588,6 +13640,8 @@ def make_step_tool() -> Any:
                                 "beagle refuses another",
                             )
                             if _at_spawn_limit(task, nodes)
+                            else _pending_route_said(task, done_when, scope, criteria)
+                            if status == "pending"
                             else "Say more specifically in notes how this route differs."
                         )
                     )
@@ -16173,6 +16227,46 @@ def _close_drop(command: str, root: Path) -> str:
     return f"{task} is not one to drop: {' '.join(kept)}"
 
 
+def _amend_argv(argv: list[str]) -> str | None:
+    """The task a `beagle pursuit amend` argv names, or None."""
+    if _steered_verb(argv) != "amend" or "amend" not in argv:
+        return None
+    rest = argv[argv.index("amend") + 1 :]
+    return next((arg for arg in rest if _TASK_ID.fullmatch(arg)), "")
+
+
+def _amend_steer(command: str, root: Path) -> str:
+    """Where a `beagle pursuit amend` run from bash goes, for the task it names.
+
+    q35 10-11: ten bash amends of container T0002 were each sent to "pursuit_step
+    on the open task", which refuses a container as not a task to work.
+    """
+    task = _bash_find(command, _amend_argv) or ""
+    node = next((n for n in _tree_nodes(root) if str(n.get("id")) == task), None)
+    if node is None or node.get("status") == "open" and not node.get("container"):
+        return f"use {_STEERED_VERBS['amend']}."
+    call = f"pursuit_step task={json.dumps(task)}"
+    if node.get("container"):
+        return (
+            f"{task} is a container, and pursuit_step does not take one. What it is for "
+            "is the user's to change: stop and ask them. A part's check changes with "
+            f"{call.replace(task, 'Tnnnn')} and the new done_when, on an open part."
+        )
+    status = str(node.get("status") or "")
+    if status == "pending":
+        return (
+            f"{task} is pending, and its check is bound when it opens: {call} with the "
+            "new done_when opens it on that check once it is ready (pursuit_step with "
+            "no arguments hands out the ready one)."
+        )
+    if status == "blocked":
+        return f"{task} is blocked: {call}, new_route=true, the new done_when and notes."
+    return (
+        f"{task} is {status or 'not in the tree'}, and no pursuit tool changes a closed "
+        "task: if its record is wrong, tell the user."
+    )
+
+
 def make_driver_pursuit_guard() -> Any:
     """Build the `tool_call` guard that steers the driver's pursuit verbs to its tools.
 
@@ -16202,6 +16296,11 @@ def make_driver_pursuit_guard() -> Any:
         except Exception:  # noqa: BLE001 - fail open, never block on a guard bug
             return None
         drop = ""
+        use = f"use {_STEERED_VERBS[verb]}."
+        if verb == "amend":
+            # A tree it cannot read gets the plain steer.
+            with contextlib.suppress(Exception):
+                use = _amend_steer(command, goal.parent.parent)
         if verb == "close":
             try:
                 drop = f" {_close_drop(command, goal.parent.parent)}"
@@ -16210,7 +16309,7 @@ def make_driver_pursuit_guard() -> Any:
         return ToolCallHookResult(
             block=True,
             reason=(
-                f"refusing `beagle pursuit {verb}` from bash: use {_STEERED_VERBS[verb]}. "
+                f"refusing `beagle pursuit {verb}` from bash: {use} "
                 f"The tool runs it with the checks around it that the bare verb skips.{drop}"
             ),
         )
