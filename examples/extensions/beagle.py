@@ -3986,6 +3986,68 @@ def _commit_before_split(
     )
 
 
+@dataclass(frozen=True)
+class _SplitCarry:
+    """The work a split committed for its parts: see `_split_carried`."""
+
+    #: The task that was split, and the commit it opened on.
+    parent: str = ""
+    opened: str = ""
+    #: The files its 'work in progress before split' commit added or changed.
+    files: tuple[str, ...] = ()
+
+    def base(self, rel: str, opened: str) -> str:
+        """The commit `rel` counts as new against: the parent's open for a carried file."""
+        return self.opened if os.path.normpath(rel) in self.files else opened
+
+    def because(self, task: str) -> str:
+        """The `--predates-because` for a witness in the carried files."""
+        return (
+            f"{self.parent}'s split committed this work as '{self.parent}: "
+            f"{SPLIT_WIP_TITLE}' before {task} opened; it is {task}'s work, counted "
+            f"from the commit {self.parent} opened on"
+        )
+
+
+def _split_carried(task: str, root: Path) -> _SplitCarry:
+    """The work `_commit_before_split` committed for `task`, a part of the split task.
+
+    q35 10-11: T0002's passing work was committed as 5f53adf before its split, so
+    every part's check already passed at its open, and `_prove` had nothing new
+    since the part opened to take away: 19 workers and 4 infeasible closes. The
+    files that commit added or changed are the parts' work, counted from the
+    commit the parent opened on, while no part has closed done and no later
+    commit has changed them. Empty for any other task.
+    """
+    rc, out = _run(
+        ["git", "log", "--format=%H %s", "--fixed-strings", f"--grep={SPLIT_WIP_TITLE}"],
+        root,
+        timeout=30.0,
+    )
+    commits = [line.partition(" ") for line in out.splitlines()] if rc == 0 else []
+    if not commits:
+        return _SplitCarry()
+    nodes = _tree_nodes(root)
+    parent = next((str(n.get("parent") or "") for n in nodes if n.get("id") == task), "")
+    split = next(
+        (sha for sha, _, subject in commits if subject == f"{parent}: {SPLIT_WIP_TITLE}"), ""
+    )
+    if not parent or not split:
+        return _SplitCarry()
+    if any(n.get("parent") == parent and n.get("status") == "done" for n in nodes):
+        return _SplitCarry()
+    opened = _opened_commit(parent, root)
+    if not opened or opened == split:
+        return _SplitCarry()
+    since = set(
+        _run(["git", "diff", "--name-only", split, "HEAD"], root, timeout=30.0)[1].splitlines()
+    )
+    files = [
+        rel for rel in _commit_paths(split, root) if rel not in since and (root / rel).is_file()
+    ]
+    return _SplitCarry(parent, opened, tuple(os.path.normpath(rel) for rel in files))
+
+
 def _split_part_lines(parts: list[str]) -> tuple[list[str], list[str]]:
     """`parts` with each part of several lines split, in place, into one part per line.
 
@@ -4318,7 +4380,7 @@ def make_plan_tool() -> Any:
             if rc != 0 and "already has children" in out:
                 rc, out = _add_children(task, parts, root)
             elif rc == 0:
-                moved_note = _move_pending_locks(goal, task, parts[0], root)
+                moved_note = _move_pending_locks(goal, task, parts, root)
         if rc != 0:
             refused = f"pursuit_plan: beagle refused (exit {rc}):\n{out}"
             if uncommitted_note:
@@ -10112,6 +10174,9 @@ def _check_reads(check: str, rel: str, root: Path) -> bool:
     )
 
 
+#: The `prove` flags whose next argument is a site the witness changes.
+SITE_FLAGS = frozenset({"--absent", "--mutate"})
+
 #: A pytest summary line naming where a run went wrong: `FAILED <node>` or `ERROR <path>`.
 _PYTEST_OUTCOME = re.compile(r"\b(FAILED|ERROR) (\S+\.py\S*)")
 _IMPORT_FAILURE = re.compile(r"\b(?:ModuleNotFoundError|ImportError)\b|No module named")
@@ -10208,10 +10273,15 @@ async def _prove(
     reverted = _locked_fix_reversion(task, scope, root, changed)
     if reverted:
         attempts.insert(0, reverted)
+    # q35 10-11: what the parent's split committed is this part's work.
+    carried = _split_carried(task, root)
+    changed = list(dict.fromkeys([*changed, *carried.files]))
     sources = [
         rel
         for rel in (lock.rstrip("/") for lock in locks or [])
-        if rel in changed and (root / rel).is_file() and not _in_commit(opened, rel, root)
+        if rel in changed
+        and (root / rel).is_file()
+        and not _in_commit(carried.base(rel, opened), rel, root)
     ]
     if not sources:
         sources = [
@@ -10230,7 +10300,7 @@ async def _prove(
     if sources:
         # Run R14: both witnesses took away interval_tree_clocks.py, which T0003
         # wrote, so removing it showed only that the import was needed.
-        sources = [rel for rel in sources if not _in_commit(opened, rel, root)]
+        sources = [rel for rel in sources if not _in_commit(carried.base(rel, opened), rel, root)]
     sources = [rel for rel in sources if os.path.normpath(rel) not in scripts]
     if sources:
         attempts.append([arg for rel in sources for arg in ("--absent", rel)])
@@ -10239,10 +10309,16 @@ async def _prove(
         rc, out = await asyncio.to_thread(
             _run, _capped(argv, _memory_max()), root, 2 * timeout + 120
         )
-        if rc != 0 and "--predates-because" in out and "--mutate" in how:
+        sites = [
+            os.path.normpath(how[at + 1]) for at, arg in enumerate(how[:-1]) if arg in SITE_FLAGS
+        ]
+        split_work = bool(sites) and set(sites) <= set(carried.files)
+        if rc != 0 and "--predates-because" in out and ("--mutate" in how or split_work):
             # A task that adds tests for code an earlier task wrote: its
             # witness is a defect in that code, which beagle takes when said.
-            argv += ["--predates-because", PREDATES_BECAUSE]
+            # A part's witness in what its parent's split committed is its own.
+            because = carried.because(task) if split_work else PREDATES_BECAUSE
+            argv += ["--predates-because", because]
             rc, out = await asyncio.to_thread(
                 _run, _capped(argv, _memory_max()), root, 2 * timeout + 120
             )
@@ -10658,21 +10734,55 @@ def _drop_pending_locks(goal: Path, task: str) -> None:
             path.write_text(json.dumps(pending, indent=1), encoding="utf-8")
 
 
-def _move_pending_locks(goal: Path, task: str, first_part: str, root: Path) -> str:
-    """Move `task`'s pending locks to the task split from `first_part`; a note, or "".
+def _names_file(text: str, rel: str) -> bool:
+    """Whether `text` names the file `rel`: by its path, or by its file name as a word."""
+    return any(
+        re.search(rf"(?<![\w.-]){re.escape(name)}(?![\w-])", text)
+        for name in dict.fromkeys([rel, Path(rel).name])
+    )
+
+
+def _move_pending_locks(goal: Path, task: str, parts: list[str], root: Path) -> str:
+    """Move `task`'s pending locks to the tasks split from `parts`; a note, or "".
 
     Run R17 split T0002 and its three pending locks stayed behind: only a
-    done close drops them, and a container is never closed that way.
+    done close drops them, and a container is never closed that way. q38fn
+    10-11: all three went to the first part, T0007, whose closes were then held
+    open for tests/test_cases.py, T0009's to write. Each lock goes to the first
+    part whose scope, title or intent names that file; one no part names goes
+    to the first part.
     """
     locks = _pending_locks(goal, task)
-    if not locks:
+    if not locks or not parts:
         return ""
-    heir = _children(task, root).get(_part_title(first_part).lower())
-    if heir is None:
+    children = _children(task, root)
+    first = children.get(_part_title(parts[0]).lower())
+    if first is None:
         return ""
-    _pending_locks(goal, heir, locks)
+    nodes = {str(n.get("id")): n for n in _tree_nodes(root)}
+    texts: list[tuple[str, str]] = []
+    for part in parts:
+        heir = children.get(_part_title(part).lower())
+        if heir is not None:
+            node = nodes.get(heir, {})
+            said = [part, str(node.get("intent") or ""), *_strings(node.get("scope"))]
+            texts.append((heir, "\n".join(said)))
+    named = {
+        lock: next((heir for heir, text in texts if _names_file(text, lock)), "") for lock in locks
+    }
+    given: dict[str, list[str]] = {}
+    for lock in locks:
+        given.setdefault(named[lock] or first, []).append(lock)
+    for heir, held in given.items():
+        _pending_locks(goal, heir, held)
     _drop_pending_locks(goal, task)
-    return f"{task}'s pending locks ({', '.join(locks)}) moved to its first part, {heir}."
+    rest = [lock for lock in locks if not named[lock]]
+    if len(rest) == len(locks):
+        return f"{task}'s pending locks ({', '.join(locks)}) moved to its first part, {first}."
+    moved = ", ".join(f"{lock} to {named[lock]}" for lock in locks if named[lock])
+    if rest:
+        moved += f"; {', '.join(rest)} to its first part, {first}, as no part names them"
+    return f"{task}'s pending locks moved to the part that names each: {moved}."
 
 
 def _fixes_known_answers(title: str) -> bool:
@@ -11364,13 +11474,20 @@ def _already_passes(
     return text
 
 
-async def _passes_without_own_work(check: str, scope: list[str], root: Path) -> bool:
+async def _passes_without_own_work(
+    check: str, scope: list[str], root: Path, carried: _SplitCarry | None = None
+) -> bool:
     """Whether `check` still passes with the uncommitted files in `scope` put back as committed.
 
     Run R12: T0008's new route was refused as already passing, five times, when
-    only its own uncommitted test made the check pass.
+    only its own uncommitted test made the check pass. q35 10-11: the files a
+    split committed for its parts (`carried`) are put back as the split task
+    opened on them.
     """
+    carried = carried or _SplitCarry()
     own = [rel for rel in _changed_files(root) if scope and _in_scope(rel, scope, root)]
+    own += [rel for rel in carried.files if scope and _in_scope(rel, scope, root)]
+    own = list(dict.fromkeys(own))
     if not own:
         return True
     saved: dict[str, bytes | None] = {}
@@ -11379,7 +11496,10 @@ async def _passes_without_own_work(check: str, scope: list[str], root: Path) -> 
             path = root / rel
             saved[rel] = path.read_bytes() if path.is_file() else None
             head = subprocess.run(
-                ["git", "show", f"HEAD:{rel}"], cwd=root, capture_output=True, check=False
+                ["git", "show", f"{carried.base(rel, 'HEAD')}:{rel}"],
+                cwd=root,
+                capture_output=True,
+                check=False,
             )
             if head.returncode == 0:
                 path.write_bytes(head.stdout)
@@ -11396,17 +11516,20 @@ async def _passes_without_own_work(check: str, scope: list[str], root: Path) -> 
                 path.write_bytes(data)
 
 
-async def _passes_only_by_uncommitted(check: str, scopes: list[list[str]], root: Path) -> bool:
+async def _passes_only_by_uncommitted(
+    check: str, scopes: list[list[str]], root: Path, carried: _SplitCarry | None = None
+) -> bool:
     """Whether `check`, passing now, passes only because of uncommitted files in `scopes`.
 
     The task's own scope and its predecessor's: the close's witness takes those
     files away, so the close judges them. Run R18 refused T0005's open as
-    "already passes" seven times, on W1's uncommitted known-answers files.
+    "already passes" seven times, on W1's uncommitted known-answers files. A
+    part's `carried` files, which its parent's split committed, count as its own.
     """
     combined = [entry for scope in scopes for entry in scope]
     if not combined:
         return False
-    return not await _passes_without_own_work(check, combined, root)
+    return not await _passes_without_own_work(check, combined, root, carried)
 
 
 def _predecessor_scope(record: dict[str, Any], root: Path) -> list[str]:
@@ -11505,8 +11628,16 @@ def _killed_open_call(task: str, check: str, scope: list[str], notes: str, root:
     )
 
 
-def _on_disk_note(check: str, task: str) -> str:
-    """The note on a check that passes only on uncommitted work in the task's scope."""
+def _on_disk_note(check: str, task: str, carried: _SplitCarry | None = None) -> str:
+    """The note on a check that passes only on uncommitted work in the task's scope,
+    or on the work its parent's split committed for it (`carried`)."""
+    if carried is not None and carried.files:
+        return (
+            f"`{check}` passes already, but only on uncommitted files in {task}'s scope or "
+            f"on what '{carried.parent}: {SPLIT_WIP_TITLE}' committed for its parts, which "
+            f"is {task}'s work: the close judges it (its witness takes those files away, "
+            "and the check must then fail).\n\n"
+        )
     return (
         f"`{check}` passes already, but only on uncommitted files in {task}'s scope: the "
         "work is on disk, and the close judges it (its witness takes those files away, "
@@ -13479,7 +13610,7 @@ def make_step_tool() -> Any:
                     # The rehearsal's refusal below, for an offered command.
                     passed = (await probe(command))[0] == 0
                     if not passed or await _passes_only_by_uncommitted(
-                        command, [route_scope], root
+                        command, [route_scope], root, _split_carried(task, root)
                     ):
                         return None
                     return _already_passes(command, task, _tree_nodes(root))
@@ -13527,7 +13658,9 @@ def make_step_tool() -> Any:
                     # check to the cap a second time.
                     killed_run = rehearsed
                 if rehearsed[0] == 0 and not (
-                    await _passes_only_by_uncommitted(new_check, [route_scope], root)
+                    await _passes_only_by_uncommitted(
+                        new_check, [route_scope], root, _split_carried(task, root)
+                    )
                 ):
                     return _step_result(
                         f"pursuit_step: no new route for {task}, which stays as it is — "
@@ -13636,7 +13769,10 @@ def make_step_tool() -> Any:
                 data_check, data_scope, data_note = data_only
                 probe = await _run_check(data_check, root, DEFAULT_CHECK_TIMEOUT)
                 if probe[0] == 0 and not await _passes_only_by_uncommitted(
-                    data_check, [data_scope, _predecessor_scope(record, root)], root
+                    data_check,
+                    [data_scope, _predecessor_scope(record, root)],
+                    root,
+                    _split_carried(task, root),
                 ):
                     # Run R40 class 3: the data test alone already passed, so the
                     # rewrite was refused as no work, four times; the absent test
@@ -13697,7 +13833,10 @@ def make_step_tool() -> Any:
             async def open_passing(command: str, scope: list[str]) -> str | None:
                 # The pre-run's refusal below, for an offered command.
                 if (await probe(command))[0] != 0 or await _passes_only_by_uncommitted(
-                    command, [scope, _predecessor_scope(record, root)], root
+                    command,
+                    [scope, _predecessor_scope(record, root)],
+                    root,
+                    _split_carried(task, root),
                 ):
                     return None
                 return passing_refusal(command, scope)
@@ -13751,10 +13890,11 @@ def make_step_tool() -> Any:
             # task's scope (or its predecessor's) is the work, and the close
             # judges it.
             pre_rc, pre_out = killed_run or await _run_check(done_when, root, DEFAULT_CHECK_TIMEOUT)
+            split_work = _split_carried(task, root)
             if pre_rc == 0 and await _passes_only_by_uncommitted(
-                done_when, [scope, _predecessor_scope(record, root)], root
+                done_when, [scope, _predecessor_scope(record, root)], root, split_work
             ):
-                route += _on_disk_note(done_when, task)
+                route += _on_disk_note(done_when, task, split_work)
                 passed_on_disk = (pre_rc, pre_out)
             elif pre_rc == 0:
                 return _step_result(
@@ -13882,7 +14022,10 @@ def make_step_tool() -> Any:
                 else:
                     pre_rc, pre_out = await _run_check(done_when, root, DEFAULT_CHECK_TIMEOUT)
                     if pre_rc == 0 and await _passes_only_by_uncommitted(
-                        done_when, [own_scope, _predecessor_scope(record, root)], root
+                        done_when,
+                        [own_scope, _predecessor_scope(record, root)],
+                        root,
+                        _split_carried(task, root),
                     ):
                         # Run R18: the T0151 refusal had the open's blind spot.
                         route += _on_disk_note(done_when, task)
@@ -14512,7 +14655,9 @@ def make_step_tool() -> Any:
             keeps = (
                 tests_only
                 and missing_data
-                and await _passes_only_by_uncommitted(check, [[*scope, *missing_data]], root)
+                and await _passes_only_by_uncommitted(
+                    check, [[*scope, *missing_data]], root, _split_carried(task, root)
+                )
             )
             fresh_check = (
                 "a done_when that runs a new test file, e.g. `python3 -m pytest -q "

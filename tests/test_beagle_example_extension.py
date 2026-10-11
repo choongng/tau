@@ -15003,6 +15003,90 @@ async def test_plan_split_moves_parent_pending_locks_to_first_part(
     assert "moved to its first part, T0008" in plan.text
 
 
+async def _split_with_pending_locks(
+    tmp_path: Path,
+    fake_beagle: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    locks: list[str],
+    parts: list[str],
+) -> tuple[dict[str, list[str]], str]:
+    """T0002, holding `locks`, split into T0007.. from `parts`: the pending locks after,
+    and the plan's text."""
+    project = _pursuit_project(tmp_path)
+    monkeypatch.chdir(project)
+    pending = project / ".beagle" / "locks-pending.json"
+    pending.write_text(json.dumps({"T0002": locks}))
+    nodes = [
+        {"id": "T0001", "title": "Ship it", "status": "pending", "container": True},
+        {"id": "T0002", "parent": "T0001", "title": "Known answers", "status": "open"},
+    ]
+    (fake_beagle / "tree.out").write_text(json.dumps({"goal": "Ship it", "nodes": nodes}))
+    nodes += [
+        {"id": f"T{7 + at:04d}", "parent": "T0002", "title": title, "status": "pending"}
+        for at, title in enumerate(part.partition("::")[0] for part in parts)
+    ]
+    (fake_beagle / "tree-split.out").write_text(json.dumps({"goal": "Ship it", "nodes": nodes}))
+    split_tree = (
+        'if sys.argv[2:3] == ["split"]:\n'
+        '    (here / "tree.out").write_text((here / "tree-split.out").read_text())\n'
+    )
+    script = FAKE_BEAGLE.replace("reply = here", split_tree + "reply = here", 1)
+    (fake_beagle / "beagle").write_text(f"#!{sys.executable}\n{script}", encoding="utf-8")
+    runtime, _ = _bound(tmp_path)
+
+    plan = await _tool(runtime, "pursuit_plan").execute("c1", {"task": "T0002", "parts": parts})
+
+    assert _pursuit_calls(fake_beagle, "split"), plan.text
+    return json.loads(pending.read_text()), plan.text
+
+
+@pytest.mark.anyio
+async def test_split_hands_each_lock_to_the_part_that_names_it(
+    tmp_path: Path, beagle: Path, fake_beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # q38fn 10-11: all three of T0002's locks went to T0007, whose green closes were
+    # then held open for tests/test_cases.py, which was T0009's to write.
+    pending, text = await _split_with_pending_locks(
+        tmp_path,
+        fake_beagle,
+        monkeypatch,
+        ["tests/cases.json", "tests/test_cases.py"],
+        [
+            "Seed the cases::write tests/cases.json from ferd",
+            "Extend from the paper::add the paper's cases to cases.json",
+            "Runner test::write test_cases.py, which runs the cases against itc",
+        ],
+    )
+
+    assert pending == {"T0007": ["tests/cases.json"], "T0009": ["tests/test_cases.py"]}
+    assert (
+        "T0002's pending locks moved to the part that names each: tests/cases.json to "
+        "T0007, tests/test_cases.py to T0009." in text
+    ), text
+
+
+@pytest.mark.anyio
+async def test_split_lock_with_no_naming_part_goes_to_the_first(
+    tmp_path: Path, beagle: Path, fake_beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    pending, text = await _split_with_pending_locks(
+        tmp_path,
+        fake_beagle,
+        monkeypatch,
+        ["tests/cases.json", "tests/test_cases.py", "tests/test_case_data.py"],
+        ["Data::the known answers", "Runner::write tests/test_cases.py"],
+    )
+
+    assert pending == {
+        "T0007": ["tests/cases.json", "tests/test_case_data.py"],
+        "T0008": ["tests/test_cases.py"],
+    }
+    assert (
+        "tests/test_cases.py to T0008; tests/cases.json, tests/test_case_data.py to its "
+        "first part, T0007, as no part names them." in text
+    ), text
+
+
 @pytest.mark.anyio
 async def test_plan_drops_rerun_only_line_in_a_multi_part_plan(
     tmp_path: Path, beagle: Path, fake_beagle: Path, monkeypatch: pytest.MonkeyPatch
@@ -18285,6 +18369,68 @@ def test_split_commit_puts_back_before_committing(tmp_path: Path, beagle: Path) 
 
     assert said == f"{R28_PUT_BACK}tests/test_cases.py."
     assert (project / "tests" / "test_cases.py").read_bytes() == R14_LOCKED_TEST
+
+
+@pytest.mark.anyio
+async def test_part_after_split_commit_proves_against_the_parents_opened_commit(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # q35 10-11: T0002's passing work was committed as 5f53adf before its split; the
+    # parts' checks then "already passed", and prove had nothing new to take away.
+    project = _git_project(tmp_path, monkeypatch)
+    monkeypatch.chdir(project)
+    (project / "README").write_text("itc\n")
+    _git(project, "add", "README")
+    _git(project, "commit", "-q", "-m", "T0001: found")
+    parent_opened = _git(project, "rev-parse", "HEAD").strip()
+    (project / "tests").mkdir()
+    (project / "tests" / "cases.json").write_text('[{"in": 1, "out": 2}]\n')
+    (project / "tests" / "test_case_data.py").write_text(CASES_DATA_TEST)
+    _git(project, "add", "tests")
+    _git(project, "commit", "-q", "-m", "T0002: work in progress before split")
+    check = "grep -q out tests/cases.json"
+    nodes = [
+        {"id": "T0001", "title": "Ship it", "status": "pending", "container": True},
+        {"id": "T0002", "parent": "T0001", "title": "Known answers", "container": True},
+        {"id": "T0007", "parent": "T0002", "title": "Validate the cases", "status": "pending"},
+        {"id": "T0008", "parent": "T0002", "title": "Runner", "status": "pending"},
+    ]
+    (fake_beagle / "tree.out").write_text(json.dumps({"goal": "Ship it", "nodes": nodes}))
+    ready = {"open": [], "ready": [{"id": "T0007", "title": "Validate the cases"}]}
+    (fake_beagle / "next.out").write_text(json.dumps({**ready, "ready_total": 1}))
+    part = {"id": "T0007", "title": "Validate the cases", "status": "pending", "done_when": check}
+    (fake_beagle / "show-T0007.out").write_text(json.dumps(part))
+    parent = {"id": "T0002", "title": "Known answers", "opened_commit": parent_opened}
+    (fake_beagle / "show-T0002.out").write_text(json.dumps(parent))
+    (fake_beagle / "brief.out").write_text("# T0007: Validate the cases\n")
+    (fake_beagle / "prove.out").write_text("T0007: PROVEN — refuses with tests/cases.json gone\n")
+    monkeypatch.setenv("FAKE_TAU_SUCCEEDS_ON", "99")
+    runtime, _ = _bound(tmp_path)
+
+    result = await _tool(runtime, "pursuit_step").execute(
+        "c1",
+        {"task": "T0007", "criteria": "the cases hold", "done_when": check, "scope": CASES_SCOPE},
+    )
+
+    assert "not opened" not in result.text, result.text
+    assert "'T0002: work in progress before split' committed for its parts" in result.text
+    assert len(_pursuit_calls(fake_beagle, "open")) == 1
+    [prove] = _pursuit_calls(fake_beagle, "prove")
+    assert prove[:3] == ["T0007", "--absent", "tests/cases.json"], prove
+    assert "closed done" in result.text, result.text
+
+    # beagle counts from the part's own open, so the split's work predates it.
+    (fake_beagle / "prove.out").write_text("tests/cases.json predates; say --predates-because\n")
+    (fake_beagle / "prove.rc").write_text("2")
+    await _module()._prove("T0007", "done, no witness", CASES_SCOPE, project, 60)
+
+    retry = _pursuit_calls(fake_beagle, "prove")[-1]
+    because = retry[retry.index("--predates-because") + 1]
+    assert because.startswith("T0002's split committed this work"), retry
 
 
 def _lock_done_by_cases(project: Path) -> Path:
