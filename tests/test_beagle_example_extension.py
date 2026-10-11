@@ -12352,6 +12352,98 @@ async def test_prove_skips_witness_in_test_file(
     assert _pursuit_calls(fake_beagle, "prove") == []
 
 
+def _known_answers_check_project(
+    tmp_path: Path, fake_beagle: Path, monkeypatch: pytest.MonkeyPatch, check: str
+) -> Path:
+    """q38fn 10-11 T0011: tests/cases.json committed, the task open on `check`."""
+    project = _git_project(tmp_path, monkeypatch)
+    (project / "tests").mkdir()
+    (project / "tests" / "cases.json").write_text('[{"events": 2, "expected": 3}]\n')
+    _git(project, "add", "tests/cases.json")
+    _git(project, "commit", "-q", "-m", "T0002: the cases")
+    opened = _git(project, "rev-parse", "HEAD").strip()
+    record = {"id": "T0011", "status": "open", "opened_commit": opened, "done_when": check}
+    (fake_beagle / "show.out").write_text(json.dumps(record))
+    return project
+
+
+DATA_WITNESS_REPORT = (
+    'fixed the cases\n\nWITNESS: tests/cases.json\nNEEDLE:\n"expected": 3\n'
+    'REPLACEMENT:\n"expected": 4\nEND WITNESS'
+)
+
+
+@pytest.mark.anyio
+async def test_data_only_task_witness_in_cases_data_is_accepted(
+    tmp_path: Path, fake_beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # q38fn 10-11 T0011: the witness in tests/cases.json, which the check reads,
+    # was refused as "in a test file", and the scope held no code to name.
+    check = "python3 -m pytest -q tests/test_case_data.py"
+    project = _known_answers_check_project(tmp_path, fake_beagle, monkeypatch, check)
+    (project / "tests" / "test_case_data.py").write_text(
+        "import json\nfrom pathlib import Path\n\n\ndef test_cases():\n"
+        '    cases = json.loads(Path(__file__).with_name("cases.json").read_text())\n'
+        '    assert all(case["expected"] == case["events"] + 1 for case in cases)\n'
+    )
+    scope = ["tests/cases.json", "tests/test_case_data.py"]
+
+    proof = await _module()._prove("T0011", DATA_WITNESS_REPORT, scope, project, 60)
+
+    assert proof is not None and "in a test file" not in proof.text, proof.text
+    prove = _pursuit_calls(fake_beagle, "prove")
+    assert prove and prove[0][:3] == ["T0011", "--mutate", "tests/cases.json"], prove
+
+    # Data the check does not read is no site of it.
+    (project / "tests" / "test_case_data.py").write_text("def test_cases():\n    assert 1\n")
+    (fake_beagle / "calls.jsonl").unlink()
+    proof = await _module()._prove("T0011", DATA_WITNESS_REPORT, scope, project, 60)
+
+    assert proof is not None and "tests/cases.json: the WITNESS is in a test file" in proof.text
+    assert _pursuit_calls(fake_beagle, "prove") == []
+
+
+@pytest.mark.anyio
+async def test_absence_fallback_never_takes_away_a_file_the_check_names(
+    tmp_path: Path, fake_beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # q38fn 10-11 T0011: the fallback took tests/check_known_answers.py, the check's
+    # own script, away with notes/paper_windows.md; the check failed only on the
+    # missing script, and beagle took the mixed sites as a witness.
+    check = "python3 tests/check_known_answers.py"
+    project = _known_answers_check_project(tmp_path, fake_beagle, monkeypatch, check)
+    (project / "tests" / "check_known_answers.py").write_text("import json\n")
+    (project / "notes").mkdir()
+    (project / "notes" / "paper_windows.md").write_text("windows\n")
+
+    await _module()._prove("T0011", "done, no witness", ["tests/", "notes/"], project, 60)
+
+    prove = _pursuit_calls(fake_beagle, "prove")
+    assert len(prove) == 1 and prove[0][:3] == ["T0011", "--absent", "notes/paper_windows.md"]
+    assert "tests/check_known_answers.py" not in prove[0]
+
+
+@pytest.mark.anyio
+async def test_witness_resting_on_the_checks_own_script_is_refused(
+    tmp_path: Path, fake_beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # q38fn 10-11 T0011: a check made to fail by changing its own script fails
+    # whatever the work is.
+    check = "python3 tests/check_known_answers.py"
+    project = _known_answers_check_project(tmp_path, fake_beagle, monkeypatch, check)
+    (project / "tests" / "check_known_answers.py").write_text("import json\nOK = 0\n")
+    report = (
+        "done\n\nWITNESS: tests/check_known_answers.py\nNEEDLE:\nOK = 0\n"
+        "REPLACEMENT:\nOK = 1\nEND WITNESS"
+    )
+
+    proof = await _module()._prove("T0011", report, ["tests/"], project, 60)
+
+    assert proof is not None and not proof.proven
+    assert "tests/check_known_answers.py: the WITNESS is in the check's own script" in proof.text
+    assert _pursuit_calls(fake_beagle, "prove") == []
+
+
 @pytest.mark.anyio
 async def test_abandon_problem_refuses_root(
     tmp_path: Path, beagle: Path, fake_beagle: Path, monkeypatch: pytest.MonkeyPatch
