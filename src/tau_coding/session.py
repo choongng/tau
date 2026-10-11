@@ -439,13 +439,11 @@ class _RequestGuard:
 
     Each request's reasoning is watched, and one that plainly loops is stopped
     and ends as an output-limit cut-off, so the session nudges as it would at
-    the cap. A request that answers an output-limit nudge goes to a
-    thinking-off twin of the provider where the session can build one.
+    the cap.
     """
 
-    def __init__(self, inner: ModelProvider, session: CodingSession) -> None:
+    def __init__(self, inner: ModelProvider) -> None:
         self.inner = inner
-        self._session = session
 
     def __getattr__(self, name: str) -> object:
         return getattr(self.inner, name)
@@ -460,9 +458,8 @@ class _RequestGuard:
         signal: CancellationToken | None = None,
         session_id: str | None = None,
     ) -> AsyncIterator[AssistantMessageEvent]:
-        provider = self._session._request_provider(self.inner)
         return _cut_looping_reasoning(
-            provider.stream_response(
+            self.inner.stream_response(
                 model=model,
                 system=system,
                 messages=messages,
@@ -804,17 +801,8 @@ class CodingSession:
         self._run_text_tool_call_follow_ups = 0
         #: Whether the next turn to end is the reply to an output-limit nudge.
         self._awaiting_nudge_reply = False
-        #: Whether the next loop request is a nudge's, sent with thinking off.
-        self._next_request_thinking_off = False
         #: The latest output-limit nudge queued, until the loop sends it.
         self._queued_nudge: UserMessage | None = None
-        #: Whether the queued nudge's request goes thinking-off: not after a loop cut.
-        self._queued_nudge_thinking_off = False
-        #: The thinking-off twin of a provider, built for nudged requests, or
-        #: None beside the provider when building it failed.
-        self._thinking_off_twin: tuple[ModelProvider, ModelProvider | None] | None = None
-        #: Whether the session has warned that it cannot build that twin.
-        self._thinking_off_twin_warned = False
         #: The latest tool calls that ran, each with a digest of its result.
         self._recent_calls: deque[tuple[str, int]] = deque(maxlen=REPEATED_CALL_WINDOW)
         #: The first line of the latest result of each call in `_recent_calls`.
@@ -2157,7 +2145,7 @@ class CodingSession:
             self._unguard_requests()
             self._length_continuations = self._run_length_continuations = 0
             self._text_tool_call_follow_ups = self._run_text_tool_call_follow_ups = 0
-            self._awaiting_nudge_reply = self._next_request_thinking_off = False
+            self._awaiting_nudge_reply = False
             if not self._nudge_queued():
                 self._queued_nudge = None
             self._recent_calls.clear()
@@ -2170,11 +2158,9 @@ class CodingSession:
             and self._queued_nudge is not None
             and event.message is self._queued_nudge
         ):
-            # The loop sends the nudge now: the request it makes next is the
-            # nudge's, and so is the turn that ends next.
+            # The loop sends the nudge now: the turn that ends next is its reply.
             self._queued_nudge = None
             self._awaiting_nudge_reply = True
-            self._next_request_thinking_off = self._queued_nudge_thinking_off
         if isinstance(event, TurnEndEvent):
             self._continue_after_output_limit(event)
             self._continue_after_text_tool_call(event)
@@ -2189,17 +2175,14 @@ class CodingSession:
         with no reply and no tool call; the loop would end the run there, and
         an unattended run would sit idle. The nudge goes in as a follow-up, so
         the loop sends one more request (the truncated reasoning is left out
-        of it), and the between-turn compaction still applies. After a turn
-        that reached the real output limit, that request goes with thinking
-        off via the twin: the reasoning it would redo is what ran out. On a
-        template that switches thinking in the prompt prefix, not only in the
-        generation prompt, that costs a full re-prefill for the nudge and
-        another for the request after it. R42 (dev-notes/itc-runs/R42.md,
-        class 4, gemma): each twin request and each return from one
-        reprocessed the whole prompt, 32,877-42,815 input tokens, 661 s over
-        20 turns. A turn tau cut for looping in its reasoning (its
-        `reasoning_loop_cut` diagnostic) is nudged at the session's own
-        thinking level instead, so the prefix stays as it was on any template.
+        of it), and the between-turn compaction still applies. The request
+        keeps the session's thinking level: a thinking switch mid-session
+        changes the prompt from its first turn on a template that renders it
+        there, and costs a full re-prefill for the nudge and another for the
+        request after it. R42 (dev-notes/itc-runs/R42.md, class 4, gemma): a
+        thinking-off twin for nudged requests reprocessed 32,877-42,815 input
+        tokens per switch, 661 s over 20 turns, and its replies acted no
+        better than R36's thinking-on ones.
         Bounded in a row, so a model that never acts does stop, and per run
         over the nudges whose reply made no tool call, so a model that keeps
         thinking itself out of room, acting just enough in between, stops too.
@@ -2207,8 +2190,8 @@ class CodingSession:
         The nudge's reply is the turn after the loop sends it, not the next to
         end: a steering message queued beside the nudge goes first. R38
         (dev-notes/itc-runs/R38.md, class 3): tau-subagents steered in its
-        report request beside a nudge, its reply took the nudge's thinking-off
-        request, and each cut-off after queued a nudge behind one still
+        report request beside a nudge, its reply took the nudge's request,
+        and each cut-off after queued a nudge behind one still
         waiting, so four ran in a row. A cut-off while a nudge is still queued
         queues no other, and a refused nudge leaves the count in a row as it
         is, so a cut-off after one that is not a nudge's reply is refused too.
@@ -2232,9 +2215,6 @@ class CodingSession:
         self._length_continuations += 1
         nudge = UserMessage(content=OUTPUT_LIMIT_NUDGE)
         self._queued_nudge = nudge
-        self._queued_nudge_thinking_off = not any(
-            diagnostic.type == "reasoning_loop_cut" for diagnostic in message.diagnostics or []
-        )
         self._record_message_origin(nudge, delivery="follow_up", source="extension")
         self._harness.follow_up_message(nudge)
 
@@ -2284,70 +2264,12 @@ class CodingSession:
         provider = self._harness.config.provider
         if isinstance(provider, _RequestGuard):
             provider = provider.inner
-        self._harness.config.provider = _RequestGuard(provider, self)
+        self._harness.config.provider = _RequestGuard(provider)
 
     def _unguard_requests(self) -> None:
         provider = self._harness.config.provider
         if isinstance(provider, _RequestGuard):
             self._harness.config.provider = provider.inner
-
-    def _request_provider(self, provider: ModelProvider) -> ModelProvider:
-        """The provider one loop request goes to: thinking off for an output-limit nudge's."""
-        if not self._next_request_thinking_off:
-            return provider
-        self._next_request_thinking_off = False
-        return self._thinking_off_provider(provider) or provider
-
-    def _thinking_off_provider(self, provider: ModelProvider) -> ModelProvider | None:
-        """A twin of the session's provider with thinking off, if it has one.
-
-        Built as a thinking change would build it, but only used for one
-        request: the session's thinking level stays as it is.
-
-        A twin that cannot be built is not tried again for the same provider,
-        and the session warns once, naming the cause. In R38
-        (dev-notes/itc-runs/R38.md, class 3) a tau-subagents child session had
-        no runtime provider config, the build failed on every nudge, and each
-        nudged request went out with thinking on with nothing to say so.
-        """
-        if self._thinking_level == "off" or "off" not in self.available_thinking_levels:
-            return None
-        twin = self._thinking_off_twin
-        if twin is not None and twin[0] is provider:
-            return twin[1]
-        try:
-            off, _ = self._build_runtime_provider(
-                inference_provider=self._inference_provider, thinking_level="off"
-            )
-        except ProviderConfigError as exc:
-            self._thinking_off_twin = (provider, None)
-            self._warn_no_thinking_off_twin(exc)
-            return None
-        self._owned_providers.append(off)
-        self._thinking_off_twin = (provider, off)
-        return off
-
-    def _warn_no_thinking_off_twin(self, exc: ProviderConfigError) -> None:
-        """Say, once per session, that output-limit nudges keep thinking on."""
-        if self._thinking_off_twin_warned:
-            return
-        self._thinking_off_twin_warned = True
-        cause = (
-            "the session has no runtime provider config"
-            if self._runtime_provider_config is None
-            else str(exc)
-        )
-        message = (
-            f"Output-limit nudges keep thinking on for {self.provider_name}:{self.model}: "
-            f"tau cannot build its thinking-off provider ({cause})"
-        )
-        self._extension_runtime.ui.notify(message, "warning")
-        with suppress(OSError):
-            self._diagnostic_logger.log_warning(
-                context=self._diagnostic_context(),
-                phase="output_limit_nudge",
-                message=message,
-            )
 
     def _run_continues_after(self, event: TurnEndEvent) -> bool:
         """Whether the loop will send another request in this run."""

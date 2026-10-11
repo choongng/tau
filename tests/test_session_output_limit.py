@@ -5,7 +5,6 @@ from pathlib import Path
 
 import pytest
 
-from conftest import isolate_home
 from pi_event_helpers import assistant_done, assistant_start
 from tau_agent import (
     AgentMessage,
@@ -25,10 +24,7 @@ from tau_ai.events import AssistantMessageEvent
 from tau_coding import (
     CodingSession,
     CodingSessionConfig,
-    OpenAICompatibleProviderConfig,
-    ProviderSettings,
 )
-from tau_coding import session as coding_session_module
 from tau_coding.session import OUTPUT_LIMIT_NUDGE
 
 # R36 driver session, turn E76 (dev-notes/itc-runs/R36.md, class 1): gemma's
@@ -254,57 +250,6 @@ async def test_reasoning_without_repetition_is_not_cut(tmp_path: Path, reasoning
     assert not message.diagnostics
     assert not _nudges(session)
     assert len(provider.calls) == 2
-
-
-@pytest.mark.anyio
-async def test_output_limit_nudge_request_sends_thinking_off(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    isolate_home(monkeypatch, tmp_path)
-    provider_config = OpenAICompatibleProviderConfig(
-        name="local",
-        models=("fake",),
-        default_model="fake",
-        thinking_levels=("off", "low", "medium"),
-        thinking_models=("fake",),
-        thinking_default="medium",
-        thinking_parameter="reasoning_effort",
-    )
-    main = FakeProvider([_truncated(), _answers("Second run.")])
-    off = FakeProvider([_answers("Acted on the nudge.")])
-    built: list[object] = []
-
-    def create(*args: object, thinking_level: object, **kwargs: object) -> FakeProvider:
-        built.append(thinking_level)
-        return off if thinking_level == "off" else main
-
-    monkeypatch.setattr(coding_session_module, "_create_runtime_provider", create)
-    session = await _session(
-        tmp_path,
-        main,
-        provider_name="local",
-        provider_settings=ProviderSettings(providers=(provider_config,)),
-        runtime_provider_config=provider_config,
-    )
-    assert session.thinking_level == "medium"
-    assert "off" not in built
-
-    await _run(session)
-
-    # The nudge's request went to a thinking-off provider, built for it alone.
-    assert built.count("off") == 1
-    assert [call[2][-1].text for call in off.calls] == [OUTPUT_LIMIT_NUDGE]
-    assert session.messages[-1].text == "Acted on the nudge."
-    # The session's thinking level is unchanged, and the next run's request
-    # goes to its own provider again.
-    assert session.thinking_level == "medium"
-    assert session.provider is main
-
-    await _run(session, "And now?")
-
-    assert len(main.calls) == 2
-    assert len(off.calls) == 1
-    assert session.messages[-1].text == "Second run."
 
 
 @pytest.mark.anyio
