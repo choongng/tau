@@ -37,16 +37,16 @@ Generated, verbatim:
 | rank | id | class | count | runs | models | live | disposition | title |
 |---:|---|---|---:|---|---|---|---|---|
 | 1 | `unrecovered:c23264dad9` | unrecovered | 199 | 24: B01…R42 | gemma/mimo/qwen | yes | deferred | 199 of 238 driver rows unrecovered: «Not run: this `Q` call ran N times in the last N calls with the same res… |
-| 2 | `driver_work:edit` | driver_work | 180 | 22: R01…R44 | mimo/qwen | yes | task T0404 | the driver wrote or edited files itself ({'write': 28, 'redirect': 94, 'edit': 22, 'in_place': 21, 'open_w': … |
+| 2 | `driver_work:edit` | driver_work | 180 | 22: R01…R44 | mimo/qwen | no | fixed 62c11bb1 | the driver wrote or edited files itself ({'write': 28, 'redirect': 94, 'edit': 22, 'in_place': 21, 'open_w': … |
 | 3 | `repeated:c23264dad9` | repeated | 42 | 21: R09…R42 | gemma/mimo/qwen | yes | deferred | repeated ×286 rows: «Not run: this `Q` call ran N times in the last N calls with the same result each time, a… |
 | 4 | `stop:breaker/driver` | stop | 20 | 20: R03…R33 | mimo/qwen | yes | not_a_bug | driver stopped by breaker (0 went on after it; reasons {'error': 12, 'aborted': 8}) |
 | 5 | `unrecovered:59291e85e9` | unrecovered | 20 | 20: R03…R33 | mimo/qwen | yes | not_a_bug | 20 of 20 driver rows unrecovered: «Not run, and the run is stopped: N tool calls in a row were refused.» |
 | 6 | `driver_work:test` | driver_work | 62 | 18: R04…R44 | gemma/mimo/qwen | yes | deferred | the driver ran the tests itself ({'test': 62}) |
 | 7 | `stop:length/worker` | stop | 47 | 18: R01…R44 | gemma/mimo/qwen | yes | not_a_bug | worker stopped by length (36 went on after it; reasons {'length': 47}) |
 | 8 | `worker_outcome:no_report/raw_call` | worker_outcome | 34 | 15: R02…R44 | mimo/qwen | no | fixed faf061f5 | worker ended no_report (raw_call): last stop L67: stopReason=stop, 204 chars, 0 call(s) |
-| 9 | `repeated:fba65173cb` | repeated | 22 | 13: R21…R44 | mimo/qwen | yes | task T0403 | repeated ×101 rows: «Tool call blocked: refusing to write P: it is outside T#'s scope (P).» |
+| 9 | `repeated:fba65173cb` | repeated | 22 | 13: R21…R44 | mimo/qwen | no | fixed 2d1bd0cf | repeated ×101 rows: «Tool call blocked: refusing to write P: it is outside T#'s scope (P).» |
 | 10 | `worker_outcome:capped/tool_result` | worker_outcome | 10 | 10: R04…R44 | gemma/mimo/qwen | yes | not_a_bug | worker ended capped (tool_result): last stop L32: stopReason=toolUse, 0 chars, 1 call(s) |
-| 11 | `repeated:30cf569817` | repeated | 30 | 9: R04…R20 | mimo/qwen | yes | task T0403 | repeated ×165 rows: «Tool call blocked: refusing to write P: it is outside T#'s scope (P); name it in your re… |
+| 11 | `repeated:30cf569817` | repeated | 30 | 9: R04…R20 | mimo/qwen | no | fixed 2d1bd0cf | repeated ×165 rows: «Tool call blocked: refusing to write P: it is outside T#'s scope (P); name it in your re… |
 | 12 | `stop:length/driver` | stop | 44 | 8: B01…R42 | gemma/mimo/qwen | yes | not_a_bug | driver stopped by length (43 went on after it; reasons {'length': 44}) |
 | 13 | `stop:breaker/worker` | stop | 14 | 7: R09…R42 | gemma/mimo | yes | not_a_bug | worker stopped by breaker (0 went on after it; reasons {'error': 3, 'aborted': 11}) |
 | 14 | `repeated:a9d4253fcf` | repeated | 12 | 7: R16…R44 | mimo/qwen | yes | deferred | repeated ×78 rows: «Tool call blocked: refusing to run `Q`: the brief already holds what the task needs; do t… |
@@ -57,17 +57,17 @@ Generated, verbatim:
 | 19 | `unrecovered:349b62dd47` | unrecovered | 11 | 4: R06, R09, R18, R40 | mimo/qwen | yes | task T0402 | 11 of 31 driver rows unrecovered: «pursuit_step: T# not opened — `Q` already passes, before any work, so it c… |
 | 20 | `repeated:9290e1e36a` | repeated | 8 | 4: R06, R08, R09, R15 | mimo/qwen | yes | deferred | repeated ×33 rows: «Tool call blocked: refusing to run `Q`: the brief has everything; do the task.» |
 | 21 | `worker_outcome:timeout/tool_result` | worker_outcome | 6 | 4: R01, R15, R21, R39 | gemma/mimo | yes | not_a_bug | worker ended timeout (tool_result): last stop L96: stopReason=toolUse, 0 chars, 1 call(s) |
-| 22 | `alternating:c23264dad9~fba65173cb` | alternating | 4 | 4: R21, R23, R24, R25 | mimo/qwen | yes | task T0403 | alternating ×24 rows: «Not run: this `Q` call ran N times in the last N calls with the same result each time,… |
+| 22 | `alternating:c23264dad9~fba65173cb` | alternating | 4 | 4: R21, R23, R24, R25 | mimo/qwen | no | fixed 2d1bd0cf | alternating ×24 rows: «Not run: this `Q` call ran N times in the last N calls with the same result each time,… |
 | 23 | `unrecovered:7c5c3a3012` | unrecovered | 12 | 3: R06, R12, R15 | mimo/qwen | yes | not_a_bug | 12 of 17 driver rows unrecovered: «pursuit_step: T# not run: N steps on it have left it not done, and another… |
 | 24 | `repeated:8f66e037e3` | repeated | 5 | 3: R35, R40, R44 | mimo/qwen | yes | deferred | repeated ×30 rows: «Tool call blocked: refusing to run this command: N of N calls used and nothing written, a… |
-| 25 | `alternating:30cf569817~c23264dad9` | alternating | 4 | 3: R09, R12, R15 | mimo/qwen | yes | task T0403 | alternating ×39 rows: «Tool call blocked: refusing to write P: it is outside T#'s scope (P); name it in your … |
+| 25 | `alternating:30cf569817~c23264dad9` | alternating | 4 | 3: R09, R12, R15 | mimo/qwen | no | fixed 2d1bd0cf | alternating ×39 rows: «Tool call blocked: refusing to write P: it is outside T#'s scope (P); name it in your … |
 | 26 | `offered_then_refused:9513435cfa>16decd7096` | offered_then_refused | 8 | 3: R06, R22, R28 | qwen | yes | task T0402 | offered by «Tool call blocked: refusing `Q` from bash: use pursuit_step, which closes a task on its check; to… |
 | 27 | `offered_then_refused:9513435cfa>6d1383189f` | offered_then_refused | 3 | 3: R08, R22, R26 | qwen | yes | task T0402 | offered by «Tool call blocked: refusing `Q` from bash: use pursuit_step, which closes a task on its check; to… |
 | 28 | `unrecovered:00c2703ea8` | unrecovered | 21 | 2: R21, R28 | mimo/qwen | no | fixed 438d88ed | 21 of 27 driver rows unrecovered: «T# is not a task to work now: it is a container of T#, …, done when its pa… |
 | 29 | `time_sink:worker/bash` | time_sink | 8 | 2: R34, R39 | gemma/qwen | no | fixed 86445034 | worker bash calls of 60s+ with no worker inside: [600, 120, 120, 120, 120, 120, 120, 120] s (8 timed out) |
 | 30 | `alternating:06a23045d9~9290e1e36a` | alternating | 3 | 2: R06, R15 | mimo/qwen | yes | deferred | alternating ×20 rows: «Tool call blocked: refusing to read P: the brief has everything; do the task.» / «Tool… |
 | 31 | `unrecovered:7fdeddcb23` | unrecovered | 10 | 2: R03, R07 | mimo | yes | deferred | 10 of 10 driver rows unrecovered: «pursuit_found: nothing written — 'Q' is not part of the goal's work: pursu… |
-| 32 | `alternating:30cf569817~a9d4253fcf` | alternating | 3 | 2: R16, R20 | qwen | yes | task T0403 | alternating ×17 rows: «Tool call blocked: refusing to write P: it is outside T#'s scope (P); name it in your … |
+| 32 | `alternating:30cf569817~a9d4253fcf` | alternating | 3 | 2: R16, R20 | qwen | no | fixed 2d1bd0cf | alternating ×17 rows: «Tool call blocked: refusing to write P: it is outside T#'s scope (P); name it in your … |
 | 33 | `time_sink:driver/pursuit_step` | time_sink | 3 | 2: R22, R30 | qwen | no | fixed 4f1aad55 | driver pursuit_step calls of 60s+ with no worker inside: [557, 278, 132] s (0 timed out) |
 | 34 | `worker_outcome:breaker/error` | worker_outcome | 3 | 2: R09, R17 | mimo | no | fixed cc8dfd5d | worker ended breaker (error): last stop L58: stopReason=error, 0 chars, 0 call(s), error 'Provider stream end… |
 | 35 | `offered_then_refused:fa3aafba9a>7913202752` | offered_then_refused | 2 | 2: R12, R20 | qwen | yes | not_a_bug | offered by «Tool call blocked: refusing to read P from the driving session: it is in the scope of T# (P), whi… |
@@ -102,7 +102,7 @@ Generated, verbatim:
 
 ### What the ranking says
 
-1. **Offers the next refusal turns down (T0402).** Here an offer and the refuser of the call it offers disagree about the state. Today's code still does it in three places:
+1. **Offers the next refusal turns down (T0402, split into T0405-T0409 by offer site).** Here an offer and the refuser of the call it offers disagree about the state. Today's code still does it in three places:
    - The bash `close` steer (`_STEERED_VERBS`, beagle.py:15511) offers `abandon=` to any task. `_abandon_problem` (beagle.py:3430, 3449) refuses that for a milestone or a non-duplicate.
    - `_already_passes` (beagle.py:10921) offers `abandon="done by X"` whenever it has an X. `_done_by` and `_done_by_unwitnessed` then refuse it (R28, and R42 L53 once).
    - Smaller cases: the open rank gate (R28), beagle's spawn attempt limit (R26), and held()'s "run the locked test" offer, which `_already_passes` then refuses (R43).
@@ -113,10 +113,10 @@ Generated, verbatim:
    - All 34 breaker stops follow 8+ refusals. That is the designed end, so `not_a_bug`.
    - 15 of them (R03-R18) surfaced as provider stream errors. That surfacing was fixed by cc8dfd5d.
    - No driver breaker stop happened after R33.
-3. **Driver bash writes (T0404).** These were replayed on 2026-10-10. Each driver bash call shaped like a write in the pursuit runs, 132 in all, was put through today's `_driver_bash_change` and `_bash_writes_dot_beagle` with its full command from the session file. 76 are refused today, and most of the rest write /tmp, which is allowed, or only read. Two gaps are still live:
+3. **Driver bash writes (T0404, fixed by 62c11bb1).** These were replayed on 2026-10-10. Each driver bash call shaped like a write in the pursuit runs, 132 in all, was put through today's `_driver_bash_change` and `_bash_writes_dot_beagle` with its full command from the session file. 76 are refused today, and most of the rest write /tmp, which is allowed, or only read. Two gaps are still live:
    - `_bash_write_targets` finds no target in a `bash -c '…'` script that holds a heredoc. Examples: R28 L142, and R22 L158-L194 behind a `BEAGLE_TAU_DRIVER_EDITS=1` prefix. `bash -c 'echo x > f'` is caught.
    - `_bash_writes_dot_beagle` misses `touch` and `ln -sf /dev/null` into `.beagle/locked/` (R22 L190, L210; R28 L842). This was the driver trying to get around the locked known answers.
-4. **Worker out-of-scope writes (T0403).** This is 52 stretches in 22 runs. The refusal (beagle.py:1208) never says what the worker can write instead.
+4. **Worker out-of-scope writes (T0403, fixed by 2d1bd0cf).** This is 52 stretches in 22 runs. The first refusal already named the scope and said to report the path. What kept happening was the repeat: 210 of 400 worker scope refusals were for a path already refused in the same session, in 64 of 135 sessions. A second or later refusal of a path now gives the count, and tells the worker to write only under the scope or to end the turn with its report.
 5. **Fixed since the run that showed them, each pinned by a test:**
    - The stop gate refused the stop the step cap offered (d31878cc).
    - Done-by was offered to an open task (3988a77d).
