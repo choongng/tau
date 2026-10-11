@@ -54,15 +54,15 @@ Generated, verbatim:
 | 16 | `worker_outcome:length/length_stop` | worker_outcome | 11 | 5: R13…R44 | gemma/mimo/qwen | yes | deferred | worker ended length (length_stop): last stop L67: stopReason=length, 28921 chars, 0 call(s) |
 | 17 | `worker_outcome:breaker/aborted` | worker_outcome | 11 | 5: R21…R42 | gemma/mimo | yes | not_a_bug | worker ended breaker (aborted): last stop L62: stopReason=aborted, 0 chars, 0 call(s), error 'Not run, and th… |
 | 18 | `worker_outcome:no_report/ended_on_tool_use` | worker_outcome | 8 | 5: R22…R41 | mimo/qwen | yes | deferred | worker ended no_report (ended_on_tool_use): last stop L37: stopReason=toolUse, 30 chars, 1 call(s) |
-| 19 | `unrecovered:349b62dd47` | unrecovered | 11 | 4: R06, R09, R18, R40 | mimo/qwen | yes | task T0402 | 11 of 31 driver rows unrecovered: «pursuit_step: T# not opened — `Q` already passes, before any work, so it c… |
+| 19 | `unrecovered:349b62dd47` | unrecovered | 11 | 4: R06, R09, R18, R40 | mimo/qwen | no | fixed 45b8572c | 11 of 31 driver rows unrecovered: «pursuit_step: T# not opened — `Q` already passes, before any work, so it c… |
 | 20 | `repeated:9290e1e36a` | repeated | 8 | 4: R06, R08, R09, R15 | mimo/qwen | yes | deferred | repeated ×33 rows: «Tool call blocked: refusing to run `Q`: the brief has everything; do the task.» |
 | 21 | `worker_outcome:timeout/tool_result` | worker_outcome | 6 | 4: R01, R15, R21, R39 | gemma/mimo | yes | not_a_bug | worker ended timeout (tool_result): last stop L96: stopReason=toolUse, 0 chars, 1 call(s) |
 | 22 | `alternating:c23264dad9~fba65173cb` | alternating | 4 | 4: R21, R23, R24, R25 | mimo/qwen | no | fixed 2d1bd0cf | alternating ×24 rows: «Not run: this `Q` call ran N times in the last N calls with the same result each time,… |
 | 23 | `unrecovered:7c5c3a3012` | unrecovered | 12 | 3: R06, R12, R15 | mimo/qwen | yes | not_a_bug | 12 of 17 driver rows unrecovered: «pursuit_step: T# not run: N steps on it have left it not done, and another… |
 | 24 | `repeated:8f66e037e3` | repeated | 5 | 3: R35, R40, R44 | mimo/qwen | yes | deferred | repeated ×30 rows: «Tool call blocked: refusing to run this command: N of N calls used and nothing written, a… |
 | 25 | `alternating:30cf569817~c23264dad9` | alternating | 4 | 3: R09, R12, R15 | mimo/qwen | no | fixed 2d1bd0cf | alternating ×39 rows: «Tool call blocked: refusing to write P: it is outside T#'s scope (P); name it in your … |
-| 26 | `offered_then_refused:9513435cfa>16decd7096` | offered_then_refused | 8 | 3: R06, R22, R28 | qwen | yes | task T0402 | offered by «Tool call blocked: refusing `Q` from bash: use pursuit_step, which closes a task on its check; to… |
-| 27 | `offered_then_refused:9513435cfa>6d1383189f` | offered_then_refused | 3 | 3: R08, R22, R26 | qwen | yes | task T0402 | offered by «Tool call blocked: refusing `Q` from bash: use pursuit_step, which closes a task on its check; to… |
+| 26 | `offered_then_refused:9513435cfa>16decd7096` | offered_then_refused | 8 | 3: R06, R22, R28 | qwen | no | fixed 2088f9b7 | offered by «Tool call blocked: refusing `Q` from bash: use pursuit_step, which closes a task on its check; to… |
+| 27 | `offered_then_refused:9513435cfa>6d1383189f` | offered_then_refused | 3 | 3: R08, R22, R26 | qwen | no | fixed 2088f9b7 | offered by «Tool call blocked: refusing `Q` from bash: use pursuit_step, which closes a task on its check; to… |
 | 28 | `unrecovered:00c2703ea8` | unrecovered | 21 | 2: R21, R28 | mimo/qwen | no | fixed 438d88ed | 21 of 27 driver rows unrecovered: «T# is not a task to work now: it is a container of T#, …, done when its pa… |
 | 29 | `time_sink:worker/bash` | time_sink | 8 | 2: R34, R39 | gemma/qwen | no | fixed 86445034 | worker bash calls of 60s+ with no worker inside: [600, 120, 120, 120, 120, 120, 120, 120] s (8 timed out) |
 | 30 | `alternating:06a23045d9~9290e1e36a` | alternating | 3 | 2: R06, R15 | mimo/qwen | yes | deferred | alternating ×20 rows: «Tool call blocked: refusing to read P: the brief has everything; do the task.» / «Tool… |
@@ -78,7 +78,7 @@ Generated, verbatim:
 | 40 | `unrecovered:c04fb59c0d` | unrecovered | 19 | 1: R18 | qwen | yes | deferred | 19 of 21 driver rows unrecovered: «pursuit_step: T# not opened — P fails with ImportError until a later task … |
 | 41 | `offered_then_refused:ef06d83f7a>d9265791df` | offered_then_refused | 17 | 1: R28 | qwen | no | fixed 438d88ed | offered by «pursuit_step: T# not opened — P is locked as the known answers (T#): a worker's change to it is p… |
 | 42 | `offered_then_refused:ef06d83f7a>42b649b070` | offered_then_refused | 16 | 1: R28 | qwen | no | fixed 438d88ed | offered by «pursuit_step: T# not opened — P is locked as the known answers (T#): a worker's change to it is p… |
-| 43 | `unrecovered:d4ccc98bf7` | unrecovered | 13 | 1: R26 | qwen | yes | task T0402 | 13 of 13 driver rows unrecovered: «pursuit_step: `Q` refused: beagle: this intent has already been attempted … |
+| 43 | `unrecovered:d4ccc98bf7` | unrecovered | 13 | 1: R26 | qwen | no | fixed d6c81b3b | 13 of 13 driver rows unrecovered: «pursuit_step: `Q` refused: beagle: this intent has already been attempted … |
 | 44 | `offered_then_refused:42b649b070>00c2703ea8` | offered_then_refused | 10 | 1: R28 | qwen | no | fixed 438d88ed | offered by «pursuit_plan: nothing added — part 'Q' has the title of T# (pending), which is still to be done.»… |
 | 45 | `unrecovered:ef06d83f7a` | unrecovered | 10 | 1: R28 | qwen | no | fixed db37e782 | 10 of 66 driver rows unrecovered: «pursuit_step: T# not opened — P is locked as the known answers (T#): a wor… |
 | 46 | `repeated:42b649b070` | repeated | 6 | 1: R28 | qwen | no | fixed 438d88ed | repeated ×23 rows: «pursuit_plan: nothing added — part 'Q' has the title of T# (pending), which is still to b… |
@@ -86,34 +86,35 @@ Generated, verbatim:
 | 48 | `repeated:ef06d83f7a` | repeated | 5 | 1: R28 | qwen | no | fixed db37e782 | repeated ×25 rows: «pursuit_step: T# not opened — P is locked as the known answers (T#): a worker's change to… |
 | 49 | `alternating:42b649b070~c23264dad9` | alternating | 3 | 1: R28 | qwen | no | fixed 438d88ed | alternating ×13 rows: «pursuit_plan: nothing added — part 'Q' has the title of T# (pending), which is still t… |
 | 50 | `offered_then_refused:0370db2c56>ef06d83f7a` | offered_then_refused | 3 | 1: R28 | qwen | no | fixed db37e782 | offered by «pursuit_plan: nothing added — T# is already one step, so one part does not break it down: a plan … |
-| 51 | `offered_then_refused:7f9a877e94>d4ccc98bf7` | offered_then_refused | 3 | 1: R26 | qwen | yes | task T0402 | offered by «pursuit_step: T# not opened — Cases first: Scope names new source P, and no locked test imports i… |
-| 52 | `offered_then_refused:349b62dd47>ea2e98ac3f` | offered_then_refused | 2 | 1: R28 | qwen | yes | task T0402 | offered by «pursuit_step: T# not opened — `Q` already passes, before any work, so it cannot tell this task's … |
+| 51 | `offered_then_refused:7f9a877e94>d4ccc98bf7` | offered_then_refused | 3 | 1: R26 | qwen | no | fixed bca1b457 | offered by «pursuit_step: T# not opened — Cases first: Scope names new source P, and no locked test imports i… |
+| 52 | `offered_then_refused:349b62dd47>ea2e98ac3f` | offered_then_refused | 2 | 1: R28 | qwen | no | fixed 696970f7 | offered by «pursuit_step: T# not opened — `Q` already passes, before any work, so it cannot tell this task's … |
 | 53 | `offered_then_refused:d9a572c630>0370db2c56` | offered_then_refused | 2 | 1: R29 | mimo | yes | not_a_bug | offered by «pursuit_step: T# not opened — Cases first: open the known-answers milestone before the code; its … |
-| 54 | `offered_then_refused:ea2e98ac3f>f4043165b7` | offered_then_refused | 2 | 1: R28 | qwen | yes | task T0402 | offered by «pursuit_step: T# not closed done by T# — this pursuit closes done only on a witnessed check, and … |
+| 54 | `offered_then_refused:ea2e98ac3f>f4043165b7` | offered_then_refused | 2 | 1: R28 | qwen | no | fixed 66b1cc7c | offered by «pursuit_step: T# not closed done by T# — this pursuit closes done only on a witnessed check, and … |
 | 55 | `offered_then_refused:ef06d83f7a>619d1748bb` | offered_then_refused | 2 | 1: R28 | qwen | yes | not_a_bug | offered by «pursuit_step: T# not opened — P is locked as the known answers (T#): a worker's change to it is p… |
-| 56 | `offered_then_refused:49ef5a6664>cc17f4c660` | offered_then_refused | 2 | 1: R43 | qwen | yes | task T0402 | offered by «Tool call blocked: refusing to change P from the driving session: in a pursuit the work, and its … |
+| 56 | `offered_then_refused:49ef5a6664>cc17f4c660` | offered_then_refused | 2 | 1: R43 | qwen | no | fixed 45b8572c | offered by «Tool call blocked: refusing to change P from the driving session: in a pursuit the work, and its … |
 | 57 | `offered_then_refused:a22ae99e29>c23264dad9` | offered_then_refused | 2 | 1: R42 | gemma | no | fixed 3988a77d | offered by «pursuit_step: T# not run — If a done task already did this work, call pursuit_step task="Q" aband… |
 | 58 | `offered_then_refused:a22ae99e29>ce68b4ec23` | offered_then_refused | 2 | 1: R42 | gemma | no | fixed 3988a77d | offered by «pursuit_step: T# not run — If a done task already did this work, call pursuit_step task="Q" aband… |
 | 59 | `offered_then_refused:c23264dad9>a22ae99e29` | offered_then_refused | 2 | 1: R42 | gemma | no | fixed 3988a77d | offered by «Not run: this `Q` call ran N times in the last N calls with the same result each time, and would … |
-| 60 | `offered_then_refused:cc17f4c660>349b62dd47` | offered_then_refused | 2 | 1: R43 | qwen | yes | task T0402 | offered by «pursuit_step: T# not opened — the scope holds X, which the locked P judges, but done_when runs no… |
+| 60 | `offered_then_refused:cc17f4c660>349b62dd47` | offered_then_refused | 2 | 1: R43 | qwen | no | fixed 45b8572c | offered by «pursuit_step: T# not opened — the scope holds X, which the locked P judges, but done_when runs no… |
 | 61 | `time_sink:driver/agent` | time_sink | 1 | 1: R11 | mimo | no | fixed 700e6865 | driver agent calls of 60s+ with no worker inside: [88] s (0 timed out) |
 | 62 | `worker_outcome:capped/user_message` | worker_outcome | 1 | 1: R25 | mimo | yes | not_a_bug | worker ended capped (user_message): last stop L66: stopReason=toolUse, 248 chars, 1 call(s) |
 | 63 | `worker_outcome:length/cut_call` | worker_outcome | 1 | 1: R41 | mimo | yes | deferred | worker ended length (cut_call): last stop L18: stopReason=toolUse, 50 chars, 1 call(s) |
 
 ### What the ranking says
 
-1. **Offers the next refusal turns down (T0402, split into T0405-T0409 by offer site).** Here an offer and the refuser of the call it offers disagree about the state. Today's code still does it in three places:
-   - The bash `close` steer (`_STEERED_VERBS`, beagle.py:15511) offers `abandon=` to any task. `_abandon_problem` (beagle.py:3430, 3449) refuses that for a milestone or a non-duplicate.
-   - `_already_passes` (beagle.py:10921) offers `abandon="done by X"` whenever it has an X. `_done_by` and `_done_by_unwitnessed` then refuse it (R28, and R42 L53 once).
-   - Smaller cases: the open rank gate (R28), beagle's spawn attempt limit (R26), and held()'s "run the locked test" offer, which `_already_passes` then refuses (R43).
+1. **Offers the next refusal turns down (T0402, fixed by T0405-T0410).** Here an offer and the refuser of the call it offers disagreed about the state. Each offer site now renders only a call its refuser accepts:
+   - The bash `close` steer offers a drop only where `_abandon_problem` takes it, else relays that refusal (2088f9b7, T0405).
+   - `_already_passes` and `_done_by` share one witness rule, so a done-by close is offered only where it would be accepted (696970f7, T0406). The done-by open passes `--over` naming the done task, so the rank gate does not refuse it (66b1cc7c, T0407; R22, R28).
+   - At beagle's attempt limit, Cases first and pursuit_step's spawn refusal offer the open of a pending task, the infeasible close of an open one, or the parent's re-plan for a closed one (bca1b457, d6c81b3b; T0408, T0410; R26).
+   - The "bind the locked test" offer is run first; where that test already passes, the refusal gives what binding it would meet instead (45b8572c, T0409; R22, R43).
 
-   The fix: render an offer only if the call passes the refusers now.
+   Each fix has a test that feeds the offered call back to its refuser. One beagle-side cause, `open --help` saying an unneeded `--over` is "refused", is on ~/beagle branch mining-fixes-2026-10-10 (518aa89) for upstream.
 2. **The repeat guard and the breaker are symptoms.**
    - Rank 1, `unrecovered:c23264dad9`, is the 7 guard rows before each breaker stop.
    - All 34 breaker stops follow 8+ refusals. That is the designed end, so `not_a_bug`.
    - 15 of them (R03-R18) surfaced as provider stream errors. That surfacing was fixed by cc8dfd5d.
    - No driver breaker stop happened after R33.
-3. **Driver bash writes (T0404, fixed by 62c11bb1).** These were replayed on 2026-10-10. Each driver bash call shaped like a write in the pursuit runs, 132 in all, was put through today's `_driver_bash_change` and `_bash_writes_dot_beagle` with its full command from the session file. 76 are refused today, and most of the rest write /tmp, which is allowed, or only read. Two gaps are still live:
+3. **Driver bash writes (T0404, fixed by 62c11bb1).** These were replayed on 2026-10-10. Each driver bash call shaped like a write in the pursuit runs, 132 in all, was put through today's `_driver_bash_change` and `_bash_writes_dot_beagle` with its full command from the session file. 76 are refused today, and most of the rest write /tmp, which is allowed, or only read. Two gaps were live then, both closed by 62c11bb1:
    - `_bash_write_targets` finds no target in a `bash -c '…'` script that holds a heredoc. Examples: R28 L142, and R22 L158-L194 behind a `BEAGLE_TAU_DRIVER_EDITS=1` prefix. `bash -c 'echo x > f'` is caught.
    - `_bash_writes_dot_beagle` misses `touch` and `ln -sf /dev/null` into `.beagle/locked/` (R22 L190, L210; R28 L842). This was the driver trying to get around the locked known answers.
 4. **Worker out-of-scope writes (T0403, fixed by 2d1bd0cf).** This is 52 stretches in 22 runs. The first refusal already named the scope and said to report the path. What kept happening was the repeat: 210 of 400 worker scope refusals were for a path already refused in the same session, in 64 of 135 sessions. A second or later refusal of a path now gives the count, and tells the worker to write only under the scope or to end the turn with its report.
