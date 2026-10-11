@@ -7161,18 +7161,20 @@ def _inverted_exit_problem(command: str) -> str | None:
     Run R44: T0004 opened on `raise SystemExit(not bad and len(c)>=5)`. Python
     exits 1 for True and 0 for False, so a pass condition given as the exit
     status fails good work and passes bad; the open's run before any work saw
-    exit 1, which a sound check also gives then. An int exit, or a call's
-    result such as `sys.exit(main())`, is not judged.
+    exit 1, which a sound check also gives then. Which one an expression means
+    cannot be told from the code, so the text says when the exit is right
+    rather than that it is wrong. An int exit, or a call's result such as
+    `sys.exit(main())`, is not judged.
     """
     call = _bash_find(command, lambda argv: _bool_exit(_python_c_code(argv)))
     if call is None:
         return None
     return (
-        f"`{call}` exits with a bool: 1, a failing check, when the expression is true, "
-        "and 0, a passing one, when it is false, so a pass condition there passes bad "
-        "work and fails good work. Make the exit explicit: `if <a failure is found>: "
-        "raise SystemExit(1)`, or `raise SystemExit(0 if <it passes> else 1)`. Call "
-        "pursuit_step again with that."
+        f"`{call}` exits 1, a failing check, when its expression is true, and 0 when "
+        "it is false, so it is right only if the expression means a failure was found; "
+        "one that means the work passed fails good work and passes bad. Make the exit "
+        "explicit either way: `if <a failure is found>: raise SystemExit(1)`, or "
+        "`raise SystemExit(0 if <it passes> else 1)`. Call pursuit_step again with that."
     )
 
 

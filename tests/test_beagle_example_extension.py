@@ -21178,9 +21178,9 @@ async def test_open_refuses_a_python_c_check_with_a_bool_exit(
     )
 
     assert plain.text.startswith("pursuit_step: T0002 not opened — ")
-    assert "`SystemExit(not bad and len(bad) >= 0)` exits with a bool" in plain.text
+    assert "`SystemExit(not bad and len(bad) >= 0)` exits 1, a failing check, when" in plain.text
     assert "raise SystemExit(0 if <it passes> else 1)" in plain.text
-    assert "`sys.exit(1 == 1)` exits with a bool" in wrapped.text
+    assert "`sys.exit(1 == 1)` exits 1, a failing check, when" in wrapped.text
     assert _pursuit_calls(fake_beagle, "open") == [] and _runs(fake_tau) == []
 
     problem = _module()._inverted_exit_problem
@@ -21231,6 +21231,69 @@ async def test_kept_bound_note_refuses_an_inverted_bound_check(
     note = _module()._kept_bound_note
     assert note(R44_INVERTED, "Write done.txt", "why", ["done.txt"], project) is None
     assert note("grep -q done done.txt", "Write done.txt", "why", ["done.txt"], project)
+
+
+@pytest.mark.anyio
+async def test_bool_exit_check_refused_on_the_amend_route(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Audit 15 on T0392: the amend route was wired to the bool-exit refusal untested.
+    project = _git_project(tmp_path, monkeypatch)
+    monkeypatch.chdir(project)
+    _open_task_in_scope(fake_beagle, ["done.txt"], "grep -q done done.txt")
+    runtime, _ = _bound(tmp_path)
+    args = {"task": "T0002", "done_when": R44_INVERTED, "notes": "Write done.txt"}
+
+    result = await _tool(runtime, "pursuit_step").execute("c1", args)
+
+    assert result.text.startswith(
+        "Kept the bound check `grep -q done done.txt`; the new done_when was not taken: "
+        "`SystemExit(not bad and len(bad) >= 0)` exits 1, a failing check, when"
+    )
+    assert _pursuit_calls(fake_beagle, "amend") == []
+
+
+@pytest.mark.anyio
+async def test_bool_exit_check_refused_on_the_new_route(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Audit 15 on T0392: the new-route route was wired to the bool-exit refusal untested.
+    monkeypatch.chdir(_pursuit_project(tmp_path))
+    _blocked_task(fake_beagle, done_when="grep -q parser .beagle/tree/T0002.md")
+    runtime, _ = _bound(tmp_path)
+    args = {"task": "T0002", "done_when": R44_INVERTED, "notes": "check the file"}
+
+    result = await _tool(runtime, "pursuit_step").execute("c1", args)
+
+    assert "`SystemExit(not bad and len(bad) >= 0)` exits 1, a failing check" in result.text
+    assert _pursuit_calls(fake_beagle, "spawn") == []
+    assert _pursuit_calls(fake_beagle, "open") == [] and _runs(fake_tau) == []
+
+
+def test_bool_exit_refusal_does_not_say_a_failure_condition_passes_bad_work() -> None:
+    # Audit 15 on T0392: the text said every bool exit passes bad work, which is
+    # false when the expression means a failure was found.
+    problem = _module()._inverted_exit_problem
+    for command, call in (
+        ('python3 -c "import sys; sys.exit(bool(failures))"', "sys.exit(bool(failures))"),
+        ('python3 -c "import sys; sys.exit(not ok)"', "sys.exit(not ok)"),
+        (R44_INVERTED, "SystemExit(not bad and len(bad) >= 0)"),
+    ):
+        text = problem(command)
+        assert text is not None, command
+        assert text.startswith(f"`{call}` exits 1, a failing check, when its expression ")
+        assert "is true, and 0 when it is false" in text
+        assert "right only if the expression means a failure was found" in text
+        assert "a pass condition there passes bad work" not in text
+        assert "raise SystemExit(0 if <it passes> else 1)" in text
 
 
 @pytest.mark.anyio
