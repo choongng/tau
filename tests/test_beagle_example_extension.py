@@ -17781,11 +17781,13 @@ async def test_unproven_step_at_spawn_limit_offers_infeasible_not_new_route(
 
 
 @pytest.mark.anyio
-async def test_spawn_refusal_relay_offers_infeasible_close(
+async def test_spawn_refused_at_the_limit_for_a_blocked_task_offers_no_infeasible_close(
     tmp_path: Path, beagle: Path, fake_beagle: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # Audit 12: beagle refused the spawn for thrash, and tau's relay asked for
-    # notes saying how the route differs, which no notes can get past.
+    # notes saying how the route differs, which no notes can get past. T0408's
+    # worker: the relay then offered the infeasible close, which _close_infeasible
+    # refuses for a task that is not open, as a blocked one is not.
     monkeypatch.chdir(_pursuit_project(tmp_path))
     _blocked_task(fake_beagle)
     _t0002_at_limit(fake_beagle, "blocked")
@@ -17802,8 +17804,36 @@ async def test_spawn_refusal_relay_offers_infeasible_close(
     assert "how this route differs" not in result.text
     assert "new_route" not in result.text
     assert "beagle's limit of 3 attempts" in result.text
-    assert 'pursuit_step task="T0002", abandon="infeasible: 4 routes were tried' in result.text
-    assert 'pursuit_plan task="T0010", parts=["Parser::' in result.text
+    assert "abandon=" not in result.text
+    assert "T0002 is blocked, and its retry chain (T0002, T0007, T0008, T0009)" in result.text
+    assert 'Re-plan its parent instead: pursuit_plan task="T0010", parts=["Parser::' in result.text
+    orphan = [{**n, "parent": ""} if n["id"] == "T0002" else n for n in _fake_tree(fake_beagle)]
+    said = _module()._spawn_limit_offer("T0002", "false", ["done.txt"], orphan)
+    assert "abandon=" not in said and "pursuit_plan" not in said
+    assert said.endswith("it has no parent to re-plan: stop and ask the user.")
+
+
+def _fake_tree(fake: Path) -> list[dict[str, Any]]:
+    return json.loads((fake / "tree.out").read_text())["nodes"]
+
+
+def test_spawn_limit_offer_for_an_open_task_still_offers_the_infeasible_close(
+    tmp_path: Path,
+) -> None:
+    module = _module()
+    _t0002_at_limit(tmp_path, "open")
+    nodes = _fake_tree(tmp_path)
+
+    said = module._spawn_limit_offer("T0002", "false", ["done.txt"], nodes)
+    pending = module._spawn_limit_offer("T0011", "false", ["done.txt"], _r26_chain("pending"))
+
+    assert said.startswith("Its retry chain (T0002, T0007, T0008, T0009) is at beagle's limit")
+    close = 'Close it infeasible instead: pursuit_step task="T0002", abandon="infeasible: '
+    assert close in said
+    assert said.index("abandon=") < said.index('then re-plan its parent: pursuit_plan task="T0010"')
+    assert "T0002 is open" not in said
+    # A pending task in a tree read before this step opened it keeps the close.
+    assert 'pursuit_step task="T0011", abandon="infeasible: ' in pending
 
 
 @pytest.mark.anyio

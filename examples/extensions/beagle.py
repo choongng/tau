@@ -6765,17 +6765,7 @@ def _cases_on_disk_route(
                 + _spawn_limit_offer(existing, str(holder.get("done_when") or ""), held, nodes)
             )
         else:
-            replan = _replan_parent_call(existing, nodes or [])
-            chain = ", ".join(sorted(_retry_chain(existing, nodes or [])))
-            settle = (
-                f"{existing} is {status or 'closed'}, and its retry chain ({chain}) is at "
-                f"beagle's limit of {SPAWN_LIMIT} attempts, so beagle refuses a new route "
-                + (
-                    f"for it. Re-plan its parent instead: {replan}."
-                    if replan
-                    else "for it, and it has no parent to re-plan: stop and ask the user."
-                )
-            )
+            settle = _spawn_limit_offer(existing, "", held, nodes or [])
         return (
             f"{head} {existing} holds them: do not split {task}. {unwait}{settle} {task} "
             f"opens once its cases are locked, its test importing {named} by name."
@@ -9704,9 +9694,25 @@ def _spawn_limit_offer(
     task: str, check: str, scope: list[str], nodes: list[dict[str, Any]], why: str = ""
 ) -> str:
     """What a result says for `task` at beagle's spawn limit: no new route, and the
-    infeasible close with the parent's re-plan to make instead."""
+    infeasible close with the parent's re-plan to make instead.
+
+    _close_infeasible refuses a task that is not open, so a task the tree shows
+    closed already (blocked, say) is offered the parent's re-plan alone. A pending
+    one keeps the close: the tree was read before this step opened it.
+    """
     chain = ", ".join(sorted(_retry_chain(task, nodes)))
     replan = _replan_parent_call(task, nodes)
+    status = str(next((n for n in nodes if str(n.get("id")) == task), {}).get("status") or "")
+    if status not in {"", "open", "pending"}:
+        return (
+            f"{task} is {status}, and its retry chain ({chain}) is at beagle's limit of "
+            f"{SPAWN_LIMIT} attempts, so beagle refuses a new route "
+            + (
+                f"for it. Re-plan its parent instead: {replan}."
+                if replan
+                else "for it, and it has no parent to re-plan: stop and ask the user."
+            )
+        )
     return (
         f"Its retry chain ({chain}) is at beagle's limit of {SPAWN_LIMIT} attempts, so "
         f"beagle refuses a new route. Close it infeasible instead: "
