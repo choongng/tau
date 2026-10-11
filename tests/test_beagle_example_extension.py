@@ -9737,9 +9737,13 @@ async def test_print_mode_stop_gate_queues_followup_twice(
 ) -> None:
     # R02 ended `tau -p` on "complete" with the root stalled: the Stop hooks
     # skip print mode. Through the real print-mode loop, each queued follow-up
-    # is one more request, and the third stop goes through.
+    # is one more request, and the third stop goes through. T0003 is blocked
+    # here, not abandoned, so it can take a new route and the root is not
+    # sealed: a sealed one gets one follow-up, saying to ask the owner (q35 10-11,
+    # test_stop_hook_does_not_offer_pursuit_plan_for_a_sealed_container).
     project = _pursuit_project(tmp_path)
-    (fake_beagle / "tree.out").write_text(json.dumps({"nodes": STALLED_TREE}))
+    unsealed = [{**n, "status": "blocked"} if n["id"] == "T0003" else n for n in STALLED_TREE]
+    (fake_beagle / "tree.out").write_text(json.dumps({"nodes": unsealed}))
 
     provider, ok = await _print_run(tmp_path, project, stops=4)
 
@@ -13438,9 +13442,55 @@ def test_stop_gate_accepts_a_stop_the_step_cap_offered(
     assert len(sent) == 1 and sent[0].startswith("[beagle] The pursuit is not done")
     # A new run starts with no stop offered.
     turn(("pursuit_step", offer))
+
     module._reset_stop_gate(None, context)
     stop()
     assert len(sent) == 2
+
+
+def test_stop_hook_does_not_offer_pursuit_plan_for_a_sealed_container(
+    tmp_path: Path, beagle: Path, fake_beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # q35 10-11: at 11:56:53 and 12:18:08 the stop gate said "add the missing work
+    # with pursuit_plan", under a T0002 that T0011's infeasible close sealed at 11:23.
+    module = _module()
+    project = _pursuit_project(tmp_path)
+    nodes = [
+        {"id": "T0001", "parent": "", "status": "pending", "container": True},
+        {"id": "T0002", "parent": "T0001", "status": "pending", "container": True},
+        {"id": "T0007", "parent": "T0002", "status": "superseded"},
+        {"id": "T0010", "parent": "T0002", "status": "superseded", "sibling_of": "T0007"},
+        {"id": "T0011", "parent": "T0002", "status": "infeasible", "sibling_of": "T0010"},
+        {"id": "T0020", "parent": "T0002", "status": "pending"},
+        {"id": "T0003", "parent": "T0001", "status": "pending", "waiting_on": ["T0002"]},
+    ]
+    (fake_beagle / "tree.out").write_text(json.dumps({"nodes": nodes}))
+    (fake_beagle / "next.out").write_text(json.dumps({"open": [], "ready": []}))
+    (fake_beagle / "next.rc").write_text("3")
+    monkeypatch.setattr(module, "_STOP_OFFERED", False)
+
+    [sent] = _stop_gate_sends(monkeypatch, project, has_ui=True)
+    again = _stop_gate_sends(monkeypatch, project, has_ui=True)
+    monkeypatch.chdir(project)
+    runtime, _ = _bound(tmp_path)
+    status = asyncio.run(_tool(runtime, "pursuit_step").execute("c1", {})).text
+    state = module._pursuit_state(project, project / ".beagle" / "pursuit.toml")
+
+    sealed = "T0002 is sealed: T0011 (infeasible) ended undone with no task holding its work"
+    owner = "Only the owner can re-scope or abandon T0002: stop, and ask the user which."
+    for text in (sent, status, state):
+        assert sealed in text and owner in text
+        assert "pursuit_plan" not in text and "new_route=true" not in text
+    assert "- T0020" in sent and "- T0003" in sent
+    assert "T0001 is sealed" not in sent
+    # The stop it says to make goes through.
+    assert again == []
+    # A tree with no sealed container keeps the old follow-up.
+    nodes[4]["status"] = "blocked"
+    (fake_beagle / "tree.out").write_text(json.dumps({"nodes": nodes}))
+    monkeypatch.setattr(module, "_STOP_OFFERED", False)
+    [plain] = _stop_gate_sends(monkeypatch, project, has_ui=True)
+    assert "sealed" not in plain and "add the missing work with pursuit_plan" in plain
 
 
 def _event_line(message: dict[str, Any]) -> bytes:
@@ -17866,8 +17916,12 @@ def test_cases_first_offers_the_infeasible_close_for_a_holder_at_the_spawn_limit
     for text in (pending, blocked):
         assert "new_route" not in text
         assert "T0007, T0009, T0010, T0011" in text and "beagle's limit of 3" in text
-        assert 'pursuit_plan task="T0002", parts=["Known answers::by a route other ' in text
         assert "T0012 opens once its cases are locked" in text
+    # q35 10-11: the close seals T0002, so it is said to, and no re-plan follows it.
+    assert "That close seals T0002: T0011 would end undone" in pending
+    assert "pursuit_plan" not in pending
+    replan = 'pursuit_plan task="T0002", parts=["Known answers::by a route other '
+    assert replan in blocked
     # A pending holder opens without a spawn, then closes infeasible once open:
     # _close_infeasible refuses a task that is not open.
     assert 'Open T0011 first, with no new route: pursuit_step task="T0011". ' in pending
@@ -17925,10 +17979,46 @@ async def test_abandon_infeasible_closes_open_task_at_attempt_limit(
         ]
     ]
     assert "T0011 infeasible" in closed.text
-    assert "Re-plan its parent T0002 with a route the finding does not rule out: " in closed.text
-    assert 'pursuit_plan task="T0002", parts=["Known answers::' in closed.text
+    assert "T0002 is now sealed: T0011 (infeasible)" in closed.text
     assert "T0001 not closed infeasible" in root.text
     assert "say why after the colon" in bare.text
+
+
+@pytest.mark.anyio
+async def test_infeasible_close_that_seals_the_parent_says_so(
+    tmp_path: Path, beagle: Path, fake_beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # q35 10-11: T0011's infeasible close at 11:23 said to re-plan T0002, which it
+    # had sealed; 60 min of pursuit_plan parts under T0002 followed, none able to
+    # make it done.
+    from types import SimpleNamespace
+
+    module = _module()
+    monkeypatch.chdir(_pursuit_project(tmp_path))
+    (fake_beagle / "next.out").write_text(json.dumps({"open": [{"id": "T0011"}], "ready": []}))
+    (fake_beagle / "tree.out").write_text(json.dumps({"nodes": _r26_chain()}))
+    (fake_beagle / "close.out").write_text("T0011 infeasible\n")
+    runtime, _ = _bound(tmp_path)
+    evidence = "`grep -q done done.txt` passes, and no defect put back into done.txt fails it"
+
+    closed = await _tool(runtime, "pursuit_step").execute(
+        "c1", {"task": "T0011", "abandon": f"infeasible: {evidence}"}
+    )
+
+    said = closed.text.rpartition("\n\n")[2]
+    assert said.startswith(
+        "T0002 is now sealed: T0011 (infeasible) ended undone with no task holding its work"
+    )
+    assert "so T0002 can never be all-done" in said
+    assert said.endswith(
+        "Only the owner can re-scope or abandon T0002: stop, and ask the user which."
+    )
+    assert "pursuit_plan task=" not in closed.text and "Re-plan" not in closed.text
+    # The stop it says to make is one the stop gate lets through.
+    monkeypatch.setattr(module, "_STOP_OFFERED", False)
+    text = SimpleNamespace(text=closed.text)
+    module._note_stop_offer([SimpleNamespace(tool_name="pursuit_step", content=[text])])
+    assert module._STOP_OFFERED is True
 
 
 # --------------------------------------------------------------------------- #
@@ -17989,7 +18079,7 @@ async def test_unproven_step_at_spawn_limit_offers_infeasible_not_new_route(
     assert "beagle's limit of 3 attempts" in result.text
     assert "Next: Its retry chain (T0002, T0007, T0008, T0009)" in result.text
     assert 'pursuit_step task="T0002", abandon="infeasible: ' in result.text
-    assert 'pursuit_plan task="T0010", parts=["Parser::' in result.text
+    assert "That close seals T0010: T0002 would end undone" in result.text
 
 
 @pytest.mark.anyio
@@ -18042,10 +18132,35 @@ def test_spawn_limit_offer_for_an_open_task_still_offers_the_infeasible_close(
     assert said.startswith("Its retry chain (T0002, T0007, T0008, T0009) is at beagle's limit")
     close = 'Close it infeasible instead: pursuit_step task="T0002", abandon="infeasible: '
     assert close in said
-    assert said.index("abandon=") < said.index('then re-plan its parent: pursuit_plan task="T0010"')
+    assert said.index("abandon=") < said.index("That close seals T0010")
+    assert "pursuit_plan" not in said
     assert "T0002 is open" not in said
     # A pending task in a tree read before this step opened it keeps the close.
     assert 'pursuit_step task="T0011", abandon="infeasible: ' in pending
+
+
+def test_infeasible_offer_warns_it_would_seal_the_parent(tmp_path: Path) -> None:
+    # q35 10-11: the hints offered T0011's infeasible close as a normal exit, then a
+    # re-plan of T0002; the close sealed T0002, and nothing had said it would.
+    module = _module()
+
+    offer = module._spawn_limit_offer("T0011", "grep -q done done.txt", ["done.txt"], _r26_chain())
+    spent = module._source_judge_spent(
+        "T0004", 5, "tests/cases.json", "case seed", "", "pursuit_step: T0004 not run — ", tmp_path
+    )
+
+    close = 'Close it infeasible instead: pursuit_step task="T0011", abandon="infeasible: '
+    assert close in offer
+    warning = offer.partition(close)[2].partition(". ")[2]
+    assert warning.startswith(
+        "That close seals T0002: T0011 would end undone with no task holding its work"
+    )
+    assert "T0002 could never be all-done" in warning
+    assert "only the owner could then re-scope or abandon T0002" in warning
+    assert "stop instead, and ask the user" in warning
+    assert "pursuit_plan task=" not in offer
+    assert 'pursuit_step task="T0004", abandon="infeasible: ' in spent
+    assert "That close seals its parent: T0004 would end undone" in spent
 
 
 @pytest.mark.anyio
@@ -18137,7 +18252,7 @@ async def test_check_still_fails_at_spawn_limit_offers_infeasible(
     assert "new_route" not in result.text
     assert "beagle's limit of 3 attempts" in result.text
     assert 'pursuit_step task="T0002", abandon="infeasible: ' in result.text
-    assert 'pursuit_plan task="T0010", parts=["Parser::' in result.text
+    assert "That close seals T0010: T0002 would end undone" in result.text
 
 
 #: R28's stripped tests/test_cases.py: W3 removed the import and the code test.
