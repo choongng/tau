@@ -11631,7 +11631,10 @@ async def _done_by(
         or str(record.get("criteria") or "").strip()
         or f"`{check}` passes on {done}'s work"
     )
-    argv = ["open", task, "--criteria", criteria, "--done-when", check]
+    # Run R28: beagle's rank gate refused the open of T0029, done by a commit,
+    # because T0027, T0031 and T0032 ranked above it.
+    over = f"closing as done by {done}: its commit {sha[:12]} already did this work"
+    argv = ["open", task, "--criteria", criteria, "--done-when", check, "--over", over]
     if scope:
         argv += ["--scope", *scope]
     if witness:

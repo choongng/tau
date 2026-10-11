@@ -139,6 +139,10 @@ if json.loads(stdin or "{}").get("stop_hook_active"):
 reply = here / (sys.argv[2] + ".out")
 if len(sys.argv) > 3 and (here / f"{sys.argv[2]}-{sys.argv[3]}.out").exists():
     reply = here / f"{sys.argv[2]}-{sys.argv[3]}.out"  # one task's own reply
+ranked = here / "open-ranked-below.out"  # as beagle's rank gate does
+if sys.argv[1:3] == ["pursuit", "open"] and "--over" not in sys.argv and ranked.exists():
+    sys.stdout.write(ranked.read_text())
+    sys.exit(2)
 if len(sys.argv) > 2 and reply.exists():
     sys.stdout.write(reply.read_text())
 status = here / (sys.argv[2] + ".rc")
@@ -8869,6 +8873,58 @@ async def test_part_whose_check_passes_on_a_done_tasks_commit_closes_done_by_it(
     ]
     assert _runs(fake_tau) == []
     assert "T0004 — Cases test: closed done" in result.text and because in result.text
+
+
+@pytest.mark.anyio
+async def test_done_by_open_passes_over_naming_the_done_task(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, sha = _done_by_project(tmp_path, fake_beagle, monkeypatch, "T0003: Cases")
+    runtime, _ = _bound(tmp_path)
+
+    await _tool(runtime, "pursuit_step").execute(
+        "c1", {"task": "T0004", "abandon": "done by T0003", "done_when": CASES_CHECK}
+    )
+
+    [opened] = _pursuit_calls(fake_beagle, "open")
+    over = opened[opened.index("--over") + 1]
+    assert "done by T0003" in over and sha[:12] in over
+    assert opened.count("--over") == 1
+
+
+@pytest.mark.anyio
+async def test_done_by_close_of_a_lower_ranked_task_is_not_refused_by_rank(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Run R28: the open of T0029, done by a commit, was refused because T0027,
+    # T0031 and T0032 ranked above it.
+    _done_by_project(tmp_path, fake_beagle, monkeypatch, "T0003: Cases")
+    ready = [{"id": "T0005", "title": "Clock tick"}, {"id": "T0004", "title": "Cases test"}]
+    (fake_beagle / "next.out").write_text(
+        json.dumps({"open": [], "ready": ready, "ready_total": 2})
+    )
+    (fake_beagle / "open-ranked-below.out").write_text(
+        'T0004 ranks below 1 ready task: T0005 Clock tick. If this one should go first, '
+        'say why: `--over "<why>"`.\n'
+    )
+    runtime, _ = _bound(tmp_path)
+
+    result = await _tool(runtime, "pursuit_step").execute(
+        "c1", {"task": "T0004", "abandon": "done by T0003", "done_when": CASES_CHECK}
+    )
+
+    assert "ranks below" not in result.text
+    assert "T0004 — Cases test: closed done" in result.text
+    [closed] = _pursuit_calls(fake_beagle, "close")
+    assert closed[:3] == ["T0004", "--outcome", "done"]
 
 
 @pytest.mark.anyio
