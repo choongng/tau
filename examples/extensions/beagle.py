@@ -7841,7 +7841,7 @@ def _data_self_import(
     command: str, scope: list[str], root: Path | None
 ) -> tuple[str, str, tuple[str, ...]] | None:
     """`_self_import` for a scope of data and tests only, where the test is a data test."""
-    if not (_scope_has_data(scope) and _only_data_and_tests(scope)):
+    if not (_scope_has_data(scope, root) and _only_data_and_tests(scope)):
         return None
     return _self_import(command, scope, root)
 
@@ -7956,7 +7956,7 @@ def _known_answers_note(command: str, scope: list[str], root: Path) -> str:
     none, and W3 deleted the import; so that is said only of a test whose AST imports
     no project module.
     """
-    data = next(r.rstrip("/") for r in scope if Path(r.rstrip("/")).suffix not in {"", ".py"})
+    data = _scope_data(scope, root)[0]
     runs = [rel for rel in _check_test_files(command, root) if rel.endswith(".py")]
     # Run R32: on a fresh repository the check's test was not on disk yet, and the
     # note named the other test in scope as the check.
@@ -8014,7 +8014,7 @@ def _absent_test_route(
     told apart by existence: the named tests on disk that import nothing unwritten,
     or with none on disk, the first named.
     """
-    if not (_scope_has_data(scope) and _only_data_and_tests(scope)):
+    if not (_scope_has_data(scope, root) and _only_data_and_tests(scope)):
         return None
     try:
         words = shlex.split(command)
@@ -8090,7 +8090,7 @@ def _data_only_bind(
             "write; a later task whose scope holds that code runs it.\n\n",
         )
     route = _data_test_route(command, scope, root) if unwritten and scope else None
-    if route is None or not (_scope_has_data(scope) and _only_data_and_tests(scope)):
+    if route is None or not (_scope_has_data(scope, root) and _only_data_and_tests(scope)):
         return None
     test, module, data_check, needs = route
     return (
@@ -8174,7 +8174,7 @@ def _tests_only_proof_note(command: str, scope: list[str], root: Path | None) ->
     none and read tests/cases.json, outside its scope.
     """
     reads = _check_data_reads(command, root) if root is not None and command else []
-    if not _scope_has_data(scope) and not reads:
+    if not _scope_has_data(scope, root) and not reads:
         return TESTS_ONLY_MUTATE_NOTE
     missing = [rel for rel in reads if not _in_scope(rel, scope, root)]
     if not missing:
@@ -8959,7 +8959,7 @@ def _collection_failure_lead(output: str, scope: list[str], root: Path) -> str:
     )
     defect = (
         f" {DATA_CHECK_IMPORT_DEFECT}"
-        if _scope_has_data(scope) and _only_data_and_tests(scope)
+        if _scope_has_data(scope, root) and _only_data_and_tests(scope)
         else ""
     )
     return f"The check fails at collection, before any test runs: {said}.{where}{defect}\n\n"
@@ -9632,8 +9632,8 @@ def _unproven_call(
     if tests_only and missing_data:
         done_when, added = check, missing_data
         notes = f"New route: {', '.join(missing_data)}, which the check reads, is in scope"
-    elif tests_only and _scope_has_data(scope):
-        data = next(r.rstrip("/") for r in scope if Path(r.rstrip("/")).suffix not in {"", ".py"})
+    elif tests_only and _scope_has_data(scope, root):
+        data = _scope_data(scope, root)[0]
         test = next(
             (t for t in tests if _cases_test_reads(root / t, Path(data).name)),
             _data_test("", scope, root),
@@ -9680,7 +9680,7 @@ def _unproven_call(
     if limited:
         if (
             tests_only
-            and _scope_has_data(scope)
+            and _scope_has_data(scope, root)
             and done_when
             and " ".join(done_when.split()) != " ".join(check.split())
         ):
@@ -13559,7 +13559,7 @@ def make_step_tool() -> Any:
             brief = f"{brief}\n\n{references}"
         brief += _last_close_note((str(root), task))
         briefed_scope = scope or _strings(record.get("scope"))
-        if check and _scope_has_data(briefed_scope) and _only_data_and_tests(briefed_scope):
+        if check and _scope_has_data(briefed_scope, root) and _only_data_and_tests(briefed_scope):
             # Run R35: workers took the data check's ImportError for the goal.
             brief += f"\n\n{DATA_CHECK_IMPORT_DEFECT}"
         if notes:
@@ -13660,7 +13660,7 @@ def make_step_tool() -> Any:
                     f"scope: the new route keeps its done_when, `{check}`, which passes, "
                     "and adds that file to its scope"
                 )
-            elif tests_only and _scope_has_data(scope):
+            elif tests_only and _scope_has_data(scope, root):
                 how = (
                     TESTS_ONLY_PROOF_NOTE
                     + " The new route's done_when runs that file's test and its scope "
@@ -13691,7 +13691,7 @@ def make_step_tool() -> Any:
                 + ". Its notes say what the new route does differently.",
                 ran=False,
             )
-        if not (tests_only and _scope_has_data(scope)):
+        if not (tests_only and _scope_has_data(scope, root)):
             brief += "\n\n" + WITNESS_NOTE
         elif not (
             _fixes_known_answers_in(title, scope or _strings(record.get("scope")), goal)

@@ -16750,6 +16750,27 @@ def test_scope_has_data_counts_a_data_file_under_a_directory_entry(tmp_path: Pat
     assert not module._scope_has_data(["tests/"])
 
 
+def test_directory_scope_data_reaches_every_scope_has_data_route(tmp_path: Path) -> None:
+    # Audit 14: T0389 passed root to _scope_has_data from one route only, so the
+    # others still read a ['tests/'] scope holding cases data as holding none.
+    module = _module()
+    tests = tmp_path / "tests"
+    tests.mkdir()
+    (tests / "test_case_data.py").write_text("import test_cases\n")
+    (tests / "test_cases.py").write_text("import cobs\n")
+    scope = ["tests/"]
+    assert module._tests_only_proof_note("", scope, tmp_path) == module.TESTS_ONLY_MUTATE_NOTE
+    blind = module._collection_failure_lead(R35_COLLECTION_TAIL, scope, tmp_path)
+    assert blind.startswith("The check fails at collection")
+    assert module.DATA_CHECK_IMPORT_DEFECT not in blind
+
+    (tests / "cases.json").write_text("[]\n")
+    assert module._tests_only_proof_note("", scope, tmp_path) == module.TESTS_ONLY_PROOF_NOTE
+    lead = module._collection_failure_lead(R35_COLLECTION_TAIL, scope, tmp_path)
+    assert lead.startswith("The check fails at collection")
+    assert module.DATA_CHECK_IMPORT_DEFECT in lead
+
+
 def test_data_test_importing_only_installed_modules_is_not_named(tmp_path: Path) -> None:
     project = _pursuit_project(tmp_path)
     check = _case_data_test(project)
