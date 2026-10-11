@@ -5596,6 +5596,67 @@ def _called_module_functions(tree: ast.Module) -> list[str]:
     ]
 
 
+def _called_on_case_inputs(
+    tree: ast.Module, functions: Collection[str], keys: Collection[str], answers: Collection[str]
+) -> list[str]:
+    """The `functions` some call gives a case's input, so their results are computed.
+
+    An input is a value read under one of the cases' `keys` other than the
+    `answers`, a name assigned or looped from one, or a whole case (a name read
+    under a case key). q35 10-11: test_case_data.py's `_load_cases()` was given
+    nothing, and `for case in _load_cases(): assert "result" in case` was judged
+    its own copy of the algorithm; a loader computes no case's result.
+    """
+    inputs = set(keys) - set(answers)
+
+    def read(node: ast.AST, under: Collection[str]) -> ast.AST | None:
+        if isinstance(node, ast.Subscript) and _str_const(node.slice) in under:
+            return node.value
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "get"
+            and node.args
+            and _str_const(node.args[0]) in under
+        ):
+            return node.func.value
+        return None
+
+    whole = {base.id for node in ast.walk(tree) if isinstance(base := read(node, keys), ast.Name)}
+
+    def given(node: ast.AST) -> bool:
+        if isinstance(node, ast.Name) and node.id in whole:
+            return True
+        return any(
+            read(sub, inputs) is not None or (isinstance(sub, ast.Name) and sub.id in held)
+            for sub in ast.walk(node)
+        )
+
+    held: set[str] = set()
+    grew = True
+    while grew:
+        before = len(held)
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Assign) and given(node.value):
+                held.update(
+                    sub.id for t in node.targets for sub in ast.walk(t) if isinstance(sub, ast.Name)
+                )
+            elif isinstance(node, ast.For | ast.AsyncFor | ast.comprehension) and given(node.iter):
+                held.update(sub.id for sub in ast.walk(node.target) if isinstance(sub, ast.Name))
+        grew = len(held) > before
+    return [
+        name
+        for name in functions
+        if any(
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == name
+            and any(given(arg) for arg in [*node.args, *(k.value for k in node.keywords)])
+            for node in ast.walk(tree)
+        )
+    ]
+
+
 #: Names a module has bound without an import or assignment in its own source.
 _MODULE_IMPLICIT_NAMES = frozenset(
     {*dir(builtins), "__file__", "__name__", "__doc__", "__spec__", "__loader__"}
@@ -5779,7 +5840,8 @@ def _cases_test_problem(root: Path, entries: list[str]) -> tuple[str, str] | Non
     data's own shape test reads no answers. Run R39: a cases test copying the
     data test, with no test importing the project, is refused too. Run R40: a
     test importing no project module that compared the answers with the results
-    of functions it defined itself checked its own copy, not the code.
+    of functions it defined itself checked its own copy, not the code. q35
+    10-11: only functions given a case's input count; a data loader does not.
     """
     files = []
     for entry in entries:
@@ -5810,11 +5872,14 @@ def _cases_test_problem(root: Path, entries: list[str]) -> tuple[str, str] | Non
             if broken is not None:
                 return test, broken
             own = _called_module_functions(tree)
+            computed = _called_on_case_inputs(
+                tree, own, {k for c in cases if isinstance(c, dict) for k in c}, answers
+            )
             if (
-                own
+                computed
                 and answers
                 and not _test_project_imports(root / test)
-                and _answers_compared(tree, answers, against=own)
+                and _answers_compared(tree, answers, against=computed)
             ):
                 named = ", ".join(own[:4]) + (", …" if len(own) > 4 else "")
                 return test, (
