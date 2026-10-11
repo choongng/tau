@@ -10047,11 +10047,12 @@ class _Proof:
     by_absent_source: bool = False
 
 
-def _opened_commit(task: str, root: Path) -> str:
+def _opened_commit(task: str, root: Path, record: Any = None) -> str:
     """The commit `task` opened on: its record's, else the parent of its first
-    commit, else HEAD; "" when git has none."""
-    rc, out = _pursuit(["show", task], root)
-    record = _json_reply(out) if rc == 0 else None
+    commit, else HEAD; "" when git has none. `record` is `task`'s, when read."""
+    if record is None:
+        rc, out = _pursuit(["show", task], root)
+        record = _json_reply(out) if rc == 0 else None
     if isinstance(record, dict) and str(record.get("opened_commit") or "").strip():
         return str(record["opened_commit"]).strip()
     rc, out = _run(["git", "log", "--format=%H", f"--grep=^{task}:"], root, timeout=30.0)
@@ -10066,6 +10067,49 @@ def _in_commit(sha: str, rel: str, root: Path) -> bool:
     if not sha:
         return False
     return _run(["git", "cat-file", "-e", f"{sha}:{rel}"], root, timeout=30.0)[0] == 0
+
+
+def _check_scripts(check: str, root: Path) -> set[str]:
+    """The files `check` runs as its own program: the script it gives Python or a
+    shell, a file it runs by path, a .py it gives pytest; not the files it reads.
+
+    q38fn 10-11 T0011: with tests/check_known_answers.py taken away, the check
+    `python3 tests/check_known_answers.py` failed on the missing file alone.
+    """
+    try:
+        tokens = [
+            part
+            for word in shlex.split(check)
+            for part in (shlex.split(word) if " " in word and not word.startswith("-") else [word])
+        ]
+    except ValueError:
+        return set()
+    run = tokens[:1]
+    for at, token in enumerate(tokens):
+        name = Path(token).name
+        if _PYTHON_NAME.fullmatch(name):
+            run.append(_python_script(tokens[at + 1 :]) or "")
+        elif name in _SHELLS:
+            run += [arg for arg in tokens[at + 1 : at + 2] if not arg.startswith("-")]
+    if any(Path(token).name in {"pytest", "py.test"} for token in tokens):
+        run += [token for token in tokens if token.split("::")[0].endswith(".py")]
+    found = (os.path.normpath(token.split("::")[0]) for token in run if token)
+    return {
+        rel
+        for rel in found
+        if not Path(rel).is_absolute() and ".." not in Path(rel).parts and (root / rel).is_file()
+    }
+
+
+def _check_reads(check: str, rel: str, root: Path) -> bool:
+    """Whether `check` reads the file `rel`: its words name it, or a .py it runs opens it."""
+    if not check:
+        return False
+    rel = os.path.normpath(rel)
+    reach = [os.path.normpath(found) for found in _check_reach(check, root)]
+    return rel in reach or any(
+        found.endswith(".py") and _cases_test_reads(root / found, Path(rel).name) for found in reach
+    )
 
 
 #: A pytest summary line naming where a run went wrong: `FAILED <node>` or `ERROR <path>`.
@@ -10106,12 +10150,29 @@ async def _prove(
     away. None
     when neither can be tried — no witness and no changed file — and the close
     decides.
+
+    q38fn 10-11 T0011: the witness in tests/cases.json was refused as a test
+    file, and the fallback took away tests/check_known_answers.py, the check's
+    own script, so the check failed only on a missing file. The cases data the
+    check reads is a site; a script the check runs is never taken away, and a
+    witness in one under tests/ is refused (one elsewhere may be the program
+    under test). A file the check only reads (`grep -q out tests/cases.json`)
+    is the work, and may be taken away.
     """
     attempts: list[list[str]] = []
     refused: list[str] = []
     witness = _witness(report)
+    rc, out = _pursuit(["show", task], root)
+    shown = _json_reply(out) if rc == 0 else None
+    record = shown if isinstance(shown, dict) else {}
+    check = str(record.get("done_when") or "").strip()
+    scripts = _check_scripts(check, root)
+    data_witness = (
+        witness is not None and _is_cases_data(witness[0]) and _check_reads(check, witness[0], root)
+    )
+    in_test = witness is not None and _is_test_path(witness[0]) and not data_witness
     modules = _imported_modules(root, scope) if _only_data_and_tests(scope) else []
-    ask_module = bool(modules) and (witness is None or _is_test_path(witness[0]))
+    ask_module = bool(modules) and (witness is None or in_test)
     if ask_module:
         # Run R12: a tests-only task's witness in its test was refused, and it
         # had no source of its own to take away; the module it tests has one.
@@ -10120,19 +10181,29 @@ async def _prove(
             f"{where}Give a WITNESS in {' or '.join(modules)}, the module the test imports: "
             "a NEEDLE there that the test must catch. Leave the test as it is."
         )
-    elif witness is not None and _is_test_path(witness[0]):
+    elif in_test:
         # Run R04: W24's witness was in tests/test_case_data.py, and beagle
         # answered about the needle's count, not the check.
         refused.append(
             f"{witness[0]}: the WITNESS is in a test file; name a defect in the code the "
             "test runs, and leave the test as it is."
         )
+    elif (
+        witness is not None
+        and os.path.normpath(witness[0]) in scripts
+        and _in_tests_dir(witness[0])
+    ):
+        refused.append(
+            f"{witness[0]}: the WITNESS is in the check's own script, `{check}`; changed, "
+            "it makes the check fail whatever the work is, which proves nothing. Name a "
+            "defect in what the script judges: the data it reads or the code it runs."
+        )
     elif witness is not None:
         path, needle, replacement = witness
         attempts.append(["--mutate", path, "--needle", needle, "--replacement", replacement])
     # Run R17: T0008's locked cases.json was never written, and the fallback
     # took away itc.py instead; for a known-answers task the data is the work.
-    opened = _opened_commit(task, root)
+    opened = _opened_commit(task, root, record or None)
     changed = _changed_files(root)
     reverted = _locked_fix_reversion(task, scope, root, changed)
     if reverted:
@@ -10160,6 +10231,7 @@ async def _prove(
         # Run R14: both witnesses took away interval_tree_clocks.py, which T0003
         # wrote, so removing it showed only that the import was needed.
         sources = [rel for rel in sources if not _in_commit(opened, rel, root)]
+    sources = [rel for rel in sources if os.path.normpath(rel) not in scripts]
     if sources:
         attempts.append([arg for rel in sources for arg in ("--absent", rel)])
     for how in attempts:
