@@ -41,3 +41,14 @@ def test_normalize_thinking_levels_rejects_empty_and_duplicates() -> None:
 def test_reasoning_effort_maps_off_to_none() -> None:
     assert reasoning_effort_for_level("off") == "none"
     assert reasoning_effort_for_level("xhigh") == "xhigh"
+
+
+def test_default_level_is_selectable_but_never_listed_or_mapped() -> None:
+    # `default` defers the level upstream, so it has no effort or budget of its
+    # own and cannot be one of the concrete levels a catalog lists.
+    assert normalize_thinking_level("Default") == "default"
+    assert "default" not in THINKING_LEVELS
+    with pytest.raises(ValueError, match="implicit"):
+        normalize_thinking_levels(["default", "high"])
+    with pytest.raises(ValueError, match="resolve it first"):
+        reasoning_effort_for_level("default")

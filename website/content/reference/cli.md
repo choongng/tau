@@ -46,7 +46,7 @@ features and fixes.
 | `-p, --print` | Run the positional prompt in non-interactive print mode |
 | `-m, --model TEXT` | Model to request from the provider |
 | `--provider TEXT` | Configured provider name to use |
-| `-t, --thinking LEVEL` | Initial [thinking level](/guides/context/#thinking-modes) for this run (`off`…`max`); overrides remembered defaults without persisting, errors if the model doesn't support it |
+| `-t, --thinking LEVEL` | Initial [thinking level](/guides/context/#thinking-modes) for this run (`default`, `off`…`max`); overrides remembered defaults without persisting, errors if the model doesn't support it. `default` (catalog default, else the server's) works for any model |
 | `--cwd PATH` | Working directory for the built-in tools |
 | `--mode [text\|json\|transcript\|rpc]` | Select headless output; `rpc` starts the JSONL subprocess protocol |
 | `--session TEXT` | Resume a session id in the TUI or print mode |

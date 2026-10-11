@@ -64,7 +64,8 @@ You can also compact on demand with `/compact`.
 ## Thinking modes
 
 Some models can spend extra effort "thinking" before they answer. Tau exposes a
-**thinking mode** (off → minimal → low → medium → high → xhigh → max) you can cycle
+**thinking mode** (default → off → minimal → low → medium → high → xhigh → max,
+where `default` defers to the catalog, else the server) you can cycle
 when the active model supports it, and optionally show the streamed reasoning.
 → [Managing context](/guides/context/#thinking-modes)
 

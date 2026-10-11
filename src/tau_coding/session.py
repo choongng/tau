@@ -193,6 +193,7 @@ from tau_coding.system_prompt import (
 from tau_coding.thinking import (
     DEFAULT_THINKING_LEVEL,
     THINKING_LEVELS,
+    UPSTREAM_THINKING_LEVEL,
     ThinkingLevel,
     next_thinking_level,
     normalize_thinking_level,
@@ -2610,7 +2611,10 @@ class CodingSession:
         if not levels:
             self._preview_thinking = "off"
         elif self.thinking_level not in levels:
-            self._preview_thinking = levels[0]
+            # The first concrete level, as at startup: `default` is opted into.
+            self._preview_thinking = next(
+                (level for level in levels if level != UPSTREAM_THINKING_LEVEL), levels[0]
+            )
         self._invalidate_runtime_model_limits()
 
     def preview_thinking_level(self, level: str) -> str:
@@ -2853,6 +2857,10 @@ class CodingSession:
         if dynamic is not None:
             model = self._active_dynamic_model
             levels = model.thinking_levels if model is not None else None
+            if override == UPSTREAM_THINKING_LEVEL and override not in (levels or ()):
+                # An extension model that does not list `default` keeps the level
+                # it starts at, the nearest thing to the provider deciding.
+                return
             if not levels:
                 raise ProviderConfigError(
                     f"Thinking modes are unavailable for {dynamic.id}:{self.model}"

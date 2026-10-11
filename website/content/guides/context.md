@@ -110,8 +110,12 @@ Some models can spend extra effort reasoning before answering. Tau exposes a
 thinking level you can cycle:
 
 ```text
-off → minimal → low → medium → high → xhigh → max
+default → off → minimal → low → medium → high → xhigh → max
 ```
+
+`default` hands the choice upstream: Tau uses the provider catalog's
+`thinking_default` for the model, and when the catalog names none it sends no
+thinking setting at all, so the API server's own default applies.
 
 - **Shift+Tab** cycles the thinking level (default is `medium`).
 - **Ctrl+T** toggles whether reasoning tokens are shown (hidden by default).
@@ -136,5 +140,6 @@ You can also set the startup level from the command line with `--thinking`
 (`-t`), for example `tau -t high` or `tau -t max -p "explain this"`. The flag
 takes precedence over remembered and catalog defaults for that run but is not
 saved as a new default; requesting a level the selected model does not support
-exits with an error listing the available modes. Levels chosen interactively
+exits with an error listing the available modes. `--thinking default` is
+accepted for every model, including ones with no thinking modes. Levels chosen interactively
 afterwards (via `/think` or Shift+Tab) persist as usual.

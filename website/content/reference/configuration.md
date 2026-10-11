@@ -378,7 +378,10 @@ Provider preferences live in `~/.tau/providers.json`:
   `thinking_parameter` (which needs `thinking_levels`). Without it Tau warns at
   startup and in `/session`: no level reaches the request, and a model using
   `thinkingFormat = "qwen-chat-template"` gets `enable_thinking: false` on every
-  request.
+  request. Every model with thinking levels also offers the `default` level,
+  which resolves to `thinking_default` when that is set and supported, and
+  otherwise sends no thinking field so the server decides; `default` itself
+  cannot appear in `thinking_levels` or `thinking_default`.
 
 Writes after `/login`, `/model`, or scoped-model changes reload the file first,
 apply only the requested change, write atomically, and keep a `.bak` backup.
