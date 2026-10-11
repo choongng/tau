@@ -3461,7 +3461,7 @@ def _abandon_problem(task: str, why: str, nodes: list[dict[str, Any]]) -> str | 
             # Run R14: beagle refuses a new route for a task never opened.
             return (
                 f"pursuit_step: {task} not abandoned — it is a milestone, and a milestone "
-                "is the goal's. Split it with pursuit_plan, or, if a done task's commit "
+                "is the goal's. Split it with pursuit_plan. If a done task's commit "
                 f'already did its work, call pursuit_step task="{task}", abandon="done by '
                 'Tnnnn" and done_when, naming that task; it closes done on that commit '
                 f"if the check passes now.{duplicate}"
@@ -15570,10 +15570,7 @@ def make_worker_pursuit_guard() -> Any:
 #: The `beagle pursuit` verbs the driver's tools run, and the tool for each.
 _STEERED_VERBS = {
     "open": "pursuit_step (with criteria and done_when)",
-    "close": (
-        "pursuit_step, which closes a task on its check; to drop one, pursuit_step with "
-        "its task and abandon='<why>'"
-    ),
+    "close": "pursuit_step, which closes a task on its check",
     "retry": "pursuit_step on the blocked task, with notes saying what to fix",
     "spawn": "pursuit_step with new_route=true and notes saying what to do instead",
     "amend": "pursuit_step on the open task, with the new done_when",
@@ -15609,6 +15606,63 @@ def _steered_verb(argv: list[str]) -> str | None:
     return verb if verb in _STEERED_VERBS else None
 
 
+#: How many tasks a close steer names as ones its task may be dropped as a repeat of.
+_DROP_TAKERS = 5
+_SENTENCE_BREAK = re.compile(r"(?<=\.)\s+(?=[A-Z])")
+
+
+def _close_argv(argv: list[str]) -> str | None:
+    """A `beagle pursuit close` argv's task and why to drop it, as JSON, or None."""
+    if _steered_verb(argv) != "close" or "close" not in argv:
+        return None
+    task, values = "", {"--abandon": "", "--reason": "", "--outcome": ""}
+    args = iter(argv[argv.index("close") + 1 :])
+    for arg in args:
+        name, eq, value = arg.partition("=")
+        if name in values:
+            values[name] = value if eq else next(args, "")
+        elif not task and _TASK_ID.fullmatch(arg):
+            task = arg
+    why = values["--abandon"] or (values["--reason"] if values["--outcome"] == "abandoned" else "")
+    return json.dumps([task, why.strip()])
+
+
+def _close_drop(command: str, root: Path) -> str:
+    """How the driver may drop the task of a `beagle pursuit close` it was refused.
+
+    Runs R06, R08, R22, R26 and R28 closed a founding milestone from bash, were
+    told to drop it with abandon='<why>', and had every why refused: a milestone
+    is the goal's. So the tree decides: a drop is offered only where
+    `_abandon_problem` takes it, and otherwise what its refusal says to do.
+    """
+    found = _bash_find(command, _close_argv)
+    task, why = json.loads(found) if found else ("", "")
+    nodes = _tree_nodes(root) if task else []
+    ids = [str(n.get("id")) for n in nodes]
+    if task not in ids:
+        return ABANDON_HINT
+    call = f'pursuit_step task="{task}"'
+    plain = why and not _DONE_BY.match(why) and not _INFEASIBLE.match(why)
+    if plain and _abandon_problem(task, why, nodes) is None:
+        return f"To drop {task} for that reason, call {call}, abandon={json.dumps(why)}."
+    others = [t for t in ids if t != task]
+    takers = [t for t in others if _abandon_problem(task, f"duplicate of {t}", nodes) is None]
+    if takers:
+        named = ", ".join(takers[:_DROP_TAKERS])
+        if len(takers) > _DROP_TAKERS:
+            named += f" and {len(takers) - _DROP_TAKERS} more"
+        return (
+            f'To drop {task} as a repeat, call {call}, abandon="duplicate of Tnnnn", '
+            f"naming as Tnnnn the task that holds its work, one of: {named}."
+        )
+    status = {str(n.get("id")): n.get("status") for n in nodes}
+    live = [t for t in others if status.get(t) in ("done", "open")]
+    refusal = _abandon_problem(task, f"duplicate of {(live or others or [''])[0]}", nodes) or ""
+    body = refusal.split(" not abandoned — ", 1)[-1]
+    kept = [s for s in _SENTENCE_BREAK.split(body) if "abandon=" not in s]
+    return f"{task} is not one to drop: {' '.join(kept)}"
+
+
 def make_driver_pursuit_guard() -> Any:
     """Build the `tool_call` guard that steers the driver's pursuit verbs to its tools.
 
@@ -15630,16 +15684,24 @@ def make_driver_pursuit_guard() -> Any:
                 return None
             if context.session_id != _STARTED_SESSION:
                 return None
-            verb = _bash_find(str((event.arguments or {}).get("command", "")), _steered_verb)
-            if verb is None or _find_goal(Path(context.cwd)) is None:
+            command = str((event.arguments or {}).get("command", ""))
+            verb = _bash_find(command, _steered_verb)
+            goal = _find_goal(Path(context.cwd)) if verb is not None else None
+            if verb is None or goal is None:
                 return None
         except Exception:  # noqa: BLE001 - fail open, never block on a guard bug
             return None
+        drop = ""
+        if verb == "close":
+            try:
+                drop = f" {_close_drop(command, goal.parent.parent)}"
+            except Exception:  # noqa: BLE001 - a tree it cannot read gets the plain offer
+                drop = f" {ABANDON_HINT}"
         return ToolCallHookResult(
             block=True,
             reason=(
                 f"refusing `beagle pursuit {verb}` from bash: use {_STEERED_VERBS[verb]}. "
-                "The tool runs it with the checks around it that the bare verb skips."
+                f"The tool runs it with the checks around it that the bare verb skips.{drop}"
             ),
         )
 

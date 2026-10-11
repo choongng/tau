@@ -7809,6 +7809,112 @@ async def test_the_driver_steers_through_its_tools_not_bash_verbs(
     assert opted_out.text == "ran"
 
 
+async def _bash_close_steer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *commands: str
+) -> list[str]:
+    """What the driver's guard says to each `beagle pursuit close` run from bash."""
+    monkeypatch.chdir(_pursuit_project(tmp_path))
+    runtime, _ = _bound(tmp_path)
+    bash = _tool_with_hooks(runtime, "bash")
+    await runtime.emit_session_start("startup")
+    said = [(await bash.execute(f"c{i}", {"command": c})).text for i, c in enumerate(commands)]
+    for text in said:
+        assert "refusing `beagle pursuit close` from bash: use pursuit_step" in text
+    return said
+
+
+def _offered_drops(text: str) -> list[str]:
+    """Each abandon= value a steer offers, with a Tnnnn filled in from its list."""
+    offered = re.findall(r'abandon=("(?:[^"\\]|\\.)*")', text)
+    whys = [json.loads(o) for o in offered]
+    listed = re.search(r"one of: ([^.]*)\.", text)
+    named = _module()._TASK_ID.findall(listed.group(1)) if listed else []
+    return [w.replace("Tnnnn", t) for w in whys for t in named] if named else whys
+
+
+@pytest.mark.anyio
+async def test_bash_close_steer_on_a_milestone_offers_no_abandon(
+    tmp_path: Path, beagle: Path, fake_beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # R06, R08, R22, R26, R28: `beagle pursuit close T0003 ...` from bash was
+    # steered to abandon='<why>', and pursuit_step refused every why given.
+    nodes = _later_milestone_nodes()
+    (fake_beagle / "tree.out").write_text(json.dumps({"nodes": nodes}))
+    problem = _module()._abandon_problem
+    tasks = ["T0001", "T0002", "T0003", "T0004"]
+    for task in tasks:
+        assert all(problem(task, f"duplicate of {t}", nodes) for t in tasks + ["T0005"])
+
+    root, opened, pending, part = await _bash_close_steer(
+        tmp_path,
+        monkeypatch,
+        "beagle pursuit close T0001 --outcome abandoned --reason 'already exists'",
+        "beagle pursuit close T0002 --outcome abandoned",
+        "cd /p && beagle pursuit close T0003 --outcome abandoned --reason 'already exists'",
+        'beagle pursuit close T0004 --abandon "duplicate of T0003"',
+    )
+
+    for text in (root, opened, pending, part):
+        assert "abandon=" not in text
+    assert "T0001 is not one to drop: it is the root" in root
+    assert "Work its open tasks with pursuit_step" in root
+    assert "T0002 is not one to drop: it is a milestone" in opened
+    assert 'pursuit_step task="T0002", new_route=true and notes' in opened
+    assert "T0003 is not one to drop: it is a milestone" in pending
+    assert pending.endswith("Split it with pursuit_plan.")
+    assert "T0004 is not one to drop: T0002 would stall for good" in part
+    assert 'Work it with pursuit_step task="T0004" and a done_when' in part
+
+
+@pytest.mark.anyio
+async def test_bash_close_steer_offered_call_passes_abandon_problem(
+    tmp_path: Path, beagle: Path, fake_beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # R22: a milestone a plan added later may go as a duplicate; offer only those.
+    nodes = _later_milestone_nodes()
+    (fake_beagle / "tree.out").write_text(json.dumps({"nodes": nodes}))
+    problem = _module()._abandon_problem
+
+    repeat, given, done_by = await _bash_close_steer(
+        tmp_path,
+        monkeypatch,
+        "beagle pursuit close T0005 --outcome abandoned --reason 'already exists'",
+        'beagle pursuit close T0005 --outcome=abandoned --reason="duplicate of T0003"',
+        "beagle pursuit close T0005 --outcome abandoned --reason 'done by T0004'",
+    )
+
+    assert 'To drop T0005 as a repeat, call pursuit_step task="T0005"' in repeat
+    assert "one of: T0002, T0003, T0004." in repeat
+    assert 'abandon="duplicate of T0003".' in given
+    assert "done by" not in done_by and done_by.endswith("one of: T0002, T0003, T0004.")
+    for text in (repeat, given, done_by):
+        drops = _offered_drops(text)
+        assert drops and all(problem("T0005", why, nodes) is None for why in drops)
+
+
+@pytest.mark.anyio
+async def test_bash_close_steer_without_a_task_offers_only_a_duplicate_drop(
+    tmp_path: Path, beagle: Path, fake_beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (fake_beagle / "tree.out").write_text(json.dumps({"nodes": _later_milestone_nodes()}))
+    no_task, unknown = await _bash_close_steer(
+        tmp_path,
+        monkeypatch,
+        "beagle pursuit close --outcome abandoned --reason 'already exists'",
+        "beagle pursuit close T0099 --outcome abandoned",
+    )
+    (fake_beagle / "tree.rc").write_text("1")
+    [unread] = await _bash_close_steer(
+        tmp_path, monkeypatch, "beagle pursuit close T0003 --outcome abandoned"
+    )
+
+    hint = _module().ABANDON_HINT
+    for text in (no_task, unknown, unread):
+        assert text.endswith(hint)
+        assert re.findall(r"abandon=\S+", text) == ["abandon='duplicate"]
+        assert "<why>" not in text
+
+
 @pytest.mark.anyio
 async def test_the_driver_runs_pursuit_verbs_outside_a_pursuit(
     tmp_path: Path, beagle: Path
