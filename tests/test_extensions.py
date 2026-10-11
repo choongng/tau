@@ -136,6 +136,7 @@ class RecordingSession:
         self.session_id = "session-1"
         self.session_name: str | None = "Test session"
         self.thinking_level = "medium"
+        self.available_thinking_levels: tuple[str, ...] = ("off", "low", "medium", "high")
         self.system_prompt = "You are Tau."
         self.project_trust_resolution: ProjectTrustResolution | None = ProjectTrustResolution(
             trusted=True, source="saved"
@@ -1604,6 +1605,17 @@ def test_context_exposes_available_provider_and_model_ids(tmp_path: Path) -> Non
         ("other", "other-model"),
     ]
     assert all(isinstance(choice, ModelChoice) for choice in api.context.available_model_choices)
+
+
+def test_context_exposes_available_thinking_levels(tmp_path: Path) -> None:
+    runtime = ExtensionRuntime()
+    api = _register_inline_extension(runtime, "reader")
+    session = RecordingSession(tmp_path)
+    runtime.bind(session)
+
+    assert api.context.available_thinking_levels == ("off", "low", "medium", "high")
+    session.available_thinking_levels = ()  # a model with no thinking modes
+    assert api.context.available_thinking_levels == ()
 
 
 def test_transcript_exposes_prior_messages_in_order(tmp_path: Path) -> None:

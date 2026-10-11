@@ -188,6 +188,7 @@ def setup(tau):
     tau.context.inference_provider_mode        # "automatic" or "fixed"
     tau.context.session_id, tau.context.session_name
     tau.context.thinking_level, tau.context.system_prompt
+    tau.context.available_thinking_levels       # modes the active model supports; () if none
     tau.context.paths                 # resolved TauPaths snapshot
     tau.context.project_trusted       # bool: were this cwd's project inputs approved?
     tau.context.project_trust_resolution  # full ProjectTrustResolution, or None

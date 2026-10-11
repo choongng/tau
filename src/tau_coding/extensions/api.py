@@ -954,6 +954,12 @@ class ExtensionContext:
         return self._runtime.session_view.thinking_level
 
     @property
+    def available_thinking_levels(self) -> tuple[str, ...]:
+        """Return the thinking modes the active model supports; empty when it has none."""
+        self._generation.assert_active()
+        return tuple(self._runtime.session_view.available_thinking_levels)
+
+    @property
     def system_prompt(self) -> str:
         """Return the active system prompt."""
         self._generation.assert_active()

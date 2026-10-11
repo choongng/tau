@@ -136,6 +136,9 @@ class BoundSession(Protocol):
     def thinking_level(self) -> str: ...
 
     @property
+    def available_thinking_levels(self) -> tuple[str, ...]: ...
+
+    @property
     def system_prompt(self) -> str: ...
 
     @property
