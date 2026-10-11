@@ -11704,6 +11704,146 @@ async def test_part_scoping_the_cases_module_must_run_the_locked_cases_test(
     assert module._locked_test_problem(other, ["docs/"], goal) is None
 
 
+LOCKED_CODEC_TEST = (
+    "import json\n\nimport codec\n\n"
+    "CASES = json.load(open('tests/cases.json'))\n\n\n"
+    "def test_encode():\n    assert codec.encode(1) == 2\n"
+)
+
+
+def _locked_codec_project(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, code: str | None
+) -> Path:
+    """A committed, locked test judging codec, with codec.py committed when `code`."""
+    project = _git_project(tmp_path, monkeypatch)
+    monkeypatch.chdir(project)
+    (project / "tests").mkdir()
+    (project / "tests" / "cases.json").write_text("[]")
+    (project / "tests" / "test_cases.py").write_text(LOCKED_CODEC_TEST)
+    _store_lock(project / ".beagle", "tests/cases.json", "[]")
+    _store_lock(project / ".beagle", "tests/test_cases.py", LOCKED_CODEC_TEST)
+    if code is not None:
+        (project / "codec.py").write_text(code)
+    _git(project, "add", ".")
+    _git(project, "commit", "-q", "-m", "base")
+    return project
+
+
+@pytest.mark.anyio
+async def test_locked_test_offer_does_not_name_a_locked_test_that_already_passes(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # R22, R43: the driver bound the locked test it was offered, and the pre-run
+    # refused it as already passing, many times.
+    _locked_codec_project(tmp_path, monkeypatch, code="def encode(value):\n    return value + 1\n")
+    _ready_task(fake_beagle)
+    runtime, _ = _bound(tmp_path)
+
+    refused = await _tool(runtime, "pursuit_step").execute("c1", _open_args(["codec.py"]))
+
+    assert "T0002 not opened" in refused.text, refused.text
+    assert "the scope holds codec, which the locked tests/test_cases.py judges" in refused.text
+    assert "Bind `python3 -m pytest -q tests/test_cases.py`" not in refused.text
+    assert "`python3 -m pytest -q tests/test_cases.py` already passes, before any work" in (
+        refused.text
+    )
+    assert "name a new test file" in refused.text
+    assert _pursuit_calls(fake_beagle, "open") == [] and _runs(fake_tau) == []
+
+
+@pytest.mark.anyio
+async def test_locked_test_offer_names_the_fix_route_for_a_locked_test_passing_without_code(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # R43 E19-E57: the locked test passes with no module, so binding it is refused too.
+    project = _git_project(tmp_path, monkeypatch)
+    monkeypatch.chdir(project)
+    cases = '[{"in": 1, "out": 2}]'
+    (project / "tests").mkdir()
+    (project / "tests" / "cases.json").write_text(cases)
+    (project / "tests" / "test_case_data.py").write_text(R43_GUARDED_CASES_TEST)
+    _git(project, "add", "tests")
+    _git(project, "commit", "-q", "-m", "T0005: Known answers")
+    _store_lock(project / ".beagle", "tests/cases.json", cases)
+    _store_lock(project / ".beagle", "tests/test_case_data.py", R43_GUARDED_CASES_TEST)
+    _ready_task(fake_beagle)
+    runtime, _ = _bound(tmp_path)
+
+    refused = await _tool(runtime, "pursuit_step").execute("c1", _open_args(["codec.py"]))
+
+    assert "T0002 not opened" in refused.text, refused.text
+    assert "`python3 -m pytest -q tests/test_case_data.py` already passes" in refused.text
+    assert "Known answers: fix tests/test_case_data.py::<what is wrong in it>" in refused.text
+    assert "Bind `python3 -m pytest -q tests/test_case_data.py`" not in refused.text
+    assert _pursuit_calls(fake_beagle, "open") == []
+
+
+@pytest.mark.anyio
+async def test_locked_test_offer_still_names_a_locked_test_that_fails(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _locked_codec_project(tmp_path, monkeypatch, code=None)
+    _ready_task(fake_beagle)
+    runtime, _ = _bound(tmp_path)
+    step = _tool(runtime, "pursuit_step")
+
+    refused = await step.execute("c1", _open_args(["codec.py"]))
+
+    assert "T0002 not opened" in refused.text, refused.text
+    assert "Bind `python3 -m pytest -q tests/test_cases.py`" in refused.text
+    assert "already passes" not in refused.text
+    assert _pursuit_calls(fake_beagle, "open") == []
+    # The offered call, sent as given, opens.
+    offered = {**_open_args(["codec.py"]), "done_when": "python3 -m pytest -q tests/test_cases.py"}
+    opened = await step.execute("c2", offered)
+    assert "not opened" not in opened.text, opened.text
+    assert len(_pursuit_calls(fake_beagle, "open")) == 1
+
+
+@pytest.mark.anyio
+async def test_driver_edit_refusal_offers_a_step_pursuit_step_accepts(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # d0978b70: the refusal names pursuit_step for the offered task; that call,
+    # sent as given, meets no done_when guard, though the task's stored check
+    # runs none of the locked tests.
+    _locked_codec_project(tmp_path, monkeypatch, code=None)
+    _ready_task(fake_beagle)
+    show = json.loads((fake_beagle / "show.out").read_text())
+    (fake_beagle / "show.out").write_text(json.dumps({**show, "scope": ["codec.py"]}))
+    runtime, _ = _bound(tmp_path)
+    await runtime.emit_session_start("startup")
+    write = _tool_with_hooks(runtime, "write")
+
+    refused = await write.execute("c1", {"path": "codec.py", "content": "x"})
+    call = "Call pursuit_step with task=T0002, with what you meant to change in its notes"
+    assert call in refused.text, refused.text
+
+    stepped = await _tool(runtime, "pursuit_step").execute(
+        "c2", {"task": "T0002", "notes": "write codec.encode"}
+    )
+
+    assert "not opened" not in stepped.text, stepped.text
+    assert "Next task: T0002" in stepped.text and "done_when:" in stepped.text
+    assert _pursuit_calls(fake_beagle, "open") == []
+
+
 @pytest.mark.anyio
 async def test_prove_does_not_offer_absent_for_a_source_that_predates_the_task(
     tmp_path: Path, beagle: Path, fake_beagle: Path, monkeypatch: pytest.MonkeyPatch

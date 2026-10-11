@@ -140,7 +140,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
-from collections.abc import Callable, Collection, Mapping
+from collections.abc import Awaitable, Callable, Collection, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -6578,9 +6578,9 @@ def _python_script(args: list[str]) -> str | None:
     return None
 
 
-def _locked_test_problem(command: str, scope: list[str], goal: Path) -> str | None:
-    """Why a part on a module a locked test judges is bound to a check that runs no
-    locked test, or None.
+def _locked_test_unrun(command: str, scope: list[str], goal: Path) -> tuple[str, str] | None:
+    """The module in `scope` a locked test judges, and that test, when `command`
+    runs no locked test; else None.
 
     Run R14 closed T0007 and T0008, both scoped on interval_tree_clocks, on
     construct-and-call checks; the locked cases test that imports it never ran.
@@ -6603,14 +6603,56 @@ def _locked_test_problem(command: str, scope: list[str], goal: Path) -> str | No
     judged = [(module, test) for module, test in imported.items() if held(module)]
     if not judged or any(_runs_test_file(command, test) for _, test in judged):
         return None
-    module, test = judged[0]
+    return judged[0]
+
+
+def _locked_test_unrun_said(module: str, test: str) -> str:
+    """The lead of a refusal of a check that runs none of the locked tests."""
     return (
         f"the scope holds {module}, which the locked {test} judges, but done_when runs "
-        f"none of the locked tests, so the reference's answers would not judge this "
-        f"part. Bind `python3 -m pytest -q {test}`. A selection of that file counts as "
-        f"running it, so a small part can bind just the cases it makes pass: a node id "
+        f"none of the locked tests, so the reference's answers would not judge this part"
+    )
+
+
+def _locked_test_problem(command: str, scope: list[str], goal: Path) -> str | None:
+    """Why a part on a module a locked test judges is bound to a check that runs no
+    locked test, or None; the call it offers binds that test."""
+    unrun = _locked_test_unrun(command, scope, goal)
+    if unrun is None:
+        return None
+    module, test = unrun
+    return (
+        f"{_locked_test_unrun_said(module, test)}. Bind `python3 -m pytest -q {test}`. "
+        "A selection of that file counts as running it, so a small part can bind just "
+        "the cases it makes pass: a node id "
         f"(`python3 -m pytest -q {test}::<test name>`) or `python3 -m pytest -q {test} "
         "-k <name>`. Call pursuit_step again with that."
+    )
+
+
+async def _locked_test_refusal(
+    command: str,
+    scope: list[str],
+    goal: Path,
+    passing_refused: Callable[[str], Awaitable[str | None]],
+) -> str | None:
+    """`_locked_test_problem`, its offer first met with the refusal that meets it.
+
+    `passing_refused` runs a check and gives the refusal of it as passing before
+    any work, or None. Runs R22 and R43 bound the locked test this offered and
+    were refused as already passing, many times: where the locked test passes
+    now, that refusal, with its own way on, is said in place of the offer.
+    """
+    unrun = _locked_test_unrun(command, scope, goal)
+    if unrun is None:
+        return None
+    module, test = unrun
+    refused = await passing_refused(f"python3 -m pytest -q {test}")
+    if refused is None:
+        return _locked_test_problem(command, scope, goal)
+    return (
+        f"{_locked_test_unrun_said(module, test)}, and binding the locked test is no "
+        f"way on either: {refused}"
     )
 
 
@@ -13006,6 +13048,14 @@ def make_step_tool() -> Any:
         retrying = False
         passed_on_disk: tuple[int, str] | None = None
         killed_run: tuple[int, str] | None = None
+        probed: dict[str, tuple[int, str]] = {}
+
+        async def probe(command: str) -> tuple[int, str]:
+            # One run per offered command in a call, whichever refusal asks.
+            if command not in probed:
+                probed[command] = await _run_check(command, root, DEFAULT_CHECK_TIMEOUT)
+            return probed[command]
+
         hang = ""
         drop_import = ""
         status = record.get("status")
@@ -13136,6 +13186,16 @@ def make_step_tool() -> Any:
                             root,
                         )
                     )
+
+                async def route_passing(command: str) -> str | None:
+                    # The rehearsal's refusal below, for an offered command.
+                    passed = (await probe(command))[0] == 0
+                    if not passed or await _passes_only_by_uncommitted(
+                        command, [route_scope], root
+                    ):
+                        return None
+                    return _already_passes(command, task, _tree_nodes(root))
+
                 scoped = (
                     _scope_problem(route_scope, task, nodes, root)
                     or _locked_scope_problem(route_scope, root, title, task, done_when or old_check)
@@ -13143,7 +13203,9 @@ def make_step_tool() -> Any:
                         done_when or old_check, route_scope, task, nodes, root
                     )
                     or _oracle_with_code_problem(route_scope, goal, task, done_when or old_check)
-                    or _locked_test_problem(done_when or old_check, route_scope, goal)
+                    or await _locked_test_refusal(
+                        done_when or old_check, route_scope, goal, route_passing
+                    )
                     or _import_scope_problem(done_when or old_check, route_scope, root)
                     or _inverted_exit_problem(done_when or old_check)
                     or _absent_check_file_problem(done_when or old_check, route_scope, root)
@@ -13305,6 +13367,53 @@ def make_step_tool() -> Any:
                 # Run R18 #56: T0008, spawned with no scope, was refused "no scope given".
                 scope = _predecessor_scope(record, root)
 
+            def passing_refusal(
+                command: str,
+                scope: list[str],
+                rewritten_from: tuple[str, str] | None = None,
+            ) -> str:
+                """The pre-run's refusal of `command`, which passes before any work."""
+                unjudged = _locked_test_without_its_module(command, goal, root)
+                if unjudged:
+                    # Run R43: binding the locked test was refused as already passing,
+                    # and a new test file as not running the locked test, for 22 calls.
+                    test, module = unjudged
+                    return (
+                        f"`{command}` already passes, before any work: "
+                        f"{_guarded_import_said(test, module, module, root)} No check that "
+                        "runs it can fail now, and one that does not run it is refused, so "
+                        "the locked test is what is wrong. "
+                        + _known_answers_fix_route(test, goal, task, title, _tree_nodes(root))
+                    )
+                now = _tree_nodes(root)
+                # The paths `_done_by` takes for the offered call, which names `scope`.
+                paths = scope or _strings(record.get("scope")) or _check_targets(command, root)
+                done_by = _done_task_in_log(paths, task, now, root)
+                named = f"{title}\n{record.get('criteria') or ''}\n{criteria}"
+                refused_lead = f"a close done by {done_by} would be refused: "
+                _, unwitnessed = (
+                    _done_by_witness(task, done_by, command, paths, root, named, refused_lead)
+                    if done_by
+                    else ([], "")
+                )
+                return _already_passes(
+                    command,
+                    task,
+                    now,
+                    done_by,
+                    rewritten_from=rewritten_from,
+                    scope=scope,
+                    unwitnessed=unwitnessed,
+                )
+
+            async def open_passing(command: str, scope: list[str]) -> str | None:
+                # The pre-run's refusal below, for an offered command.
+                if (await probe(command))[0] != 0 or await _passes_only_by_uncommitted(
+                    command, [scope, _predecessor_scope(record, root)], root
+                ):
+                    return None
+                return passing_refusal(command, scope)
+
             async def scope_refusal(scope: list[str]) -> str | None:
                 return (
                     _no_scope_problem(
@@ -13321,7 +13430,9 @@ def make_step_tool() -> Any:
                     or _cases_first_problem(
                         scope, task, title, goal, nodes, _strings(arguments.get("locks"))
                     )
-                    or _locked_test_problem(done_when, scope, goal)
+                    or await _locked_test_refusal(
+                        done_when, scope, goal, lambda command: open_passing(command, scope)
+                    )
                     or _import_scope_problem(done_when, scope, root)
                     or _inverted_exit_problem(done_when)
                     or _absent_check_file_problem(done_when, scope, root)
@@ -13357,42 +13468,10 @@ def make_step_tool() -> Any:
             ):
                 route += _on_disk_note(done_when, task)
                 passed_on_disk = (pre_rc, pre_out)
-            elif pre_rc == 0 and (
-                unjudged := _locked_test_without_its_module(done_when, goal, root)
-            ):
-                # Run R43: binding the locked test was refused as already passing,
-                # and a new test file as not running the locked test, for 22 calls.
-                test, module = unjudged
-                return _step_result(
-                    f"pursuit_step: {task} not opened — `{done_when}` already passes, "
-                    f"before any work: {_guarded_import_said(test, module, module, root)} "
-                    "No check that runs it can fail now, and one that does not run it is "
-                    "refused, so the locked test is what is wrong. "
-                    + _known_answers_fix_route(test, goal, task, title, _tree_nodes(root))
-                )
             elif pre_rc == 0:
-                now = _tree_nodes(root)
-                # The paths `_done_by` takes for the offered call, which names `scope`.
-                paths = scope or _strings(record.get("scope")) or _check_targets(done_when, root)
-                done_by = _done_task_in_log(paths, task, now, root)
-                named = f"{title}\n{record.get('criteria') or ''}\n{criteria}"
-                refused_lead = f"a close done by {done_by} would be refused: "
-                _, unwitnessed = (
-                    _done_by_witness(task, done_by, done_when, paths, root, named, refused_lead)
-                    if done_by
-                    else ([], "")
-                )
                 return _step_result(
                     f"pursuit_step: {task} not opened — "
-                    + _already_passes(
-                        done_when,
-                        task,
-                        now,
-                        done_by,
-                        rewritten_from=rewritten_from,
-                        scope=scope,
-                        unwitnessed=unwitnessed,
-                    )
+                    + passing_refusal(done_when, scope, rewritten_from)
                 )
             broke = _check_broke(pre_rc, pre_out, scope, root)
             if broke is not None:
