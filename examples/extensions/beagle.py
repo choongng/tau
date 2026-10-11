@@ -10940,6 +10940,8 @@ def _already_passes(
     done_by: str = "",
     *,
     rewritten_from: tuple[str, str] | None = None,
+    scope: list[str] | None = None,
+    unwitnessed: str = "",
 ) -> str:
     """Why a check that passes before any work is not bound.
 
@@ -10948,7 +10950,10 @@ def _already_passes(
     nine times. A done sibling closed on the same check is named instead.
     With `done_by`, a done task whose commit is in the scope's history, the
     done-by abandon is offered: run R14 was told to bind the goal's test,
-    which was the same passing check.
+    which was the same passing check. The offer names `scope`, the paths
+    `_done_by` then takes. With `unwitnessed`, `_done_by_witness`'s refusal of
+    that close, its way forward is offered in place of the done-by: runs R06,
+    R09, R18 and R40 were offered a done-by close the witness rule refused.
     With `rewritten_from`, the command as sent and why it became `check`, the
     refusal names both: run R40 class 3 was told to put a new test in scope, which
     its call had done, four times, while the rewrite was said only in the route.
@@ -10956,13 +10961,19 @@ def _already_passes(
     if rewritten_from is not None and rewritten_from[0].split() != check.split():
         sent, why = rewritten_from
         return f"`{sent}`, as sent, was rewritten to `{check}`: {why} " + _already_passes(
-            check, task, nodes, done_by
+            check, task, nodes, done_by, scope=scope, unwitnessed=unwitnessed
+        )
+    if done_by and unwitnessed:
+        return (
+            f"`{check}` already passes, before any work, so it cannot tell this task's "
+            f"work from none; {unwitnessed}"
         )
     if done_by:
+        scoped = f" scope={json.dumps(scope)}" if scope else ""
         return (
             f"`{check}` already passes, before any work, so it cannot tell this task's "
             f"work from none. If {done_by}'s work already did this, call pursuit_step "
-            f'task="{task}" abandon="done by {done_by}" done_when="{check}": it closes '
+            f'task="{task}" abandon="done by {done_by}" done_when="{check}"{scoped}: it closes '
             f"done on {done_by}'s commit, with no sub-agent. If work is left, bind a check "
             "that fails now: name a new test file for what is left, put it in scope, and "
             "say in the notes what it should test; do not write it yourself."
@@ -11611,17 +11622,10 @@ async def _done_by(
     # Run R22: the close refused T0018 for want of a witness and left it open, and
     # six workers then ran on its empty scope. A witness here takes away a file
     # `done` committed in this task's paths; with none, the close cannot be met.
-    witness: list[str] = []
-    if _requires_witness(root):
-        committed = list(dict.fromkeys(rel for s in shas for rel in _commit_paths(s, root)))
-        witness = [
-            rel
-            for rel in committed
-            if _in_scope(rel, paths, root) and _can_witness(rel) and (root / rel).is_file()
-        ]
-        if not witness:
-            named = f"{title}\n{record.get('criteria') or ''}\n{arguments.get('criteria') or ''}"
-            return _done_by_unwitnessed(task, done, check, paths, committed, root, named)
+    named = f"{title}\n{record.get('criteria') or ''}\n{arguments.get('criteria') or ''}"
+    witness, unwitnessed = _done_by_witness(task, done, check, paths, root, named)
+    if unwitnessed:
+        return unwitnessed
     criteria = (
         str(arguments.get("criteria") or "").strip()
         or str(record.get("criteria") or "").strip()
@@ -11712,6 +11716,37 @@ def _can_witness(rel: str) -> bool:
     return not (_is_test_path(rel) and rel.endswith(".py"))
 
 
+def _done_by_witness(
+    task: str,
+    done: str,
+    check: str,
+    paths: list[str],
+    root: Path,
+    named: str = "",
+    lead: str = "",
+) -> tuple[list[str], str]:
+    """The files `done` committed in `paths` that can witness a done-by close of `task`,
+    and, when the pursuit requires a witness and none can, `_done_by_unwitnessed`'s
+    refusal ("" otherwise).
+
+    `_done_by` refuses on it and `_already_passes` offers a done-by only where it
+    gives no refusal: runs R06, R09, R18 and R40 were offered done-by closes this
+    refused.
+    """
+    if not _requires_witness(root):
+        return [], ""
+    shas = _task_commits(done, root)
+    committed = list(dict.fromkeys(rel for s in shas for rel in _commit_paths(s, root)))
+    witness = [
+        rel
+        for rel in committed
+        if _in_scope(rel, paths, root) and _can_witness(rel) and (root / rel).is_file()
+    ]
+    if witness:
+        return witness, ""
+    return [], _done_by_unwitnessed(task, done, check, paths, committed, root, named, lead)
+
+
 def _done_by_unwitnessed(
     task: str,
     done: str,
@@ -11720,8 +11755,10 @@ def _done_by_unwitnessed(
     committed: list[str],
     root: Path,
     named: str = "",
+    lead: str = "",
 ) -> str:
-    """The up-front refusal of a done-by close the witness rule would refuse.
+    """The up-front refusal of a done-by close the witness rule would refuse; `lead`,
+    when given, stands for its opening "pursuit_step: T not closed done by D — ".
 
     Run R28: the offer widened eleven tasks' scope with tests/cases.json, T0002's
     data, and each then closed as done by T0002. A file outside the paths is
@@ -11736,10 +11773,11 @@ def _done_by_unwitnessed(
         and (rel in named or re.search(rf"(?<![\w./-]){re.escape(Path(rel).name)}\b", named))
     ]
     said = (
-        f"pursuit_step: {task} not closed done by {done} — this pursuit closes done only on "
-        f"a witnessed check, and no file {done} committed in {', '.join(paths)} is a source "
-        "or data file whose absence could show the check refuses, so the close would "
-        f"refuse and leave {task} open. Nothing was opened."
+        (lead or f"pursuit_step: {task} not closed done by {done} — ")
+        + "this pursuit closes done only on a witnessed check, and no file "
+        f"{done} committed in {', '.join(paths)} is a source or data file whose absence "
+        f"could show the check refuses, so the close would refuse and leave {task} open. "
+        "Nothing was opened."
     )
     if outside:
         return (
@@ -13304,11 +13342,27 @@ def make_step_tool() -> Any:
                 )
             elif pre_rc == 0:
                 now = _tree_nodes(root)
-                paths = scope or _check_targets(done_when, root)
+                # The paths `_done_by` takes for the offered call, which names `scope`.
+                paths = scope or _strings(record.get("scope")) or _check_targets(done_when, root)
                 done_by = _done_task_in_log(paths, task, now, root)
+                named = f"{title}\n{record.get('criteria') or ''}\n{criteria}"
+                refused_lead = f"a close done by {done_by} would be refused: "
+                _, unwitnessed = (
+                    _done_by_witness(task, done_by, done_when, paths, root, named, refused_lead)
+                    if done_by
+                    else ([], "")
+                )
                 return _step_result(
                     f"pursuit_step: {task} not opened — "
-                    + _already_passes(done_when, task, now, done_by, rewritten_from=rewritten_from)
+                    + _already_passes(
+                        done_when,
+                        task,
+                        now,
+                        done_by,
+                        rewritten_from=rewritten_from,
+                        scope=scope,
+                        unwitnessed=unwitnessed,
+                    )
                 )
             broke = _check_broke(pre_rc, pre_out, scope, root)
             if broke is not None:

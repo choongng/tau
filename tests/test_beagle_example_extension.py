@@ -16529,6 +16529,131 @@ async def test_done_by_does_not_leave_the_task_open_when_close_fails(
     assert _runs(fake_tau) == []
 
 
+_OFFERED_DONE_BY = re.compile(
+    r'pursuit_step task="(T\d+)",? abandon="(done by T\d+)",? '
+    r'done_when=("(?:[^"\\]|\\.)*")(?:,? scope=(\[[^\]]*\]))?'
+)
+
+
+def _offered_done_by(text: str) -> dict[str, Any] | None:
+    """The done-by call a result offers, as pursuit_step arguments; None if none."""
+    found = _OFFERED_DONE_BY.search(text)
+    if found is None:
+        return None
+    task, abandon, done_when, scope = found.groups()
+    args: dict[str, Any] = {"task": task, "abandon": abandon, "done_when": json.loads(done_when)}
+    if scope:
+        args["scope"] = json.loads(scope)
+    return args
+
+
+@pytest.mark.anyio
+async def test_already_passes_offers_no_done_by_that_needs_a_witness_it_lacks(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # R06, R09, R18, R40: the already-passes refusal offered abandon="done by T…",
+    # which the witness rule then refused, as T0003 committed only a test file.
+    project, _ = _done_by_project(tmp_path, fake_beagle, monkeypatch, "T0003: Cases")
+    _require_witness(project)
+    runtime, _ = _bound(tmp_path)
+    step = _tool(runtime, "pursuit_step")
+    scope = ["tests/test_cases.py"]
+
+    offer = await step.execute(
+        "c1", {"task": "T0004", "criteria": "c", "done_when": CASES_CHECK, "scope": scope}
+    )
+    refused = await step.execute(
+        "c2",
+        {"task": "T0004", "abandon": "done by T0003", "done_when": CASES_CHECK, "scope": scope},
+    )
+
+    assert "T0004 not opened" in offer.text and "already passes" in offer.text
+    assert _offered_done_by(offer.text) is None and 'abandon="done by' not in offer.text
+    assert "a close done by T0003 would be refused" in offer.text
+    assert 'call pursuit_step task="T0004" and bind a check that fails now' in offer.text
+    # The offer says what the done-by route says when it refuses that call.
+    reason = "this pursuit closes done only on a witnessed check"
+    assert refused.text.startswith("pursuit_step: T0004 not closed done by T0003 — ")
+    assert offer.text[offer.text.index(reason) :] == refused.text[refused.text.index(reason) :]
+    assert _pursuit_calls(fake_beagle, "open") == [] == _pursuit_calls(fake_beagle, "close")
+    assert _runs(fake_tau) == []
+
+
+@pytest.mark.anyio
+async def test_already_passes_offered_done_by_is_one_done_by_accepts(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project, _ = _done_by_project(tmp_path, fake_beagle, monkeypatch, "T0003: Cases")
+    _require_witness(project)
+    (project / "tests" / "cases.json").write_text("[]\n")
+    _git(project, "add", "tests/cases.json")
+    _git(project, "commit", "-q", "-m", "T0003: Cases data")
+    (fake_beagle / "prove.out").write_text("T0004: PROVEN — refuses with tests/cases.json gone\n")
+    runtime, _ = _bound(tmp_path)
+    step = _tool(runtime, "pursuit_step")
+
+    # In scope, tests/cases.json witnesses; outside it, the offer adds it to the
+    # scope, as the task's criteria name it.
+    for scope in (["tests"], ["tests/test_cases.py"]):
+        (fake_beagle / "calls.jsonl").unlink(missing_ok=True)
+        offer = await step.execute(
+            "c1",
+            {
+                "task": "T0004",
+                "criteria": "the cases in tests/cases.json run",
+                "done_when": CASES_CHECK,
+                "scope": scope,
+            },
+        )
+        args = _offered_done_by(offer.text)
+        assert args is not None and args["abandon"] == "done by T0003", offer.text
+
+        closed = await step.execute("c2", args)
+
+        assert "not closed done" not in closed.text, closed.text
+        assert "T0004 — Cases test: closed done" in closed.text
+        [opened] = _pursuit_calls(fake_beagle, "open")
+        assert opened[opened.index("--confirms") + 1] == "T0003"
+        assert [c[2] for c in _pursuit_calls(fake_beagle, "close")] == ["done"]
+    assert _runs(fake_tau) == []
+
+
+@pytest.mark.anyio
+async def test_already_passes_still_offers_a_witnessable_done_by(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project, _ = _done_by_project(tmp_path, fake_beagle, monkeypatch, "T0003: Cases")
+    _require_witness(project)
+    (project / "tests" / "cases.json").write_text("[]\n")
+    _git(project, "add", "tests/cases.json")
+    _git(project, "commit", "-q", "-m", "T0003: Cases data")
+    runtime, _ = _bound(tmp_path)
+
+    result = await _tool(runtime, "pursuit_step").execute(
+        "c1", {"task": "T0004", "criteria": "c", "done_when": CASES_CHECK, "scope": ["tests"]}
+    )
+
+    assert "T0004 not opened" in result.text and "already passes" in result.text
+    assert (
+        f'pursuit_step task="T0004" abandon="done by T0003" done_when="{CASES_CHECK}" '
+        'scope=["tests"]: it closes done'
+    ) in result.text
+    assert "would be refused" not in result.text
+    assert _pursuit_calls(fake_beagle, "open") == [] and _runs(fake_tau) == []
+
+
 def _open_on_done_txt(project: Path, fake: Path, scope: list[str]) -> None:
     (project / "done.txt").write_text("done\n")
     record = {"id": "T0002", "title": "Parser", "status": "open"}
