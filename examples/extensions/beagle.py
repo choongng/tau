@@ -2001,9 +2001,13 @@ async def _talk(proc: asyncio.subprocess.Process, brief: str, events: _WorkerEve
 #: A tool call written out as text, which a turn-capped worker can end on: the
 #: angle form (`<tool_call><function=…>`) and the pipe-delimited form, whose
 #: call and channel tokens ended Run R36's worker descriptions and founding
-#: statement (`<tool_call|><|channel>thought…<|tool_call>call:bash{…`).
+#: statement (`<tool_call|><|channel>thought…<|tool_call>call:bash{…`). q35 R55:
+#: W9's reports were calls with closing tags only, the function a bare tag
+#: (`<read>\n<parameter=path>…</parameter>\n</function>\n</tool_call>`); the
+#: close is tau core's TEMPLATE_TOOL_CALL_TOKEN's, and the bare tag cuts there.
 _TOOL_CALL_MARKUP = re.compile(
     r"<tool_call>|<function=|<\|(?:tool_call|channel)>|<(?:tool_call|channel)\|>"
+    r"|<[\w.-]+>\s*<parameter=|</function>\s*</tool_call>"
 )
 
 
