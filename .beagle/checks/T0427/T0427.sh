@@ -1,0 +1,44 @@
+#!/bin/bash
+# T0427: R61 q35 itc run, scored and diagnosed (v8), thinking medium for driver and workers,
+# arm full (R0002) on the frozen tau sha, compared with the q35 baseline B04 and the other arm's run (-),
+# with the mechanisms that fired and what each cost or caught.
+set -eu
+R=R61
+ITC_MODEL_MAP="q35=qwen3.6-35b-q6-mtp-thinking-coding" bash .beagle/checks/runs/v8/scored.sh $R q35 itc
+bash .beagle/checks/runs/v8/diagnosed.sh $R
+python3 - "$R" <<'PY'
+import json, re, sys
+R = sys.argv[1]
+m = json.load(open(f'/home/choong/tautest/itc-harness/runs/{R}/meta.json'))
+d = m.get('driver_thinking') or {}
+assert m.get('mode') == 'pursuit', f"not a pursuit run: {m.get('mode')}"
+assert d.get('level') == 'medium' and d.get('sent'), f"driver thinking not medium/sent: {d}"
+assert m.get('worker_thinking') == 'medium', f"worker thinking not medium: {m.get('worker_thinking')}"
+assert m.get('arm') == 'full', f"arm is {m.get('arm')!r}, not full"
+frozen = open('.beagle/checks/runs/frozen-sha.txt').read().split()[0]
+assert m.get('tau_sha', '').startswith(frozen), f"tau {m.get('tau_sha')} is not the frozen {frozen}"
+assert m.get('tau_dirty_code_files', 1) == 0, "tau had uncommitted code changes at launch"
+md = open(f'dev-notes/itc-runs/{R}.md').read()
+assert re.search(r'driver_thinking\S*\s+medium|driver thinking\S*\s+medium', md, re.I), "note does not record the driver's thinking level"
+assert re.search(r'worker\S* thinking\S*\s+medium|worker_thinking\S*\s+medium', md, re.I), "note does not record the workers' thinking level"
+assert re.search(r'^Against B04: \S', md, re.M), "no 'Against B04:' line comparing with the q35 baseline"
+assert re.search(r'^Arm: full\b', md, re.M), "no 'Arm: full' line"
+if '-' != '-':
+    assert re.search(r'^Against -: \S', md, re.M), "no 'Against -:' line comparing with the other arm"
+mech = re.search(r"^## Mechanisms\s*\n((?:.*\n)*?)(?=^## |\Z)", md, re.M)
+assert mech and len(re.findall(r"^- M\d\d\b", mech.group(1), re.M)) >= 3,     "no '## Mechanisms' section with '- Mnn' lines (from itc-harness/ledger/mechanism-ledger.md): what fired, cost, caught"
+assert re.search(r'^Wall: \S', md, re.M), "no 'Wall:' line (wall time, driver and worker tokens, tasks spawned per task done)"
+sec = re.split(r"^## ", md.split("\n## Failure classes", 1)[1], maxsplit=1, flags=re.M)[0]
+classes = re.split(r"^(?=### )", sec, flags=re.M)[1:]
+bad = [c.splitlines()[0] for c in classes if not re.search(r"^Seen in: \S", c, re.M)]
+assert not bad, "classes without 'Seen in:': " + "; ".join(bad)
+untested = [c.splitlines()[0] for c in classes
+            if "[tau]" in c.splitlines()[0] and not re.search(r"tests/[\w/]+\.py::test_\w+", c)]
+assert not untested, "[tau] classes naming no test function: " + "; ".join(untested)
+assert re.search(r"^### Timeline\s*\n(?:.*\n){3,}", md, re.M), "no ### Timeline with entries"
+assert re.search(r"^### The questions\s*\n(?:.*\n){3,}", md, re.M), "no ### The questions with answers"
+noind = [c.splitlines()[0] for c in classes if not re.search(r"^Prompt- and model-independent: \S", c, re.M)]
+assert not noind, "classes without a 'Prompt- and model-independent:' line: " + "; ".join(noind)
+print("OK")
+PY
+for t in ; do grep -q "$t" dev-notes/itc-runs/$R.md || { echo "$R.md does not say what $t did"; exit 1; }; done
