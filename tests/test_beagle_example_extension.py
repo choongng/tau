@@ -11486,6 +11486,28 @@ async def test_short_report_before_markup_is_kept(
     assert "<tool_call>" not in text
 
 
+@pytest.mark.anyio
+async def test_raw_report_with_closing_tool_call_tags_gets_the_stub(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # R55 W9 L12-L16: each reply was a read call written out with closing tags
+    # only; tau core nudged on it, and beagle handed it to the driver as the report.
+    _ready_task(fake_beagle)
+    report = (
+        "<read>\n<parameter=path>\n/home/choong/itc/tests/cases.json\n</parameter>\n"
+        "</function>\n</tool_call>"
+    )
+    text = await _raw_markup_step(tmp_path, monkeypatch, report)
+
+    assert "the sub-agent ended without a report, on a raw tool call." in text
+    assert "Changed or new in its scope: cases.json" in text
+    assert "<parameter=" not in text and "</tool_call>" not in text
+
+
 #: Run R36 W1: a report whose text ran into the next call's pipe-delimited tokens.
 R36_PIPE_MARKUP = "<tool_call|><|channel>thought\n<channel|><|tool_call>call:bash{command:"
 
