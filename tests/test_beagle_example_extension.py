@@ -12019,10 +12019,24 @@ async def test_worker_guard_refuses_beagle_commands_and_beagle_reads(
 
         needs = "the brief already holds what the task needs; do the task"
         assert needs in result.text, (tool, arguments)
+    # The contract's seal is the driver's, whichever guard says so first.
+    seal = await _tool_with_hooks(runtime, "bash").execute(
+        "c1", {"command": "beagle pursuit contract seal"}
+    )
+    assert "refusing to run `beagle pursuit contract seal`" in seal.text
     # Its own test runs and its check script still run.
     allowed = [
         ("bash", {"command": "python3 -m pytest -q tests/test_beagle.py"}),
         ("bash", {"command": "bash .beagle/checks/T0003/check.sh"}),
+        # R77's contract worker, refused the anchors its brief named.
+        (
+            "bash",
+            {
+                "command": 'PATH="/home/u/.tau/beagle-plugin/bin:$PATH" '
+                "beagle pursuit contract check --draft 2>&1 | tail -100"
+            },
+        ),
+        ("bash", {"command": "beagle pursuit contract refs itc2008 --grep fork"}),
         ("read", {"path": "tests/x.py"}),
     ]
     for tool, arguments in allowed:
@@ -12041,7 +12055,8 @@ async def test_worker_guard_refuses_beagle_commands_and_beagle_reads(
         "c4", {"command": "beagle pursuit brief T0003"}
     )
     assert brief.text == "ran"
-    assert _module().NO_BEAGLE_NOTE == "Do not inspect .beagle/ or run beagle."
+    assert _module().NO_BEAGLE_NOTE.startswith("Do not inspect .beagle/ or run beagle")
+    assert "beagle pursuit contract refs" in _module().NO_BEAGLE_NOTE
 
 
 # run R15 class 7: workers read .beagle/ through git, uv init wrote unseen, retries re-read

@@ -16473,7 +16473,10 @@ NO_BEAGLE_REASON = (
     "inspect .beagle/ or run beagle: the session that sent you does that."
 )
 #: What a worker is told in its brief, to the same end.
-NO_BEAGLE_NOTE = "Do not inspect .beagle/ or run beagle."
+NO_BEAGLE_NOTE = (
+    "Do not inspect .beagle/ or run beagle, apart from reading the contract "
+    "(`beagle pursuit contract refs`, `check`, `status`)."
+)
 #: What a worker is told to do with a locked test no code can pass. q35 R51:
 #: W4 spent 15.7 min fitting code to test_cases.py, which made one call for
 #: double_event and event_on_full; W5 saw why and circled until it was killed.
@@ -16548,6 +16551,10 @@ def _worker_orientation(tool: str, args: Mapping[str, Any], cwd: Path) -> str | 
 
     def match(argv: list[str]) -> str | None:
         if _named(argv, "beagle"):
+            # R77: the contract worker, told to cite by `contract refs`, was
+            # refused it and made anchors up. The contract's reads pass.
+            if _pursuit_verb(argv) == "contract" and _pursuit_write_verb(argv) is None:
+                return None
             return f"run `{' '.join(argv[:3])}`"
         if Path(argv[0]).name in _READERS and any(_in_store(a) for a in argv[1:]):
             return f"run `{' '.join(argv)}`"
