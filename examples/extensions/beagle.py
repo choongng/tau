@@ -11004,6 +11004,7 @@ async def _prove(
     elif witness is not None:
         path, needle, replacement = witness
         attempts.append(["--mutate", path, "--needle", needle, "--replacement", replacement])
+    mutated = attempts[-1] if witness is not None and attempts else None
     # Run R17: T0008's locked cases.json was never written, and the fallback
     # took away itc.py instead; for a known-answers task the data is the work.
     opened = _opened_commit(task, root, record or None)
@@ -11042,6 +11043,7 @@ async def _prove(
     sources = [rel for rel in sources if os.path.normpath(rel) not in scripts]
     if sources:
         attempts.append([arg for rel in sources for arg in ("--absent", rel)])
+    still_passes = ""
     for how in attempts:
         argv = [BEAGLE_BIN, "pursuit", "prove", task, *how, "--check-timeout", f"{timeout:.0f}"]
         rc, out = await asyncio.to_thread(
@@ -11075,10 +11077,22 @@ async def _prove(
                 continue
             return _Proof(proven=True, text=tail, by_absent_source=by_absent_source)
         if verdicts.get(task) == "NOT PROVEN" and "STILL PASSES" in out:
+            if (
+                how is mutated
+                and not _in_scope(how[1], scope, root)
+                and os.path.normpath(how[1]) not in changed
+            ):
+                # q35 R54: W5's witness in cobs/__init__.py, outside T0005's scope
+                # [pyproject.toml], still passed ruff, and that ended the attempts
+                # before the absence of pyproject.toml, which would have proven.
+                still_passes = tail
+                continue
             # The check passed over the defect: a real answer, not one a
             # different witness should be asked to overturn.
             return _Proof(proven=False, text=tail, weak=True)
         refused.append(tail)
+    if still_passes:
+        return _Proof(proven=False, text=still_passes, weak=True)
     if ask_module:
         return _Proof(proven=False, text="\n\n".join(refused), ask_module=True)
     if not attempts and not refused:
@@ -15364,6 +15378,11 @@ def make_step_tool() -> Any:
                     # after every such verdict, and six identical steps more.
                     _UNPROVEN.add(unproven_key)
                     break
+                # q35 R54: W6 was told to make the tests catch the defect, and
+                # T0005's scope [pyproject.toml] held no test; its check ran none.
+                tests_in_scope = any(
+                    _in_scope(test, scope, root) for test in _check_test_files(check, root)
+                )
                 retry_note = (
                     f"\n\nAn earlier attempt {ended} and the check passes, but `prove` "
                     "could not show the check catches a defect in the work:\n"
@@ -15373,6 +15392,12 @@ def make_step_tool() -> Any:
                         "what this task built. Make the task's tests catch such a defect "
                         "(in the test file, not by changing the check), then give a new "
                         "WITNESS block."
+                        if proof.weak and tests_in_scope
+                        else "The check passed with the defect put back, so it does not "
+                        "catch that defect, and no test the check runs is in this task's "
+                        f"scope ({', '.join(scope)}): write none. Give a new WITNESS block "
+                        "whose NEEDLE is in a file in that scope, a defect the check must "
+                        "catch."
                         if proof.weak
                         else "Give that WITNESS block; its NEEDLE must occur exactly once "
                         "in that module."

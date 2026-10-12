@@ -3033,8 +3033,9 @@ async def test_pursuit_step_keeps_a_task_open_while_its_check_passes_over_a_defe
     )
 
     first, second = _runs(fake_tau)
-    assert "does not test what this task built" in second["stdin"]
-    assert len(_pursuit_calls(fake_beagle, "prove")) == 2
+    assert "so it does not catch that defect" in second["stdin"]
+    # src/clock.py is outside the scope, so the absence of done.txt is tried too.
+    assert len(_pursuit_calls(fake_beagle, "prove")) == 4
     assert _pursuit_calls(fake_beagle, "close") == []
     assert _pursuit_calls(fake_beagle, "commit") == []
     assert "stays open" in result.text and "test of the behaviour itself" in result.text
@@ -12786,6 +12787,99 @@ async def test_prove_skips_witness_in_test_file(
     assert proof is not None and not proof.proven
     assert "the WITNESS is in a test file; name a defect in the code the test runs" in proof.text
     assert _pursuit_calls(fake_beagle, "prove") == []
+
+
+@pytest.mark.anyio
+async def test_prove_witness_outside_scope_does_not_preempt_absence_of_the_tasks_own_file(
+    tmp_path: Path, fake_beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # q35 R54: W5's witness in cobs/__init__.py, outside T0005's scope, still
+    # passed ruff, and the absence of pyproject.toml, which would prove, never ran.
+    project = _git_project(tmp_path, monkeypatch)
+    (project / "cobs").mkdir()
+    (project / "cobs" / "__init__.py").write_text("def encode(data):\n    return bytes(data)\n")
+    _git(project, "add", "cobs")
+    _git(project, "commit", "-q", "-m", "T0003: cobs")
+    opened = _git(project, "rev-parse", "HEAD").strip()
+    record = {"id": "T0005", "status": "open", "opened_commit": opened}
+    (fake_beagle / "show.out").write_text(json.dumps({**record, "done_when": "ruff check cobs/"}))
+    (project / "pyproject.toml").write_text("[tool.ruff.lint]\nignore = ['E501']\n")
+    report = (
+        "wrote pyproject.toml\n\nWITNESS: cobs/__init__.py\nNEEDLE:\n    return bytes(data)\n"
+        "REPLACEMENT:\n    return b''\nEND WITNESS"
+    )
+    module = _module()
+    real = module._run
+    proved: list[list[str]] = []
+
+    def run(cmd: list[str], *args: Any, **kwargs: Any) -> tuple[int, str]:
+        if "prove" not in cmd:
+            return real(cmd, *args, **kwargs)
+        proved.append(cmd[cmd.index("prove") + 2 :])
+        if "--mutate" in cmd:
+            return 1, "T0005: NOT PROVEN — the check STILL PASSES with the defect put back\n"
+        return 0, "T0005: PROVEN — refuses with pyproject.toml absent\n"
+
+    monkeypatch.setattr(module, "_run", run)
+
+    proof = await module._prove("T0005", report, ["pyproject.toml"], project, 60)
+
+    assert [how[:2] for how in proved] == [
+        ["--mutate", "cobs/__init__.py"],
+        ["--absent", "pyproject.toml"],
+    ]
+    assert proof is not None and proof.proven, proof
+
+    # A witness in the scope that still passes is the answer, as before.
+    proved.clear()
+    proof = await module._prove("T0005", report, ["pyproject.toml", "cobs/"], project, 60)
+
+    assert [how[:2] for how in proved] == [["--mutate", "cobs/__init__.py"]]
+    assert proof is not None and not proof.proven and proof.weak
+
+
+@pytest.mark.anyio
+async def test_not_proven_retry_does_not_ask_for_a_test_when_scope_has_none(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # q35 R54: W6 was told to "Make the task's tests catch such a defect (in the
+    # test file ...)", and T0005's scope held only pyproject.toml.
+    monkeypatch.chdir(_git_project(tmp_path, monkeypatch))
+    monkeypatch.setenv("FAKE_TAU_REPORT", WITNESSED_REPORT)
+    _ready_task(fake_beagle)
+    (fake_beagle / "prove.out").write_text(
+        "T0002: NOT PROVEN — the check STILL PASSES with the defect put back\n"
+    )
+    (fake_beagle / "prove.rc").write_text("9")
+    runtime, _ = _bound(tmp_path)
+    args = {"task": "T0002", "criteria": "c", "done_when": "grep -q done done.txt"}
+
+    await _tool(runtime, "pursuit_step").execute("c1", {**args, "scope": ["done.txt"]})
+
+    _, retry = _runs(fake_tau)
+    assert "Make the task's tests catch" not in retry["stdin"]
+    assert "in the test file" not in retry["stdin"]
+    assert (
+        "no test the check runs is in this task's scope (done.txt): write none. Give a new "
+        "WITNESS block whose NEEDLE is in a file in that scope"
+    ) in retry["stdin"]
+
+    # With the check's test in scope, the retry still asks for the test to catch it.
+    tests = Path("tests")
+    tests.mkdir()
+    (tests / "test_done.py").write_text("def test_done():\n    assert open('done.txt').read()\n")
+    Path("done.txt").unlink(missing_ok=True)
+    scope = ["done.txt", "tests/test_done.py"]
+    check = "python3 -m pytest -q tests/test_done.py"
+    _ready_task(fake_beagle, check)
+    await _tool(runtime, "pursuit_step").execute("c2", {**args, "done_when": check, "scope": scope})
+
+    retry = _runs(fake_tau)[-1]
+    assert "Make the task's tests catch such a defect (in the test file" in retry["stdin"]
 
 
 def _known_answers_check_project(
