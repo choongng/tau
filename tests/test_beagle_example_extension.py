@@ -14160,6 +14160,58 @@ async def test_known_answers_worker_ranged_reference_read_is_not_refused(
 
 
 @pytest.mark.anyio
+async def test_contract_worker_reads_the_references_by_contract_refs(
+    tmp_path: Path, beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # R79: told "12 reads at 60 lines per read", the contract worker paged the
+    # references 14 times, was refused `contract refs` at call 23 of 30 as "not
+    # the check", and made its anchors up (241#a00-241#c02).
+    module = _module()
+    runtime, project = _reference_worker(tmp_path, monkeypatch, cap=10, scope="contract/")
+    goal = project / ".beagle" / "pursuit.toml"
+    goal.write_text(goal.read_text() + module.CONTRACT_TABLE, encoding="utf-8")
+    (project / "references" / "index.json").write_text(
+        json.dumps({"fetched": {"paper.txt": "https://example.org/paper.pdf"}})
+    )
+    read = _tool_with_hooks(runtime, "read")
+    bash = _tool_with_hooks(runtime, "bash")
+
+    pages = [await read.execute(f"r{i}", {"path": "references/paper.txt"}) for i in range(6)]
+    refs = [
+        await bash.execute(
+            "c1", {"command": f"cd {project} && beagle pursuit contract refs paper 2>&1 | head -20"}
+        ),
+        await bash.execute(
+            "c2",
+            {"command": 'PATH="/x/bin:$PATH" beagle pursuit contract refs paper --lines 1-60'},
+        ),
+        await bash.execute("c3", {"command": "beagle pursuit contract refs paper --grep value"}),
+    ]
+    # The three refs calls went uncounted: call 7 runs, and call 8 is refused as 7 of 10.
+    idle = [await bash.execute(f"l{i}", {"command": "ls"}) for i in range(2)]
+    late = await bash.execute(
+        "c4", {"command": "beagle pursuit contract refs paper --lines 61-120"}
+    )
+
+    assert all(page.text == "ran" for page in pages[:5])
+    assert "refusing to read references/paper.txt: 5 of 10 calls used" in pages[5].text
+    assert "Read it with `beagle pursuit contract refs paper --lines A-B`" in pages[5].text
+    assert "Search the references instead" not in pages[5].text
+    assert all(result.text == "ran" for result in refs) and idle[0].text == "ran"
+    assert "refusing to run this command: 7 of 10 calls used" in idle[1].text
+    assert late.text == "ran"
+    # The brief names `contract refs` and each reference's name for it, not page reads.
+    brief = module._references_brief(project, contract=True)
+    assert (
+        "- references/paper.txt (from https://example.org/paper.pdf) — 300 lines, as `paper`"
+        in brief
+    )
+    assert "Read them with `beagle pursuit contract refs NAME --lines A-B`" in brief
+    assert "reads at 60 lines per read" not in brief
+    assert "reads at 60 lines per read" in module._references_brief(project)
+
+
+@pytest.mark.anyio
 async def test_nth_reread_of_a_reference_window_is_still_refused(
     tmp_path: Path, beagle: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

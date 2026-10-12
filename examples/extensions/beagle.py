@@ -3043,11 +3043,14 @@ def _reference_search_note() -> str:
     )
 
 
-def _references_brief(root: Path, context_only: bool = False) -> str:
+def _references_brief(root: Path, context_only: bool = False, contract: bool = False) -> str:
     """The worker brief's part from `references/index.json`: request and references.
 
     `context_only` is for a data task: run R09's T0002 brief ended on the
     request verbatim, and its worker set out to implement the library.
+    `contract` is for work on the contract, which reads the references by
+    `contract refs`: R79's worker, told "12 reads at 60 lines per read", paged
+    them with `read`, ran out of calls and made its anchors up.
     """
     try:
         index = json.loads((root / REFERENCES_DIR / REFERENCES_INDEX).read_text(encoding="utf-8"))
@@ -3060,12 +3063,18 @@ def _references_brief(root: Path, context_only: bool = False) -> str:
     failed = index.get("failed") or {}
     if fetched or failed:
         lines = [
-            f"- {REFERENCES_DIR}/{name} (from {url}){_reference_size(root / REFERENCES_DIR / name)}"
+            f"- {REFERENCES_DIR}/{name} (from {url})"
+            + (
+                _reference_lines(root / REFERENCES_DIR / name)
+                if contract
+                else _reference_size(root / REFERENCES_DIR / name)
+            )
             for name, url in fetched.items()
         ]
         lines += [f"- could not fetch {url}: {why}" for url, why in failed.items()]
+        how = f" Read them with {_contract_refs_note()}, not with `read`." if contract else ""
         parts.append(
-            "References: read first; outranks the driver's notes. Where the driver's "
+            f"References: read first; outranks the driver's notes.{how} Where the driver's "
             "notes or the task disagree with the reference, the reference is right:\n"
             + "\n".join(lines)
         )
@@ -3086,6 +3095,15 @@ def _references_brief(root: Path, context_only: bool = False) -> str:
             "(offset and limit), not the whole file."
         )
     return "\n\n".join(parts)
+
+
+def _reference_lines(path: Path) -> str:
+    """` — N lines, as NAME`: the length, and the name `contract refs` reads it by."""
+    try:
+        count = len(path.read_text(encoding="utf-8", errors="replace").splitlines())
+    except OSError:
+        return ""
+    return f" — {count} lines, as `{path.stem}`"
 
 
 def _reference_size(path: Path) -> str:
@@ -15200,6 +15218,7 @@ def make_step_tool() -> Any:
                 check,
                 _pending_locks(goal, task) + _strings(arguments.get("locks")),
             ),
+            contract=_contract_work(scope or _strings(record.get("scope")), root),
         )
         if references:
             brief = f"{brief}\n\n{references}"
@@ -16333,6 +16352,45 @@ def _pursuit_write_verb(argv: list[str]) -> str | None:
     return None if verb in _PURSUIT_READ_VERBS else verb
 
 
+def _contract_read(argv: list[str]) -> str | None:
+    """`argv` itself if it reads the contract or a source with its anchors
+    (`beagle pursuit contract refs`, `check`, `status`, `diff`, `run`), or None."""
+    if _pursuit_verb(argv) == "contract" and _pursuit_write_verb(argv) is None:
+        return " ".join(argv)
+    return None
+
+
+def _contract_refs_call(command: str) -> bool:
+    """Whether a bash command only prints a source with `beagle pursuit contract
+    refs`, after at most a `cd` and piped into filters such as head.
+
+    R79: the contract worker paged the references with 14 reads, the
+    nothing-written guard then refused it `contract refs` at call 23 of 30, and
+    it made its anchors up.
+    """
+
+    def refs(argv: list[str]) -> str | None:
+        read = _contract_read(argv)
+        return read if read and "refs" in argv else None
+
+    def other(argv: list[str]) -> str | None:
+        if refs(argv) or _named(argv, "cd") or Path(argv[0]).name in _SEARCH_FILTERS:
+            return None
+        return argv[0]
+
+    command = _QUIET_REDIRECT.sub(" ", command)
+    return _bash_find(command, refs) is not None and _bash_find(command, other) is None
+
+
+def _contract_refs_note(name: str = "NAME") -> str:
+    """How a contract worker reads a source: with the anchors its cites copy."""
+    return (
+        f"`beagle pursuit contract refs {name} --lines A-B` ({WINDOW_LINES} lines at a "
+        f"time) or `beagle pursuit contract refs {name} --grep WORD`, which print each "
+        "line with the anchor a cite copies"
+    )
+
+
 def make_history_guard() -> Any:
     """Build the `tool_call` guard that keeps a pursuit's history and tree.
 
@@ -16553,7 +16611,7 @@ def _worker_orientation(tool: str, args: Mapping[str, Any], cwd: Path) -> str | 
         if _named(argv, "beagle"):
             # R77: the contract worker, told to cite by `contract refs`, was
             # refused it and made anchors up. The contract's reads pass.
-            if _pursuit_verb(argv) == "contract" and _pursuit_write_verb(argv) is None:
+            if _contract_read(argv):
                 return None
             return f"run `{' '.join(argv[:3])}`"
         if Path(argv[0]).name in _READERS and any(_in_store(a) for a in argv[1:]):
@@ -17031,7 +17089,9 @@ def _free_reference_call(
         return None
     root = _resolved(goal.parent.parent)
     if tool == "bash":
-        return "search" if command and _reference_search_call(command, cwd, root) else None
+        if command and (_reference_search_call(command, cwd, root) or _contract_refs_call(command)):
+            return "search"
+        return None
     window = _reference_window(arguments, cwd, root)
     if window is None or window in windows:
         return None
@@ -17094,6 +17154,12 @@ def _reread_refusal(
             f"{', '.join(scope)} now."
         )
     # A scope never names references/ (`_scope_problem`), so their re-reads land here.
+    if root / REFERENCES_DIR in target.parents and _contract_work(list(scope), root):
+        return (
+            f"refusing to read {path}: {calls - 1} of {cap} calls used and nothing written. "
+            f"Read it with {_contract_refs_note(target.stem)}, then write "
+            f"{', '.join(scope)} now."
+        )
     if root / REFERENCES_DIR in target.parents:
         return (
             f"refusing to read {path}: {calls - 1} of {cap} calls used and nothing written. "
@@ -17123,6 +17189,8 @@ def _idle_bash_refusal(
     check = " ".join(_task_check(goal, task).split())
     if not check or check in " ".join(command.split()):
         return None
+    if _bash_find(command, _contract_read) is not None:
+        return None  # R79: refused `contract refs`, the worker made its anchors up.
     return (
         f"refusing to run this command: {calls - 1} of {cap} calls used and nothing "
         f"written, and a command that is not the check changes nothing in the scope. "
@@ -17237,11 +17305,15 @@ def make_worker_scope_guard() -> Any:
             task, scope = sent
             known = _only_data_and_tests(list(scope))
             free = _free_reference_call(event.tool_name, arguments, command, cwd, windows)
-            if known and free is not None:
+            # R79: `contract refs` is how a contract worker reads the references.
+            uncounted = free is not None and (
+                known or (bool(command) and _contract_refs_call(command))
+            )
+            if uncounted:
                 calls -= 1  # q35 R51: not counted toward the nothing-written refusals
             reread = (
                 None
-                if wrote or (known and free is not None)
+                if wrote or uncounted
                 else _reread_refusal(event.tool_name, arguments, cwd, scope, calls, reads)
             )
             if reread is not None:
@@ -17257,7 +17329,7 @@ def make_worker_scope_guard() -> Any:
             links = _script_links(command, cwd) if scripted else []
             if scripted:
                 targets += _script_write_targets(command, _cwd_after_cd(command, cwd))
-            searched = free == "search" and (known or offered)
+            searched = free == "search" and (uncounted or offered)
             idle = bool(command) and not wrote and sent_on_task and not searched
             goal = _find_goal(cwd) if targets or idle else None
             if goal is None:
