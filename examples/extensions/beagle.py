@@ -6572,7 +6572,9 @@ def _cases_test_problem(root: Path, entries: list[str]) -> tuple[str, str] | Non
                     and not _test_project_imports(root / test)
                     and _answers_compared(tree, answers, against=computed)
                 ):
-                    named = ", ".join(own[:4]) + (", …" if len(own) > 4 else "")
+                    # The functions given a case's input, not every one it
+                    # calls: a loader such as _load_cases copies nothing.
+                    named = ", ".join(computed[:4]) + (", …" if len(computed) > 4 else "")
                     return test, (
                         f"checks its own copy of the algorithm, not the code: it defines {named} "
                         "and imports no module of the project"

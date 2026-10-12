@@ -4164,7 +4164,7 @@ def test_cases_test_problem_flags_in_file_implementation(tmp_path: Path) -> None
 
     assert found == (
         "tests/test_cases.py",
-        "checks its own copy of the algorithm, not the code: it defines split_id, fork and "
+        "checks its own copy of the algorithm, not the code: it defines fork and "
         "imports no module of the project",
     )
     closing = module._cases_close_problem(tmp_path, entries)
@@ -4230,6 +4230,25 @@ def test_cases_test_computing_results_with_own_function_is_still_an_own_copy(
     whole = R40_IN_FILE_CASES_TEST.replace('fork(case["input"])', "fork(case)")
     found = module._cases_test_problem(tmp_path, _write_cases(tmp_path, whole))
     assert found is not None and found[1].startswith("checks its own copy of the algorithm")
+
+
+def test_own_copy_refusal_names_only_the_computing_functions(tmp_path: Path) -> None:
+    # Audit 2026-10-12: the refusal listed every function the test called, so a
+    # test with a loader read "it defines _load_cases, fork", naming the loader
+    # as the copy.
+    module = _module()
+    source = Q35_LOADER_DATA_TEST + (
+        "\n\ndef fork(stamp):\n    return [stamp, stamp]\n\n\n"
+        "def test_cases():\n"
+        "    for case in _load_cases():\n"
+        '        got = fork(case["input"])\n'
+        '        assert got == case["expected"]\n'
+    )
+    found = module._cases_test_problem(tmp_path, _write_cases(tmp_path, source))
+
+    assert found is not None
+    assert "it defines fork and imports no module" in found[1]
+    assert "_load_cases" not in found[1]
 
 
 #: q35 R51's locked tests/test_cases.py (~/itc, locked at T0002's close): it reads
