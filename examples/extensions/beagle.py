@@ -307,6 +307,22 @@ WORKER_ENV = "BEAGLE_TAU_WORKER"
 WORKER_TASK_ENV = "BEAGLE_TAU_WORKER_TASK"
 WORKER_SCOPE_ENV = "BEAGLE_TAU_WORKER_SCOPE"
 
+#: R0002's lean arm: set (to anything but "" or "0"), the mechanisms that caught
+#: nothing across the q35 runs do not fire: known-answers locks, the plan guards,
+#: abandon and done-by gating, the escalation demand, the audit cadence, the
+#: own-copy rule, the already-passes refusal, cases-first and the worker's read
+#: guards. Read at call time, so the driver and its workers, which inherit the
+#: environment, agree; set at launch and never changed within a session.
+LEAN_ENV = "BEAGLE_TAU_LEAN"
+#: What founding adds to the goal file under lean (see `_lean`).
+LEAN_AUDIT_OFF = "\n[audit]\nevery = 0\n"
+
+
+def _lean() -> bool:
+    """Whether `LEAN_ENV` is on: set to anything but "" or "0"."""
+    return os.environ.get(LEAN_ENV, "") not in ("", "0")
+
+
 #: The memory cap a worker and a pre-close check run under, as a systemd size
 #: (`4G`, `512M`); `off` runs them uncapped. Applied through a systemd user
 #: scope with swap shut off, so a runaway is killed rather than left to drag
@@ -3864,6 +3880,8 @@ def _abandon_problem(task: str, why: str, nodes: list[dict[str, Any]]) -> str | 
     here. One a plan added later may go as a duplicate of a task that holds its
     work: run R22's driver planned five such on the root, and none could go.
     """
+    if _lean():
+        return None
     parent = {str(n.get("id")): str(n.get("parent") or "") for n in nodes}
     roots = [t for t, p in parent.items() if not p]
     if task in roots:
@@ -4104,7 +4122,10 @@ def make_found_tool(
             # pursuit_step opens, works and closes in one call, so nothing
             # else stands where `prove` goes; beagle holds every done close
             # to a witnessed check only when told to.
-            '\n[close]\nrequire = "witness"\n',
+            '\n[close]\nrequire = "witness"\n'
+            # R0002: the lean arm runs no audit sub-agent, so beagle core's
+            # cadence (an audit due every 16 closes refuses `open`) is off too.
+            f"{LEAN_AUDIT_OFF if _lean() else ''}",
             encoding="utf-8",
         )
         _ignore_caches(root)
@@ -4238,6 +4259,8 @@ def _commit_before_split(
     R28: the commit kept a stripped locked test, so locked files are put back
     first; the task being split no longer fixes them.
     """
+    if _lean():
+        return _uncommitted_note(task, paths)
     put_back = _put_back_drift(goal, root, but=task) if goal is not None else ""
     if put_back:
         paths = [rel for rel in _changed_files(root) if _in_scope(rel, scope, root)]
@@ -4447,6 +4470,8 @@ def _live_title_clash(task: str, parts: list[str], nodes: list[dict[str, Any]]) 
     Ancestors of `task` and containers are left out: neither is a task to step.
     Titles are compared case-folded with whitespace normalized.
     """
+    if _lean():
+        return None
     node = next((n for n in nodes if str(n.get("id")) == task), None)
     if node is None:
         return None
@@ -6536,21 +6561,22 @@ def _cases_test_problem(root: Path, entries: list[str]) -> tuple[str, str] | Non
             broken = _test_structure_problem(tree)
             if broken is not None:
                 return test, broken
-            own = _called_module_functions(tree)
-            computed = _called_on_case_inputs(
-                tree, own, {k for c in cases if isinstance(c, dict) for k in c}, answers
-            )
-            if (
-                computed
-                and answers
-                and not _test_project_imports(root / test)
-                and _answers_compared(tree, answers, against=computed)
-            ):
-                named = ", ".join(own[:4]) + (", …" if len(own) > 4 else "")
-                return test, (
-                    f"checks its own copy of the algorithm, not the code: it defines {named} "
-                    "and imports no module of the project"
+            if not _lean():
+                own = _called_module_functions(tree)
+                computed = _called_on_case_inputs(
+                    tree, own, {k for c in cases if isinstance(c, dict) for k in c}, answers
                 )
+                if (
+                    computed
+                    and answers
+                    and not _test_project_imports(root / test)
+                    and _answers_compared(tree, answers, against=computed)
+                ):
+                    named = ", ".join(own[:4]) + (", …" if len(own) > 4 else "")
+                    return test, (
+                        f"checks its own copy of the algorithm, not the code: it defines {named} "
+                        "and imports no module of the project"
+                    )
             absent = _absent_case_lookup(tree, labels, keys) if labels else None
             if absent is not None:
                 return test, f'looks up case "{absent}", which {data} does not hold'
@@ -7530,6 +7556,8 @@ async def _locked_test_refusal(
     were refused as already passing, many times: where the locked test passes
     now, that refusal, with its own way on, is said in place of the offer.
     """
+    if _lean():
+        return None
     unrun = _locked_test_unrun(command, scope, goal)
     if unrun is None:
         return None
@@ -7853,6 +7881,8 @@ def _cases_first_problem(
     siblings T0007-T0009 already held the cases: given the tree, a sibling
     that writes the known answers is named instead.
     """
+    if _lean():
+        return None
     root = goal.parent.parent
     if not (root / REFERENCES_DIR).is_dir():
         return None
@@ -8810,6 +8840,8 @@ def _locked_test_without_its_module(command: str, goal: Path, root: Path) -> tup
     """(locked test, module) when `command` runs a locked test that imports a module
     the tree and the installed packages do not provide, ignoring the scope that would
     write it; or None. With the check passing, that test passes without the module."""
+    if _lean():
+        return None
     for module, test in _locked_test_imports(goal).items():
         if _runs_test_file(command, test) and not _module_written(
             module, root, (root / test).parent, []
@@ -9330,6 +9362,8 @@ def _rerun_only_part(parts: list[str]) -> str | None:
     part with nothing to change, whose check every close already runs. Such a
     part opens with a re-run verb, names a check, and has no making verb.
     """
+    if _lean():
+        return None
     for part in parts:
         title, sep, purpose = part.partition("::")
         if not sep:
@@ -10267,6 +10301,8 @@ def _missing_locked_file(output: str, locks: list[str], root: Path) -> str | Non
     """A locked path the check failed on for want of it, not on disk: the work not yet
     done, not a wrong check. Run R17 E26 failed on FileNotFoundError for
     tests/cases.json, locked for the task, and was told to pass a corrected done_when."""
+    if _lean():
+        return None
     missing = [lock.rstrip("/") for lock in locks if not (root / lock).exists()]
     if not missing:
         return None
@@ -10281,7 +10317,11 @@ def _missing_locked_file(output: str, locks: list[str], root: Path) -> str | Non
 
 
 def _absent_locks(locks: list[str], root: Path) -> list[str]:
-    """The lock entries that are not a file on disk: the task's work not yet done."""
+    """The lock entries that are not a file on disk: the task's work not yet done.
+
+    Under `LEAN_ENV` nothing is locked, so a close is not held for them."""
+    if _lean():
+        return []
     return [lock for lock in locks if not (root / lock.rstrip("/")).is_file()]
 
 
@@ -11167,6 +11207,8 @@ def _locked(goal: Path) -> list[str]:
     Run R22: a copy put into the store by hand locked a file nothing had locked;
     only beagle writes the manifest, so a copy it does not name is not a lock.
     """
+    if _lean():
+        return []
     store = goal.parent / LOCKED_DIR
     try:
         return sorted(rel for rel in _lock_manifest(goal) if (store / rel).is_file())
@@ -11194,6 +11236,8 @@ def _lock(
     A path in `relock` is locked again from its new content: a known-answers
     fix task's close.
     """
+    if _lean():
+        return [], []
     store = goal.parent / LOCKED_DIR
     held = set(_locked(goal)) - set(relock)
     locked: list[str] = []
@@ -11232,6 +11276,8 @@ def _sha256(data: bytes) -> str:
 
 def _lock_manifest(goal: Path) -> dict[str, dict[str, Any]]:
     """The lock manifest: each locked path's sha256 and the commit holding it."""
+    if _lean():
+        return {}
     try:
         raw = json.loads((goal.parent / LOCK_MANIFEST).read_text(encoding="utf-8"))
     except (OSError, ValueError):
@@ -11304,6 +11350,8 @@ def _restore_locked(goal: Path, root: Path, spare: Collection[str] = ()) -> list
     from its lock commit, the store copy rewritten with it: a tool run over
     the whole tree changes the store too.
     """
+    if _lean():
+        return []
     store = goal.parent / LOCKED_DIR
     manifest = _lock_manifest(goal)
     changed_manifest = False
@@ -11428,6 +11476,8 @@ def _move_pending_locks(goal: Path, task: str, parts: list[str], root: Path) -> 
     part whose scope, title or intent names that file; one no part names goes
     to the first part.
     """
+    if _lean():
+        return ""
     locks = _pending_locks(goal, task)
     if not locks or not parts:
         return ""
@@ -11566,6 +11616,8 @@ def _locked_scope_problem(
     holding a locked file is allowed: put-back still guards the file, and later
     tasks add their own tests beside it.
     """
+    if _lean():
+        return None
     goal = root / ".beagle" / GOAL_BASENAME
     if _fixes_known_answers_in(task_title, scope, goal):
         return None
@@ -13017,6 +13069,8 @@ def _escalation(
     offered (see `_offered_data_test_passes`). `bound_fails` says the bound
     check fails on the tree now, so a sub-agent can make it pass.
     """
+    if _lean():
+        return ""
     if arguments is None:
         return _escalation_options(
             task,
@@ -13817,7 +13871,7 @@ def _not_done(
         _NOT_DONE_CASES.pop(key, None)
         if _LAST_CHECK_EXIT.get(key, 0) != 0:
             _NOT_DONE_CHECK_FAILED.setdefault(key, count)
-    if count >= ESCALATE_AFTER:
+    if count >= ESCALATE_AFTER and not _lean():
         text += "\n\n" + _still_open_escalation(task, count, root)
     elif count >= DRIVER_READS_UNTIL and scope:
         text += (
@@ -13832,6 +13886,8 @@ def _still_open_escalation(task: str, count: int, root: Path) -> str:
     """What a not-done result, and a refusal pointing at `task`, say once `count`
     steps have left it not done: the notes-only rerun when only the close's judge
     kept it open, else that the next step runs no sub-agent."""
+    if _lean():
+        return ""
     demand = _judge_kept_open(task, root)
     if demand:
         return _judge_escalation(task, count, demand, lead=f"{task} is still open — ", root=root)
@@ -13902,7 +13958,7 @@ def _escalated_calls(workable: list[str], root: Path | None) -> str:
     Run R21 pointed its driver at "Workable now: T0005" thirteen times; T0005 had
     three not-done steps, so only a new route would run it.
     """
-    if root is None:
+    if root is None or _lean():
         return ""
     said = ""
     for t in workable:
@@ -14123,7 +14179,7 @@ def make_step_tool() -> Any:
                 return _step_result(
                     _close_infeasible(task, infeasible.group(1).strip(), nodes, roots, root, goal)
                 )
-            if done_by is not None and task not in roots:
+            if done_by is not None and task not in roots and not _lean():
                 return _step_result(
                     await _done_by(task, done_by.group(1).upper(), arguments, nodes, root)
                 )
@@ -14131,7 +14187,7 @@ def make_step_tool() -> Any:
             if refused is not None:
                 return _step_result(refused)
             return _step_result(_abandon(task, abandon, root, goal))
-        if ready.get("audit_due"):
+        if ready.get("audit_due") and not _lean():
             return _step_result(await _audit(root, signal, on_update))
         if not task:
             task = (open_ids or ready_ids or [""])[0]
@@ -14306,7 +14362,7 @@ def make_step_tool() -> Any:
                     old_check.split()
                 ) and sorted(route_scope) == sorted(_strings(record.get("scope")))
                 tried = _NOT_DONE.get((str(root), task), 0)
-                if same_route and tried >= ESCALATE_AFTER:
+                if same_route and tried >= ESCALATE_AFTER and not _lean():
                     # Run R35 #8, #12, #16: each such route spawned an heir that
                     # was left not done the same way.
                     return _step_result(
@@ -14373,9 +14429,13 @@ def make_step_tool() -> Any:
                     # Run R30 #22: a -9 here fell through to the open, which ran the
                     # check to the cap a second time.
                     killed_run = rehearsed
-                if rehearsed[0] == 0 and not (
-                    await _passes_only_by_uncommitted(
-                        new_check, [route_scope], root, _split_carried(task, root)
+                if (
+                    rehearsed[0] == 0
+                    and not _lean()
+                    and not (
+                        await _passes_only_by_uncommitted(
+                            new_check, [route_scope], root, _split_carried(task, root)
+                        )
                     )
                 ):
                     return _step_result(
@@ -14423,6 +14483,7 @@ def make_step_tool() -> Any:
         if (
             not route
             and tried >= ESCALATE_AFTER
+            and not _lean()
             and not _judge_notes_rerun(task, arguments, record, root)
         ):
             if _broken_check_rerun(task, arguments, record, root):
@@ -14619,7 +14680,7 @@ def make_step_tool() -> Any:
             ):
                 route += _on_disk_note(done_when, task, split_work)
                 passed_on_disk = (pre_rc, pre_out)
-            elif pre_rc == 0:
+            elif pre_rc == 0 and not _lean():
                 return _step_result(
                     f"pursuit_step: {task} not opened — "
                     + passing_refusal(done_when, scope, rewritten_from)
@@ -14752,7 +14813,7 @@ def make_step_tool() -> Any:
                     ):
                         # Run R18: the T0151 refusal had the open's blind spot.
                         route += _on_disk_note(done_when, task)
-                    elif pre_rc == 0:
+                    elif pre_rc == 0 and not _lean():
                         keep = (
                             f" Keep the bound check `{bound_check}`: leave done_when out to "
                             "keep it."
@@ -16701,6 +16762,8 @@ def _reread_refusal(
     Run R40: workers re-read whole references 6-20 times; a refused read of one
     offers the search that finds the line instead.
     """
+    if _lean():
+        return None
     cap = _worker_max_turns()
     if tool != "read":
         return None
@@ -16756,6 +16819,8 @@ def _idle_bash_refusal(
     runs. Run R34: W7's ~12 encoder trials and W8's analysis scripts wrote no
     file and ran into the cap. Fails open when the task has no bound check.
     """
+    if _lean():
+        return None
     cap = _worker_max_turns()
     if calls <= cap * 3 // 4:
         return None
