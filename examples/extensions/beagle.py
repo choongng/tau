@@ -4246,9 +4246,11 @@ def _uncommitted_note(task: str, paths: list[str]) -> str:
     named = ", ".join(paths[:8])
     if len(paths) > 8:
         named += f", {len(paths) - 8} more"
+    # T0462: lean locks nothing; set at launch, so the text holds for the session.
+    locks = "" if _lean() else ", with locks when it is data"
     return (
-        f"Uncommitted in {task}'s scope: {named}. Give each to the part that writes it, "
-        "with locks when it is data; otherwise it goes out in a later part's commit."
+        f"Uncommitted in {task}'s scope: {named}. Give each to the part that writes it"
+        f"{locks}; otherwise it goes out in a later part's commit."
     )
 
 
@@ -5332,11 +5334,12 @@ def _oracle_with_code_problem(
     if not data or not source:
         return None
     data, source = _first_few(data), _first_few(source)
+    # T0462: lean locks nothing; set at launch, so the text holds for the session.
+    passing = "" if _lean() else f", passing locks=[{', '.join(data)}]"
     return (
         f"scope holds known-answer data ({', '.join(data)}) and the code it judges "
         f"({', '.join(source)}). Split it: first a task with only the data and its cases "
-        f"test in scope, passing locks=[{', '.join(data)}]; then the code in a later task."
-        + _helper_note(helpers)
+        f"test in scope{passing}; then the code in a later task." + _helper_note(helpers)
     )
 
 
@@ -5369,10 +5372,11 @@ def _open_mixed_refusal(scope: list[str], goal: Path, task: str, check: str) -> 
         f"judges ({', '.join(_first_few(source))})."
     )
     if narrowed is None:
+        # T0462: lean locks nothing; set at launch, so the text holds for the session.
+        passing = "" if _lean() else f", passing locks=[{', '.join(_first_few(data))}]"
         return (
-            f"{held} Narrow the scope to the data and its cases test, passing "
-            f"locks=[{', '.join(_first_few(data))}]; the code goes to a later task."
-            + _helper_note(helpers)
+            f"{held} Narrow the scope to the data and its cases test{passing}; the code "
+            "goes to a later task." + _helper_note(helpers)
         )
     removed = [*source, *helpers]
     return (

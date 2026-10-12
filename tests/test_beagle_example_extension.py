@@ -14972,6 +14972,48 @@ async def test_lean_switch_drops_lock_promises_from_driver_texts(
     assert "Nothing is locked" in locks["description"]
 
 
+def test_lean_uncommitted_note_and_oracle_hints_recommend_no_locks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # T0462: under lean nothing is locked, but the split's uncommitted note and
+    # both mixed-scope hints still told the driver to pass locks.
+    module = _module()
+    project = _r31_project(tmp_path)
+    goal = project / ".beagle" / "pursuit.toml"
+    scope = ["src/codec.py", "tests/cases.json", "tests/test_cases.py"]
+    # The open-task hint's narrow-the-scope form, where no narrowed call runs.
+    monkeypatch.setattr(module, "_narrowed_scope", lambda *_: None)
+
+    def texts() -> list[str | None]:
+        return [
+            module._uncommitted_note("T0007", ["tests/test_x.py"]),
+            module._oracle_with_code_problem(scope, goal, "T0002"),
+            module._open_mixed_refusal(scope, goal, "T0002", ""),
+        ]
+
+    monkeypatch.delenv(module.LEAN_ENV, raising=False)
+    held = "scope holds known-answer data (tests/cases.json) and the code it judges (src/codec.py)"
+    assert texts() == [
+        "Uncommitted in T0007's scope: tests/test_x.py. Give each to the part that writes "
+        "it, with locks when it is data; otherwise it goes out in a later part's commit.",
+        f"{held}. Split it: first a task with only the data and its cases test in "
+        "scope, passing locks=[tests/cases.json]; then the code in a later task.",
+        f"{held}. Narrow the scope to the data and its cases test, passing "
+        "locks=[tests/cases.json]; the code goes to a later task.",
+    ]
+    _lean_on(monkeypatch)
+    lean = texts()
+    for text in lean:
+        assert "locks=" not in text and "with locks" not in text, text
+    assert lean == [
+        "Uncommitted in T0007's scope: tests/test_x.py. Give each to the part that writes "
+        "it; otherwise it goes out in a later part's commit.",
+        f"{held}. Split it: first a task with only the data and its cases test in "
+        "scope; then the code in a later task.",
+        f"{held}. Narrow the scope to the data and its cases test; the code goes to a later task.",
+    ]
+
+
 @pytest.mark.parametrize(
     "command",
     [
