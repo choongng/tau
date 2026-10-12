@@ -9255,6 +9255,30 @@ def _tests_only_proof_note(command: str, scope: list[str], root: Path | None) ->
     )
 
 
+def _joint_cases_route(command: str, scope: list[str], root: Path) -> str:
+    """For a scope of tests only whose check runs a test importing a module that is not
+    on disk: the route that writes that code and the test in one task; or "".
+
+    q35 R59 L47-L53: T0003's scope held only tests/test_cases.py, which imports the
+    unwritten itc. Told to mutate the module the test imports, or to name a new data
+    test, it met prove's refusal of a WITNESS in a test file either way. The route is
+    `_locked_data_route`'s; under lean nothing is locked.
+    """
+    if not _only_data_and_tests(scope) or _scope_has_data(scope, root):
+        return ""
+    found = _imports_unwritten(command, scope, root)
+    if found is None:
+        return ""
+    test, module = found[0], found[1]
+    base = "src/" if (root / "src").is_dir() else ""
+    scoped = json.dumps([test, f"{base}{module.split('.')[0]}/"])
+    check = f'done_when="python3 -m pytest -q {test}"'
+    write = f"Write {test} and the code it imports, `{module}`, in one task"
+    if _lean():
+        return f"{write}: scope={scoped}, {check}."
+    return f'{write}, and lock {test} at its close: scope={scoped}, {check}, locks=["{test}"].'
+
+
 def _data_test_imports_unwritten(data_check: str, scope: list[str], root: Path) -> str:
     """What the data test `data_check` runs must change when it imports unwritten code
     too, itself or through a sibling test; or "".
@@ -12564,10 +12588,17 @@ async def _data_route_on_disk(
         else f"If a done task already did this work, call pursuit_step task={json.dumps(task)} "
         f'abandon="done by <that task>" done_when="{data_check}"; if '
     )
+    # q35 R59 L49: for a scope of tests only, prove refuses a new data test's WITNESS too.
+    joint = _joint_cases_route(f"pytest {shlex.quote(test)}", needs, root)
     return (
-        f"{done_by or 'If '}work is left, name a new data test file for it that fails now, put "
-        "it in scope, and say in the notes "
-        f"what it should test. {test} imports {module}, which a later task writes, and the "
+        f"{done_by or 'If '}work is left"
+        + (
+            f": {joint}"
+            if joint
+            else ", name a new data test file for it that fails now, put it in scope, and "
+            "say in the notes what it should test."
+        )
+        + f" {test} imports {module}, which a later task writes, and the "
         f"data test `{data_check}` already passes on the committed tree, so neither check "
         f"can tell {task}'s work from none."
     )
@@ -15650,6 +15681,9 @@ def make_step_tool() -> Any:
             held = _changed_locked_only(scope, goal, root)
             if held:
                 proof_note = _locked_data_proof_note(held)
+            elif proof_note == TESTS_ONLY_MUTATE_NOTE:
+                # q35 R59 L47: no module the test imports is on disk to mutate.
+                proof_note = _joint_cases_route(check, scope, root) or proof_note
             # The new route the Next offers keeps this check only where the route's
             # open would not refuse it as already passing: one rule for both.
             keeps = (
