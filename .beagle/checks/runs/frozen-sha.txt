@@ -1,4 +1,19 @@
-56dda5a91b681bf430a36cfc20be1f502f10d39c  choong-dev after the R53-R56 pair boundary; R0002 freeze for R57-R60 (only outright bugs change it, each recorded here)
+844c2a93c6f35ba57ea7e01a9e1689b8a8ca3f72  choong-dev after the R57-R60 pair boundary; R0002 freeze for R61-R64 (only outright bugs change it, each recorded here)
+# Earlier: 56dda5a91b681bf430a36cfc20be1f502f10d39c  freeze for R57-R60.
+# Landed at the R57-R60 boundary (each merged --no-ff, its witness proven, the task closed):
+#   T0463 55822859 (fix e2f841a4): beagle ext: the source judge judges results under encoded and decoded keys
+#   T0464 94449ae2 (fix 7584abe8): beagle ext: a cut-off kill note says "without acting" only of a worker that made no call
+#   T0465 ad240915 (fix 23405a9f): beagle ext: under lean, the worker's ruff-over-root refusal names no locked tests
+#   T0466 5efced47 (fix 1bf6789e): beagle ext: brief the witness note when an amended check passes on disk
+#   T0467 10885cd7 (fix 2a7ccd1e): beagle ext: send a held new route's notes to a worker
+#   T0468 b5eb75c9 (fix 817003a3): session: a line whose sentences loop is cut as a loop of lines
+#   T0469 a8856cd4 (fix f3285ba9): beagle ext: a cut-off kill note is not briefed as an earlier attempt's notes
+#   T0470 54a08dd4 (fix 35ed19f1): beagle ext: a new route's successor is "not opened" only when its open was refused
+#   T0471 8d9b9806 (fix 38002e9d): beagle ext: a step open refused by rank names the ready task, not `--over`
+#   T0472 c6c84ac6 (fix 5bfbf457): beagle ext: a tests-only task whose test imports unwritten code is offered the joint route
+#   T0473 792765e7 (fix 67768306): beagle ext: M12's locked-data route lists a scoped test once
+#   T0474 b23c62de (fix e65764e5): beagle ext: a worker's git commit gets the worker refusal, not commit-claims advice
+#   T0475 deferred (design); T0476-T0477 (R60 bugs) land at the R61-R64 boundary.
 # Earlier: 3d07bc9f515e0db013474f14c835721e3beff00a  choong-dev after T0447-T0452; freeze for R53-R56.
 # Landed at the R53-R56 boundary (each merged --no-ff, with its witness proven and the task closed):
 #   T0453 2687ca3a  scope-less done-by refusal offers back the committed source (R53)
