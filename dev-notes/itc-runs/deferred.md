@@ -98,3 +98,15 @@ All three [tau] classes were fixed before the freeze:
 - **A wall-kill result drops the failure the worker ran** (class 7). Deferred.
 - **Checks bound to the encoder never ran its long inputs**, and the report cut hid the worker who said so (class 8). Deferred.
 - **The src layout and a dropped pyproject.toml** (class 9; R56 class 3 seen again). Deferred.
+
+## R59
+
+- **Outright bugs, landing at the R57–R60 boundary:**
+  - T0472: a tests-only task is offered routes that prove refuses. Narrowed to the false texts; folding the cases test at founding is deferred.
+  - T0473: the locked-data route repeats a scoped test.
+  - T0474: a worker's commit gets the driver's commit-claims advice.
+  - T0475: retry notes say "read the references" over any report.
+- **A cleanup task's git-status check can never pass, and an abandoned route's files turn a gate red** (class 6). Deferred. It cost 29.9 min in R59.
+- **Abandoning a superseded milestone's successor accepts any reason** (class 7). Deferred.
+- **The .beagle substring rule refuses a check that names '.beagle/' as data** (class 12). Deferred.
+- **Pair read:** R57 lean scored 23 and R59 full scored 0 on the same freeze. The spread within each arm is as large as the gap between them; founding and route variance dominate.
