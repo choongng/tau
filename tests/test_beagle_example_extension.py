@@ -10656,6 +10656,80 @@ async def test_killed_worker_progress_reaches_the_next_attempts_notes(
 
 
 @pytest.mark.anyio
+async def test_wall_kill_step_result_shows_the_killed_workers_last_words(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # q35 R51: W5 said "test is buggy, cannot make both pass" and was killed at its
+    # step budget; the result said its words went to the next brief, and the driver
+    # spent a 3.6-min turn finding the bug again.
+    project = _git_project(tmp_path, monkeypatch)
+    monkeypatch.chdir(project)
+    monkeypatch.setenv("FAKE_TAU_SUCCEEDS_ON", "99")
+    monkeypatch.setenv("FAKE_TAU_HANGS_ON", "1")
+    monkeypatch.setenv("FAKE_TAU_MIDTURN", "x" * 5000 + " test is buggy, cannot make both pass")
+    monkeypatch.setenv("FAKE_TAU_WRITES", json.dumps({"tests/test_x.py": "def test_x(): ...\n"}))
+    _ready_task(fake_beagle)
+    runtime, _ = _bound(tmp_path)
+    args = {
+        "task": "T0002",
+        "criteria": "c",
+        "done_when": "grep -q done done.txt",
+        "scope": ["done.txt", "tests/test_x.py"],
+        "timeout": 3,
+    }
+
+    killed = (await _tool(runtime, "pursuit_step").execute("c1", args)).text
+
+    said = "What it said last (its reasoning, the end of it):\n[...] xxx"
+    assert said in killed and "test is buggy, cannot make both pass" in killed
+    # Short in the driver's context; the next brief keeps the longer tail.
+    assert "x" * 500 in killed and "x" * 600 not in killed
+    assert killed.index(said) < killed.index("In the tree now:\n") < killed.index("test_x.py")
+    assert "test is buggy" in _loaded_module()._KILLED_PROGRESS[(str(project.resolve()), "T0002")]
+
+
+@pytest.mark.anyio
+async def test_new_route_carries_killed_progress_to_the_sibling(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # q35 R51: W5's last words were kept for T0003's next brief; the driver took a
+    # new route, T0007, and W6's brief had no word of them.
+    project = _git_project(tmp_path, monkeypatch)
+    monkeypatch.chdir(project)
+    _failing_open_task(fake_beagle, monkeypatch)
+    monkeypatch.setenv("FAKE_TAU_HANGS_ON", "1")
+    monkeypatch.setenv("FAKE_TAU_MIDTURN", "x" * 50 + " test is buggy, cannot make both pass")
+    runtime, _ = _bound(tmp_path)
+    step = _tool(runtime, "pursuit_step")
+    args = {"task": "T0002", "criteria": "c", "done_when": "grep -q done done.txt"}
+    await step.execute("c1", args | {"scope": STAYS_OPEN_SCOPE, "timeout": 3, "attempts": 1})
+    _now_open(fake_beagle)
+    _r35_successor(fake_beagle)
+    monkeypatch.setenv("FAKE_TAU_HANGS_ON", "99")
+
+    rerouted = await step.execute(
+        "r1", {"task": "T0002", "new_route": True, "notes": "fix the test", "attempts": 2}
+    )
+
+    assert "T0003" in rerouted.text
+    killed, first, second = _runs(fake_tau)
+    assert "test is buggy" not in killed["stdin"]
+    assert "The last sub-agent on this task was killed at its 3s wall" in first["stdin"]
+    assert "test is buggy, cannot make both pass" in first["stdin"]
+    # Given once: the sibling's second attempt has the first's report instead.
+    assert "test is buggy" not in second["stdin"]
+    assert _loaded_module()._KILLED_PROGRESS == {}
+
+
+@pytest.mark.anyio
 async def test_worker_timeout_names_output_limit_turns_not_the_env_var(
     tmp_path: Path,
     beagle: Path,
