@@ -6975,6 +6975,30 @@ def _quoted_context(source: str, lines: list[str]) -> list[str]:
     ]
 
 
+#: A split table row's first line: its example index, then its input (`1 | 00`).
+_INDEXED_ROW = re.compile(r"\d+\s*\|")
+
+
+def _input_half(lines: list[str], at: int, inputs: list[object]) -> bool:
+    """Whether reference line `at` is a table row's example index and input, its
+    output on the next line, in a row that does not hold every one of `inputs`.
+
+    q35 R52: Wikipedia's example table puts each row on two lines, "1 | 00" then
+    "| 1 | 01 01 00". Case empty_input quoted "1 | 00", the row's input, as the
+    source of its expected [0], and the judge accepted it. A decode case's
+    expected bytes are on that line and its input on the next, so the line still
+    holds a result when the row holds the case's inputs.
+    """
+    if at + 1 >= len(lines) or not _INDEXED_ROW.match(lines[at]):
+        return False
+    if not lines[at + 1].startswith("|"):
+        return False
+    row = lines[at : at + 2]
+    return not inputs or not all(
+        any(_renders_result(line, value, whole=True) for line in row) for value in inputs
+    )
+
+
 def _result_unquoted(case: object, references: list[list[str]]) -> bool:
     """Whether `case` has a checkable result that is not where it must be."""
     return _result_found(case, references) is False
@@ -6994,19 +7018,32 @@ def _result_found(case: object, references: list[list[str]]) -> bool | None:
     passed on the 2 in "{0,2}" on the next line.
 
     Run R44: a bare `true` has nothing to search, so it is not judged.
+
+    q35 R52: a quote of only a table row's index and input (`_input_half`) does
+    not hold the result itself; the row's output line after it still may.
     """
     results = _case_results(case)
     if not results:
         return None
     sources = _source_strings(case)
+    inputs = _case_inputs(case)
     quoted: list[str] = []
     after: list[str] = []
+    halves: list[str] = []
+    spanned = False
     for lines in references:
         for source in sources:
             after += _lines_after(source, lines)
-            for first, last in _quoted_spans(source, lines):
-                quoted += lines[first : last + 1]
-    wide = [*sources, *after]
+            spans = _quoted_spans(source, lines)
+            for first, last in spans:
+                spanned = True
+                if first < last or not _input_half(lines, first, inputs):
+                    quoted += lines[first : last + 1]
+            if spans and all(
+                first == last and _input_half(lines, first, inputs) for first, last in spans
+            ):
+                halves.append(source)
+    wide = [*(source for source in sources if source not in halves), *after]
 
     def found(result: object, is_narrow: bool) -> bool:
         if not is_narrow:
@@ -7015,7 +7052,7 @@ def _result_found(case: object, references: list[list[str]]) -> bool | None:
             _renders_result(text, result, whole=True) for text in after
         )
 
-    checked = [(result, is_narrow) for result, is_narrow in results if quoted or not is_narrow]
+    checked = [(result, is_narrow) for result, is_narrow in results if spanned or not is_narrow]
     if not checked:
         return None
     return all(found(result, is_narrow) for result, is_narrow in checked)
@@ -7300,105 +7337,19 @@ def _value_lines(root: Path, data: str, named: list[str]) -> str:
     return " ".join(sentence for sentence in sentences if sentence)
 
 
-#: Lines of the references `_result_lines` names, at most.
-RESULT_LINES_MAX = 4
-#: Chars of a reference line `_result_lines` quotes.
-RESULT_LINE_CHARS = 80
-#: A relation between an expression and its value: `=`, `≡`, `∼`, `→`, `->`, `=>`.
-_RESULT_RELATION = re.compile(r"(?<![<>!=])(?:->|=>|==|⇒|→|↦|≡|∼|~|=)")
-#: A value that holds letters: a `0x1f`, or a run of two or more hex bytes split by
-#: spaces (`0A 1F 00`, `01 02 ... FE`); a lone `e1` is a name, not a byte.
-_HEX_VALUE = re.compile(
-    r"(?<![\w.])(?:0[xX][0-9A-Fa-f]+|[0-9A-Fa-f]{2}(?:\s+(?:(?:\.\.\.|…)\s+)?[0-9A-Fa-f]{2})+)"
-    r"(?![\w.])"
-)
-#: A line of code rather than a result: a statement's trailing `;`, a block's
-#: brace, or a `++`/`--` step such as `*p++`.
-_CODE_LINE = re.compile(r";$|^[{}]$|^\}|\{$|[\w)\]](?:\+\+|--(?![->]))|(?:\+\+|--)[\w*(]")
-
-
-def _concrete(text: str) -> bool:
-    """Whether `text` is a value alone: a digit, and no letter outside a hex value."""
-    rest = _HEX_VALUE.sub("", text)
-    return any(ch.isdigit() for ch in text) and not any(ch.isalpha() for ch in rest)
-
-
-def _table_row(text: str) -> bool:
-    """Whether `text` is a table row of values: two or more cells, each a value sequence."""
-    cells = [cell.strip() for cell in text.split("|")]
-    filled = [cell for cell in cells if cell]
-    return len(filled) >= 2 and all(_concrete(cell) for cell in filled)
-
-
-def _result_line(text: str, lead: str) -> bool:
-    """Whether a reference line gives a concrete result.
-
-    A table row of values (`3 | 0A 1F 00`); a single relation whose right side is a
-    value alone (`f(2) = (4, 1)`, not the rule `f(x) = (2x, 1)` nor the chain
-    `1 = (1) = ((1))`); or a worked example: a line of values alone after a prose
-    line ending in a colon. A line of code (`n = 0;`, `*p++`) is none of them.
-    """
-    if _CODE_LINE.search(text):
-        return False
-    if "|" in text and _table_row(text):
-        return True
-    relation = _RESULT_RELATION.search(text)
-    if relation and text[: relation.start()].strip():
-        right = text[relation.end() :]
-        return not _RESULT_RELATION.search(right) and _concrete(right)
-    return _concrete(text) and lead.rstrip().endswith(":") and any(ch.isalpha() for ch in lead)
-
-
-def _result_lines(root: Path) -> list[str]:
-    """Lines of references/*.txt that give a concrete result, as `file:line "quote"`.
-
-    Run R40: three of four cases asked for results no reference gives, and the
-    verdict only asked for a quote of the line giving them, so workers re-quoted
-    rule lines. These are the lines a replacement case can come from, taken from
-    each reference in turn, bracketed values first, RESULT_LINES_MAX at most.
-    """
-    refs = root / REFERENCES_DIR
-    found: list[list[str]] = []
-    for path in sorted(refs.glob("*.txt")) if refs.is_dir() else []:
-        try:
-            raw = path.read_text(encoding="utf-8", errors="replace")
-        except OSError:
-            continue
-        lead = ""
-        lines: list[str] = []
-        for number, line in enumerate(raw.splitlines(), 1):
-            text = " ".join(line.split())
-            if not text:
-                continue
-            if _result_line(text, lead):
-                if len(text) > RESULT_LINE_CHARS:
-                    text = text[:RESULT_LINE_CHARS] + "…"
-                lines.append(f'{path.name}:{number} "{text}"')
-            lead = text
-        # A bracketed value is more often a worked result than a bare definition.
-        found.append(sorted(lines, key=lambda line: not any(ch in line for ch in "([{")))
-    taken = [line for row in itertools.zip_longest(*found) for line in row if line]
-    return taken[:RESULT_LINES_MAX]
-
-
 def _unanswered_case_note(root: Path) -> str:
-    """The known-answers verdict's sentence for a case no reference line answers."""
+    """The known-answers verdict's sentence for a case no reference line answers.
+
+    q35 R52: it listed reference lines that "give a concrete result", and two were
+    a table's example index and input ("1 | 00"); the driver read one as a result
+    and a right case was made wrong. It names no lines, only where to search.
+    """
     note = (
         f"If no line of {REFERENCES_DIR}/*.txt gives a case's result, no quote can source "
         "it: replace the case with one whose input and result the reference both gives, "
         "rather than quote a rule or prose line again."
     )
-    candidates = _result_lines(root)
-    if candidates:
-        note += (
-            f" Lines of {REFERENCES_DIR}/*.txt that give a concrete result: "
-            + "; ".join(candidates)
-            + "."
-        )
-    return (
-        f"{note} To find {'more ' if candidates else ''}lines that give a result, search "
-        f"with bash: `{_reference_search()}`."
-    )
+    return f"{note} To find lines that give a result, search with bash: `{_reference_search()}`."
 
 
 def _reads_locked_data(root: Path, test: str, data: list[str]) -> bool:
@@ -13205,8 +13156,8 @@ def _source_judge_escalation(
     lead: str = "",
 ) -> str:
     """The escalation of a task only the close's source judge kept open: a notes-only
-    rerun naming its cases and the reference lines with results, or stopping; once
-    its SOURCE_JUDGE_RERUNS are spent, closing it infeasible on those cases, or stopping.
+    rerun naming its cases and where to search, or stopping; once its
+    SOURCE_JUDGE_RERUNS are spent, closing it infeasible on those cases, or stopping.
 
     Run R40: the escalation offered a split by file; its parts opened already
     passing, and no part could change a case, so the driver split and re-split.

@@ -21669,34 +21669,6 @@ async def test_known_answers_unsourced_result_says_replace_the_case(
     assert _pursuit_calls(fake_beagle, "close") == []
 
 
-@pytest.mark.anyio
-async def test_known_answers_unsourced_result_names_reference_result_lines(
-    tmp_path: Path,
-    beagle: Path,
-    fake_beagle: Path,
-    fake_tau: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    # R40: the references gave concrete results on a few lines, among many rule
-    # lines; the verdict named none, so workers re-read whole references.
-    result, project = await _unsourced_result_step(tmp_path, fake_beagle, monkeypatch)
-    module = _module()
-
-    verdict = result.text.partition("Next: pursuit_step")[0]
-    named = (
-        'Lines of references/*.txt that give a concrete result: rules.txt:5 "(2, 1)"; '
-        'rules.txt:6 "twist((1, 2)) = (3, 1)"; rules.txt:7 "twist((0, 5)) → (6, 0)"; '
-        'rules.txt:8 "twist((7, 7)) ∼ (8, 7)".'
-    )
-    assert named in verdict
-    assert len(module._result_lines(project)) == module.RESULT_LINES_MAX
-    assert "rules.txt:9" not in verdict  # past the cap
-    assert "rules.txt:2" not in verdict  # a rule, with variables on its right
-    assert "rules.txt:10" not in verdict  # prose
-    assert "rules.txt:11" not in verdict  # a bare number, with no lead-in
-    assert not (project / ".beagle" / "locked").exists()
-
-
 async def _source_judge_escalated(
     tmp_path: Path, fake_beagle: Path, monkeypatch: pytest.MonkeyPatch
 ) -> tuple[Any, Path, dict[str, Any]]:
@@ -21750,7 +21722,7 @@ async def test_judge_only_escalation_offers_no_split(
 
 
 @pytest.mark.anyio
-async def test_judge_only_escalation_names_cases_and_result_lines(
+async def test_judge_only_escalation_names_cases(
     tmp_path: Path,
     beagle: Path,
     fake_beagle: Path,
@@ -21758,7 +21730,7 @@ async def test_judge_only_escalation_names_cases_and_result_lines(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     # R40: workers re-quoted rule lines for cases no reference answers; the
-    # escalation's rerun must carry the cases, "replace the case" and the lines.
+    # escalation's rerun must carry the cases and "replace the case".
     module, project, record = await _source_judge_escalated(tmp_path, fake_beagle, monkeypatch)
     count = module.JUDGE_NOTES_UNTIL
 
@@ -21778,8 +21750,6 @@ async def test_judge_only_escalation_names_cases_and_result_lines(
     assert f"The call that works, whole: {call}" in text
     assert f"- {call}, a sub-agent at those cases" in text
     assert "replace the case with one whose input and result the reference both gives" in notes
-    lines = 'rules.txt:5 "(2, 1)"; rules.txt:6 "twist((1, 2)) = (3, 1)"'
-    assert lines in notes and json.dumps(lines, ensure_ascii=False)[1:-1] in text
     assert "only the close's source check keeps it open, on case nested_twist" in text
     assert "unit_twist" not in text  # its source gives its result
 
@@ -21798,14 +21768,29 @@ def test_unanswered_case_note_says_how_to_search(
         'To find lines that give a result, search with bash: `tilth "<words>" --scope references`.'
     )
 
-    (tmp_path / "references" / "rules.txt").write_text(RULES_REFERENCE)
     monkeypatch.setattr(module.shutil, "which", lambda name, *a, **k: None)
-    listed = module._unanswered_case_note(tmp_path)
-    assert "Lines of references/*.txt that give a concrete result: " in listed
-    assert listed.endswith(
-        "To find more lines that give a result, search with bash: "
+    assert module._unanswered_case_note(tmp_path).endswith(
+        "To find lines that give a result, search with bash: "
         '`grep -n -i -F "<words>" references/*.txt`.'
     )
+
+
+def test_unanswered_case_note_names_no_result_lines(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # q35 R52: the note listed "1 | 00", a table row's example index and input, as a
+    # line giving a result; the driver read it so, and a right case was made wrong.
+    module = _module()
+    monkeypatch.setattr(module.shutil, "which", lambda name, *a, **k: None)
+    (tmp_path / "references").mkdir()
+    bare = module._unanswered_case_note(tmp_path)
+    (tmp_path / "references" / "cobs.txt").write_text(R35_REFERENCE)
+    (tmp_path / "references" / "rules.txt").write_text(RULES_REFERENCE)
+    note = module._unanswered_case_note(tmp_path)
+    assert note == bare
+    assert "replace the case with one whose input and result the reference both gives" in note
+    for line in ("1 | 00", "| 1 | 01 01 00", "cobs.txt:", "rules.txt:", "(2, 1)"):
+        assert line not in note, line
 
 
 @pytest.mark.anyio
@@ -21995,69 +21980,48 @@ def test_input_equal_result_checked_against_quoted_reference_line(tmp_path: Path
     assert module._unquoted_cases(tmp_path, ["tests/cases.json"]) is None
 
 
-#: A C decoder of the kind R35's reference ends with: statements, not results.
-C_SNIPPET = (
-    "Decoding is the reverse:\n"
-    "if (block && (code != 0xff)) // write a zero unless at the end\n"
-    "*decode++ = 0;\n"
-    "code = 0xff;\n"
-    "if (code == 0) {\n"
-    "} else if (code == 1)\n"
-    "length--;\n"
-)
-
-
-def test_result_lines_name_hex_table_rows_not_code_lines(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    # Audit 13: on R35's reference the close named only `*decode++ = 0;`, as a hex
-    # byte held a letter, so no table row of the worked examples was a value.
+def test_unquoted_cases_rejects_example_index_row_as_source(tmp_path: Path) -> None:
+    # q35 R52: empty_input quoted "1 | 00", the example index and input of the
+    # table's first row, as the source of a wrong expected [0], and was accepted.
     module = _module()
-    (tmp_path / "references").mkdir()
-    reference = C_SNIPPET + R35_REFERENCE
-    (tmp_path / "references" / "cobs.txt").write_text(reference)
-    lines = reference.splitlines()
-    rows = [
-        f'cobs.txt:{n} "{line}"'
-        for n, line in enumerate(lines, 1)
-        if "|" in line and any(ch.isdigit() for ch in line)
+    reference = _r35_reference()
+    wrong = {"name": "empty_input", "input": [], "expected": [0], "source": "1 | 00"}
+    assert module._result_unquoted(wrong, [reference])
+    assert module._result_unquoted({**wrong, "input": [17]}, [reference])
+    right = [
+        {"name": "single_zero", "input": [0], "expected": [1, 1, 0], "source": "1 | 00"},
+        {
+            "name": "two_zeros",
+            "input": [0, 0],
+            "expected": [1, 1, 1, 0],
+            "source": "| 2 | 01 01 01 00",
+        },
+        {
+            "name": "decode_zero_data_zero",
+            "input": [1, 2, 17, 1, 0],
+            "expected": [0, 17, 0],
+            "source": "3 | 00 11 00",
+        },
+        {
+            "name": "quoted_bytes",
+            "input": [17, 34, 0, 51],
+            "expected": [3, 17, 34, 2, 51, 0],
+            "source": 'the row "| 4 | 03 11 22 02 33 00"',
+        },
     ]
-    assert len(rows) == 14
-    assert module._result_lines(tmp_path) == rows[: module.RESULT_LINES_MAX]
-
-    monkeypatch.setattr(module, "RESULT_LINES_MAX", 100)
-    named = module._result_lines(tmp_path)
-    assert named == rows
-    assert any('"| 4 | 03 11 22 02 33 00"' in line for line in named)
-    assert any('"| 254 | FF 01 02 03 ... FD FE 00"' in line for line in named)
-    assert not any("decode" in line or "code" in line for line in named)
-    assert not any("Example" in line or "Data bytes" in line for line in named)
-
-
-def test_result_lines_skip_code_statements(tmp_path: Path) -> None:
-    # A statement assigning a value reads as a relation with a value on its
-    # right; its `;`, `++`/`--` step or block brace marks it as code.
-    module = _module()
-    code = [
-        "*out++ = 0;",
-        "mask = 0x1f;",
-        "total = 12;",
-        "n = --k == 2",
-        "if (n == 0) {",
-        "} else if (n == 1)",
-    ]
-    results = ["f(2) = (4, 1)", "mask → 0x1f", "| 2 | 0A 1F 00", "0A 1F 00"]
-    for line in code:
-        assert not module._result_line(line, "For example:"), line
-    for line in results:
-        assert module._result_line(line, "For example:"), line
-    assert not module._result_line("e1 = e2", "For example:")  # a name, not a byte
+    for case in right:
+        assert not module._result_unquoted(case, [reference]), case["name"]
 
     (tmp_path / "references").mkdir()
-    (tmp_path / "references" / "f.txt").write_text(
-        "The step, for example:\n" + "\n".join(code[:3]) + "\nf(2) = (4, 1)\n"
-    )
-    assert module._result_lines(tmp_path) == ['f.txt:5 "f(2) = (4, 1)"']
+    (tmp_path / "references" / "cobs.txt").write_text(R35_REFERENCE)
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "tests" / "cases.json").write_text(json.dumps([wrong, *right]))
+    found = module._unquoted_cases(tmp_path, ["tests/cases.json"])
+    assert found is not None
+    assert found[:5] == ("tests/cases.json", 1, 5, ["empty_input"], True)
+    assert "decode_zero_data_zero" in found[6] and "empty_input" not in found[6]
+    (tmp_path / "tests" / "cases.json").write_text(json.dumps(right))
+    assert module._unquoted_cases(tmp_path, ["tests/cases.json"]) is None
 
 
 def test_short_result_with_no_quoted_context_is_not_flagged() -> None:
