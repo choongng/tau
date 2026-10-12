@@ -11742,11 +11742,18 @@ def _with_spawn_notice(
     """`result`, led by the spawn of `successor` when the reply would drop it.
 
     Run R18 #20 and #54 asked about T0002 and T0006 and were told only "T0005 not
-    opened" and "T0008 not opened": the spawn that superseded each was lost.
+    opened" and "T0008 not opened": the spawn that superseded each was lost. It
+    says `successor` was not opened only of an open refusal.
     """
     text = "".join(getattr(c, "text", "") for c in result.content)
     if spawned.strip() and spawned.strip() in text:
         return result
+    if (
+        f"pursuit_step: {successor} not opened — " not in text
+        and "pursuit_step: `beagle pursuit open` refused" not in text
+    ):
+        # q35 R58 L25: T0007 opened, and its worker was killed at its wall.
+        return _step_result(f"{predecessor} was superseded by {successor} (new route).\n\n{text}")
     refusal = text.removeprefix(f"pursuit_step: {successor} not opened — ")
     return _step_result(
         f"{predecessor} was superseded by {successor} (new route); {successor} was not "
