@@ -6737,8 +6737,9 @@ def _case_label(case: object, index: int) -> str:
     return f"#{index + 1}"
 
 
-#: Key fragments that mark a case's expected result.
-RESULT_KEY_PARTS = ("expect", "result", "output", "want", "answer")
+#: Key fragments that mark a case's expected result. q35 R56: `encoded_hex` and
+#: `decoded_hex` held every result, and the judge judged none of them.
+RESULT_KEY_PARTS = ("expect", "result", "output", "want", "answer", "encoded", "decoded")
 #: A scalar or string result shorter than this is searched for only in the
 #: reference lines its source quotes: "1", "ok" or "00" occurs in, or is
 #: absent from, a whole source by chance.
@@ -6957,10 +6958,11 @@ def _case_results(case: object) -> list[tuple[object, bool]]:
     """
     if not isinstance(case, dict):
         return []
+    # q35 R56: decoded_hex equalled input_hex, an echo once `decoded` is a result key.
     inputs = [
         item
         for key, value in case.items()
-        if str(key).lower() in _CASE_NON_ANSWER_KEYS
+        if (str(key).lower() in _CASE_NON_ANSWER_KEYS or str(key).lower().startswith("input_"))
         and not any(part in str(key).lower() for part in SOURCE_KEY_PARTS)
         for item in _input_values(value)
     ]

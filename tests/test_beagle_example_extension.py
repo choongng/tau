@@ -22435,6 +22435,55 @@ async def test_known_answer_source_must_hold_expected_result(
     assert module._unquoted_cases(project, ["tests/cases.json"]) is None
 
 
+def test_source_judge_judges_results_under_encoded_and_decoded_keys(tmp_path: Path) -> None:
+    # q35 R56: 11 cases keyed input_hex/encoded_hex/decoded_hex all quoted one prose
+    # sentence, example 11's encoding was wrong, and the judge found no result to
+    # judge in any of them, so the close passed with no hold.
+    module = _module()
+    prose = "These examples show how various data sequences would be encoded by the COBS algorithm."
+    (tmp_path / "references").mkdir()
+    (tmp_path / "references" / "cobs.txt").write_text(f"{prose}\n\n{R34_REFERENCE}")
+    (tmp_path / "tests").mkdir()
+    data = tmp_path / "tests" / "cases.json"
+    # example_3's decoded_hex echoes its input_hex, on the input row it quotes.
+    rows = {
+        "example_3": "3 | 00 11 00",
+        "example_4": ["4 | 11 22 00 33", "| 4 | 03 11 22 02 33 00"],
+    }
+    cases = [
+        {
+            "name": "example_3",
+            "input_hex": "00 11 00",
+            "encoded_hex": "01 02 11 01 00",
+            "decoded_hex": "00 11 00",
+            "source": prose,
+        },
+        {
+            "name": "example_4",
+            "input_hex": "11 22 00 33",
+            "encoded_hex": "03 11 22 02 33 00",
+            "decoded_hex": "11 22 00 33",
+            "source": prose,
+        },
+    ]
+    data.write_text(json.dumps(cases))
+
+    found = module._unquoted_cases(tmp_path, ["tests/cases.json"])
+    assert found is not None
+    assert found[:5] == ("tests/cases.json", 2, 2, ["example_3", "example_4"], True)
+
+    for case in cases:
+        case["source"] = rows[case["name"]]
+    data.write_text(json.dumps(cases))
+    assert module._unquoted_cases(tmp_path, ["tests/cases.json"]) is None
+
+    cases[1]["encoded_hex"] = "03 11 22 33 00"
+    data.write_text(json.dumps(cases))
+    found = module._unquoted_cases(tmp_path, ["tests/cases.json"])
+    assert found is not None
+    assert found[:5] == ("tests/cases.json", 1, 2, ["example_4"], True)
+
+
 #: A reference defining an operation by rules, with only a few worked results (R40).
 RULES_REFERENCE = (
     "The twist of a pair swaps its halves and adds one to the first.\n"
