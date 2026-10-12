@@ -1749,10 +1749,12 @@ REPLY_FILLED = "its reply text filled the output limit before any call"
 NOTHING_FILLED = "the output limit came before any reply or call"
 #: The kill note's advice when no call was cut off. Run R43: W13 spent two turns
 #: on reply text with no call and was told to write in parts, which the driver
-#: passed on to the next worker's notes.
+#: passed on to the next worker's notes. q35 R56: W3 made 9 calls between its
+#: two cut-offs, so a worker that made calls gets only the last sentence.
+NO_CALL_CUT_ONLY = "No call was cut off, so writing in smaller pieces would not help."
 NO_CALL_CUT = (
     "It spent its turns reasoning in prose without acting: the next notes should say "
-    "what to do first. No call was cut off, so writing in smaller pieces would not help."
+    f"what to do first. {NO_CALL_CUT_ONLY}"
 )
 #: The task whose last worker was ended on reasoning-only cut-offs, by project
 #: root: its next worker runs thinking-off, once. Run R41: W1-W6 each spent two
@@ -1808,6 +1810,8 @@ class _WorkerEvents:
     reasoning_cut_offs: int = 0
     #: What filled each cut-off turn, in order: CUT_THINKING, CUT_REPLY or CUT_CALL.
     cut_fills: list[str] = field(default_factory=list)
+    #: How many tool calls its turns made, over the whole run (q35 R56).
+    calls: int = 0
     #: Output tokens, and the milliseconds after each turn's first output: its decode.
     decode_tokens: int = 0
     decode_ms: int = 0
@@ -1853,6 +1857,7 @@ class _WorkerEvents:
         if text or self.thinking:
             self.said = ("reply text", text) if text else ("reasoning", self.thinking)
         calls = [block for block in blocks if block.get("type") == "toolCall"]
+        self.calls += len(calls)
         arguments = calls[-1].get("arguments") if calls else None
         command = arguments.get("command") if isinstance(arguments, dict) else None
         self.pending_command = (
@@ -2262,6 +2267,8 @@ async def _run_worker(
             advice = (
                 "Split the task or have the notes say to write in parts."
                 if CUT_CALL in fills
+                else NO_CALL_CUT_ONLY
+                if events.calls
                 else NO_CALL_CUT
             )
             cause = "; ".join(filled) or NOTHING_FILLED
@@ -13933,6 +13940,7 @@ def _killed_attempt_context(
     check: str,
     root: Path,
     scope: list[str],
+    reported: bool,
 ) -> str:
     """What a killed worker's step result keeps: the attempt before it, and the tree.
 
@@ -13943,10 +13951,14 @@ def _killed_attempt_context(
     q35 R51: W5, killed at its step budget, had said "test is buggy, cannot make
     both pass"; only the next brief on T0003 held it, and the driver spent a
     3.6-min turn finding that again. The result shows the end of what it said.
+
+    q35 R56: W3, the attempt before W4, was killed at its second cut-off with no
+    report, and the result said "The attempt before it reported:".
     """
     parts: list[str] = []
     if shown:
-        parts.append(f"The attempt before it reported:\n{shown}")
+        ended = "reported" if reported else "ended without a report"
+        parts.append(f"The attempt before it {ended}:\n{shown}")
         if check and verdict[1]:
             parts.append(
                 f"`{check}` exit {verdict[0]} after that attempt:\n{verdict[1][-CHECK_TAIL_CHARS:]}"
@@ -15160,7 +15172,7 @@ def make_step_tool() -> Any:
         check_timeout = float(record.get("check_timeout") or DEFAULT_CHECK_TIMEOUT)
 
         spent: int | None = None
-        report = shown = ""
+        report = shown = ended = ""
         verdict: tuple[int, str] = (1, "")
         bad_thinking = _bad_thinking(arguments.get("thinking"))
         if bad_thinking:
@@ -15358,7 +15370,9 @@ def make_step_tool() -> Any:
                     scope,
                     _implementation_in_tests_lead(root, scope, check)
                     + f"pursuit_step: {task} stays open — {run.problem}\n\n"
-                    + _killed_attempt_context(run, shown, verdict, check, root, scope)
+                    + _killed_attempt_context(
+                        run, shown, verdict, check, root, scope, ended == "reported back"
+                    )
                     + f'Call pursuit_step with task="{task}" to send it again.',
                 )
             if run.unreported:
