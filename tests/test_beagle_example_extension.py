@@ -17826,6 +17826,44 @@ async def test_open_on_uncommitted_pass_asks_only_for_a_witness_when_absence_is_
 
 
 @pytest.mark.anyio
+async def test_amended_check_passing_on_disk_briefs_witness_note_not_old_demand(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # q35 R57 L30: T0002's check was amended to one that passed only on the
+    # uncommitted work, and W3's brief carried the old check's close demand ("Fix
+    # that; the check alone is not enough"), not the on-disk witness note.
+    project = _git_project(tmp_path, monkeypatch)
+    monkeypatch.chdir(project)
+    (project / "src").mkdir()
+    (project / "src" / "clock.py").write_text("def add(a, b):\n    return a + b\n")
+    monkeypatch.setenv("FAKE_TAU_SUCCEEDS_ON", "99")
+    monkeypatch.setenv("FAKE_TAU_REPORT", WITNESSED_REPORT)
+    _open_task_in_scope(fake_beagle, ["src/clock.py"], "ruff check src/clock.py")
+    (fake_beagle / "prove.out").write_text("T0002: PROVEN — refuses with the defect\n")
+    runtime, _ = _bound(tmp_path)
+    module = _loaded_module()
+    module._NOT_DONE_DEMAND[(str(Path.cwd()), "T0002")] = (
+        "the check passes even with a defect put back into the work, so it does not test "
+        "what this task built"
+    )
+
+    await _tool(runtime, "pursuit_step").execute(
+        "c1", {"task": "T0002", "done_when": "grep -q 'a + b' src/clock.py", "attempts": 3}
+    )
+
+    assert len(_pursuit_calls(fake_beagle, "amend")) == 1
+    [run] = _runs(fake_tau)
+    assert "the check passes already on the uncommitted work" in run["stdin"].lower()
+    assert "do not change the implementation" in run["stdin"]
+    assert "The last close kept this task open" not in run["stdin"]
+    assert "the check alone is not enough" not in run["stdin"]
+
+
+@pytest.mark.anyio
 @pytest.mark.parametrize("committed", [False, True])
 async def test_data_test_route_is_not_offered_when_the_data_test_already_passes(
     tmp_path: Path,
