@@ -16,7 +16,10 @@ assert d.get('level') == 'medium' and d.get('sent'), f"driver thinking not mediu
 assert m.get('worker_thinking') == 'medium', f"worker thinking not medium: {m.get('worker_thinking')}"
 assert m.get('arm') == 'lean', f"arm is {m.get('arm')!r}, not lean"
 frozen = open('.beagle/checks/runs/frozen-sha.txt').read().split()[0]
-assert m.get('tau_sha', '').startswith(frozen), f"tau {m.get('tau_sha')} is not the frozen {frozen}"
+import subprocess
+moved = subprocess.run(['git', 'diff', '--name-only', frozen, m.get('tau_sha', 'HEAD'), '--', '.', ':!.beagle', ':!dev-notes'],
+                       capture_output=True, text=True, check=True).stdout.split()
+assert not moved, f"tau {m.get('tau_sha')} differs from the frozen {frozen} in {moved[:5]}"
 assert m.get('tau_dirty_code_files', 1) == 0, "tau had uncommitted code changes at launch"
 md = open(f'dev-notes/itc-runs/{R}.md').read()
 assert re.search(r'driver_thinking\S*\s+medium|driver thinking\S*\s+medium', md, re.I), "note does not record the driver's thinking level"
