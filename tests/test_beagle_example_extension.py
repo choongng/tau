@@ -15371,6 +15371,30 @@ async def test_worker_guard_refuses_ruff_format_over_the_whole_tree(
         assert "refusing" not in result.text, command
 
 
+@pytest.mark.anyio
+async def test_ruff_over_root_refusal_names_no_locked_tests_when_none_are_locked(
+    tmp_path: Path, beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # q35 R57 W3 L77, W5 L37: under lean nothing is locked, yet `ruff check --fix .`
+    # was refused as reaching "the pursuit's locked tests". Lean off keeps the text.
+    texts = {}
+    for lean_on, name in ((False, "full"), (True, "lean")):
+        if lean_on:
+            _lean_on(monkeypatch)
+        runtime = _scoped_worker(tmp_path / name, monkeypatch, scope="src/itc.py\nsrc/cli.py")
+        bash = _tool_with_hooks(runtime, "bash")
+        result = await bash.execute("c1", {"command": "ruff check --fix ."})
+        texts[name] = str(result.text)
+
+    assert (
+        "refusing `ruff check --fix .`: it reaches the pursuit's locked tests, which no "
+        "sub-agent may change. Name the files instead: src/itc.py, src/cli.py."
+    ) in texts["full"]
+    assert "refusing `ruff check --fix .`" in texts["lean"]
+    assert "locked tests" not in texts["lean"]
+    assert "Name the files instead: src/itc.py, src/cli.py." in texts["lean"]
+
+
 def test_changed_files_keeps_the_first_path_whole(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

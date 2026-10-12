@@ -17106,9 +17106,16 @@ def make_worker_scope_guard() -> Any:
                     files = ", ".join(sent[1]) if sent is not None else "the files you changed"
                     return ToolCallHookResult(
                         block=True,
+                        # q35 R57: under lean nothing is locked; fixed at launch.
                         reason=(
-                            f"refusing {ruff}: it reaches the pursuit's locked tests, which "
-                            f"no sub-agent may change. Name the files instead: {files}."
+                            f"refusing {ruff}"
+                            + (
+                                ""
+                                if _lean()
+                                else ": it reaches the pursuit's locked tests, which "
+                                "no sub-agent may change"
+                            )
+                            + f". Name the files instead: {files}."
                         ),
                     )
             if sent is None:
