@@ -1613,6 +1613,8 @@ class _WorkerRun:
     #: How its last assistant message ended, and that message's text or an earlier one's.
     stop_reason: str | None = None
     last_words: str = ""
+    #: A run killed at its wall: what it said last, as (kind, text), for the step result.
+    said_last: tuple[str, str] = ("", "")
     #: The memory cap the run was killed at, when SIGKILL ended it under one.
     killed_at: str | None = None
     #: The command of the tool call its last assistant message made, if any.
@@ -1709,6 +1711,9 @@ _READ_CHUNK = 1 << 16
 _MAX_EVENT_LINE = 16 << 20
 #: How much of a worker's stderr, and of its last thinking, a report quotes.
 _WORKER_TAIL_CHARS = 2000
+#: How much of a worker killed at its wall's last words the step result shows;
+#: the next brief keeps the longer _WORKER_TAIL_CHARS.
+KILLED_WORDS_CHARS = 600
 
 
 #: How tau's repeat breaker words a refused call's tool result, and the stop.
@@ -2269,7 +2274,12 @@ async def _run_worker(
                 _KILLED_PROGRESS[(root_key, task)] = kept
             problem = _wall_problem(timeout, events, task if kept else "", cwd, model, provider)
         problem = f"{problem} {thinking_off_note}".strip()
-        return _WorkerRun(returncode=proc.returncode, problem=problem, transcript=transcript)
+        return _WorkerRun(
+            returncode=proc.returncode,
+            problem=problem,
+            transcript=transcript,
+            said_last=events.last_said() if walled else ("", ""),
+        )
 
     stderr = talk.result()
     _record_decode(cwd, model, provider, events)
@@ -13460,6 +13470,10 @@ def _killed_attempt_context(
     Run R15's second worker was killed at the wall, and the result named only
     the timeout: the first worker's report and the check's output were dropped,
     so the driver went on believing the tests were unwritten.
+
+    q35 R51: W5, killed at its step budget, had said "test is buggy, cannot make
+    both pass"; only the next brief on T0003 held it, and the driver spent a
+    3.6-min turn finding that again. The result shows the end of what it said.
     """
     parts: list[str] = []
     if shown:
@@ -13468,6 +13482,11 @@ def _killed_attempt_context(
             parts.append(
                 f"`{check}` exit {verdict[0]} after that attempt:\n{verdict[1][-CHECK_TAIL_CHARS:]}"
             )
+    kind, said = run.said_last
+    if said:
+        tail = said[-KILLED_WORDS_CHARS:]
+        cut = "[...] " if len(tail) < len(said) else ""
+        parts.append(f"What it said last (its {kind}, the end of it):\n{cut}{tail}")
     if run.transcript is not None:
         changes = _scope_changes(root, scope)
         if changes:
@@ -14100,6 +14119,11 @@ def make_step_tool() -> Any:
                 spawns[:] = [(task, successor, spawned)]
                 if same_route:
                     _carry_not_done(root, task, successor)
+                # q35 R51: W5's last words were kept for T0003's next brief, and the
+                # new route to T0007 dropped them; the successor's first brief has them.
+                kept_progress = _KILLED_PROGRESS.pop((str(_resolved(root)), task), None)
+                if kept_progress:
+                    _KILLED_PROGRESS[(str(_resolved(root)), successor)] = kept_progress
                 _forget_task(root, task)
                 task = successor
                 criteria = old_criteria or criteria
