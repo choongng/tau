@@ -3715,6 +3715,25 @@ def test_cases_first_never_plans_known_answers_over_locked_data(
     assert module._cases_first_problem(["cobs.py"], "T0003", "Codec", goal, R22_NODES, locks)
 
 
+def test_cases_first_locked_data_route_does_not_repeat_a_scoped_test(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # q35 R59 L91: the scope already held tests/test_cases.py, and M12's route listed
+    # it a second time; the driver copied it, and T0015's record held it twice.
+    project = _r22_committed(tmp_path, monkeypatch, test=False)
+    module = _module()
+    goal = project / ".beagle" / "pursuit.toml"
+    scope = [".gitignore", "tests/test_cases.py", "cobs.py"]
+
+    found = module._cases_first_problem(scope, "T0003", "Codec", goal, R22_NODES)
+
+    assert found is not None
+    assert (
+        'scope=[".gitignore", "tests/test_cases.py", "cobs.py"] '
+        'done_when="python3 -m pytest -q tests/test_cases.py" locks=["tests/test_cases.py"]'
+    ) in found
+
+
 def test_cases_first_offers_existing_uncommitted_cases_test(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
