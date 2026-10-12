@@ -1,1 +1,13 @@
-3d07bc9f515e0db013474f14c835721e3beff00a  choong-dev after T0447-T0452; R0002 freeze for R53-R70 (only outright bugs change it, each recorded here)
+56dda5a91b681bf430a36cfc20be1f502f10d39c  choong-dev after the R53-R56 pair boundary; R0002 freeze for R57-R60 (only outright bugs change it, each recorded here)
+# Earlier: 3d07bc9f515e0db013474f14c835721e3beff00a  choong-dev after T0447-T0452; freeze for R53-R56.
+# Landed at the R53-R56 boundary (each merged --no-ff, with its witness proven and the task closed):
+#   T0453 2687ca3a  scope-less done-by refusal offers back the committed source (R53)
+#   T0454 aa4966a0  retry note says "reported back" only for an attempt that reported (R53)
+#   T0455 e5fd4330  already-passes offers no done-by or abandon its own rules refuse (R53/R54)
+#   T0456 cd3cd187  locked-test refusal of a lint check offers a scope without the judged module (R54)
+#   T0457 f567c50f  prove: no out-of-scope witness pre-empts the task's own proof (R54)
+#   T0458 b1d150ba  under lean, no driver text promises locks (R55)
+#   T0459 92d1a7d8  drop-import brief skips a task whose criteria name the import (R55)
+#   T0460 4a614d35  import-only prove asks for a WITNESS, not a new check (R55)
+#   T0461 ac18b9b4  raw report with closing tool-call tags gets the stub (R55)
+#   T0462 40493c9c  under lean, the uncommitted note and the oracle hints recommend no locks (audit of T0458)
