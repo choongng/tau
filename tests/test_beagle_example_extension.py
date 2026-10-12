@@ -18099,6 +18099,49 @@ async def test_refusal_after_a_new_route_spawn_names_the_successor(
 
 
 @pytest.mark.anyio
+async def test_new_route_successor_killed_at_its_wall_is_not_reported_as_not_opened(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # q35 R58 L25: "T0007 was not opened: pursuit_step: T0007 stays open — the
+    # step-executor exceeded its wall-clock budget", after W4 ran 15 min on T0007.
+    project = _pursuit_project(tmp_path)
+    monkeypatch.chdir(project)
+    (fake_beagle / "next.out").write_text(json.dumps({"open": [{"id": "T0002"}], "ready": []}))
+    opened = {**R06_PREDECESSOR, "status": "open", "done_when": "grep -q nothing done.txt"}
+    (fake_beagle / "show-T0002.out").write_text(json.dumps(opened))
+    (fake_beagle / "show-T0008.out").write_text(json.dumps(R06_SUCCESSOR))
+    (fake_beagle / "spawn.out").write_text("T0002 superseded by T0008\n")
+    runtime, _ = _bound(tmp_path)
+    module = _loaded_module()
+    runs = [module._WorkerRun(problem="it exceeded its wall-clock budget of 3s and was killed.")]
+
+    async def run_worker(brief: str, *args: Any, **kwargs: Any) -> Any:
+        return runs.pop(0)
+
+    monkeypatch.setattr(module, "_run_worker", run_worker)
+    result = await _tool(runtime, "pursuit_step").execute(
+        "c1",
+        {
+            "task": "T0002",
+            "new_route": True,
+            "notes": "check the file holds the word",
+            "done_when": "grep -q word done.txt",
+        },
+    )
+
+    assert runs == []
+    assert [call[0] for call in _pursuit_calls(fake_beagle, "open")] == ["T0008"]
+    assert "not opened" not in result.text
+    assert result.text.startswith(
+        "T0002 was superseded by T0008 (new route).\n\npursuit_step: T0008 stays open — "
+    )
+
+
+@pytest.mark.anyio
 async def test_new_route_successor_keeps_the_predecessor_scope(
     tmp_path: Path,
     beagle: Path,
