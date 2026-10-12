@@ -2564,6 +2564,10 @@ STEP_REPORT_END_CHARS = 750
 DEFAULT_CHECK_TIMEOUT = 600.0
 
 _TASK_ID = re.compile(r"\bT\d{4,}\b")
+#: beagle's refusal to open a task ranked below a ready one, up to its remedy.
+_RANKED_BELOW = re.compile(
+    r"ranks below (.+?)(?: \(`pursuit next` lists them\))?\. If this one should go first", re.S
+)
 
 
 def _step_result(text: str) -> AgentToolResult:
@@ -14881,6 +14885,14 @@ def make_step_tool() -> Any:
             if budget:
                 argv += ["--budget", budget]
             rc, opened = _pursuit(argv, root, timeout=DEFAULT_CHECK_TIMEOUT + 60)
+            ranked = _RANKED_BELOW.search(opened) if rc != 0 else None
+            if ranked is not None and (first := _TASK_ID.search(ranked.group(1))):
+                # q35 R58 L63: beagle's remedy is `--over "<why>"`, which this
+                # tool cannot pass.
+                return _step_result(
+                    f"pursuit_step: {task} not opened — it ranks below {ranked.group(1)}. "
+                    f'Send {first.group()} first, with pursuit_step task="{first.group()}".'
+                )
             if rc != 0:
                 return _step_result(
                     f"pursuit_step: `beagle pursuit open` refused (exit {rc}):\n{opened}"
