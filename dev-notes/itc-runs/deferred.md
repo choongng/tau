@@ -73,3 +73,16 @@ All three [tau] classes were fixed before the freeze:
   - It joins the "check can't pass, no verdict says why" family.
   - Candidate test: test_step_result_names_a_src_layout_module_the_check_cannot_import.
 - **R54's revisit-if condition is not met.** It said to revisit if both arms keep missing cobs boundary cases. R56 got the boundary rows only because the driver read the reference before founding.
+
+## R57
+
+- **Outright bugs, landing at the R57–R60 boundary:**
+  - T0465: under lean, the ruff refusal names locked tests.
+  - T0466: an amended check passing on disk briefs the old close demand.
+  - T0467: a new route held at close reaches no worker.
+- **No task's check ran a founding criterion** (class 4). Deferred.
+  - A witness-by-absence close committed the whole implementation as scaffolding.
+  - It joins the "check can't pass / check passes over nothing" family (R56 class 3).
+- **A defect a worker finds outside its scope has no route to the task that owns the code** (class 5). Deferred.
+  - W4 found the leq bug, the scope guard refused its fix, and the finding died.
+- **The source judge held the cases task four times** (19.2 min) and removed the cases nearest the bugs (class 6). Deferred; joins R53/R55 class 5.
