@@ -1,0 +1,8 @@
+#!/bin/bash
+# T0447: BEAGLE_TAU_LEAN turns off the zero-catch mechanisms (R0002) and leaves the rest
+set -e
+T=tests/test_beagle_example_extension.py
+F=examples/extensions/beagle.py
+bash .beagle/checks/fix/named_tests.sh $T 11 test_lean_switch_turns_off_known_answers_locks test_lean_switch_turns_off_plan_guards test_lean_switch_turns_off_abandon_and_done_by test_lean_switch_turns_off_escalation test_lean_switch_turns_off_audit test_lean_switch_turns_off_own_copy_rule test_lean_switch_turns_off_already_passes test_lean_switch_turns_off_cases_first test_lean_switch_turns_off_worker_read_guards test_lean_switch_keeps_the_other_guards test_lean_switch_is_off_unless_set
+uv run pytest -q $T
+uv run ruff check $F $T
