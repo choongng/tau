@@ -9596,6 +9596,43 @@ async def test_done_by_close_of_a_lower_ranked_task_is_not_refused_by_rank(
 
 
 @pytest.mark.anyio
+async def test_rank_refusal_of_a_step_open_offers_no_flag_the_driver_cannot_pass(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # q35 R58 L63: the open of T0010 was refused by rank, and the result relayed
+    # beagle's `--over "<why>"`, which pursuit_step has no way to pass.
+    monkeypatch.chdir(_pursuit_project(tmp_path))
+    _ready_task(fake_beagle)
+    (fake_beagle / "open-ranked-below.out").write_text(
+        "beagle: T0002 ranks below 1 ready task: T0005 Write tests that verify encode/decode "
+        "round-trip and correctness against the\u2026. If this one should go first, say why: "
+        '`--over "<why>"`. The reason is kept on the task, because an order overridden in '
+        "silence is an order nobody fixes. If the reason is lasting, record it as an input "
+        'instead: `depend <later> <earlier> --reason "\u2026"`.\n'
+    )
+    runtime, _ = _bound(tmp_path)
+
+    result = await _tool(runtime, "pursuit_step").execute(
+        "c1",
+        {
+            "task": "T0002",
+            "criteria": "done.txt exists",
+            "done_when": "grep -q done done.txt",
+            "scope": ["done.txt"],
+        },
+    )
+
+    assert _runs(fake_tau) == []
+    assert "--over" not in result.text and "depend" not in result.text
+    assert "T0002 not opened — it ranks below 1 ready task: T0005 Write tests" in result.text
+    assert 'Send T0005 first, with pursuit_step task="T0005".' in result.text
+
+
+@pytest.mark.anyio
 async def test_done_by_abandon_without_that_tasks_commit_is_refused(
     tmp_path: Path,
     beagle: Path,
