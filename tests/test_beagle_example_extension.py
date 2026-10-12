@@ -1483,6 +1483,9 @@ if attempt >= int(os.environ.get("FAKE_TAU_HANGS_ON") or 99):
         print(json.dumps({"type": "message_end", "message": cut}), flush=True)
         if os.environ.get("FAKE_TAU_SPACED"):  # R33: a normal turn after each cut-off
             turn = {"role": "assistant", "content": [], "stopReason": "toolUse"}
+            if os.environ["FAKE_TAU_SPACED"] == "call":  # q35 R56: W3 made calls between
+                ls = {"type": "toolCall", "id": "t2", "name": "bash", "arguments": {}}
+                turn["content"] = [ls]
             print(json.dumps({"type": "message_end", "message": turn}), flush=True)
     for _ in range(int(os.environ.get("FAKE_TAU_CUT_OFFS", "0"))):
         # R27: the provider reports a call cut off at the output limit as "toolUse".
@@ -11162,6 +11165,70 @@ async def test_cut_off_kill_note_says_write_in_parts_only_for_a_call_argument(
         assert "write in parts" not in notes[name] and "Split the task" not in notes[name], name
         assert "reasoning in prose without acting" in notes[name], name
     assert "its reasoning filled the output limit" in notes["thinking"]
+
+
+@pytest.mark.anyio
+async def test_cut_off_kill_note_omits_without_acting_when_the_worker_made_calls(
+    tmp_path: Path, beagle: Path, fake_tau: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # q35 R56: W3 made 9 calls between two reasoning-only cut-offs, and its kill
+    # note said "It spent its turns reasoning in prose without acting".
+    project = _git_project(tmp_path, monkeypatch)
+    monkeypatch.setenv("FAKE_TAU_HANGS_ON", "1")
+    monkeypatch.setenv("FAKE_TAU_LENGTH_STOPS", "2")
+    monkeypatch.setenv("FAKE_TAU_THINKS", "1")
+    run_worker = _worker_module(monkeypatch)._run_worker
+    notes = {}
+    for name, spaced in (("calls", "call"), ("no calls", "")):
+        monkeypatch.setenv("FAKE_TAU_SPACED", spaced)
+        run = await run_worker("Write cases", project, "", "", 30, None, "T0002", ["a.txt"])
+        assert "the sub-agent was ended: cut off twice at the output limit" in run.report
+        assert "No call was cut off, so writing in smaller pieces would not help." in run.report
+        notes[name] = run.report
+
+    assert "without acting" not in notes["calls"]
+    assert "the next notes should say what to do first" not in notes["calls"]
+    assert "reasoning in prose without acting" in notes["no calls"]
+
+
+@pytest.mark.anyio
+async def test_killed_attempt_context_says_the_attempt_before_ended_without_a_report(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # q35 R56: W3 was cut-off-killed with no report, W4 hit the wall, and L49's
+    # step result showed W3's salvage under "The attempt before it reported:".
+    monkeypatch.chdir(_pursuit_project(tmp_path))
+    _ready_task(fake_beagle)
+    runtime, _ = _bound(tmp_path)
+    module = _loaded_module()
+    killed = f"Tracing example 1.\n\n(the sub-agent was ended: {module.CUT_OFF_TWICE}: x.)"
+    runs = [
+        module._WorkerRun(returncode=-9, report=killed, stop_reason="length"),
+        module._WorkerRun(problem="it exceeded its wall-clock budget of 3s."),
+    ]
+
+    async def run_worker(brief: str, *args: Any, **kwargs: Any) -> Any:
+        return runs.pop(0)
+
+    monkeypatch.setattr(module, "_run_worker", run_worker)
+    result = await _tool(runtime, "pursuit_step").execute(
+        "c1",
+        {
+            "task": "T0002",
+            "criteria": "done.txt exists",
+            "done_when": "grep -q done done.txt",
+            "scope": ["done.txt"],
+            "attempts": 2,
+        },
+    )
+
+    assert runs == []
+    assert "The attempt before it reported" not in result.text
+    assert "The attempt before it ended without a report:\nTracing example 1." in result.text
 
 
 @pytest.mark.anyio
