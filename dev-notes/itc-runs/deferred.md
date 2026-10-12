@@ -52,3 +52,13 @@ All three [tau] classes were fixed before the freeze:
   - Its revisit condition ("both arms keep missing cobs boundary cases") is decided by R56.
 - **The locked-test binding route left no way to open a task with code in scope** (class 3, route part). Deferred, as with R52's tests-only route.
   - M14 locks are off in the lean arm, so R56 measures this.
+
+## R55
+
+- **Outright bugs, landing after R56:**
+  - T0458: lean still promises locks.
+  - T0459: the drop-import brief removed an import the criteria require.
+  - T0460: the import-only prove asks for a new check, and the spawn-limit refusal contradicts itself.
+  - T0461: raw tool-call markup reached the driver as a report.
+- **The source judge held W1's correct event case** (class 5). Deferred; joins R53's classes 1 and 5.
+  - M15 is on in both arms, so the pairs don't measure it.
