@@ -12211,6 +12211,14 @@ def _already_passes(
     parent = {str(n.get("id")): str(n.get("parent") or "") for n in nodes}
     roots = [t for t, p in parent.items() if not p]
     container = parent.get(task, "")
+    if (
+        container in roots
+        and task in _founding_milestones(nodes)
+        and _abandon_problem(task, "duplicate of Tnnnn", nodes) is not None
+    ):
+        # q35 R54 L37-L39: T0004, a founding milestone, was offered the duplicate
+        # abandon, and `_abandon_problem` refused it: "it is a milestone".
+        return text
     if not container or container in roots:
         return f"{text} {ABANDON_HINT}"
     same = " ".join(check.split())
@@ -12963,6 +12971,31 @@ def _can_witness(rel: str) -> bool:
     return not (_is_test_path(rel) and rel.endswith(".py"))
 
 
+def _imported_at_top(rel: str, check: str, root: Path) -> bool:
+    """Whether `rel`, a .py module, is imported at the top of a test `check` runs under
+    pytest, so that taking it away fails only on the import (`_import_error_only`)."""
+    if not rel.endswith(".py") or not any(
+        Path(word).name in {"pytest", "py.test"} for word in re.split(r"[\s'\"]+", check)
+    ):
+        return False
+    names = set(_module_names(rel))
+    for test in _check_test_files(check, root):
+        try:
+            tree = ast.parse((root / test).read_text(encoding="utf-8"))
+        except (OSError, SyntaxError, ValueError):
+            continue
+        for node in tree.body:
+            if isinstance(node, ast.Import):
+                imported = {alias.name for alias in node.names}
+            elif isinstance(node, ast.ImportFrom) and node.module and not node.level:
+                imported = {node.module, *(f"{node.module}.{a.name}" for a in node.names)}
+            else:
+                continue
+            if names & imported:
+                return True
+    return False
+
+
 def _done_by_witness(
     task: str,
     done: str,
@@ -12986,10 +13019,15 @@ def _done_by_witness(
         return [], ""
     shas = _task_commits(done, root)
     committed = list(dict.fromkeys(rel for s in shas for rel in _commit_paths(s, root)))
+    # q35 R54 L33-L35: T0003's cobs/__init__.py was offered as the witness, and the
+    # test imports it at its top, so `_done_by`'s import-only rule refused the close.
     witness = [
         rel
         for rel in committed
-        if _in_scope(rel, paths, root) and _can_witness(rel) and (root / rel).is_file()
+        if _in_scope(rel, paths, root)
+        and _can_witness(rel)
+        and (root / rel).is_file()
+        and not _imported_at_top(rel, check, root)
     ]
     if witness:
         return witness, ""
@@ -13027,6 +13065,7 @@ def _done_by_unwitnessed(
         if not _in_scope(rel, paths, root)
         and _can_witness(rel)
         and (root / rel).is_file()
+        and not _imported_at_top(rel, check, root)
         and (
             targets
             or rel in named
@@ -13061,6 +13100,9 @@ def _done_by_released(task: str, why: str, out: str, root: Path) -> str:
     stalls its container; a blocked task stays accountable and is reworked by its
     own check or a new route.
     """
+    # q35 R54 L35: the pasted tail began mid-word, "n __init__.py is absent".
+    cut = out[-CHECK_TAIL_CHARS:]
+    tail = cut.split("\n", 1)[1] if len(cut) < len(out) and "\n" in cut else cut
     reason = f"done-by close not taken: {why}"[:500]
     argv = ["close", task, "--outcome", "blocked", "--reason", reason]
     if out.strip():
@@ -13070,12 +13112,12 @@ def _done_by_released(task: str, why: str, out: str, root: Path) -> str:
     _forget_task(root, task)
     if rc != 0:
         return (
-            f"pursuit_step: {task} not closed done — {why}:\n{out[-CHECK_TAIL_CHARS:]}\n\n"
+            f"pursuit_step: {task} not closed done — {why}:\n{tail}\n\n"
             f"It is still open: closing it blocked exited {rc}:\n{closed}"
         )
     return (
         f"pursuit_step: {task} not closed done — {why}. It was closed blocked rather than "
-        f"left open:\n{out[-CHECK_TAIL_CHARS:]}\n\n{closed}\n\n{_tree(root)}\n\n"
+        f"left open:\n{tail}\n\n{closed}\n\n{_tree(root)}\n\n"
         f'Next: give it a new route, pursuit_step task="{task}", new_route=true, with a '
         "done_when that fails until the work is done and notes saying what that work is; "
         "or call pursuit_step with no arguments for the next task."
