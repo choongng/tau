@@ -21416,6 +21416,44 @@ async def test_open_task_whose_check_imports_unwritten_module_runs_with_drop_imp
 
 
 @pytest.mark.anyio
+async def test_drop_import_brief_skips_a_task_whose_criteria_name_the_import(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # R55: T0003's criteria required its cases test to import itc, and the brief
+    # told W5 and W6 to remove `import itc`. That import is the work, not a stray.
+    project = _git_project(tmp_path, monkeypatch)
+    monkeypatch.chdir(project)
+    _case_data_test(project)
+    (project / "tests" / "cases.json").write_text('[{"name": "seed", "result": 1}]\n')
+    _commit(project, *R18_DATA_SCOPE)
+    (project / "docs").mkdir()
+    (project / "docs" / "notes.md").write_text("notes\n")
+    (project / "tests" / "test_notes_check.py").write_text(R42_OWN_TEST)
+    monkeypatch.setenv("FAKE_TAU_SUCCEEDS_ON", "99")
+    _open_task_in_scope(fake_beagle, ["docs/", "tests/"], R42_CHECK)
+    record = json.loads((fake_beagle / "show.out").read_text())
+    criteria = (
+        "tests/test_notes_check.py imports from interval_tree_clocks.clock; it cannot "
+        "pass until the interval_tree_clocks.clock module exists"
+    )
+    (fake_beagle / "show.out").write_text(json.dumps({**record, "criteria": criteria}))
+    runtime, _ = _bound(tmp_path)
+
+    result = await _tool(runtime, "pursuit_step").execute(
+        "c1", {"task": "T0002", "notes": "write the cases test", "attempts": 1}
+    )
+
+    briefs = "".join(run["stdin"] for run in _runs(fake_tau))
+    for text in (result.text, briefs):
+        assert "checks this task's own files only" not in text
+        assert "remove `from interval_tree_clocks.clock import Clock`" not in text
+
+
+@pytest.mark.anyio
 async def test_open_task_not_run_offers_no_abandon_done_by(
     tmp_path: Path,
     beagle: Path,

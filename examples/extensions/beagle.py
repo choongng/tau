@@ -12551,18 +12551,23 @@ async def _data_check_passes_committed(
     return not await _passes_only_by_uncommitted(data_check, scopes, root)
 
 
-def _own_test_import_note(command: str, scope: list[str], root: Path) -> str:
+def _own_test_import_note(command: str, scope: list[str], root: Path, task_text: str) -> str:
     """The worker note for a check whose own in-scope test imports, itself or through
     a sibling test, a module the tree and the installed packages do not provide and
-    no scope path creates; or "".
+    no scope path creates; or "". Also "" when `task_text`, the task's title and
+    criteria, names that module: the import is then the work, not a stray.
 
     Run R42 class 2: tests/test_analysis_check.py, T0007's own test, gained an
     import of the unwritten module, and every step was refused before a worker ran.
+    q35 R55: T0003's criteria required its cases test to import itc, and the note
+    told its workers to remove `import itc`.
     """
     found = _imports_unwritten(command, scope, root)
     if found is None or not _in_scope(found[0], scope, root):
         return ""
     test, module, via = found
+    if re.search(rf"(?<![\w.]){re.escape(module)}(?![\w])", task_text):
+        return ""
     imported = Path(via[0]).stem if via else module
     line = _import_line(root / test, imported)
     named = f"`{line}`" if line else f"its import of {imported}"
@@ -15005,7 +15010,10 @@ def make_step_tool() -> Any:
             # Run R42 class 2: the data test passed on the committed tree, so binding it
             # judged no work, and the import in the check's own test was never dropped.
             own_import = _own_test_import_note(
-                bound_check, scope or _strings(record.get("scope")), root
+                bound_check,
+                scope or _strings(record.get("scope")),
+                root,
+                f"{title}\n{record.get('criteria') or ''}\n{criteria}",
             )
             if own_import and await _data_check_passes_committed(
                 data_check, [data_route[3], _predecessor_scope(record, root)], root
