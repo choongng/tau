@@ -177,7 +177,7 @@ from tau_coding.provider_config import (
 )
 from tau_coding.resources import parse_markdown_resource
 from tau_coding.skills import Skill, format_skill_invocation
-from tau_coding.tool_buffers import WINDOW_LINES
+from tau_coding.tool_buffers import WINDOW_LINES, read_request
 from tau_coding.tools import BASH_TIMEOUT_ENV_VAR
 
 #: The beagle checkout. `BEAGLE_ROOT` overrides the default `~/beagle`.
@@ -16246,6 +16246,121 @@ def _reads_needed(path: Path) -> tuple[int, int] | None:
     return count, max(1, -(-count // WINDOW_LINES))
 
 
+_GREPS = frozenset({"grep", "egrep", "fgrep", "rg"})
+_GREP_VALUES = frozenset({"-e", "-f", "-m", "-A", "-B", "-C", "--regexp", "--file", "--max-count"})
+_FILTER_VALUES = frozenset({"-n", "-c", "-d", "-f", "-k", "-t"})
+_SEARCH_FILTERS = frozenset({"head", "tail", "sort", "uniq", "wc", "cut", "nl"})
+_QUIET_REDIRECT = re.compile(r"\s2>(?:&1|\s*/dev/null)")
+_SED_PRINT = re.compile(r"(?:\d+|\$)(?:,(?:\d+|\$))?p|/[^/]*/p")
+
+
+def _searched_files(program: str, args: list[str], piped: bool) -> list[str] | None:
+    """The files one command of a reference search reads, or None if it is not
+    a search: grep or rg, tilth with --scope, `sed -n '<lines>p'`, or, fed by a
+    pipe, a filter such as head."""
+    if program in _GREPS:
+        positional = _positional(args, _GREP_VALUES)
+        patterned = any(a.split("=")[0] in ("-e", "-f", "--regexp", "--file") for a in args)
+        return positional if patterned else positional[1:]
+    if program == "tilth":
+        scoped = [value for flag, value in itertools.pairwise(args) if flag == "--scope"]
+        return scoped + [a.removeprefix("--scope=") for a in args if a.startswith("--scope=")]
+    if program == "sed":
+        positional = _positional(args)
+        if "-n" not in args or _sed_in_place_files(args) or not positional:
+            return None
+        return positional[1:] if _SED_PRINT.fullmatch(positional[0]) else None
+    if piped and program in _SEARCH_FILTERS:
+        return _positional(args, _FILTER_VALUES)
+    return None
+
+
+def _reference_search_call(command: str, cwd: Path, root: Path) -> bool:
+    """Whether a bash command only searches the references: grep, rg, tilth or
+    `sed -n '<lines>p'` over paths under references/, piped at most into filters
+    such as head.
+
+    q35 R51: the read guard's refusal offered `grep -n ... references/*.txt`, and
+    the bash guard then refused W2's four greps and W3's two searches of it.
+    """
+    tokens = _shell_tokens(_QUIET_REDIRECT.sub(" ", command))
+    if not tokens:
+        return False
+    references = root / REFERENCES_DIR
+    segments: list[tuple[str, list[str]]] = []
+    separator, words = ";", []
+    for token in [*tokens, ";"]:
+        if token in ("|", "&&", "||", ";"):
+            if words:
+                segments.append((separator, words))
+            elif token != ";":
+                return False
+            separator, words = token, []
+        elif _is_operator(token):
+            return False
+        else:
+            words.append(token)
+    for separator, (program, *args) in segments:
+        piped = separator == "|"
+        files = _searched_files(program, args, piped)
+        if files is None or not (files or piped):
+            return False
+        for name in files:
+            path = _own_path(cwd / Path(name).expanduser(), root)
+            if path != references and references not in path.parents:
+                return False
+    return bool(segments)
+
+
+def _reference_window(
+    arguments: Mapping[str, Any], cwd: Path, root: Path
+) -> tuple[Path, int, int] | None:
+    """The reference window a ranged read asks for, (file, first line, limit), or None.
+
+    A read of a file under references/ with an explicit limit of at most
+    WINDOW_LINES is a window; a read without one pages the file whole (R40).
+    """
+    path = arguments.get("path")
+    if not isinstance(path, str) or not path:
+        return None
+    first, limit = read_request(arguments)
+    if limit is None or limit > WINDOW_LINES:
+        return None
+    target = _own_path(cwd / Path(path).expanduser(), root)
+    if root / REFERENCES_DIR not in target.parents:
+        return None
+    return target, first, limit
+
+
+def _free_reference_call(
+    tool: str,
+    arguments: Mapping[str, Any],
+    command: str,
+    cwd: Path,
+    windows: set[tuple[Path, int, int]],
+) -> str | None:
+    """What a call that the nothing-written refusals do not count is: "read" for
+    the first read of a reference window, "search" for a search confined to the
+    references; else None. The window is recorded as read.
+
+    q35 R51: a known-answers brief asks for ranged reads and searches of the
+    references, and W1-W3 were refused them at 15-25 of 30 calls although they
+    read each window once. The guards were built for 9Bs re-reading the same
+    windows (R33, R34, R40), and a second read of a window is not free.
+    """
+    goal = _find_goal(cwd) if tool in ("read", "bash") else None
+    if goal is None:
+        return None
+    root = _resolved(goal.parent.parent)
+    if tool == "bash":
+        return "search" if command and _reference_search_call(command, cwd, root) else None
+    window = _reference_window(arguments, cwd, root)
+    if window is None or window in windows:
+        return None
+    windows.add(window)
+    return "read"
+
+
 def _reread_refusal(
     tool: str,
     arguments: Mapping[str, Any],
@@ -16380,10 +16495,12 @@ def make_worker_scope_guard() -> Any:
     calls = 0
     wrote = False
     reads: dict[Path, int] = {}
+    windows: set[tuple[Path, int, int]] = set()
+    offered = False
     refusals: dict[Path, int] = {}
 
     async def guard(event: Any, context: ExtensionContext) -> ToolCallHookResult | None:
-        nonlocal cut_offs, calls, wrote
+        nonlocal cut_offs, calls, wrote, offered
         calls += 1
         try:
             cwd = Path(context.cwd)
@@ -16429,12 +16546,17 @@ def make_worker_scope_guard() -> Any:
             if sent is None:
                 return None
             task, scope = sent
+            known = _only_data_and_tests(list(scope))
+            free = _free_reference_call(event.tool_name, arguments, command, cwd, windows)
+            if known and free is not None:
+                calls -= 1  # q35 R51: not counted toward the nothing-written refusals
             reread = (
                 None
-                if wrote
+                if wrote or (known and free is not None)
                 else _reread_refusal(event.tool_name, arguments, cwd, scope, calls, reads)
             )
             if reread is not None:
+                offered = offered or _reference_search() in reread
                 return ToolCallHookResult(block=True, reason=reread)
             script = _bash_find(command, _driver_change) if command else None
             scripted = (
@@ -16446,7 +16568,8 @@ def make_worker_scope_guard() -> Any:
             links = _script_links(command, cwd) if scripted else []
             if scripted:
                 targets += _script_write_targets(command, _cwd_after_cd(command, cwd))
-            idle = bool(command) and not wrote and sent_on_task
+            searched = free == "search" and (known or offered)
+            idle = bool(command) and not wrote and sent_on_task and not searched
             goal = _find_goal(cwd) if targets or idle else None
             if goal is None:
                 return None

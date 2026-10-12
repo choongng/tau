@@ -13428,6 +13428,128 @@ async def test_reread_refusal_on_reference_offers_search(
     assert '`tilth "<words>" --scope references`' in refusal
 
 
+def _reference_worker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, cap: int, scope: str = "tests/"
+) -> tuple[ExtensionRuntime, Path]:
+    """A worker on T0003 with `scope`, a bound check and a 300-line reference."""
+    monkeypatch.setenv(_module().WORKER_MAX_TURNS_ENV, str(cap))
+    runtime = _scoped_worker(tmp_path, monkeypatch, scope=scope)
+    project = tmp_path / "project"
+    (project / ".beagle" / "tree").mkdir(parents=True, exist_ok=True)
+    (project / ".beagle" / "tree" / "T0003.md").write_text(
+        '+++\nid = "T0003"\ndone_when = "python3 -m pytest -q tests/"\n+++\n'
+    )
+    (project / "references").mkdir()
+    (project / "references" / "paper.txt").write_text(
+        "".join(f"line {n}: the value is {n}\n" for n in range(1, 301))
+    )
+    (project / "notes.txt").write_text("x\n")
+    return runtime, project
+
+
+@pytest.mark.anyio
+async def test_known_answers_worker_ranged_reference_read_is_not_refused(
+    tmp_path: Path, beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # q35 R51: W1 and W3 were refused first-time 20-120-line reads of the references
+    # at 15-18 of 30 calls, and W2 and W3 the greps that refusal offered.
+    runtime, _ = _reference_worker(tmp_path, monkeypatch, cap=10)
+    read = _tool_with_hooks(runtime, "read")
+    bash = _tool_with_hooks(runtime, "bash")
+    paper = "references/paper.txt"
+
+    windows = [
+        await read.execute(f"r{i}", {"path": paper, "offset": 1 + 30 * i, "limit": 30})
+        for i in range(10)
+    ]
+    searches = [
+        await bash.execute("g1", {"command": 'grep -n -i -F "value is 7" references/*.txt'}),
+        await bash.execute("g2", {"command": f"sed -n '290,300p' {paper}"}),
+        await bash.execute("g3", {"command": 'tilth "value" --scope references | head -5'}),
+    ]
+    # None of the 13 counted, so calls 14-18 are the first five of the cap of 10.
+    others = [await read.execute(f"n{i}", {"path": "notes.txt"}) for i in range(5)]
+    late = await read.execute("n5", {"path": "notes.txt"})
+    whole = await read.execute("p1", {"path": paper})
+    wide = await read.execute("p2", {"path": paper, "offset": 1, "limit": 120})
+
+    assert all(result.text == "ran" for result in windows + searches + others)
+    assert "refusing to read notes.txt: 5 of 10 calls used and nothing written" in late.text
+    # A read of the whole reference, or of more than one window, counts as before.
+    assert "refusing to read references/paper.txt: 6 of 10" in whole.text
+    assert "refusing to read references/paper.txt: 7 of 10" in wide.text
+
+
+@pytest.mark.anyio
+async def test_nth_reread_of_a_reference_window_is_still_refused(
+    tmp_path: Path, beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # R34/R40: 9B workers re-read the same reference windows until the cap.
+    runtime, _ = _reference_worker(tmp_path, monkeypatch, cap=10)
+    read = _tool_with_hooks(runtime, "read")
+    window = {"path": "references/paper.txt", "offset": 41, "limit": 20}
+
+    first = await read.execute("r0", window)
+    rereads = [await read.execute(f"r{i}", window) for i in range(1, 6)]
+    again = await read.execute("r6", window)
+    other = await read.execute("r7", {**window, "offset": 61})
+
+    assert first.text == "ran" and all(result.text == "ran" for result in rereads)
+    assert "refusing to read references/paper.txt: 5 of 10 calls used" in again.text
+    assert "Search the references instead with bash" in again.text
+    assert other.text == "ran"
+
+
+@pytest.mark.anyio
+async def test_reference_search_offered_by_a_read_refusal_is_not_refused(
+    tmp_path: Path, beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # q35 R51: refused a read, W2 ran the grep the refusal offered and was refused
+    # it four times at 22-25 of 30 calls, then wrote its sources from memory.
+    module = _module()
+    real = shutil.which
+    monkeypatch.setattr(
+        module.shutil, "which", lambda name, *a, **k: None if name == "tilth" else real(name)
+    )
+    runtime, project = _reference_worker(tmp_path, monkeypatch, cap=8, scope="tests/x.py")
+    read = _tool_with_hooks(runtime, "read")
+    bash = _tool_with_hooks(runtime, "bash")
+
+    reads = [await read.execute(f"r{i}", {"path": "references/paper.txt"}) for i in range(5)]
+    runs = [await bash.execute(f"b{i}", {"command": "python3 -c 'print(1)'"}) for i in range(2)]
+    offered = 'grep -n -i -F "<words>" references/*.txt'
+    searches = [
+        await bash.execute("g1", {"command": offered.replace("<words>", "value is 7")}),
+        await bash.execute("g2", {"command": "grep -n 'grow(1' references/paper.txt | head"}),
+        await bash.execute("g3", {"command": "sed -n '1,20p' references/paper.txt 2>&1"}),
+    ]
+    elsewhere = await bash.execute("g4", {"command": "grep -rn value ."})
+
+    assert [result.text == "ran" for result in reads] == [True] * 4 + [False]
+    assert f"Search the references instead with bash, `{offered}`" in reads[-1].text
+    assert runs[0].text == "ran" and "6 of 8 calls used and nothing written" in runs[1].text
+    assert all(result.text == "ran" for result in searches)
+    assert "refusing to run this command" in elsewhere.text
+
+    search = module._reference_search_call
+    for command in (
+        'tilth "seed stamp" --scope references',
+        "grep -c x references/paper.txt && grep -n y references/",
+        "rg -n -e norm references/paper.txt | sort | uniq",
+    ):
+        assert search(command, project, project), command
+    for command in (
+        "grep -n x references/paper.txt > tests/cases.json",
+        "grep -n x references/paper.txt notes.txt",
+        "grep -n x references/paper.txt | python3 -c 'print(1)'",
+        "sed -i 's/a/b/' references/paper.txt",
+        "sed -n '1,5w out.txt' references/paper.txt",
+        'tilth "value"',
+        "cat references/paper.txt",
+    ):
+        assert not search(command, project, project), command
+
+
 @pytest.mark.anyio
 async def test_no_write_guard_counts_bash_runs_without_writes(
     tmp_path: Path, beagle: Path, monkeypatch: pytest.MonkeyPatch
