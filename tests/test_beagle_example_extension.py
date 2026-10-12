@@ -10580,6 +10580,28 @@ def _scoped_worker(
 
 
 @pytest.mark.anyio
+async def test_worker_git_commit_gets_the_worker_refusal_not_commit_claims_advice(
+    tmp_path: Path, beagle: Path, fake_beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # q35 R59 W10 L12: a worker's `git commit` got beagle's commit-claims advice, to
+    # run `beagle pursuit message` and `git commit -F`, which the worker guards refuse.
+    (fake_beagle / "commit-claims.out").write_text(_block("no Claims block"), encoding="utf-8")
+    runtime = _scoped_worker(tmp_path, monkeypatch, scope=".gitignore")
+    bash = _tool_with_hooks(runtime, "bash")
+
+    for command, verb in (
+        ("git commit -m wip", "commit"),
+        ("git add .gitignore && git commit -m 'T0014: ignore .beagle'", "add"),
+    ):
+        result = await bash.execute("c1", {"command": command})
+
+        refused = f"Tool call blocked: refusing to run `git {verb}` in a sub-agent"
+        assert result.text.startswith(refused), command
+        assert "commit-claims" not in result.text
+    assert not [c for c in _calls(fake_beagle) if "commit-claims" in c["argv"]]
+
+
+@pytest.mark.anyio
 async def test_worker_write_outside_scope_refused(
     tmp_path: Path, beagle: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
