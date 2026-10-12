@@ -11794,6 +11794,19 @@ def _without_beagle_habits(brief: str, bound: str | None = None) -> str:
     return "".join(lines)
 
 
+#: The paths of a brief's Scope line, up to its aside.
+_BRIEF_SCOPE_PATHS = re.compile(r"^Scope: .*?(?= \(|$)", re.M)
+
+
+def _brief_in_scope(brief: str, scope: list[str]) -> str:
+    """The brief with its Scope line naming `scope`, the paths the worker guard holds.
+
+    q35 R52: the call's scope held cobs/__init__.py, and W8's brief named only the
+    record's "Scope: tests/test_edge_cases.py (writes outside it are refused)".
+    """
+    return _BRIEF_SCOPE_PATHS.sub(lambda _: f"Scope: {' '.join(scope)}", brief)
+
+
 def _blocked_brief(task: str, record: Mapping[str, Any]) -> str:
     """A worker's brief for a blocked task, which `beagle pursuit brief` refuses."""
     lines = [f"Task {task}: {record.get('title', '')}"]
@@ -14966,6 +14979,11 @@ def make_step_tool() -> Any:
                 _without_commit_steps(brief),
                 _command_bound(_memory_max(), _worker_timeout(arguments.get("timeout"))[0]),
             )
+        if scope and {os.path.normpath(e) for e in scope} != {
+            os.path.normpath(e) for e in _strings(record.get("scope"))
+        }:
+            # q35 R52: the guard held W8 to the call's scope; its brief named the record's.
+            brief = _brief_in_scope(brief, scope)
         references = _references_brief(
             root,
             _data_task(
@@ -15170,6 +15188,7 @@ def make_step_tool() -> Any:
         worker_ran = False
         _KILLED_PROGRESS.pop(progress_key, None)
         unreported: list[tuple[int, _WorkerRun, list[str]]] = []
+        reported: tuple[int, str] | None = None
         # Run R39: one step is bounded by one budget, not a full timeout per attempt.
         step_budget = timeout * STEP_BUDGET_FACTOR
         budget_spent = ""
@@ -15225,6 +15244,15 @@ def make_step_tool() -> Any:
             if run.unreported:
                 unreported.append((attempt, run, _scope_changes(root, scope)))
             report, shown = run.report, _capped_report(run)
+            if report.strip() and not report.startswith(NO_REPORT):
+                reported = (attempt, shown)
+            elif reported is not None:
+                # q35 R52: W7 left no report, and the step result showed its stub,
+                # not W6's report that cobs/__init__.py was outside the scope.
+                shown = (
+                    f"(attempt {attempt} left no report; attempt {reported[0]}'s follows)\n\n"
+                    + reported[1]
+                )
             # Run R17: W4, W9 and W11 claimed files they never wrote.
             missing = _report_missing_paths(report, root)
             if missing:

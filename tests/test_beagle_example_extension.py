@@ -1447,6 +1447,10 @@ if str(attempt) == os.environ.get("FAKE_TAU_SILENT_ON"):
         "usage": {"totalTokens": 1000},
         "stopReason": "toolUse",
     }
+if str(attempt) == os.environ.get("FAKE_TAU_EMPTY_ON"):
+    # q35 R52 W7: the session ends with no text, so no report.
+    message = {"role": "assistant", "content": [], "usage": {"totalTokens": 1000}}
+    message["stopReason"] = "stop"
 if os.environ.get("FAKE_TAU_RAMBLES"):
     # A worker that spends its whole output on reasoning: the update events
     # repeat the growing message, one of them past the reader's line limit.
@@ -11248,6 +11252,37 @@ async def test_step_result_names_earlier_worker_without_report(
     ) in text
     assert "Run 2 of 2" not in text
     assert text.index("Run 1 of 2") < text.index("Last report:\nattempt 2: the check fails")
+
+
+@pytest.mark.anyio
+async def test_step_result_keeps_last_nonempty_report(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # q35 R52: W7 left no report, and the step result showed its stub, not W6's report.
+    monkeypatch.chdir(_git_project(tmp_path, monkeypatch))
+    monkeypatch.setenv("FAKE_TAU_SUCCEEDS_ON", "99")
+    monkeypatch.setenv("FAKE_TAU_EMPTY_ON", "2")
+    monkeypatch.setenv("FAKE_TAU_REPORT", "attempt 1: the defect is in code outside the scope")
+    _ready_task(fake_beagle)
+    runtime, _ = _bound(tmp_path)
+    args = {
+        "task": "T0002",
+        "criteria": "c",
+        "done_when": "grep -q done done.txt",
+        "scope": ["done.txt"],
+    }
+
+    text = (await _tool(runtime, "pursuit_step").execute("c1", args)).text
+
+    assert len(_runs(fake_tau)) == 2
+    assert (
+        "Last report:\n(attempt 2 left no report; attempt 1's follows)\n\n"
+        "attempt 1: the defect is in code outside the scope"
+    ) in text
 
 
 def _timed_step(
@@ -22864,6 +22899,30 @@ async def test_brief_scope_line_says_outside_writes_are_refused(
     [run, *_] = _runs(fake_tau)
     assert "Scope: tests/cases.json (writes outside it are refused)" in run["stdin"]
     assert "named at close" not in run["stdin"]
+
+
+@pytest.mark.anyio
+async def test_brief_scope_line_is_call_scope(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # q35 R52: the call's scope held cobs/__init__.py, and W8's brief named only the
+    # record's "Scope: tests/test_edge_cases.py (writes outside it are refused)".
+    monkeypatch.chdir(_pursuit_project(tmp_path))
+    _open_task_in_scope(fake_beagle, ["tests/test_x.py"], "grep -q done done.txt")
+    beagle_line = "Scope: tests/test_x.py (paths changed outside it are named at close)\n"
+    (fake_beagle / "brief.out").write_text(f"# T0002: Parser\nDo the parser.\n{beagle_line}")
+    runtime, _ = _bound(tmp_path)
+    args = {"task": "T0002", "attempts": 1, "scope": ["tests/test_x.py", "done.txt"]}
+
+    await _tool(runtime, "pursuit_step").execute("c1", args)
+
+    [run, *_] = _runs(fake_tau)
+    assert "Scope: tests/test_x.py done.txt (writes outside it are refused)" in run["stdin"]
+    assert "Scope: tests/test_x.py (" not in run["stdin"]
 
 
 R44_INVERTED = 'python3 -c "bad = []; raise SystemExit(not bad and len(bad) >= 0)"'
