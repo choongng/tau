@@ -19665,9 +19665,12 @@ def setup(tau: ExtensionAPI) -> None:
     #    beagle's Bash PreToolUse hooks onto the same seam.
     tau.on("tool_call", make_guard())
     tau.on("tool_call", make_record_guard())
+    if _is_worker():
+        # q35 R59 W10: before the bash hooks, so a worker's `git commit` gets this
+        # refusal, not commit-claims advice naming verbs a worker is refused.
+        tau.on("tool_call", make_worker_pursuit_guard())
     tau.on("tool_call", make_bash_hooks())
     if _is_worker():
-        tau.on("tool_call", make_worker_pursuit_guard())
         tau.on("tool_call", make_worker_scope_guard())
     else:
         tau.on("tool_call", make_scope_guard())
