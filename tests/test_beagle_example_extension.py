@@ -24118,3 +24118,123 @@ async def test_retry_note_omits_fix_the_work_when_the_output_names_no_failure(
         assert said(1, output, check) == fix, output
     assert said(124, "", check) == fix
     assert said(5, "no tests ran in 0.01s\n", "python3 -m pytest -q tests/test_x.py") == fix
+
+
+def _contract_project(tmp_path: Path) -> Path:
+    """A pursuit whose goal declares beagle's `[contract]`, as founding writes it."""
+    project = _pursuit_project(tmp_path)
+    goal = project / ".beagle" / "pursuit.toml"
+    goal.write_text(goal.read_text() + _module().CONTRACT_TABLE, encoding="utf-8")
+    return project
+
+
+def test_a_check_may_run_the_contract_and_nothing_else_of_beagle() -> None:
+    # Contract first: the Contract task's check is `contract check --draft`, the
+    # second's `contract check`, and the done criterion's `contract run`.
+    problem = _module()._check_problem
+
+    assert problem("beagle pursuit contract check --draft") is None
+    assert problem("beagle pursuit contract check") is None
+    assert problem("beagle pursuit contract run") is None
+    assert "runs beagle itself" in str(problem("beagle pursuit contract seal"))
+    assert "runs beagle itself" in str(problem("beagle pursuit close T0002"))
+
+
+def test_a_declared_contract_turns_the_known_answers_machinery_off(
+    tmp_path: Path, beagle: Path
+) -> None:
+    module = _module()
+    plain = _pursuit_project(tmp_path / "plain")
+    sealed = _contract_project(tmp_path / "contract")
+
+    assert not module._cases_off(plain) and module._cases_off(sealed)
+    assert module._contract_work(["contract/", "references/"], sealed)
+    assert not module._contract_work(["contract/", "src/"], sealed)
+    assert not module._contract_work(["contract/"], plain)
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("state", ["ready", "draft"])
+async def test_a_close_seals_the_contract_once_beagle_reads_it_ready(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    state: str,
+) -> None:
+    monkeypatch.chdir(_contract_project(tmp_path))
+    monkeypatch.setenv("FAKE_TAU_REPORT", "wrote done.txt")
+    _ready_task(fake_beagle)
+    (fake_beagle / "contract-status.out").write_text(json.dumps({"state": state}))
+    (fake_beagle / "contract-seal.out").write_text("sealed 3 file(s)\n")
+    runtime, _ = _bound(tmp_path)
+
+    result = await _tool(runtime, "pursuit_step").execute(
+        "c1",
+        {
+            "task": "T0002",
+            "criteria": "c",
+            "done_when": "grep -q done done.txt",
+            "scope": ["done.txt"],
+            "locks": ["done.txt"],
+        },
+    )
+
+    assert "closed done" in result.text
+    assert _module().CONTRACT_LOCKS_NOTE in result.text and "Locked:" not in result.text
+    sealed = "Sealed the contract (contract/contract.json)" in result.text
+    calls = _pursuit_calls(fake_beagle, "contract")
+    if state == "ready":
+        assert sealed and calls == [["status", "--json"], ["seal"]]
+    else:
+        assert not sealed and calls == [["status", "--json"]]
+
+
+@pytest.mark.anyio
+async def test_nothing_ready_says_what_the_contracts_acceptance_found(
+    tmp_path: Path, beagle: Path, fake_beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(_contract_project(tmp_path))
+    nodes = [{"id": "T0001", "title": "Ship it", "status": "done"}]
+    (fake_beagle / "tree.out").write_text(json.dumps({"goal": "Ship it", "nodes": nodes}))
+    run = {"command": "sh contract/accept.sh", "code": 1, "tail": ["C4 failed: got 00"]}
+    gate = {"state": "sealed", "met": False, "acceptance": run, "current": True}
+    runtime, _ = _bound(tmp_path)
+
+    async def step(gate: dict[str, Any]) -> str:
+        ready = {"open": [], "ready": [], "contract": gate}
+        (fake_beagle / "next.out").write_text(json.dumps(ready))
+        return (await _tool(runtime, "pursuit_step").execute("c1", {})).text
+
+    failing = await step(gate)
+    met = await step(gate | {"met": True, "assumptions": ["a block ends at 254 bytes"]})
+
+    assert "NOT done" in failing and "exited 1" in failing and "  | C4 failed: got 00" in failing
+    assert "tell the user the pursuit is done" not in failing
+    assert "Every entry of the contract passes (`sh contract/accept.sh`)" in met
+    assert "- a block ends at 254 bytes" in met and "NOT done" not in met
+
+
+@pytest.mark.anyio
+async def test_a_task_on_the_contract_witnesses_a_quote_not_code(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.chdir(_contract_project(tmp_path))
+    monkeypatch.setenv("FAKE_TAU_SUCCEEDS_ON", "99")
+    record = {"id": "T0002", "title": "Contract", "status": "open", "scope": ["contract/"]}
+    record |= {"criteria": "c", "done_when": "grep -q done done.txt"}
+    (fake_beagle / "show.out").write_text(json.dumps(record))
+    (fake_beagle / "next.out").write_text(json.dumps({"open": ["T0002"], "ready": []}))
+    (fake_beagle / "brief.out").write_text("# T0002: Contract\n")
+    runtime, _ = _bound(tmp_path)
+
+    await _tool(runtime, "pursuit_step").execute("c1", {"task": "T0002", "attempts": 1})
+    [run] = _runs(fake_tau)
+
+    assert _module().CONTRACT_WITNESS_NOTE in run["stdin"]
+    assert _module().WITNESS_NOTE not in run["stdin"]

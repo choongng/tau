@@ -347,6 +347,13 @@ CONTRACT_MILESTONES = (
     "Second extraction::list it again in "
     f"{CONTRACT_SECOND} without reading the first, then reconcile the two",
 )
+#: How long sealing may take: it runs the contract's full check first.
+CONTRACT_SEAL_TIMEOUT = 300.0
+#: What pursuit_step says when it drops the locks a driver passed under a contract.
+CONTRACT_LOCKS_NOTE = (
+    "locks are not taken here: the sealed contract holds the known answers, and beagle "
+    "refuses a change to a sealed file outside a task on the contract.\n\n"
+)
 #: The milestone founding seeds when the driver named none but known answers,
 #: which the contract now is.
 CONTRACT_BUILD_MILESTONE = f"Build to the contract::make every entry of {CONTRACT_PATH} pass"
@@ -355,6 +362,113 @@ CONTRACT_BUILD_MILESTONE = f"Build to the contract::make every entry of {CONTRAC
 def _lean() -> bool:
     """Whether `LEAN_ENV` is on: set to anything but "" or "0"."""
     return os.environ.get(LEAN_ENV, "") not in ("", "0")
+
+
+def _contract_declared(root: Path) -> bool:
+    """Whether the pursuit declares beagle's `[contract]`, as founding writes it."""
+    try:
+        goal = tomllib.loads((root / ".beagle" / GOAL_BASENAME).read_text(encoding="utf-8"))
+    except (OSError, tomllib.TOMLDecodeError):
+        return False
+    return isinstance(goal.get("contract"), dict)
+
+
+def _cases_off(root: Path) -> bool:
+    """Whether the known-answers machinery steps aside: under `LEAN_ENV`, or with a contract.
+
+    The locks, the cases-first refusals and the source judge held the known
+    answers a worker wrote. With `[contract]` beagle holds them instead: the
+    contract is checked against its sources and sealed before the code is
+    planned, and a sealed file changes only in a task on the contract.
+    """
+    return _lean() or _contract_declared(root)
+
+
+def _contract_work(scope: list[str], root: Path) -> bool:
+    """Whether `scope` is work on the contract: under its directory and references/."""
+    tops = {Path(rel).parts[0] for rel in scope if Path(rel).parts}
+    within = CONTRACT_DIR in tops and tops <= {CONTRACT_DIR, REFERENCES_DIR}
+    return within and _contract_declared(root)
+
+
+def _seal_when_ready(root: Path) -> str:
+    """Seal the contract once beagle reads it ready; a note saying so, or "".
+
+    The work founding planned waits on the contract and its second extraction,
+    and beagle opens none of it before the seal. A close that leaves the
+    contract ready seals it, so the driver never needs the verb.
+    """
+    if not _contract_declared(root):
+        return ""
+    rc, out = _pursuit(["contract", "status", "--json"], root)
+    status = _json_reply(out)
+    if rc != 0 or not isinstance(status, dict) or status.get("state") != "ready":
+        return ""
+    rc, out = _pursuit(["contract", "seal"], root, timeout=CONTRACT_SEAL_TIMEOUT)
+    if rc != 0:
+        return (
+            f"The contract reads ready, but sealing it failed (exit {rc}):\n"
+            f"{out[-PROVE_TAIL_CHARS:]}\n\n"
+        )
+    return (
+        f"Sealed the contract ({CONTRACT_PATH}): from here it is what done means, and "
+        "the work after it opens.\n\n"
+    )
+
+
+def _contract_verdict(gate: Any, root: Path) -> str:
+    """What beagle's contract says of done when nothing is ready, for the driver; "".
+
+    `next` runs the acceptance when nothing is ready or open and puts its
+    verdict in the reply. beagle words it with its own commands, which the
+    driver does not run, so it is said again here in pursuit_step's terms.
+    """
+    if not isinstance(gate, dict):
+        return ""
+    state = gate.get("state")
+    if state == "ready":
+        sealed = _seal_when_ready(root)
+        if sealed.startswith("Sealed"):
+            return sealed + "Call pursuit_step again for the next task."
+    if state in ("none", "draft", "ready"):
+        return (
+            f"The pursuit is NOT done: the contract ({CONTRACT_PATH}) is "
+            f"{'not written' if state == 'none' else state}, not sealed, so nothing says yet "
+            f"what done means. Add a task on {CONTRACT_DIR}/ with pursuit_plan to finish it; "
+            "its check is `beagle pursuit contract check`."
+        )
+    if state == "altered":
+        return (
+            "The pursuit is NOT done: files sealed with the contract changed since the "
+            f"seal ({', '.join(_strings(gate.get('altered')))}), so done cannot be judged. "
+            "Put them back with git, or change the contract in a task on "
+            f"{CONTRACT_DIR}/, which seals it again when it closes."
+        )
+    run = gate.get("acceptance")
+    if not isinstance(run, dict) or not gate.get("current"):
+        return (
+            "The pursuit is NOT done: the contract's acceptance has not run on the work as "
+            "it stands. Call pursuit_step again."
+        )
+    command = run.get("command", "")
+    if not gate.get("met"):
+        tail = "\n".join(f"  | {line}" for line in _strings(run.get("tail")))
+        return (
+            f"The pursuit is NOT done: the contract's acceptance (`{command}`) exited "
+            f"{run.get('code')}, so entries of the contract fail:\n{tail}\n\n"
+            "Add the work for what failed with pursuit_plan."
+        )
+    assumptions = _strings(gate.get("assumptions"))
+    return (
+        f"Every entry of the contract passes (`{command}`). If every criterion of the "
+        "goal holds, tell the user the pursuit is done"
+        + (
+            ", and put to them these assumptions the contract rests on, which no source "
+            "settled:\n" + "\n".join(f"- {a}" for a in assumptions)
+            if assumptions
+            else "."
+        )
+    )
 
 
 #: The memory cap a worker and a pre-close check run under, as a systemd size
@@ -4896,6 +5010,21 @@ _TESTS = frozenset({"test", "["})
 _FILE_TESTS = frozenset({"-f", "-e", "-s"})
 
 
+#: The beagle commands a check may be: each judges the contract's files and the
+#: code they run against, never what beagle recorded about the work.
+CONTRACT_CHECKS = (("check",), ("check", "--draft"), ("run",))
+
+
+def _contract_command(words: list[str]) -> bool:
+    """Whether `words` is `beagle pursuit contract check [--draft]` or `... contract run`."""
+    return (
+        len(words) >= 4
+        and Path(words[0]).name == "beagle"
+        and words[1:3] == ["pursuit", "contract"]
+        and tuple(words[3:]) in CONTRACT_CHECKS
+    )
+
+
 def _check_problem(command: str) -> str | None:
     """Why `command` cannot be a task's check, or None.
 
@@ -4922,6 +5051,8 @@ def _check_problem(command: str) -> str | None:
     if not words:
         return None
     one_command = _ONE_COMMAND
+    if _contract_command(words):
+        return None
     if _bash_find(command, lambda argv: "beagle" if _named(argv, "beagle") else None):
         # The close runs the check, so a check that runs beagle can only ever
         # answer how it was called, never whether the work is done.
@@ -5406,6 +5537,8 @@ def _oracle_with_code_problem(
     filed as this task's pending lock, is restored before each check, so it is
     no oracle the worker can bend.
     """
+    if _contract_declared(goal.parent.parent):
+        return None
     data, source, helpers = _oracle_with_code_parts(scope, goal, task, check)
     if not data or not source:
         return None
@@ -5439,6 +5572,8 @@ def _narrowed_scope(scope: list[str], goal: Path, task: str, check: str) -> list
 
 def _open_mixed_refusal(scope: list[str], goal: Path, task: str, check: str) -> str | None:
     """The open-task refusal for a mixed scope, naming the narrowed call that runs."""
+    if _contract_declared(goal.parent.parent):
+        return None
     data, source, helpers = _oracle_with_code_parts(scope, goal, task, check)
     if not data or not source:
         return None
@@ -6648,7 +6783,7 @@ def _cases_test_problem(root: Path, entries: list[str]) -> tuple[str, str] | Non
             broken = _test_structure_problem(tree)
             if broken is not None:
                 return test, broken
-            if not _lean():
+            if not _cases_off(root):
                 own = _called_module_functions(tree)
                 computed = _called_on_case_inputs(
                     tree, own, {k for c in cases if isinstance(c, dict) for k in c}, answers
@@ -7656,7 +7791,7 @@ async def _locked_test_refusal(
     were refused as already passing, many times: where the locked test passes
     now, that refusal, with its own way on, is said in place of the offer.
     """
-    if _lean():
+    if _cases_off(goal.parent.parent):
         return None
     unrun = _locked_test_unrun(command, scope, goal)
     if unrun is None:
@@ -7993,7 +8128,7 @@ def _cases_first_problem(
     siblings T0007-T0009 already held the cases: given the tree, a sibling
     that writes the known answers is named instead.
     """
-    if _lean():
+    if _cases_off(goal.parent.parent):
         return None
     root = goal.parent.parent
     if not (root / REFERENCES_DIR).is_dir():
@@ -8952,7 +9087,7 @@ def _locked_test_without_its_module(command: str, goal: Path, root: Path) -> tup
     """(locked test, module) when `command` runs a locked test that imports a module
     the tree and the installed packages do not provide, ignoring the scope that would
     write it; or None. With the check passing, that test passes without the module."""
-    if _lean():
+    if _cases_off(root):
         return None
     for module, test in _locked_test_imports(goal).items():
         if _runs_test_file(command, test) and not _module_written(
@@ -9340,7 +9475,7 @@ def _joint_cases_route(command: str, scope: list[str], root: Path) -> str:
     scoped = json.dumps([test, f"{base}{module.split('.')[0]}/"])
     check = f'done_when="python3 -m pytest -q {test}"'
     write = f"Write {test} and the code it imports, `{module}`, in one task"
-    if _lean():
+    if _cases_off(root):
         return f"{write}: scope={scoped}, {check}."
     return f'{write}, and lock {test} at its close: scope={scoped}, {check}, locks=["{test}"].'
 
@@ -9910,6 +10045,20 @@ def _check_broke(
 
 
 #: What a worker is asked to end its report with: one defect `prove` can put back.
+#: The WITNESS_NOTE of a task on the contract: its defect is a quote made wrong.
+CONTRACT_WITNESS_NOTE = (
+    "When the check passes, end your report with the WITNESS block below. It names one "
+    "small defect the check must catch, in the contract file you wrote "
+    f"({CONTRACT_PATH}, or {CONTRACT_SECOND} for the second extraction): one entry's "
+    "quote with a word changed, so it is no longer what its source says. `prove` puts "
+    "it back, and if the check still passes, the task is not done. The NEEDLE is text "
+    "copied exactly from the file that occurs there only once; the REPLACEMENT is the "
+    "same text with the word changed.\n\n"
+    "WITNESS: <path of the contract file>\n"
+    "NEEDLE:\n<exact text from the file>\n"
+    "REPLACEMENT:\n<that text with one word changed>\n"
+    "END WITNESS"
+)
 WITNESS_NOTE = (
     "When the check passes, end your report with the WITNESS block below. It names one "
     "small defect the check must catch, in the code you wrote — or, if this task only "
@@ -10433,7 +10582,7 @@ def _missing_locked_file(output: str, locks: list[str], root: Path) -> str | Non
     """A locked path the check failed on for want of it, not on disk: the work not yet
     done, not a wrong check. Run R17 E26 failed on FileNotFoundError for
     tests/cases.json, locked for the task, and was told to pass a corrected done_when."""
-    if _lean():
+    if _cases_off(root):
         return None
     missing = [lock.rstrip("/") for lock in locks if not (root / lock).exists()]
     if not missing:
@@ -10452,7 +10601,7 @@ def _absent_locks(locks: list[str], root: Path) -> list[str]:
     """The lock entries that are not a file on disk: the task's work not yet done.
 
     Under `LEAN_ENV` nothing is locked, so a close is not held for them."""
-    if _lean():
+    if _cases_off(root):
         return []
     return [lock for lock in locks if not (root / lock.rstrip("/")).is_file()]
 
@@ -11357,7 +11506,7 @@ def _locked(goal: Path) -> list[str]:
     Run R22: a copy put into the store by hand locked a file nothing had locked;
     only beagle writes the manifest, so a copy it does not name is not a lock.
     """
-    if _lean():
+    if _cases_off(goal.parent.parent):
         return []
     store = goal.parent / LOCKED_DIR
     try:
@@ -11386,7 +11535,7 @@ def _lock(
     A path in `relock` is locked again from its new content: a known-answers
     fix task's close.
     """
-    if _lean():
+    if _cases_off(goal.parent.parent):
         return [], []
     store = goal.parent / LOCKED_DIR
     held = set(_locked(goal)) - set(relock)
@@ -11426,7 +11575,7 @@ def _sha256(data: bytes) -> str:
 
 def _lock_manifest(goal: Path) -> dict[str, dict[str, Any]]:
     """The lock manifest: each locked path's sha256 and the commit holding it."""
-    if _lean():
+    if _cases_off(goal.parent.parent):
         return {}
     try:
         raw = json.loads((goal.parent / LOCK_MANIFEST).read_text(encoding="utf-8"))
@@ -11500,7 +11649,7 @@ def _restore_locked(goal: Path, root: Path, spare: Collection[str] = ()) -> list
     from its lock commit, the store copy rewritten with it: a tool run over
     the whole tree changes the store too.
     """
-    if _lean():
+    if _cases_off(goal.parent.parent):
         return []
     store = goal.parent / LOCKED_DIR
     manifest = _lock_manifest(goal)
@@ -11626,7 +11775,7 @@ def _move_pending_locks(goal: Path, task: str, parts: list[str], root: Path) -> 
     part whose scope, title or intent names that file; one no part names goes
     to the first part.
     """
-    if _lean():
+    if _cases_off(goal.parent.parent):
         return ""
     locks = _pending_locks(goal, task)
     if not locks or not parts:
@@ -11766,7 +11915,7 @@ def _locked_scope_problem(
     holding a locked file is allowed: put-back still guards the file, and later
     tasks add their own tests beside it.
     """
-    if _lean():
+    if _cases_off(root):
         return None
     goal = root / ".beagle" / GOAL_BASENAME
     if _fixes_known_answers_in(task_title, scope, goal):
@@ -14359,6 +14508,9 @@ def make_step_tool() -> Any:
             if outside is not None:
                 return _step_result(outside)
             arguments = {**arguments, "scope": scope}
+        if _strings(arguments.get("locks")) and _contract_declared(root):
+            kept_lead.append(CONTRACT_LOCKS_NOTE)
+            arguments = {**arguments, "locks": []}
         if _strings(arguments.get("locks")):
             # Run R29: absolute locks never matched the relative check.
             locks, outside = _root_relative_scope(_strings(arguments.get("locks")), root, "locks")
@@ -14406,7 +14558,7 @@ def make_step_tool() -> Any:
                 )
             )
         else:
-            after = (
+            after = _contract_verdict(ready.get("contract"), root) or (
                 "If every criterion of the goal now holds, tell the user the pursuit "
                 "is done. If work remains, add it with pursuit_plan."
             )
@@ -15387,7 +15539,9 @@ def make_step_tool() -> Any:
                 + ". Its notes say what the new route does differently.",
                 ran=False,
             )
-        if not (tests_only and _scope_has_data(scope, root)):
+        if _contract_work(scope or _strings(record.get("scope")), root):
+            brief += "\n\n" + CONTRACT_WITNESS_NOTE
+        elif not (tests_only and _scope_has_data(scope, root)):
             brief += "\n\n" + WITNESS_NOTE
         elif not (
             _fixes_known_answers_in(title, scope or _strings(record.get("scope")), goal)
@@ -15863,7 +16017,12 @@ def make_step_tool() -> Any:
                 "whose scope holds it) or delete them.",
                 ran=worker_ran,
             )
-        if not locks and _only_data_and_tests(changed) and any(map(_is_cases_data, changed)):
+        if (
+            not locks
+            and not _cases_off(root)
+            and _only_data_and_tests(changed)
+            and any(map(_is_cases_data, changed))
+        ):
             # Run R04: the driver passed no locks for its known-answers task.
             # Run R42: a task that wrote no cases data is no known-answers task.
             locks = changed
@@ -16022,9 +16181,10 @@ def make_step_tool() -> Any:
             if skipped:
                 lock_note += f"Not locked: {'; '.join(skipped)}.\n\n"
         superseded = _SUPERSEDED_REPORT_NOTE if rc == 0 and _report_claims_failure(shown) else ""
+        seal_note = _seal_when_ready(root) if rc == 0 else ""
         return _step_result(
             f"{route}{task} — {title}: {state}.\n\n{committed}\n\n{closed}\n\n"
-            f"{undid}{lock_note}{unrun_note}"
+            f"{undid}{lock_note}{seal_note}{unrun_note}"
             f"{superseded}Sub-agent report:\n{shown}\n\n"
             "Next: call pursuit_step with no arguments for the next task."
         )
@@ -16820,7 +16980,7 @@ def _known_answers_source_refusal(
     rel = target.relative_to(root).as_posix()
     if not rel.endswith(".py") or _is_test_path(rel) or _in_tests_dir(rel):
         return None
-    if not (root / REFERENCES_DIR).is_dir():
+    if _cases_off(root) or not (root / REFERENCES_DIR).is_dir():
         return None
     if not _names_known_answers(str(_task_record(goal, task).get("title") or "")):
         return None
