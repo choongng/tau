@@ -26,3 +26,16 @@ All three [tau] classes were fixed before the freeze:
   - It would add something, and the note itself leaves it as the owner's call against the tooling-weight concern.
   - B05 wrote those rows unasked.
   - Revisit if the full and lean arms both keep missing cobs boundary cases.
+
+## R53
+
+- **Outright bugs, filed to land after R56 so the first pairs run on identical code:**
+  - T0453: the done-by refusal points back to the offered scope.
+  - T0454: the retry note no longer says a killed worker "reported back".
+- **Founding comes before the references are read, so the plan never gained event** (class 1). Deferred.
+  - It is a design change: bringing the reference's operations back into the plan.
+  - It drove 32 of the 37 grade failures, so it is the first candidate once R53–R70 are summarised.
+  - The lean arm doesn't touch founding, so the pairs say nothing about it. Compare across runs instead.
+- **The head/tail report cut dropped W5's reference disagreement** (class 4, design part). Deferred.
+- **The source judge held correct rule-instance cases and asked for no reference examples** (class 5). Deferred.
+  - It joins R52's boundary-rows class, which also asked for no reference examples.
