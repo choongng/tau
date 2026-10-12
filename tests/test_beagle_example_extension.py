@@ -18377,6 +18377,81 @@ async def test_already_passes_still_offers_a_witnessable_done_by(
     assert _pursuit_calls(fake_beagle, "open") == [] and _runs(fake_tau) == []
 
 
+@pytest.mark.anyio
+async def test_already_passes_offers_no_done_by_whose_only_witness_is_an_imported_module(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # q35 R54 L33-L35: the offer's only witness was cobs/__init__.py, which the
+    # test imports at its top, and the import-only rule refused the close.
+    project, _ = _done_by_project(tmp_path, fake_beagle, monkeypatch, "T0003: Cases")
+    (project / "cobs").mkdir()
+    (project / "cobs" / "__init__.py").write_text("def encode(data):\n    return data\n")
+    (project / "tests" / "test_cases.py").write_text(
+        "from cobs import encode\n\n\ndef test_cases():\n    assert encode(b'a') == b'a'\n"
+    )
+    _git(project, "add", ".")
+    _git(project, "commit", "-q", "-m", "T0003: Cobs")
+    _require_witness(project)
+    runtime, _ = _bound(tmp_path)
+    check = "python3 -m pytest -q tests/test_cases.py"
+    module = _loaded_module()
+
+    offer = await _tool(runtime, "pursuit_step").execute(
+        "c1", {"task": "T0004", "criteria": "c", "done_when": check, "scope": ["cobs/__init__.py"]}
+    )
+
+    assert "T0004 not opened" in offer.text and "already passes" in offer.text, offer.text
+    assert _offered_done_by(offer.text) is None, offer.text
+    assert "a close done by T0003 would be refused" in offer.text
+    assert module._imported_at_top("cobs/__init__.py", check, project)
+    assert not module._imported_at_top("cobs/__init__.py", CASES_CHECK, project)
+    assert _pursuit_calls(fake_beagle, "open") == [] and _runs(fake_tau) == []
+
+
+def test_already_passes_offers_no_duplicate_abandon_for_a_founding_milestone() -> None:
+    # q35 R54 L37-L39: T0004, a founding milestone, was offered abandon='duplicate
+    # of Tnnnn', and the abandon was refused: "it is a milestone".
+    module = _module()
+    nodes = [
+        {"id": "T0001", "parent": "", "title": "Goal", "status": "open", "container": True},
+        {"id": "T0002", "parent": "T0001", "title": "Encode", "status": "done"},
+        {"id": "T0003", "parent": "T0001", "title": "Decode", "status": "pending"},
+        {"id": "T0004", "parent": "T0002", "title": "Part", "status": "done"},
+        {"id": "T0005", "parent": "T0001", "title": "Later", "status": "pending"},
+    ]
+    check = "grep -q done done.txt"
+
+    founding = module._already_passes(check, "T0003", nodes)
+    later = module._already_passes(check, "T0005", nodes)
+
+    assert module._abandon_problem("T0003", "duplicate of T0002", nodes) is not None
+    assert "already passes" in founding and "duplicate of" not in founding
+    assert module._abandon_problem("T0005", "duplicate of T0002", nodes) is None
+    assert later.endswith(module.ABANDON_HINT)
+
+
+@pytest.mark.anyio
+async def test_done_by_released_tail_starts_at_a_line(
+    tmp_path: Path, beagle: Path, fake_beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # q35 R54 L35: the pasted prove output began mid-word, "n __init__.py is absent".
+    project, _ = _done_by_project(tmp_path, fake_beagle, monkeypatch, "T0003: Cases")
+    module = _module()
+    out = "".join(f"line {i:03d}: cobs/__init__.py is absent\n" for i in range(100))
+    assert len(out) > module.CHECK_TAIL_CHARS
+    assert out[-module.CHECK_TAIL_CHARS - 1] != "\n"
+
+    released = module._done_by_released("T0004", "why", out, project)
+
+    pasted = released.split("left open:\n", 1)[1]
+    assert pasted.startswith("line ") and out.endswith(pasted.split("\n\n", 1)[0] + "\n")
+    assert len(pasted.split("\n\n", 1)[0]) < module.CHECK_TAIL_CHARS
+
+
 def _open_on_done_txt(project: Path, fake: Path, scope: list[str]) -> None:
     (project / "done.txt").write_text("done\n")
     record = {"id": "T0002", "title": "Parser", "status": "open"}
