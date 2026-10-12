@@ -4232,6 +4232,192 @@ def test_cases_test_computing_results_with_own_function_is_still_an_own_copy(
     assert found is not None and found[1].startswith("checks its own copy of the algorithm")
 
 
+#: q35 R51's locked tests/test_cases.py (~/itc, locked at T0002's close): it reads
+#: only "operation", "node" and "new_node" of each case, and `clock.event()` then
+#: `{"event": clock.event}`.
+R51_CASES_TEST = (
+    '"""Import from itc and validate each case in cases.json against the code."""\n\n'
+    "import json\nfrom pathlib import Path\n\nimport pytest\n\n"
+    'CASES_PATH = Path(__file__).with_name("cases.json")\n\n\n'
+    "def _load_cases():\n"
+    "    with CASES_PATH.open() as f:\n"
+    '        return json.load(f)["cases"]\n\n\n'
+    "def _stamp_eq(actual, expected):\n"
+    '    return actual["id"] == expected["id"] and actual["event"] == expected["event"]\n\n\n'
+    '@pytest.mark.parametrize("case", _load_cases(), ids=[c["name"] for c in _load_cases()])\n'
+    "def test_case_create(case):\n"
+    '    if case["operation"] != "create":\n'
+    '        pytest.skip("not a create case")\n'
+    "    from itc import IntervalTreeClock\n\n"
+    '    node = case["input"]["node"]\n'
+    "    clock = IntervalTreeClock(node)\n"
+    '    actual = {"id": clock.id, "event": clock.event}\n'
+    '    assert _stamp_eq(actual, case["expected"]), (\n'
+    "        f\"{case['name']}: expected {case['expected']}, got {actual}\"\n"
+    "    )\n\n\n"
+    '@pytest.mark.parametrize("case", _load_cases(), ids=[c["name"] for c in _load_cases()])\n'
+    "def test_case_event(case):\n"
+    '    if case["operation"] != "event":\n'
+    '        pytest.skip("not an event case")\n'
+    "    from itc import IntervalTreeClock\n\n"
+    '    node = case["input"]["node"]\n'
+    "    clock = IntervalTreeClock(node)\n"
+    "    clock.event()\n"
+    '    actual = {"id": clock.id, "event": clock.event}\n'
+    '    assert _stamp_eq(actual, case["expected"]), (\n'
+    "        f\"{case['name']}: expected {case['expected']}, got {actual}\"\n"
+    "    )\n\n\n"
+    '@pytest.mark.parametrize("case", _load_cases(), ids=[c["name"] for c in _load_cases()])\n'
+    "def test_case_subdivide(case):\n"
+    '    if case["operation"] != "subdivide":\n'
+    '        pytest.skip("not a subdivide case")\n'
+    "    from itc import IntervalTreeClock\n\n"
+    '    node = case["input"]["node"]\n'
+    '    new_node = case["input"]["new_node"]\n'
+    "    clock = IntervalTreeClock(node)\n"
+    "    child = clock.subdivide(new_node)\n"
+    "    actual = {\n"
+    '        node: {"id": clock.id, "event": clock.event},\n'
+    '        new_node: {"id": child.id, "event": child.event},\n'
+    "    }\n"
+    '    assert actual == case["expected"], (\n'
+    "        f\"{case['name']}: expected {case['expected']}, got {actual}\"\n"
+    "    )\n"
+)
+
+
+def _r51_case(name: str, operation: str, given: dict[str, Any], expected: Any) -> dict[str, Any]:
+    return {
+        "name": name,
+        "description": f"{name} from itc2008",
+        "source": "join((i1, e1), (i2, e2)) = (i1 + i2, e1 ⊔ e2).",
+        "operation": operation,
+        "input": given,
+        "expected": expected,
+    }
+
+
+#: q35 R51's tests/cases.json, less the merge cases: W2 added initial_id and
+#: initial_event to double_event and fork_after_event and left the test alone.
+R51_CASES = [
+    _r51_case("seed_stamp", "create", {"node": "A"}, {"id": "1", "event": 0}),
+    _r51_case(
+        "fork_seed",
+        "subdivide",
+        {"node": "A", "new_node": "B"},
+        {"A": {"id": "1,0", "event": 0}, "B": {"id": "0,1", "event": 0}},
+    ),
+    _r51_case("event_on_full", "event", {"node": "A"}, {"id": "1", "event": 1}),
+    _r51_case(
+        "double_event",
+        "event",
+        {"node": "A", "initial_id": "1", "initial_event": 1},
+        {"id": "1", "event": 2},
+    ),
+    _r51_case(
+        "fork_after_event",
+        "subdivide",
+        {"node": "A", "new_node": "B", "initial_id": "1", "initial_event": 1},
+        {"A": {"id": "1,0", "event": 1}, "B": {"id": "0,1", "event": 1}},
+    ),
+]
+
+
+def _write_r51(tmp_path: Path, source: str, cases: list[dict[str, Any]] = R51_CASES) -> list[str]:
+    (tmp_path / "tests").mkdir(exist_ok=True)
+    (tmp_path / "tests" / "cases.json").write_text(json.dumps({"cases": cases}))
+    (tmp_path / "tests" / "test_cases.py").write_text(source)
+    return ["tests/cases.json", "tests/test_cases.py"]
+
+
+def test_cases_test_problem_refuses_cases_the_test_cannot_tell_apart(tmp_path: Path) -> None:
+    # q35 R51: test_case_event made one call for event_on_full and double_event,
+    # which expected events 1 and 2; W4 and W5 spent 24 min on it.
+    module = _module()
+    ticking = R51_CASES_TEST.replace("clock.event()", "clock.tick()")
+
+    found = module._cases_test_problem(tmp_path, _write_r51(tmp_path, ticking))
+
+    assert found == (
+        "tests/test_cases.py",
+        "makes the same call in test_case_event for cases double_event and event_on_full, "
+        "which expect different answers (it never reads their input keys initial_id, "
+        "initial_event)",
+    )
+    closing = module._cases_close_problem(tmp_path, _write_r51(tmp_path, ticking))
+    assert closing is not None
+    assert "every input key that tells the two cases apart" in closing[1]
+    # The locked file as it was is refused for the cases first.
+    found = module._cases_test_problem(tmp_path, _write_r51(tmp_path, R51_CASES_TEST))
+    assert found is not None and "double_event and event_on_full" in found[1]
+    # Two cases agreeing on every key read are refused even with nothing unread.
+    apart = [case for case in R51_CASES if "initial_id" not in case["input"]]
+    twin = [*apart, _r51_case("event_twice", "event", {"node": "A"}, {"id": "1", "event": 2})]
+    found = module._cases_test_problem(tmp_path, _write_r51(tmp_path, ticking, twin))
+    assert found is not None
+    assert "event_on_full and event_twice" in found[1]
+    assert "(they agree on every input key it reads)" in found[1]
+
+    # Reading every input key tells the cases apart; seed_stamp and
+    # event_on_full share an input but not an operation, so not a call.
+    reads_all = ticking.replace(
+        "    clock = IntervalTreeClock(node)\n",
+        '    clock = IntervalTreeClock(node, case["input"].get("initial_id", "1"),\n'
+        '                              case["input"].get("initial_event", 0))\n',
+    )
+    assert module._cases_test_problem(tmp_path, _write_r51(tmp_path, reads_all)) is None
+    # A test routing on the operation in the call, or given the whole input,
+    # tells the cases apart too.
+    routed = ticking.replace(
+        '    if case["operation"] != "event":\n        pytest.skip("not an event case")\n', ""
+    ).replace("    clock.tick()\n", '    getattr(clock, case["operation"])(**case["input"])\n')
+    unpacked = ticking.replace(
+        '    node = case["input"]["node"]\n    clock = IntervalTreeClock(node)\n    clock.tick()',
+        '    clock = IntervalTreeClock(**case["input"])\n    clock.tick()',
+    )
+    events = [case for case in R51_CASES if case["operation"] == "event"]
+    assert module._indistinguishable_cases(ast.parse(ticking), events) is not None
+    for source in (routed, unpacked):
+        assert module._indistinguishable_cases(ast.parse(source), events) is None
+    # When the case goes whole to a helper, which keys reach the call is unknown.
+    handed = ticking.replace("    clock.tick()\n", "    clock.tick()\n    _apply(clock, case)\n")
+    assert module._indistinguishable_cases(ast.parse(handed), events) is None
+    # Cases parametrized from a filtered list may never meet in one test.
+    filtered = ticking.replace(
+        '@pytest.mark.parametrize("case", _load_cases(),',
+        '@pytest.mark.parametrize("case", [c for c in _load_cases() if c["input"]],',
+    )
+    assert module._indistinguishable_cases(ast.parse(filtered), events) is None
+
+
+def test_method_and_value_follows_an_attribute_into_a_dict(tmp_path: Path) -> None:
+    # q35 R51: `clock.event()` then `actual = {"id": clock.id, "event": clock.event}`
+    # and `assert _stamp_eq(actual, case["expected"])`; W4's 61,465-char cut-off.
+    module = _module()
+    assert module._method_and_value(ast.parse(R51_CASES_TEST)) == "event"
+    head = "def _same(a, b):\n    return a == b\n\n\ndef test_it(clock):\n    clock.event()\n"
+    for value in (
+        '    got = {"event": clock.event}\n    assert _same(got, {"event": 1})\n',
+        "    assert [clock.event, 0] == [1, 0]\n",
+        "    got = (clock.event,)\n    seen = got\n    assert seen\n",
+        "    assert _same(clock.event, 1)\n",
+    ):
+        assert module._method_and_value(ast.parse(head + value)) == "event", value
+    for method in (
+        "    handler = clock.event\n    handler()\n",
+        "    assert callable(clock.event)\n",
+        '    handlers = {"event": clock.event}\n    handlers["event"]()\n',
+        "    assert list(map(clock.event, [1])) == [2]\n",
+        '    got = {"event": other.event}\n    assert _same(got, {"event": 1})\n',
+    ):
+        assert module._method_and_value(ast.parse(head + method)) is None, method
+    # Through the close: cases the test can tell apart, and .event both ways.
+    apart = [case for case in R51_CASES if "initial_id" not in case["input"]]
+    found = module._cases_test_problem(tmp_path, _write_r51(tmp_path, R51_CASES_TEST, apart))
+    assert found is not None
+    assert found[1].startswith("uses .event both as a method, .event(), and as a value")
+
+
 ITC_REFERENCE = (
     "Interval Tree Clocks\n\n4\n\n"
     "fork(i) = (i1, i2), where (i1, i2) = split(i)\n"
@@ -5354,6 +5540,49 @@ async def test_a_step_locks_its_cases_and_later_steps_cannot_change_them(
     assert "changed locked files (cases.json)" in second.text
     assert "Locked files:" in _runs(fake_tau)[-1]["stdin"]
     assert "- cases.json" in _runs(fake_tau)[-1]["stdin"]
+
+
+@pytest.mark.anyio
+async def test_locked_files_brief_says_to_report_an_unpassable_locked_test(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # q35 R51: W4 spent 15.7 min fitting itc/clock.py to a locked test that made
+    # one call for double_event and event_on_full; W5 found it and circled.
+    project = _pursuit_project(tmp_path)
+    monkeypatch.chdir(project)
+    (project / "cases.json").write_text('[{"in": 1, "out": 2}]')
+    _ready_task(fake_beagle)
+    runtime, _ = _bound(tmp_path)
+    step = _tool(runtime, "pursuit_step")
+    first = await step.execute(
+        "c1",
+        {
+            "task": "T0002",
+            "criteria": "the cases are written",
+            "done_when": "grep -q done done.txt",
+            "locks": ["cases.json"],
+        },
+    )
+    assert "Locked: cases.json" in first.text
+    (project / "done.txt").unlink()
+
+    await step.execute(
+        "c2", {"task": "T0002", "criteria": "the code passes", "done_when": "grep -q done done.txt"}
+    )
+
+    brief = _runs(fake_tau)[-1]["stdin"]
+    locked = brief[brief.index("Locked files:") :]
+    assert "- cases.json\n" in locked
+    assert (
+        "If a locked test can pass against no code (it makes the same call for two cases "
+        "that expect different answers, or uses one attribute both as a method and as a "
+        "value), do not work around it: report that it cannot be passed, naming the two "
+        "cases or the attribute, and end the step there."
+    ) in " ".join(locked.split())
 
 
 @pytest.mark.anyio
