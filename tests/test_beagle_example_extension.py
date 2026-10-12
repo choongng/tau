@@ -136,6 +136,30 @@ if sys.argv[1:3] == ["loop", "stop"]:  # as beagle does: no run in flight after
     (here / "read.rc").write_text("3")
 if json.loads(stdin or "{}").get("stop_hook_active"):
     sys.exit(0)  # as beagle's Stop hooks do
+pages = here / "refs-pages.json"  # as `beagle refs fetch` does, serving these pages
+if sys.argv[1:3] == ["refs", "fetch"] and pages.exists():
+    served = json.loads(pages.read_text())
+    folder = Path("references")
+    folder.mkdir(exist_ok=True)
+    index = {"fetched": {}, "failed": {}}
+    if (folder / "index.json").exists():
+        index = json.loads((folder / "index.json").read_text())
+    for arg in sys.argv[3:]:
+        if arg.startswith("--request="):
+            index["request"] = arg.split("=", 1)[1]
+    held = {url: name for name, url in index["fetched"].items()}
+    for url in [arg for arg in sys.argv[3:] if not arg.startswith("--")]:
+        name = held.get(url) or url.rstrip("/").rsplit("/", 1)[-1].rsplit(".", 1)[0] + ".txt"
+        if url in held and (folder / name).exists():
+            continue
+        if url not in served:
+            index["failed"][url] = "Name or service not known"
+            continue
+        (folder / name).write_text(served[url])
+        index["failed"].pop(url, None)
+        index["fetched"][name] = url
+    (folder / "index.json").write_text(json.dumps(index, indent=2) + "\\n")
+    sys.exit(1 if index["failed"] else 0)
 reply = here / (sys.argv[2] + ".out")
 if len(sys.argv) > 3 and (here / f"{sys.argv[2]}-{sys.argv[3]}.out").exists():
     reply = here / f"{sys.argv[2]}-{sys.argv[3]}.out"  # one task's own reply
@@ -2165,66 +2189,20 @@ async def test_found_accepts_max_length_milestone(
     assert _milestone_splits(fake_beagle) == [["T0001", *milestones, "--ordered"]]
 
 
-def _tiny_pdf(text: str) -> bytes:
-    """A one-page PDF that shows `text`, built by hand so tests need no PDF library."""
-    stream = f"BT /F1 12 Tf 72 720 Td ({text}) Tj ET".encode()
-    objects = [
-        b"<< /Type /Catalog /Pages 2 0 R >>",
-        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
-        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] "
-        b"/Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >>",
-        b"<< /Length %d >>\nstream\n" % len(stream) + stream + b"\nendstream",
-        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+def _fake_web(fake_beagle: Path, pages: dict[str, str]) -> None:
+    """Have the fake `beagle refs fetch` serve `pages` (url -> text); any other URL fails."""
+    (fake_beagle / "refs-pages.json").write_text(json.dumps(pages))
+
+
+def _refs_asked(fake_beagle: Path) -> list[str]:
+    """Each URL the extension asked `beagle refs fetch` for, in order."""
+    return [
+        arg
+        for call in _calls(fake_beagle)
+        if call["argv"][:2] == ["refs", "fetch"]
+        for arg in call["argv"][2:]
+        if not arg.startswith("--")
     ]
-    out = b"%PDF-1.4\n"
-    offsets = []
-    for number, body in enumerate(objects, 1):
-        offsets.append(len(out))
-        out += b"%d 0 obj\n" % number + body + b"\nendobj\n"
-    xref = len(out)
-    out += b"xref\n0 %d\n0000000000 65535 f \n" % (len(objects) + 1)
-    out += b"".join(b"%010d 00000 n \n" % offset for offset in offsets)
-    out += b"trailer\n<< /Size %d /Root 1 0 R >>\nstartxref\n%d\n%%%%EOF\n" % (
-        len(objects) + 1,
-        xref,
-    )
-    return out
-
-
-class _FakeResponse:
-    def __init__(self, body: bytes, content_type: str) -> None:
-        import email.message
-
-        self._body = body
-        self.headers = email.message.Message()
-        self.headers["Content-Type"] = content_type
-
-    def read(self, limit: int = -1) -> bytes:
-        return self._body if limit < 0 else self._body[:limit]
-
-    def __enter__(self) -> _FakeResponse:
-        return self
-
-    def __exit__(self, *exc: object) -> None:
-        return None
-
-
-def _fake_web(monkeypatch: pytest.MonkeyPatch, pages: dict[str, tuple[bytes, str]]) -> list[str]:
-    """Serve `pages` (url -> body, content type) to urllib; any other URL fails."""
-    import urllib.error
-    import urllib.request
-
-    asked: list[str] = []
-
-    def urlopen(request: Any, timeout: float | None = None) -> _FakeResponse:
-        url = request.full_url if hasattr(request, "full_url") else str(request)
-        asked.append(url)
-        if url not in pages:
-            raise urllib.error.URLError("Name or service not known")
-        return _FakeResponse(*pages[url])
-
-    monkeypatch.setattr(urllib.request, "urlopen", urlopen)
-    return asked
 
 
 ITC_PROMPT = (
@@ -2243,19 +2221,13 @@ async def test_found_fetches_references(
     project.mkdir()
     monkeypatch.chdir(project)
     (fake_beagle / "add.out").write_text("T0001  Interval tree clocks\n")
-    page = (
-        b"<html><head><title>t</title><style>p{color:red}</style></head><body>"
-        b"<script>var stamp = 1;</script><h1>Interval Tree Clocks</h1>"
-        b"<p>A stamp is an id and an event tree.</p></body></html>"
-    )
-    asked = _fake_web(
-        monkeypatch,
+    _fake_web(
+        fake_beagle,
         {
-            "https://example.org/papers/itc2008.pdf": (
-                _tiny_pdf("fork event join"),
-                "application/pdf",
+            "https://example.org/papers/itc2008.pdf": "Interval Tree Clocks\n\nfork event join\n",
+            "https://example.org/blog/interval-tree-clocks.html": (
+                "Interval Tree Clocks\n\nA stamp is an id and an event tree.\n"
             ),
-            "https://example.org/blog/interval-tree-clocks.html": (page, "text/html"),
         },
     )
     runtime, _ = _bound(tmp_path)
@@ -2272,24 +2244,15 @@ async def test_found_fetches_references(
     )
 
     assert "Founded the pursuit" in result.text
-    assert asked == [
+    assert _refs_asked(fake_beagle) == [
         "https://example.org/papers/itc2008.pdf",
         "https://example.org/blog/interval-tree-clocks.html",
     ]
     refs = project / "references"
-    walkthrough = (refs / "interval-tree-clocks.txt").read_text()
-    assert "Interval Tree Clocks" in walkthrough and "an id and an event tree" in walkthrough
-    assert "var stamp" not in walkthrough and "color:red" not in walkthrough
+    assert "an id and an event tree" in (refs / "interval-tree-clocks.txt").read_text()
     index = json.loads((refs / "index.json").read_text())
     assert index["request"] == ITC_PROMPT
-    if shutil.which("pdftotext"):
-        assert "fork event join" in (refs / "itc2008.txt").read_text()
-        assert set(index["fetched"]) == {"itc2008.txt", "interval-tree-clocks.txt"}
-    else:
-        assert (
-            "pdftotext is not installed"
-            in index["failed"]["https://example.org/papers/itc2008.pdf"]
-        )
+    assert set(index["fetched"]) == {"itc2008.txt", "interval-tree-clocks.txt"}
     assert "references/" in (project / ".gitignore").read_text().splitlines()
     assert "references/interval-tree-clocks.txt" in result.text
 
@@ -2302,8 +2265,8 @@ async def test_found_reference_fetch_failure_is_noted(
     project.mkdir()
     monkeypatch.chdir(project)
     (fake_beagle / "add.out").write_text("T0001  Interval tree clocks\n")
-    page = (b"Interval tree clocks, in plain text.", "text/plain")
-    _fake_web(monkeypatch, {"https://example.org/blog/interval-tree-clocks.html": page})
+    page = "Interval tree clocks, in plain text."
+    _fake_web(fake_beagle, {"https://example.org/blog/interval-tree-clocks.html": page})
     runtime, _ = _bound(tmp_path)
     await runtime.run_input_hooks(ITC_PROMPT)
 
@@ -2331,68 +2294,12 @@ async def test_found_reference_fetch_failure_is_noted(
     assert missed in brief and "references/interval-tree-clocks.txt" in brief
 
 
-_STRAY_BREAKS = "a\x0cb\x1cc\x1dd\x1ee\x0bf\x85g\u2028h\u2029i\rj\r\nk\nl\n"
-
-
-def _lines_agree(text: str) -> None:
-    by_newline = text.split("\n")
-    if text.endswith("\n"):
-        by_newline = by_newline[:-1]
-    assert len(by_newline) == len(text.splitlines())
-
-
-def test_pdf_text_has_no_line_breaks_besides_newline(monkeypatch: pytest.MonkeyPatch) -> None:
-    # R25: itc2008.txt held form feeds and \x1c/\x1d, 671 lines by "\n", 718 by splitlines().
-    module = _module()
-    monkeypatch.setattr(module.shutil, "which", lambda name: f"/usr/bin/{name}")
-
-    def run(argv: list[str], **kwargs: Any) -> subprocess.CompletedProcess[bytes]:
-        assert argv[0] == "pdftotext"
-        return subprocess.CompletedProcess(argv, 0, _STRAY_BREAKS.encode(), b"")
-
-    monkeypatch.setattr(module.subprocess, "run", run)
-    text = module._pdf_text(b"%PDF-1.4")
-
-    assert len(_STRAY_BREAKS.splitlines()) > _STRAY_BREAKS.count("\n")
-    _lines_agree(text)
-    assert text.split("\n") == ["a b c d e f g h i j", "k", "l", ""]
-
-
-def test_fetched_reference_line_numbers_agree_for_split_and_splitlines(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    module = _module()
-    html = f"<html><body><p>{_STRAY_BREAKS}</p></body></html>".encode()
-    _fake_web(
-        monkeypatch,
-        {
-            "https://example.org/notes.txt": (_STRAY_BREAKS.encode(), "text/plain"),
-            "https://example.org/page.html": (html, "text/html"),
-        },
-    )
-    index = module._fetch_references(
-        tmp_path, "See https://example.org/notes.txt and https://example.org/page.html"
-    )
-
-    assert set(index["fetched"].values()) == {
-        "https://example.org/notes.txt",
-        "https://example.org/page.html",
-    }
-    for name in index["fetched"]:
-        written = (tmp_path / "references" / name).read_bytes().decode("utf-8")
-        _lines_agree(written)
-    notes = next(n for n, u in index["fetched"].items() if u.endswith("notes.txt"))
-    assert (tmp_path / "references" / notes).read_bytes().decode("utf-8") == (
-        "a b c d e f g h i j\nk\nl\n"
-    )
-
-
 def _loaded_module() -> Any:
     """The extension module the last-bound runtime loaded (not a fresh `_module()`)."""
     loaded = [
         m
         for m in list(sys.modules.values())
-        if getattr(m, "__file__", None) == str(EXTENSION) and hasattr(m, "_fetch_reference")
+        if getattr(m, "__file__", None) == str(EXTENSION) and hasattr(m, "_fetch_references")
     ]
     assert loaded
     return loaded[-1]
@@ -2409,96 +2316,9 @@ ITC_ABSTRACT = (
 )
 
 
-def _stub_fetch(monkeypatch: pytest.MonkeyPatch, pages: dict[str, str]) -> list[str]:
-    asked: list[str] = []
-
-    def fetch(url: str) -> str:
-        asked.append(url)
-        if url not in pages:
-            raise OSError("Name or service not known")
-        return pages[url]
-
-    monkeypatch.setattr(_loaded_module(), "_fetch_reference", fetch)
-    return asked
-
-
-def test_reference_fetch_retries_a_timeout_with_a_longer_timeout(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    # R09: itc2008.pdf timed out at 30 s and every worker re-downloaded it.
-    import urllib.error
-
-    module = _module()
-    paper = "https://example.org/papers/itc2008.pdf"
-    timeouts: list[float] = []
-
-    def fetch(url: str, timeout: float = module.REFERENCE_FETCH_TIMEOUT) -> str:
-        timeouts.append(timeout)
-        if len(timeouts) == 1:
-            raise urllib.error.URLError(TimeoutError("timed out"))
-        return "Interval tree clocks, the paper."
-
-    monkeypatch.setattr(module, "_fetch_reference", fetch)
-    index = module._fetch_references(tmp_path, f"The paper: {paper}")
-
-    assert timeouts == [30.0, 90.0]
-    assert module.REFERENCE_FETCH_RETRY_TIMEOUT == 90.0
-    assert index["fetched"] == {"itc2008.txt": paper} and index["failed"] == {}
-    written = (tmp_path / "references" / "itc2008.txt").read_text()
-    assert written == "Interval tree clocks, the paper."
-
-    timeouts.clear()
-
-    def always_slow(url: str, timeout: float = module.REFERENCE_FETCH_TIMEOUT) -> str:
-        timeouts.append(timeout)
-        raise TimeoutError(f"timed out after {timeout:g} s")
-
-    monkeypatch.setattr(module, "_fetch_reference", always_slow)
-    index = module._fetch_references(tmp_path, f"The paper: {paper}")
-
-    assert timeouts == [30.0, 90.0]
-    reason = index["failed"][paper]
-    assert "timed out after 30 s" in reason and "timed out after 90 s" in reason
-
-
-def test_reference_fetch_does_not_retry_a_refused_url(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    import email.message
-    import urllib.error
-
-    module = _module()
-    paper = "https://example.org/papers/itc2008.pdf"
-    refusals: list[Exception] = [
-        urllib.error.HTTPError(paper, 404, "Not Found", email.message.Message(), None),
-        urllib.error.URLError(ConnectionRefusedError(111, "Connection refused")),
-        ConnectionRefusedError(111, "Connection refused"),
-        ValueError("larger than 5 MB"),
-        ValueError("it held no text"),
-    ]
-    for refusal in refusals:
-        calls: list[float] = []
-
-        def fetch(
-            url: str,
-            timeout: float = module.REFERENCE_FETCH_TIMEOUT,
-            refusal: Exception = refusal,
-            calls: list[float] = calls,
-        ) -> str:
-            calls.append(timeout)
-            raise refusal
-
-        monkeypatch.setattr(module, "_fetch_reference", fetch)
-        index = module._fetch_references(tmp_path, f"The paper: {paper}")
-
-        assert calls == [30.0], refusal
-        assert index["failed"][paper] == str(refusal)
-        assert not (tmp_path / "references" / "itc2008.txt").exists()
-
-
 @pytest.mark.anyio
 async def test_found_first_steer_carries_reference_extracts(
-    tmp_path: Path, beagle: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, beagle: Path, fake_beagle: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # R02 and R03: criteria about interval trees for a request about interval
     # tree clocks, because nothing of the reference reached the driver first.
@@ -2506,7 +2326,7 @@ async def test_found_first_steer_carries_reference_extracts(
     monkeypatch.chdir(tmp_path / "project")
     session.is_running = True
     walkthrough = "https://example.org/blog/interval-tree-clocks.html"
-    _stub_fetch(monkeypatch, {walkthrough: ITC_ABSTRACT})
+    _fake_web(fake_beagle, {walkthrough: ITC_ABSTRACT})
 
     await runtime.emit_session_start("startup")
     await runtime.run_input_hooks(ITC_PROMPT)
@@ -2537,7 +2357,7 @@ async def test_found_reuses_references_fetched_before_founding(
         "https://example.org/papers/itc2008.pdf": ITC_ABSTRACT,
         "https://example.org/blog/interval-tree-clocks.html": "Interval Tree Clocks\nA walk.",
     }
-    asked = _stub_fetch(monkeypatch, pages)
+    _fake_web(fake_beagle, pages)
 
     await runtime.emit_session_start("startup")
     await runtime.run_input_hooks(ITC_PROMPT)
@@ -2553,11 +2373,68 @@ async def test_found_reuses_references_fetched_before_founding(
     )
 
     assert "Founded the pursuit" in result.text
-    assert sorted(asked) == sorted(pages)
+    assert sorted(_refs_asked(fake_beagle)) == sorted(pages)  # once, before founding
     assert "references/interval-tree-clocks.txt" in result.text
     assert "references/" in (project / ".gitignore").read_text().splitlines()
     index = json.loads((project / "references" / "index.json").read_text())
     assert index["request"] == ITC_PROMPT
+
+
+def test_references_are_fetched_by_beagle_refs(tmp_path: Path, fake_beagle: Path) -> None:
+    # One fetcher, beagle's, so Claude Code fills references/ as tau does.
+    walkthrough = "https://example.org/blog/interval-tree-clocks.html"
+    _fake_web(fake_beagle, {walkthrough: "Interval Tree Clocks\nA walk.\n"})
+
+    index = _module()._fetch_references(tmp_path, ITC_PROMPT)
+
+    [call] = [c for c in _calls(fake_beagle) if c["argv"][:2] == ["refs", "fetch"]]
+    paper = "https://example.org/papers/itc2008.pdf"
+    assert call["argv"] == [
+        "refs",
+        "fetch",
+        paper,
+        walkthrough,
+        f"--request={ITC_PROMPT}",
+        "--no-exclude",
+    ]
+    assert call["cwd"] == str(tmp_path)
+    assert index == json.loads((tmp_path / "references" / "index.json").read_text())
+    assert index["fetched"] == {"interval-tree-clocks.txt": walkthrough}
+    assert "Name or service not known" in index["failed"][paper]
+    assert "references/" in (tmp_path / ".gitignore").read_text().splitlines()
+
+
+def test_a_request_without_urls_is_recorded_without_beagle_refs(
+    tmp_path: Path, fake_beagle: Path
+) -> None:
+    # A data task's brief gives the request as context, so it is recorded with no URL in it.
+    request = "Build a COBS codec, as a beagle pursuit."
+
+    index = _module()._fetch_references(tmp_path, request)
+
+    assert _refs_asked(fake_beagle) == [] and _calls(fake_beagle) == []
+    assert index == {"request": request, "fetched": {}, "failed": {}}
+    assert json.loads((tmp_path / "references" / "index.json").read_text()) == index
+
+
+def test_a_beagle_without_refs_records_each_url_as_failed(
+    tmp_path: Path, fake_beagle: Path
+) -> None:
+    # beagle before 0.47 has no `refs`: founding goes on, and each URL says why it has no file.
+    (fake_beagle / "fetch.out").write_text("beagle: error: invalid choice: 'refs'\n")
+    (fake_beagle / "fetch.rc").write_text("2")
+
+    index = _module()._fetch_references(tmp_path, ITC_PROMPT)
+
+    why = "`beagle refs fetch` exited 2: beagle: error: invalid choice: 'refs'"
+    assert index["fetched"] == {}
+    assert index["failed"] == {
+        "https://example.org/papers/itc2008.pdf": why,
+        "https://example.org/blog/interval-tree-clocks.html": why,
+    }
+    assert json.loads((tmp_path / "references" / "index.json").read_text()) == index
+    brief = _module()._references_brief(tmp_path)
+    assert f"could not fetch https://example.org/papers/itc2008.pdf: {why}" in brief
 
 
 def test_reference_extract_is_title_and_opening() -> None:
@@ -2580,62 +2457,6 @@ def test_reference_extract_is_title_and_opening() -> None:
     assert module._reference_extract(html_page) == "ITC paper\n\nShort body."
 
 
-def _html_text(page: str) -> str:
-    parser = _module()._HtmlText()
-    parser.feed(page)
-    parser.close()
-    return parser.text()
-
-
-def test_html_text_keeps_table_cells_apart_and_drops_page_chrome() -> None:
-    page = (
-        "<html><head><title>COBS</title></head><body>"
-        '<a href="#content">Jump to content</a>'
-        '<header class="mw-header"><a>Main menu</a> Search <a>Donate</a></header>'
-        '<div role="navigation" class="vector-main-menu"><div><ul><li>Contents</li></ul></div>'
-        "<li>Random article</li></div>"
-        "<nav><ul><li>Create account</li><li>Log in</li></ul></nav>"
-        '<main id="content"><header class="mw-body-header"><h1>Consistent Overhead Byte '
-        "Stuffing</h1></header>"
-        "<div><p>COBS encodes a <b>packet</b> so that it holds no zero byte.</p>"
-        "<aside>Related articles</aside>"
-        "<table><tr><th>Example</th><th>Unencoded data (hex)</th><th>Encoded with COBS</th></tr>"
-        "<tr><td>7</td><td>01 02 03 ... FD FE</td><td>FF 01 02 03 ... FD FE 00</td></tr>"
-        "<tr><td>8</td><td><table><tr><td>a</td><td>b</td></tr></table></td><td>c</td></tr>"
-        "</table>"
-        "<p>Overhead is at most one byte in 254.</p></div></main>"
-        "<footer><ul><li>Privacy policy</li></ul></footer>"
-        "</body></html>"
-    )
-    text = _html_text(page)
-    lines = text.splitlines()
-
-    assert "Example | Unencoded data (hex) | Encoded with COBS" in lines
-    assert "7 | 01 02 03 ... FD FE | FF 01 02 03 ... FD FE 00" in lines
-    assert "701 02 03" not in text
-    assert "a | b" in lines
-    assert "a | b | c" not in text
-
-    for chrome in (
-        "Main menu",
-        "Donate",
-        "Contents",
-        "Random article",
-        "Create account",
-        "Log in",
-        "Related articles",
-        "Privacy policy",
-    ):
-        assert chrome not in text, chrome
-    assert "Consistent Overhead Byte Stuffing" in lines
-    assert "COBS encodes a packet so that it holds no zero byte." in lines
-    assert "Overhead is at most one byte in 254." in lines
-
-    article = "<article><header><h1>Join</h1></header><p>Join merges two stamps.</p></article>"
-    assert _html_text(article) == "Join\n\nJoin merges two stamps.\n"
-    assert _html_text("<p>One para.</p><p>Two <i>para</i>.</p>") == "One para.\n\nTwo para.\n"
-
-
 @pytest.mark.anyio
 async def test_step_brief_carries_references_and_prompt(
     tmp_path: Path,
@@ -2646,8 +2467,8 @@ async def test_step_brief_carries_references_and_prompt(
 ) -> None:
     project = _pursuit_project(tmp_path)
     monkeypatch.chdir(project)
-    page = (b"<p>Join merges two stamps.</p>", "text/html")
-    _fake_web(monkeypatch, {"https://example.org/blog/interval-tree-clocks.html": page})
+    page = "Join merges two stamps.\n"
+    _fake_web(fake_beagle, {"https://example.org/blog/interval-tree-clocks.html": page})
     _module()._fetch_references(project, ITC_PROMPT)
     _ready_task(fake_beagle)
     runtime, _ = _bound(tmp_path)
@@ -14531,7 +14352,7 @@ async def test_brief_for_a_data_task_gives_the_request_as_context_only(
     # R09 T0002: a cases task's brief ended on the request, and its worker implemented it.
     project = _pursuit_project(tmp_path)
     monkeypatch.chdir(project)
-    _fake_web(monkeypatch, {})
+    _fake_web(fake_beagle, {})
     _module()._fetch_references(project, ITC_PROMPT)
     _ready_task(fake_beagle, "grep -q out tests/cases.json")
     runtime, _ = _bound(tmp_path)

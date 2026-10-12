@@ -130,7 +130,6 @@ import contextlib
 import fnmatch
 import functools
 import hashlib
-import html.parser
 import importlib.util
 import itertools
 import json
@@ -140,15 +139,11 @@ import re
 import shlex
 import shutil
 import signal
-import socket
 import subprocess
 import sys
 import tempfile
 import time
 import tomllib
-import urllib.error
-import urllib.parse
-import urllib.request
 import uuid
 from collections.abc import Awaitable, Callable, Collection, Mapping
 from dataclasses import dataclass, field
@@ -2832,11 +2827,10 @@ def _ignore(root: Path, names: list[str]) -> None:
 REFERENCES_DIR = "references"
 #: What founding recorded there: the request, and each URL's file or failure.
 REFERENCES_INDEX = "index.json"
-REFERENCE_FETCH_TIMEOUT = 30.0
-#: A fetch that timed out is tried once more with this: R09's itc2008.pdf
-#: timed out at 30 s and every worker re-downloaded it to /tmp.
-REFERENCE_FETCH_RETRY_TIMEOUT = 90.0
-REFERENCE_MAX_BYTES = 5 * 1024 * 1024
+#: What `beagle refs fetch` may take per URL: a 30 s try, the 90 s one beagle
+#: makes after a timeout (R09's itc2008.pdf timed out at 30 s and every worker
+#: re-downloaded it to /tmp), and pdftotext's 120 s.
+REFS_FETCH_SECONDS_PER_URL = 240.0
 _PROMPT_URL = re.compile(r"https?://[^\s<>\"'`]+")
 
 
@@ -2854,236 +2848,50 @@ def _prompt_urls(text: str) -> list[str]:
     return urls
 
 
-def _reference_name(url: str, taken: set[str]) -> str:
-    """`references/<name>.txt`'s name for `url`: its last path segment, extension off."""
-    parsed = urllib.parse.urlsplit(url)
-    segments = [s for s in urllib.parse.unquote(parsed.path).split("/") if s]
-    stem = segments[-1] if segments else parsed.hostname or "reference"
-    stem = re.sub(r"\.(pdf|html?|php|aspx?|txt|md)$", "", stem, flags=re.IGNORECASE)
-    stem = re.sub(r"[^A-Za-z0-9._-]+", "-", stem).strip("-.") or "reference"
-    name, n = f"{stem}.txt", 1
-    while name in taken or name == REFERENCES_INDEX:
-        n += 1
-        name = f"{stem}-{n}.txt"
-    taken.add(name)
-    return name
-
-
-class _HtmlText(html.parser.HTMLParser):
-    """An HTML page's text: script, style and page chrome left out, blocks and table rows on
-    their own lines, cells in a row kept apart by " | "."""
-
-    _SKIP = frozenset({"script", "style", "noscript", "template", "svg", "head"})
-    _BLOCK = frozenset(
-        {
-            "p",
-            "div",
-            "br",
-            "li",
-            "tr",
-            "h1",
-            "h2",
-            "h3",
-            "h4",
-            "h5",
-            "h6",
-            "pre",
-            "section",
-            "article",
-            "blockquote",
-            "table",
-            "ul",
-            "ol",
-            "dt",
-            "dd",
-            "hr",
-            "figure",
-        }
-    )
-
-    # Page chrome: always left out, or (header, footer) only outside the article or main body,
-    # where a header can hold the article's own title.
-    _CHROME = frozenset({"nav", "aside"})
-    _PAGE_CHROME = frozenset({"header", "footer"})
-    _CONTENT = frozenset({"article", "main"})
-
-    def __init__(self) -> None:
-        super().__init__(convert_charrefs=True)
-        self.parts: list[str] = []
-        self._skipping = 0
-        self._chrome_tag = ""
-        self._chrome_depth = 0
-        self._in_content = 0
-        self._row_has_cell = False
-
-    def _is_chrome(self, tag: str, attrs: Any) -> bool:
-        if tag in self._CHROME:
-            return True
-        if tag in self._PAGE_CHROME and not self._in_content:
-            return True
-        return any(k == "role" and (v or "").strip().lower() == "navigation" for k, v in attrs)
-
-    def handle_starttag(self, tag: str, attrs: Any) -> None:
-        if self._chrome_depth:
-            if tag == self._chrome_tag:
-                self._chrome_depth += 1
-            return
-        if tag in self._SKIP:
-            self._skipping += 1
-        elif self._is_chrome(tag, attrs):
-            self._chrome_tag, self._chrome_depth = tag, 1
-            self.parts.append("\n")
-        else:
-            if tag in self._CONTENT:
-                self._in_content += 1
-            if tag == "tr":
-                self._row_has_cell = False
-            elif tag in ("td", "th"):
-                if self._row_has_cell and not self._skipping:
-                    self.parts.append(" | ")
-                self._row_has_cell = True
-            if tag in self._BLOCK:
-                self.parts.append("\n")
-
-    def handle_endtag(self, tag: str) -> None:
-        if self._chrome_depth:
-            if tag == self._chrome_tag:
-                self._chrome_depth -= 1
-            return
-        if tag in self._SKIP:
-            self._skipping = max(0, self._skipping - 1)
-        else:
-            if tag in self._CONTENT:
-                self._in_content = max(0, self._in_content - 1)
-            if tag in self._BLOCK:
-                self.parts.append("\n")
-
-    def handle_data(self, data: str) -> None:
-        if not self._skipping and not self._chrome_depth:
-            self.parts.append(data)
-
-    def text(self) -> str:
-        lines = (
-            re.sub(r"[ \t\r\f\v]+", " ", line).strip() for line in "".join(self.parts).splitlines()
-        )
-        return re.sub(r"\n{3,}", "\n\n", "\n".join(lines)).strip() + "\n"
-
-
-_NON_NEWLINE_BREAKS = str.maketrans(dict.fromkeys("\r\x0b\x0c\x1c\x1d\x1e\x85\u2028\u2029", " "))
-
-
-def _newline_only(text: str) -> str:
-    """`text` with no line break `splitlines()` sees but newline: CRLF to LF, the rest to spaces.
-
-    R25: a PDF's form feeds and \\x1c/\\x1d made `splitlines()` count 718 lines
-    where the read tool, splitting on newlines, counted 671, so workers checking
-    a citation in Python "fixed" correct line numbers into wrong ones.
-    """
-    return text.replace("\r\n", "\n").translate(_NON_NEWLINE_BREAKS)
-
-
-def _pdf_text(body: bytes) -> str:
-    if shutil.which("pdftotext") is None:
-        raise OSError("it is a PDF and pdftotext is not installed")
-    with tempfile.TemporaryDirectory() as tmp:
-        pdf = Path(tmp) / "reference.pdf"
-        pdf.write_bytes(body)
-        proc = subprocess.run(
-            ["pdftotext", "-layout", str(pdf), "-"],
-            capture_output=True,
-            timeout=120,
-            check=False,
-        )
-    if proc.returncode != 0:
-        why = proc.stderr.decode("utf-8", "replace").strip().splitlines()
-        raise OSError(f"pdftotext failed (exit {proc.returncode}): {why[-1] if why else ''}")
-    return _newline_only(proc.stdout.decode("utf-8", "replace"))
-
-
-def _is_timeout(exc: BaseException) -> bool:
-    """Whether `exc` is a timeout, bare or wrapped in urllib's URLError."""
-    if isinstance(exc, urllib.error.URLError) and not isinstance(exc, urllib.error.HTTPError):
-        return isinstance(exc.reason, (TimeoutError, socket.timeout))
-    return isinstance(exc, (TimeoutError, socket.timeout))
-
-
-def _fetch_reference(url: str, timeout: float = REFERENCE_FETCH_TIMEOUT) -> str:
-    """`url`'s content as text: a PDF through `pdftotext -layout`, HTML stripped.
-
-    Raises OSError (urllib's errors are its subclasses) or ValueError on failure.
-    """
-    request = urllib.request.Request(url, headers={"User-Agent": "tau-beagle/1"})
-    with urllib.request.urlopen(request, timeout=timeout) as response:
-        body = response.read(REFERENCE_MAX_BYTES + 1)
-        kind = response.headers.get_content_type() if response.headers else ""
-        charset = (response.headers.get_content_charset() if response.headers else None) or "utf-8"
-    if len(body) > REFERENCE_MAX_BYTES:
-        raise ValueError(f"larger than {REFERENCE_MAX_BYTES // (1024 * 1024)} MB")
-    if kind == "application/pdf" or body.startswith(b"%PDF"):
-        text = _pdf_text(body)
-    else:
-        try:
-            text = body.decode(charset, "replace")
-        except LookupError:
-            text = body.decode("utf-8", "replace")
-        if kind in ("text/html", "application/xhtml+xml") or re.match(
-            r"\s*(<!doctype html|<html)", text[:512], re.IGNORECASE
-        ):
-            parser = _HtmlText()
-            parser.feed(text)
-            parser.close()
-            text = parser.text()
-    if not text.strip():
-        raise ValueError("it held no text")
-    return _newline_only(text)
-
-
-def _failure_reason(exc: BaseException) -> str:
-    return str(exc).strip() or type(exc).__name__
+def _references_index(root: Path) -> dict[str, Any] | None:
+    try:
+        index = json.loads((root / REFERENCES_DIR / REFERENCES_INDEX).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return index if isinstance(index, dict) else None
 
 
 def _fetch_references(root: Path, prompt: str) -> dict[str, Any]:
-    """Fetch each URL in the user's `prompt` once into `references/`, as text.
+    """Fetch each URL in the user's `prompt` into `references/`, as text.
 
     R02's workers never saw the paper: the driver, barred from the
     reference, wrote the domain into its step notes from the name alone.
     The request itself, and each URL's file or why it could not be fetched,
     go in `references/index.json`, which every worker brief is built from.
-    A failed fetch is recorded, never fatal; one that timed out is tried
-    once more with REFERENCE_FETCH_RETRY_TIMEOUT before it is.
+    `beagle refs fetch` does the fetching, so Claude Code fills references/
+    the same way; it keeps a reference already on disk. A failed fetch, or a
+    beagle with no `refs`, is recorded against each URL, never fatal.
     """
     urls = _prompt_urls(prompt)
     if not prompt.strip():
         return {}
     folder = root / REFERENCES_DIR
     index: dict[str, Any] = {"request": prompt, "fetched": {}, "failed": {}}
-    taken: set[str] = set()
-    try:
-        folder.mkdir(parents=True, exist_ok=True)
-    except OSError as exc:
-        return {**index, "failed": {url: f"cannot make {folder}: {exc}" for url in urls}}
-    for url in urls:
-        name = _reference_name(url, taken)
-        try:
-            try:
-                text = _fetch_reference(url)
-            except Exception as exc:  # noqa: BLE001 - only a timeout is retried
-                if not _is_timeout(exc):
-                    raise
-                first = _failure_reason(exc)
-                try:
-                    text = _fetch_reference(url, timeout=REFERENCE_FETCH_RETRY_TIMEOUT)
-                except Exception as again:  # noqa: BLE001 - recorded with both reasons
-                    raise OSError(
-                        f"{first}; retried with {REFERENCE_FETCH_RETRY_TIMEOUT:g} s: "
-                        f"{_failure_reason(again)}"
-                    ) from again
-            (folder / name).write_text(text, encoding="utf-8")
-        except Exception as exc:  # noqa: BLE001 - one bad URL must not stop founding
-            index["failed"][url] = _failure_reason(exc)
-            continue
-        index["fetched"][name] = url
+    if urls:
+        rc, out = _run(
+            [BEAGLE_BIN, "refs", "fetch", *urls, f"--request={prompt}", "--no-exclude"],
+            root,
+            timeout=60.0 + REFS_FETCH_SECONDS_PER_URL * len(urls),
+        )
+        written = _references_index(root)
+        if written is not None and written.get("request") == prompt:
+            index = {**written, "fetched": dict(written.get("fetched") or {})}
+            index["failed"] = dict(written.get("failed") or {})
+        last = (out.strip().splitlines() or [""])[-1]
+        fetched = set(index["fetched"].values())
+        unaccounted = [url for url in urls if url not in fetched and url not in index["failed"]]
+        for url in unaccounted:
+            index["failed"][url] = f"`beagle refs fetch` exited {rc}: {last}".rstrip(": ")
+        if written is not None and not unaccounted:
+            _ignore(root, [REFERENCES_DIR])
+            return index
     with contextlib.suppress(OSError):
+        folder.mkdir(parents=True, exist_ok=True)
         (folder / REFERENCES_INDEX).write_text(json.dumps(index, indent=2) + "\n", encoding="utf-8")
     _ignore(root, [REFERENCES_DIR])
     return index
