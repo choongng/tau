@@ -11858,7 +11858,10 @@ async def test_unproven_memory_keyed_by_task_survives_scope_change(
     assert "new_route=true" in first.text
     assert "not run — call instead: " in rescoped.text
     assert "This check already passes and cannot be shown to refuse" in rescoped.text
-    assert "whatever check or scope" in rescoped.text
+    # R55 L69, L77: it said no sub-agent would help, whatever the check or scope,
+    # and then offered a new route, which runs one.
+    assert "Another sub-agent on this route would change nothing." in rescoped.text
+    assert "whatever check or scope" not in rescoped.text
     assert 'pursuit_step task="T0002", new_route=true' in rescoped.text
 
 
@@ -20452,6 +20455,46 @@ async def test_witness_import_error_only_is_not_proof(
     assert refused is not None and not refused.proven
     assert "failed only on importing it" in refused.text
     assert proven is not None and proven.proven and proven.by_absent_source
+
+
+@pytest.mark.anyio
+async def test_import_only_not_proof_next_asks_for_a_witness_not_a_new_check(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # R55 L65, L79: with itc/__init__.py taken away T0009's check failed only on
+    # importing it, and the Next asked for a new route whose test imports the code;
+    # the check's test already did. What was missing was the worker's WITNESS.
+    monkeypatch.chdir(_git_project(tmp_path, monkeypatch))
+    monkeypatch.setenv("FAKE_TAU_WRITES", json.dumps({"itc.py": "X = 1\n"}))
+    monkeypatch.setenv("FAKE_TAU_REPORT", "wrote itc.py")
+    _ready_task(fake_beagle, "grep -q X itc.py")
+    (fake_beagle / "prove.out").write_text(
+        "T0002: PROVEN — refuses when itc.py is absent\n"
+        "  refused at: ERROR tests/test_cases.py - ModuleNotFoundError: No module named 'itc'\n"
+    )
+    runtime, _ = _bound(tmp_path)
+    step = _tool(runtime, "pursuit_step")
+    args = {"task": "T0002", "criteria": "c", "done_when": "grep -q X itc.py"}
+
+    first = await step.execute("c1", {**args, "scope": ["itc.py"], "attempts": 1})
+    record = {"id": "T0002", "title": "Parser", "status": "open"}
+    record |= {"done_when": "grep -q X itc.py", "scope": ["itc.py"]}
+    (fake_beagle / "show.out").write_text(json.dumps(record))
+    again = await step.execute("c2", {"task": "T0002", "notes": "give a WITNESS", "attempts": 1})
+
+    assert "failed only on importing it" in first.text
+    assert "no WITNESS named a defect in the module the test imports" in first.text
+    assert "notes asking for a WITNESS in the module the test imports" in first.text
+    assert "new_route=true" not in first.text
+    assert "must import the code this task tests" not in first.text
+    assert "no defect could be put back" not in first.text
+    assert "not run" not in again.text
+    assert len(_runs(fake_tau)) == 2
+    assert _pursuit_calls(fake_beagle, "close") == []
 
 
 @pytest.mark.anyio
