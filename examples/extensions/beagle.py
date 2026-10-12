@@ -7820,7 +7820,8 @@ def _locked_data_route(
         None,
     )
     test = started or next((rel for rel in candidates if not (root / rel).exists()), candidates[-1])
-    scoped = ", ".join(f'"{e}"' for e in [*scope, test])
+    # q35 R59 L91: a scope that held the test listed it twice.
+    scoped = ", ".join(f'"{e}"' for e in dict.fromkeys([*scope, test]))
     write = (
         f"{test} is on disk, uncommitted and unlocked, and reads {listed}: put {test} in "
         f"scope and make it import the code, {named}, in this task, then lock it at its "
