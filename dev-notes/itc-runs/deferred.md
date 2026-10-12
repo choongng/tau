@@ -86,3 +86,15 @@ All three [tau] classes were fixed before the freeze:
 - **A defect a worker finds outside its scope has no route to the task that owns the code** (class 5). Deferred.
   - W4 found the leq bug, the scope guard refused its fix, and the finding died.
 - **The source judge held the cases task four times** (19.2 min) and removed the cases nearest the bugs (class 6). Deferred; joins R53/R55 class 5.
+
+## R58
+
+- **Outright bugs, landing at the R57–R60 boundary:**
+  - T0468: the reasoning loop cut misses a repeat within one line.
+  - T0469: a cut-off kill note is briefed as reference notes.
+  - T0470: a successor that ran is reported as not opened.
+  - T0471: a rank refusal offers --over, which pursuit_step cannot pass.
+- **Known answers stopped at the short rows** (class 6). Deferred, but R54 class 1's revisit condition is now met: the full arm (R54) and the lean arm (R58) both missed the cobs boundary rows.
+- **A wall-kill result drops the failure the worker ran** (class 7). Deferred.
+- **Checks bound to the encoder never ran its long inputs**, and the report cut hid the worker who said so (class 8). Deferred.
+- **The src layout and a dropped pyproject.toml** (class 9; R56 class 3 seen again). Deferred.
