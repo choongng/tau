@@ -110,3 +110,13 @@ All three [tau] classes were fixed before the freeze:
 - **Abandoning a superseded milestone's successor accepts any reason** (class 7). Deferred.
 - **The .beagle substring rule refuses a check that names '.beagle/' as data** (class 12). Deferred.
 - **Pair read:** R57 lean scored 23 and R59 full scored 0 on the same freeze. The spread within each arm is as large as the gap between them; founding and route variance dominate.
+
+## R60
+
+- **Outright bugs, landing at the R61–R64 boundary** (filed after the R57–R60 batch was set):
+  - T0476: the seat guard sends an out-of-scope fix to the open task's notes.
+  - T0477: the locked-test refusal offers the route the refused call already took.
+- **An out-of-scope defect a worker finds still has no route** (class 3; R57 class 5 seen again). Deferred.
+- **Known answers stopped at the short rows** (class 4). The revisit trigger is now met by R54, R58 and R60. Deferred.
+- **Worker isolation refuses a find that excludes .beagle/** (class 5; same design as R59 class 12). Deferred.
+- **Pair read:** lean R58 scored 29 and full R60 scored 42, but R54 (full) scored 27 and R56 (lean) scored 42. The arms overlap completely, so confidence is low.
