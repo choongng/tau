@@ -1,0 +1,89 @@
+Wrenfold sequence encoding, revision 3
+
+Status: stable. Revision 3 replaces revision 2, whose four-byte form is
+withdrawn; nothing written by revision 2 with that form is valid revision 3.
+
+1. Scope
+
+A Wrenfold sequence is a list of unsigned integers written as bytes. It is
+meant for small counters and offsets in log records, where most values are
+small and a few are large. Each integer takes one of four forms, and the
+sequence ends with an end marker, so a reader needs no length in front of it.
+
+2. Integers
+
+An integer in a Wrenfold sequence is at least 0 and at most
+274877906943 (2^38 − 1). An encoder given any other value, a
+negative one included, must fail rather than write anything.
+
+The top two bits of an integer's first byte are its form tag. The bits after
+the tag, through the form's last byte, are the value, most significant bit
+first:
+
+Tag | Bytes | Value bits | Values
+
+00 | 1 | 6 | 0 to 62
+
+01 | 2 | 14 | 0 to 16383
+
+10 | 3 | 22 | 0 to 4194303
+
+11 | 5 | 38 | 0 to 274877906943
+
+The byte 0x3F is the end marker (section 3), so the one-byte form never
+holds 63, although six bits could: 63 is written in the two-byte form, as
+0x40 0x3F.
+
+An encoder writes every integer in the shortest form that holds it.
+
+3. Sequences
+
+A sequence is its integers' encodings in order, followed by one end marker
+byte, 0x3F. The empty sequence is the single byte 0x3F. A byte 0x3F where an
+integer would begin is always the end marker; inside a two-, three- or
+five-byte form it is an ordinary byte of the value.
+
+4. Examples
+
+Integers | Bytes (hex)
+
+(none) | 3F
+
+0 | 00 3F
+
+5 | 05 3F
+
+1, 300, 5 | 01 41 2C 05 3F
+
+9000 | 63 28 3F
+
+70000 | 81 11 70 3F
+
+5000000 | C0 00 4C 4B 40 3F
+
+2, 2, 2 | 02 02 02 3F
+
+5. Reading
+
+A decoder reads integers until it reaches the end marker and returns them
+in order. It must reject, rather than return any integers for, an input
+that:
+
+ends before its end marker, or ends inside an integer (the input
+05 has no end marker; in C0 00 00 3F the five-byte
+form runs past the end);
+
+has any byte after its end marker (05 3F 00);
+
+holds an integer in a longer form than the shortest that holds it: the
+input 40 05 3F writes 5 in the two-byte form, and is rejected.
+
+A reader that needs only how many integers a sequence holds uses
+count, which returns that number without building the list, and
+rejects exactly the inputs a decoder rejects.
+
+6. Changes from revision 2
+
+Revision 2 had a four-byte form with tag 11. Revision 3 makes tag 11 the
+five-byte form, so that a full 38-bit value fits, and adds the rule that an
+integer is in its shortest form.

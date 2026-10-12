@@ -1,0 +1,1546 @@
+{
+  "sources": {
+    "itc2008": {
+      "path": "references/itc2008.txt"
+    },
+    "interval-tree-clocks": {
+      "path": "references/interval-tree-clocks.txt"
+    }
+  },
+  "entries": [
+    {
+      "id": "op-fork",
+      "kind": "operation",
+      "operation": "fork",
+      "source": "itc2008",
+      "quote": "The fork operation allows the cloning of the causal past of a stamp, resulting in a pair of stamps that",
+      "statement": "fork takes a stamp (i, e) and returns two stamps ((i1, e), (i2, e)) where i1 + i2 = i, i1 · i2 = 0, and i2 ≠ i1. The event component is preserved identically in both outputs."
+    },
+    {
+      "id": "op-peek",
+      "kind": "operation",
+      "operation": "peek",
+      "source": "itc2008",
+      "quote": "A special case of fork when it is enough to obtain an anonymous stamp (0, e), with “null” iden-",
+      "statement": "peek takes a stamp (i, e) and returns two stamps: ((0, e), (i, e)). The first stamp has a null identity (0) and cannot be used for events. The second stamp retains the original identity."
+    },
+    {
+      "id": "op-event",
+      "kind": "operation",
+      "operation": "event",
+      "source": "itc2008",
+      "quote": "An event operation adds a new event to the event component, so that if (i, e0 ) results from event((i, e))",
+      "statement": "event takes a stamp (i, e) with non-null identity and returns (i, e0) where e0 strictly dominates e (e < e0). The event component is inflated on elements available in the identity: e0 = e + f · i for any f such that f · i ≠ 0."
+    },
+    {
+      "id": "op-join",
+      "kind": "operation",
+      "operation": "join",
+      "source": "itc2008",
+      "quote": "This operation merges two stamps, producing a new one. If join((i1 , e1 ), (i2 , e2 )) = (i3 , e3 ), the",
+      "statement": "join takes two stamps and returns a new stamp whose event component is the pointwise maximum (join semilattice join) of both inputs, and whose identity is the sum of both identities. The result causally dominates both inputs."
+    },
+    {
+      "id": "op-send",
+      "kind": "operation",
+      "operation": "send",
+      "source": "itc2008",
+      "quote": "This operation is the atomic composition of event followed by peek. E.g. in vector clock systems,",
+      "statement": "send((i, e)) = peek(event((i, e))). First increments the event component, then creates an anonymous copy of the resulting stamp for transmission."
+    },
+    {
+      "id": "op-receive",
+      "kind": "operation",
+      "operation": "receive",
+      "source": "itc2008",
+      "quote": "A receive is the atomic composition of join followed by event. E.g. in vector clocks taking the",
+      "statement": "receive((i, e), (j, f)) = event(join((i, e), (j, f))). First merges the two stamps, then increments the event component on the local identity."
+    },
+    {
+      "id": "op-sync",
+      "kind": "operation",
+      "operation": "sync",
+      "source": "itc2008",
+      "quote": "A sync is the atomic composition of join followed by fork. E.g. In version vector systems and in",
+      "statement": "sync((i, e), (j, f)) = fork(join((i, e), (j, f))). First merges the two stamps, then forks the result into two stamps with the same event component but split identities."
+    },
+    {
+      "id": "ex-seed-stamp",
+      "kind": "example",
+      "operation": "seed",
+      "source": "itc2008",
+      "quote": "ITC makes use what we call the seed stamp, (1, 0), from which we can fork as desired to obtain an",
+      "input": {
+        "stamp": null
+      },
+      "expect": {
+        "id_tree": 1,
+        "event_tree": 0
+      }
+    },
+    {
+      "id": "ex-fork-seed",
+      "kind": "example",
+      "operation": "fork",
+      "source": "itc2008",
+      "quote": "split(1) = ((1, 0), (0, 1))",
+      "input": {
+        "id_tree": 1,
+        "event_tree": 0
+      },
+      "expect": {
+        "stamps": [
+          {
+            "id_tree": [
+              1,
+              0
+            ],
+            "event_tree": 0
+          },
+          {
+            "id_tree": [
+              0,
+              1
+            ],
+            "event_tree": 0
+          }
+        ]
+      }
+    },
+    {
+      "id": "ex-id-tree-representation",
+      "kind": "example",
+      "operation": "id-tree-semantic",
+      "source": "itc2008",
+      "quote": "As an example, (1, (0, 1)) represents the function",
+      "input": {
+        "id_tree": [
+          1,
+          [
+            0,
+            1
+          ]
+        ]
+      },
+      "expect": {
+        "semantic-equals": [
+          [
+            0,
+            [
+              1,
+              0
+            ]
+          ],
+          [
+            1,
+            0
+          ]
+        ]
+      }
+    },
+    {
+      "id": "ex-event-tree-semantic",
+      "kind": "example",
+      "operation": "event-tree-semantic",
+      "source": "itc2008",
+      "quote": "(1, 2, (0, (1, 0, 2), 0)) ∼",
+      "input": {
+        "event_tree": [
+          1,
+          2,
+          [
+            0,
+            [
+              1,
+              0,
+              2
+            ],
+            0
+          ]
+        ]
+      },
+      "expect": {
+        "graphical": "base=1, left subtree base=2, right subtree is [0, [1, 0, 2], 0]"
+      }
+    },
+    {
+      "id": "ex-normalize-id-zero",
+      "kind": "example",
+      "operation": "normalize-id",
+      "source": "itc2008",
+      "quote": "norm((0, 0)) = 0",
+      "input": {
+        "id_tree": [
+          0,
+          0
+        ]
+      },
+      "expect": {
+        "id_tree": 0
+      }
+    },
+    {
+      "id": "ex-normalize-id-one",
+      "kind": "example",
+      "operation": "normalize-id",
+      "source": "itc2008",
+      "quote": "norm((1, 1)) = 1",
+      "input": {
+        "id_tree": [
+          1,
+          1
+        ]
+      },
+      "expect": {
+        "id_tree": 1
+      }
+    },
+    {
+      "id": "ex-normalize-event",
+      "kind": "example",
+      "operation": "normalize-event",
+      "source": "itc2008",
+      "quote": "(2, 1, 1) ∼                ≡                  ∼ 3,",
+      "input": {
+        "event_tree": [
+          2,
+          1,
+          1
+        ]
+      },
+      "expect": {
+        "event_tree": 3
+      }
+    },
+    {
+      "id": "ex-normalize-event-complex",
+      "kind": "example",
+      "operation": "normalize-event",
+      "source": "itc2008",
+      "quote": "(2, (2, 1, 0), 3) ∼               ≡                  ∼ (4, (0, 1, 0), 1).",
+      "input": {
+        "event_tree": [
+          2,
+          [
+            2,
+            1,
+            0
+          ],
+          3
+        ]
+      },
+      "expect": {
+        "event_tree": [
+          4,
+          [
+            0,
+            1,
+            0
+          ],
+          1
+        ]
+      }
+    },
+    {
+      "id": "ex-fork-step1",
+      "kind": "example",
+      "operation": "fork",
+      "source": "interval-tree-clocks",
+      "quote": "The first initial ID is always 1:",
+      "input": {
+        "id_tree": 1,
+        "event_tree": 0
+      },
+      "expect": {
+        "stamps": [
+          {
+            "id_tree": [
+              1,
+              0
+            ],
+            "event_tree": 0
+          },
+          {
+            "id_tree": [
+              0,
+              1
+            ],
+            "event_tree": 0
+          }
+        ]
+      }
+    },
+    {
+      "id": "ex-fork-step2",
+      "kind": "example",
+      "operation": "fork",
+      "source": "interval-tree-clocks",
+      "quote": "If I fork the one to the left again, I now have 3 IDs:",
+      "input": {
+        "id_tree": [
+          1,
+          0
+        ],
+        "event_tree": 0
+      },
+      "expect": {
+        "stamps": [
+          {
+            "id_tree": [
+              [
+                1,
+                0
+              ],
+              0
+            ],
+            "event_tree": 0
+          },
+          {
+            "id_tree": [
+              0,
+              [
+                1,
+                0
+              ]
+            ],
+            "event_tree": 0
+          }
+        ]
+      }
+    },
+    {
+      "id": "ex-join-example",
+      "kind": "example",
+      "operation": "join",
+      "source": "interval-tree-clocks",
+      "quote": "I could, for example, join the first ID with the third one and obtain:",
+      "input": {
+        "left_id_tree": [
+          [
+            0,
+            1
+          ],
+          0
+        ],
+        "left_event_tree": 0,
+        "right_id_tree": [
+          1,
+          0
+        ],
+        "right_event_tree": 1
+      },
+      "expect": {
+        "id_tree": [
+          [
+            0,
+            1
+          ],
+          [
+            1,
+            0
+          ]
+        ],
+        "event_tree": 1
+      }
+    },
+    {
+      "id": "limit-event-on-anonymous",
+      "kind": "limit",
+      "operation": "event",
+      "source": "itc2008",
+      "quote": "An event cannot be applied to an anonymous stamp as no element in the domain is available to be inflated.",
+      "input": {
+        "id_tree": 0,
+        "event_tree": 5
+      },
+      "expect": "error: event cannot be applied to anonymous stamp (id_tree == 0)",
+      "statement": "The event operation requires a non-null identity. Applying event to a stamp with id_tree = 0 is invalid."
+    },
+    {
+      "id": "limit-disjoint-ids",
+      "kind": "limit",
+      "operation": "identity-invariant",
+      "source": "itc2008",
+      "quote": "We adopt a less general but more useful invariant, as it can be maintained by local operations without access",
+      "input": {
+        "id_tree_1": [
+          1,
+          0
+        ],
+        "id_tree_2": [
+          1,
+          0
+        ]
+      },
+      "expect": "error: identity functions overlap — causality invariant violated",
+      "statement": "At any point, the identity functions of all active participants must have non-overlapping graphs: for any two distinct participant IDs i1 and i2, their dot product must be 0."
+    },
+    {
+      "id": "limit-initialization",
+      "kind": "limit",
+      "operation": "initialization",
+      "source": "interval-tree-clocks",
+      "quote": "The cluster must be initialised with a single root node given the ID 1.",
+      "input": {
+        "cluster_size": 0
+      },
+      "expect": "error: cluster must be initialised with a single root node at ID 1",
+      "statement": "The system must start with a single root node whose ID is 1 (the seed stamp (1, 0)). Booting a new cluster with many nodes simultaneously, where two assume the same ID, breaks causality."
+    },
+    {
+      "id": "invalid-event-anonymous",
+      "kind": "invalid",
+      "operation": "event",
+      "source": "itc2008",
+      "quote": "An event cannot be applied to an anonymous stamp as no element in the domain is available to be inflated.",
+      "input": {
+        "id_tree": 0,
+        "event_tree": 5
+      },
+      "expect": "error: event cannot be applied to anonymous stamp (id_tree == 0)"
+    },
+    {
+      "id": "invalid-overlapping-ids",
+      "kind": "invalid",
+      "operation": "identity-invariant",
+      "source": "itc2008",
+      "quote": "The essential point towards ensuring a correct tracking of causality is to be able to inflate the",
+      "input": {
+        "id_tree_1": [
+          1,
+          0
+        ],
+        "id_tree_2": [
+          1,
+          0
+        ]
+      },
+      "expect": "error: identity functions overlap — causality invariant violated"
+    },
+    {
+      "id": "prop-ordering",
+      "kind": "property",
+      "operation": "comparison",
+      "source": "itc2008",
+      "quote": "Comparison of stamps is made through the event component:",
+      "statement": "Stamp comparison is based solely on the event component: (i1,e1) <= (i2,e2) iff e1 <= e2. Two stamps are ordered by their event components regardless of identity.",
+      "input": {
+        "left_stamp": {
+          "id_tree": [
+            1,
+            0
+          ],
+          "event_tree": 3
+        },
+        "right_stamp": {
+          "id_tree": [
+            0,
+            1
+          ],
+          "event_tree": 5
+        }
+      },
+      "expect": {
+        "result": "right_dominates",
+        "reason": "e1=3 < e2=5, so (i1,e1) <= (i2,e2)"
+      }
+    },
+    {
+      "id": "prop-join-dominates",
+      "kind": "property",
+      "operation": "join",
+      "source": "itc2008",
+      "quote": "If join((i1 , e1 ), (i2 , e2 )) = (i3 , e3 ), the",
+      "statement": "The result of join causally dominates both inputs: the event component of the result is >= both input event components.",
+      "input": {
+        "left_stamp": {
+          "id_tree": [
+            1,
+            0
+          ],
+          "event_tree": 3
+        },
+        "right_stamp": {
+          "id_tree": [
+            0,
+            1
+          ],
+          "event_tree": 5
+        }
+      },
+      "expect": {
+        "result_id_tree": [
+          1,
+          1
+        ],
+        "result_event_tree": 5,
+        "dominates_left": true,
+        "dominates_right": true,
+        "reason": "join result event=5 >= both 3 and 5"
+      }
+    },
+    {
+      "id": "prop-join-no-excess",
+      "kind": "property",
+      "operation": "join",
+      "source": "itc2008",
+      "quote": "Also, e3 should not dominate",
+      "statement": "The join result does not dominate any event beyond what either input already dominated. It is the least upper bound in the join semilattice.",
+      "input": {
+        "left_stamp": {
+          "id_tree": [
+            1,
+            0
+          ],
+          "event_tree": 3
+        },
+        "right_stamp": {
+          "id_tree": [
+            0,
+            1
+          ],
+          "event_tree": 5
+        }
+      },
+      "expect": {
+        "result_event_tree": 5,
+        "no_excess": true,
+        "reason": "join(3,5)=5 is the exact least upper bound, not more"
+      }
+    },
+    {
+      "id": "prop-event-strict-advance",
+      "kind": "property",
+      "operation": "event",
+      "source": "itc2008",
+      "quote": "This action does a strict advance in the partial order such",
+      "statement": "After an event, the new event component e0 strictly dominates e, dominates no other existing event component x, and any event component that was less than e remains less than or equal to e0.",
+      "input": {
+        "stamp": {
+          "id_tree": [
+            1,
+            0
+          ],
+          "event_tree": 3
+        }
+      },
+      "expect": {
+        "result_event_tree_gt_input": true,
+        "reason": "event(3) produces e0 where e0 > 3, strictly advancing the partial order"
+      }
+    },
+    {
+      "id": "prop-fork-event-preserved",
+      "kind": "property",
+      "operation": "fork",
+      "source": "itc2008",
+      "quote": "Forking preserves the event component, and must split the id in two parts whose corresponding functions",
+      "statement": "Both stamps returned by fork have the identical event component as the input. The identity components sum to the original identity and have zero dot product.",
+      "input": {
+        "stamp": {
+          "id_tree": [
+            1,
+            0
+          ],
+          "event_tree": 7
+        }
+      },
+      "expect": {
+        "both_events_equal_input": true,
+        "left_event": 7,
+        "right_event": 7,
+        "reason": "fork preserves the event component identically in both outputs"
+      }
+    },
+    {
+      "id": "prop-normalization-equivalence",
+      "kind": "property",
+      "operation": "normalize",
+      "source": "itc2008",
+      "quote": "There can be several equivalent representations for a given function. ITC is conceived so as to keep stamps",
+      "statement": "Normalizing an id or event tree produces a structurally different tree that represents the same function. Normal forms are unique for a given function.",
+      "input": {
+        "id_tree": [
+          1,
+          [
+            1,
+            1
+          ]
+        ]
+      },
+      "expect": {
+        "normalized": 1,
+        "same_function": true,
+        "reason": "norm((1,(1,1))) = 1, both represent the same function 1"
+      }
+    },
+    {
+      "id": "prop-peek-produces-anonymous",
+      "kind": "property",
+      "operation": "peek",
+      "source": "interval-tree-clocks",
+      "quote": "peek: creates a copy of the timestamp, but with a NULL id, such that the event counter may be read, but not incremented.",
+      "statement": "One output of peek has id_tree = 0 (anonymous) and preserves the event component. The other output preserves the original stamp.",
+      "input": {
+        "stamp": {
+          "id_tree": [
+            1,
+            0
+          ],
+          "event_tree": 5
+        }
+      },
+      "expect": {
+        "left_id_is_zero": true,
+        "right_preserves_original": true,
+        "left_event": 5,
+        "right_event": 5,
+        "reason": "peek produces ((0, e), (i, e))"
+      }
+    },
+    {
+      "id": "prop-send-composition",
+      "kind": "property",
+      "operation": "send",
+      "source": "interval-tree-clocks",
+      "quote": "send: atomic composition of event+peek. Also not shown",
+      "statement": "send produces two outputs: the local stamp with incremented event counter, and an anonymous copy of the incremented stamp for transmission.",
+      "input": {
+        "stamp": {
+          "id_tree": [
+            1,
+            0
+          ],
+          "event_tree": 3
+        }
+      },
+      "expect": {
+        "local_event_increased": true,
+        "message_event": 4,
+        "message_id_is_zero": true,
+        "reason": "send = peek(event((i,e))) increments then creates anonymous copy"
+      }
+    },
+    {
+      "id": "prop-receive-composition",
+      "kind": "property",
+      "operation": "receive",
+      "source": "interval-tree-clocks",
+      "quote": "receive: atomic composition of join+event. Not shown either.",
+      "statement": "receive merges the incoming stamp with the local stamp via join, then increments the event component on the merged result.",
+      "input": {
+        "local_stamp": {
+          "id_tree": [
+            1,
+            0
+          ],
+          "event_tree": 3
+        },
+        "message_stamp": {
+          "id_tree": [
+            0,
+            1
+          ],
+          "event_tree": 5
+        }
+      },
+      "expect": {
+        "result_event_gt_both": true,
+        "reason": "receive = event(join((i,e1),(j,e2))) merges then increments"
+      }
+    },
+    {
+      "id": "prop-sync-composition",
+      "kind": "property",
+      "operation": "sync",
+      "source": "interval-tree-clocks",
+      "quote": "sync: atomic composition of join+fork. This is not shown on the diagram, but can be thought of as leaving the IDs as they are, but merging the event counter.",
+      "statement": "sync merges two stamps via join, then forks the result. Both outputs share the same event component (the joined value) but have split identities.",
+      "input": {
+        "stamp1": {
+          "id_tree": [
+            1,
+            0
+          ],
+          "event_tree": 3
+        },
+        "stamp2": {
+          "id_tree": [
+            0,
+            1
+          ],
+          "event_tree": 5
+        }
+      },
+      "expect": {
+        "both_events_equal": true,
+        "event_value": 5,
+        "ids_split": true,
+        "reason": "sync = fork(join((i,e),(j,f))) merges events then splits ids"
+      }
+    },
+    {
+      "id": "prop-id-split-conservation",
+      "kind": "property",
+      "operation": "fork",
+      "source": "itc2008",
+      "quote": "fork((i, e)) = ((i1 , e), (i2 , e))      subject to i1 + i2 = i and i1 · i2 = 0.",
+      "statement": "The id split in fork must conserve the total identity: the sum of the two output identity functions equals the input identity function, and they have zero overlap.",
+      "input": {
+        "stamp": {
+          "id_tree": 1,
+          "event_tree": 0
+        }
+      },
+      "expect": {
+        "left_id_plus_right_id_equals_original": true,
+        "left_dot_right_equals_zero": true,
+        "reason": "fork(1) = ((1,0),(0,1)), sum=(1,1)=1, dot=(1,0)·(0,1)=0"
+      }
+    },
+    {
+      "id": "prop-join-id-sum",
+      "kind": "property",
+      "operation": "join",
+      "source": "itc2008",
+      "quote": "join((i1 , e1 ), (i2 , e2 )) = (sum(i1 , i2 ), join(e1 , e2 )),",
+      "statement": "The identity of the join result is the sum of the two input identities. The event component is the join (pointwise maximum) of the two input event components.",
+      "input": {
+        "left_stamp": {
+          "id_tree": [
+            1,
+            0
+          ],
+          "event_tree": 3
+        },
+        "right_stamp": {
+          "id_tree": [
+            0,
+            1
+          ],
+          "event_tree": 5
+        }
+      },
+      "expect": {
+        "result_id_tree": [
+          1,
+          1
+        ],
+        "result_event_tree": 5,
+        "reason": "join((i1,e1),(i2,e2)) = (i1+i2, e1 join e2)"
+      }
+    },
+    {
+      "id": "ex-protocol-fork-order",
+      "kind": "example",
+      "operation": "protocol-fork",
+      "source": "interval-tree-clocks",
+      "quote": "Step 2 has to happen in that order to prevent the case where the forking node sends a split id to the remote end, then crash-restarts or loses track of the change. If that happens, causality for the whole cluster is thrown off the mark as ID spaces now overlap; causality is corrupted.",
+      "input": {
+        "action": "fork",
+        "steps": [
+          "read local id from storage",
+          "fork in memory",
+          "overwrite local id in storage",
+          "send forked id to peer"
+        ]
+      },
+      "expect": {
+        "result": "causality preserved",
+        "error_if_wrong_order": "overlapping ID spaces, causality corrupted"
+      }
+    },
+    {
+      "id": "prop-min-event-tree",
+      "kind": "property",
+      "operation": "normalize-event",
+      "source": "itc2008",
+      "quote": "min(n) = n,\n                              min((n, e1 , e2 )) = n + min(min(e1 ), min(e2 )),",
+      "statement": "In a normalized event tree, one of the two subtrees always has minimum value 0. The min function over a tree returns the minimum value of the corresponding function over [0,1).",
+      "input": {
+        "event_tree": [
+          3,
+          [
+            1,
+            2,
+            0
+          ],
+          0
+        ]
+      },
+      "expect": {
+        "min_is_0": true,
+        "one_subtree_has_min_zero": true,
+        "reason": "In normalized event tree, one subtree has minimum equal to 0"
+      }
+    },
+    {
+      "id": "ex-split-id-zero",
+      "kind": "example",
+      "operation": "split",
+      "source": "itc2008",
+      "quote": "split(0) = (0, 0)",
+      "input": {
+        "id_tree": 0
+      },
+      "expect": {
+        "stamps": [
+          {
+            "id_tree": 0
+          },
+          {
+            "id_tree": 0
+          }
+        ]
+      }
+    },
+    {
+      "id": "ex-split-id-one",
+      "kind": "example",
+      "operation": "split",
+      "source": "itc2008",
+      "quote": "split(1) = ((1, 0), (0, 1))",
+      "input": {
+        "id_tree": 1
+      },
+      "expect": {
+        "stamps": [
+          {
+            "id_tree": [
+              1,
+              0
+            ]
+          },
+          {
+            "id_tree": [
+              0,
+              1
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "id": "ex-split-id-left-child",
+      "kind": "example",
+      "operation": "split",
+      "source": "itc2008",
+      "quote": "split((0, i)) = ((0, i1 ), (0, i2 )), where (i1 , i2 ) = split(i)",
+      "input": {
+        "id_tree": [
+          0,
+          [
+            1,
+            0
+          ]
+        ]
+      },
+      "expect": {
+        "stamps": [
+          {
+            "id_tree": [
+              0,
+              [
+                1,
+                0
+              ]
+            ]
+          },
+          {
+            "id_tree": [
+              0,
+              [
+                0,
+                1
+              ]
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "id": "ex-split-id-right-child",
+      "kind": "example",
+      "operation": "split",
+      "source": "itc2008",
+      "quote": "split((i, 0)) = ((i1 , 0), (i2 , 0)), where (i1 , i2 ) = split(i)",
+      "input": {
+        "id_tree": [
+          [
+            1,
+            0
+          ],
+          0
+        ]
+      },
+      "expect": {
+        "stamps": [
+          {
+            "id_tree": [
+              [
+                1,
+                0
+              ],
+              0
+            ]
+          },
+          {
+            "id_tree": [
+              [
+                0,
+                1
+              ],
+              0
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "id": "ex-split-id-both-children",
+      "kind": "example",
+      "operation": "split",
+      "source": "itc2008",
+      "quote": "split((i1 , i2 )) = ((i1 , 0), (0, i2 ))",
+      "input": {
+        "id_tree": [
+          [
+            0,
+            1
+          ],
+          [
+            1,
+            0
+          ]
+        ]
+      },
+      "expect": {
+        "stamps": [
+          {
+            "id_tree": [
+              [
+                0,
+                1
+              ],
+              0
+            ]
+          },
+          {
+            "id_tree": [
+              0,
+              [
+                1,
+                0
+              ]
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "id": "ex-sum-id-zero-left",
+      "kind": "example",
+      "operation": "sum-id",
+      "source": "itc2008",
+      "quote": "sum(0, i) = i",
+      "input": {
+        "id_tree_1": 0,
+        "id_tree_2": [
+          1,
+          0
+        ]
+      },
+      "expect": {
+        "id_tree": [
+          1,
+          0
+        ]
+      }
+    },
+    {
+      "id": "ex-sum-id-zero-right",
+      "kind": "example",
+      "operation": "sum-id",
+      "source": "itc2008",
+      "quote": "sum(i, 0) = i",
+      "input": {
+        "id_tree_1": [
+          1,
+          0
+        ],
+        "id_tree_2": 0
+      },
+      "expect": {
+        "id_tree": [
+          1,
+          0
+        ]
+      }
+    },
+    {
+      "id": "ex-join-event-integers",
+      "kind": "example",
+      "operation": "join-event",
+      "source": "itc2008",
+      "quote": "join(n1 , n2 ) = max(n1 , n2 )",
+      "input": {
+        "event_tree_1": 3,
+        "event_tree_2": 5
+      },
+      "expect": {
+        "event_tree": 5
+      }
+    },
+    {
+      "id": "ex-join-event-mixed",
+      "kind": "example",
+      "operation": "join-event",
+      "source": "itc2008",
+      "quote": "join(n1 , (n2 , l2 , r2 )) = join((n1 , 0, 0), (n2 , l2 , r2 ))",
+      "input": {
+        "event_tree_1": 3,
+        "event_tree_2": [
+          5,
+          2,
+          1
+        ]
+      },
+      "expect": {
+        "event_tree": [
+          5,
+          2,
+          1
+        ]
+      }
+    },
+    {
+      "id": "prop-leave-protocol",
+      "kind": "property",
+      "operation": "leave",
+      "source": "interval-tree-clocks",
+      "quote": "Any node leaving the cluster may, in order to help reduce the ID and event space:",
+      "statement": "A leaving node: (1) stops accepting writes, (2) synchronizes with the cluster, (3) reads its local ID, (4) deletes its ID from storage, (5) picks a random peer and gives it its ID for joining. Steps a-b are optional but good practice. Steps c-d-e must happen in that order to avoid crash-restart scenarios.",
+      "input": {
+        "local_id": [
+          0,
+          1
+        ],
+        "peer_id": [
+          1,
+          0
+        ]
+      },
+      "expect": {
+        "join_result_id": [
+          1,
+          1
+        ],
+        "reason": "leaving node gives ID to peer; join merges them"
+      }
+    },
+    {
+      "id": "prop-backup-caution",
+      "kind": "limit",
+      "operation": "backup-restore",
+      "source": "interval-tree-clocks",
+      "quote": "it is risky for any node to be restored if it had previously removed itself from the cluster since it could start corrupting timelines by using either an id that is either a duplicate or a subset of an existing one.",
+      "input": {
+        "node_state": "removed_from_cluster",
+        "action": "restore_from_backup"
+      },
+      "expect": "warning: ID may be duplicate or subset of existing ID — abandon the ID if reuse status is uncertain",
+      "statement": "Restoring a node that removed itself from the cluster is risky: it may use a duplicate or subset of an existing ID, corrupting timelines. If ID reuse status is uncertain, abandon the ID."
+    },
+    {
+      "id": "prop-event-inflation",
+      "kind": "property",
+      "operation": "event",
+      "source": "itc2008",
+      "quote": "event((i, e)) = (i, e + f · i)              for any f such that f · i A 0.",
+      "statement": "The event operation inflates the event function by adding f · i for some f with non-zero overlap with i. The event tree may be simplified (filled) or grown during this operation.",
+      "input": {
+        "stamp": {
+          "id_tree": [
+            1,
+            0
+          ],
+          "event_tree": 3
+        }
+      },
+      "expect": {
+        "result_event_dominates_input": true,
+        "inflation_formula": "Je0K = JeK + f * JiK for f with f·JiK != 0",
+        "reason": "event inflates by adding f*i where f·i != 0"
+      }
+    },
+    {
+      "id": "prop-fill-simplification",
+      "kind": "property",
+      "operation": "fill",
+      "source": "itc2008",
+      "quote": "Fill either succeeds in doing one or more simplifications, or returns an unmodified tree; it never incre-",
+      "statement": "The fill operation attempts to simplify the event tree by filling gaps using available id parts. If no simplification is possible, it returns the tree unmodified and grow is used instead.",
+      "input": {
+        "event_tree": [
+          2,
+          [
+            2,
+            1,
+            0
+          ],
+          3
+        ]
+      },
+      "expect": {
+        "simplified_or_unmodified": true,
+        "reason": "Fill either simplifies the tree or returns it unmodified, never increments unnecessarily"
+      }
+    },
+    {
+      "id": "prop-grow-optimization",
+      "kind": "property",
+      "operation": "grow",
+      "source": "itc2008",
+      "quote": "Grow performs a dynamic programming based optimization to choose the inflation that can be per-",
+      "statement": "The grow operation uses dynamic programming to minimize event tree growth cost. Preferences: (1) incrementing an existing integer over expanding to a tuple, (2) operations near the root over deeper operations.",
+      "input": {
+        "event_tree": [
+          0,
+          [
+            0,
+            0,
+            0
+          ],
+          0
+        ],
+        "id_tree": [
+          1,
+          0
+        ]
+      },
+      "expect": {
+        "minimal_growth": true,
+        "preference_increment_over_expand": true,
+        "reason": "Grow uses DP to minimize growth cost: prefer incrementing over expanding, prefer operations near root"
+      }
+    },
+    {
+      "id": "prop-normalize-event-rule",
+      "kind": "property",
+      "operation": "normalize-event",
+      "source": "itc2008",
+      "quote": "norm((n, m, m)) = n + m,",
+      "statement": "Event tree normalization: (1) a leaf n normalizes to n, (2) (n, m, m) where both subtrees have the same minimum m normalizes to n + m, (3) otherwise lift the base by the minimum of the subtree minimums and sink both subtrees by that minimum.",
+      "input": {
+        "event_tree": [
+          2,
+          [
+            2,
+            1,
+            0
+          ],
+          3
+        ]
+      },
+      "expect": {
+        "normalized_event_tree": [
+          4,
+          [
+            0,
+            1,
+            0
+          ],
+          1
+        ],
+        "same_function": true,
+        "reason": "norm((2,(2,1,0),3)) = (4,(0,1,0),1) per the normalization rule"
+      }
+    },
+    {
+      "id": "prop-unique-id-space",
+      "kind": "limit",
+      "operation": "id-uniqueness",
+      "source": "interval-tree-clocks",
+      "quote": "one of the explicit requirements of the algorithm is that the ID space does not overlap and we can easily break that requirement!",
+      "input": {
+        "id_tree_1": [
+          1,
+          0
+        ],
+        "id_tree_2": [
+          1,
+          0
+        ]
+      },
+      "expect": "error: ID space overlap — causality invariant violated",
+      "statement": "The ID space must not overlap between cluster members. This is ensured by the fork-join protocol: each new node gets a non-overlapping fraction of an existing node's ID space, and joins merge ID spaces without overlap."
+    },
+    {
+      "id": "ex-stamp-graphical",
+      "kind": "example",
+      "operation": "stamp-graphical",
+      "source": "itc2008",
+      "quote": "A stamp in ITC is a pair (i, e), where i is an id tree and e an event tree; we will also use a graphical notation",
+      "input": {
+        "id_tree": [
+          [
+            0,
+            [
+              1,
+              0
+            ]
+          ],
+          [
+            1,
+            0
+          ]
+        ],
+        "event_tree": [
+          1,
+          2,
+          [
+            0,
+            [
+              1,
+              0,
+              2
+            ],
+            0
+          ]
+        ]
+      },
+      "expect": {
+        "graphical": "id component stacked with event component, showing intervals and counter values"
+      }
+    },
+    {
+      "id": "prop-join-anonymous",
+      "kind": "property",
+      "operation": "join",
+      "source": "itc2008",
+      "quote": "When one stamp is anonymous, join can model message reception, where join((i, e1 ), (0, e2 )) =",
+      "statement": "Joining a non-anonymous stamp with an anonymous stamp (id=0) produces a non-anonymous stamp whose identity is the non-anonymous one, and whose event component is the join of both event components.",
+      "input": {
+        "left_stamp": {
+          "id_tree": [
+            1,
+            0
+          ],
+          "event_tree": 3
+        },
+        "right_stamp": {
+          "id_tree": 0,
+          "event_tree": 5
+        }
+      },
+      "expect": {
+        "result_id_tree": [
+          1,
+          0
+        ],
+        "result_event_tree": 5,
+        "reason": "join((i,e1),(0,e2)) = (i, e1 join e2)"
+      }
+    },
+    {
+      "id": "ex-join-anonymous",
+      "kind": "example",
+      "operation": "join",
+      "source": "itc2008",
+      "quote": "join((i, e1 ), (0, e2 )) =",
+      "input": {
+        "left_id_tree": [
+          1,
+          0
+        ],
+        "left_event_tree": 3,
+        "right_id_tree": 0,
+        "right_event_tree": 5
+      },
+      "expect": {
+        "id_tree": [
+          1,
+          0
+        ],
+        "event_tree": 5
+      }
+    },
+    {
+      "id": "prop-version-vector-equivalence",
+      "kind": "property",
+      "operation": "version-vector-mode",
+      "source": "interval-tree-clocks",
+      "quote": "If you want to track the causal ordering of modifications to a data set (i.e. data in a database), you want version vectors",
+      "statement": "ITC can be used as version vectors: increment the event counter on data modifications. When pushing data for sync, only send the event counter (not the ID). When receiving, if current stamp >= received, do nothing; if current stamp < received, store new one.",
+      "input": {
+        "local_event": 5,
+        "remote_event": 3
+      },
+      "expect": {
+        "local_kept": true,
+        "reason": "Version vector mode: if current >= received, keep current. Event-only tracking without ID."
+      }
+    },
+    {
+      "id": "prop-vector-clock-equivalence",
+      "kind": "property",
+      "operation": "vector-clock-mode",
+      "source": "interval-tree-clocks",
+      "quote": "If you want to track the causal ordering of modifications to a data set (i.e. data in a database), you want version vectors",
+      "statement": "ITC can be used as vector clocks: increment the event counter on every send and receive. The distinction from version vector mode is that communication itself triggers counter increments.",
+      "input": {
+        "send_events": 2,
+        "receive_events": 1
+      },
+      "expect": {
+        "send_increments_counter": true,
+        "receive_increments_counter": true,
+        "reason": "Vector clock mode: increment event counter on every send and receive"
+      }
+    },
+    {
+      "id": "prop-id-propagation-order",
+      "kind": "limit",
+      "operation": "id-propagation",
+      "source": "interval-tree-clocks",
+      "quote": "Step 2 has to happen in that order to prevent the case where the forking node sends a split id to the remote end, then crash-restarts or loses track of the change. If that happens, causality for the whole cluster is thrown off the mark as ID spaces now overlap; causality is corrupted.",
+      "input": {
+        "steps": [
+          "send forked id to peer",
+          "overwrite local id in storage"
+        ]
+      },
+      "expect": "error: ID spaces overlap — causality corrupted",
+      "statement": "ID propagation during fork must happen in strict order: (1) read local ID from storage, (2) fork in memory, (3) overwrite local ID in storage, (4) send forked ID to peer. Deviating causes overlapping ID spaces and causality corruption."
+    },
+    {
+      "id": "prop-leave-order",
+      "kind": "limit",
+      "operation": "leave-protocol",
+      "source": "interval-tree-clocks",
+      "quote": "Step 3 has to see steps c, d, and e happen in that specific order to avoid crash-restart scenarios possibly asking the same ID to be joined on various remote nodes at once. This would create conflicts and corrupt causal relationships to come.",
+      "input": {
+        "steps": [
+          "pick peer and give ID for joining",
+          "read local ID",
+          "delete ID from storage"
+        ]
+      },
+      "expect": "error: wrong leave order — conflicts and corrupted causal relationships",
+      "statement": "When leaving, steps must happen in order: (c) read local ID, (d) delete ID from storage, (e) pick peer and give ID for joining. Steps (a) stop accepting writes and (b) synchronize are optional but recommended."
+    },
+    {
+      "id": "prop-join-id-merge",
+      "kind": "property",
+      "operation": "join-id",
+      "source": "itc2008",
+      "quote": "sum((l1 , r1 ), (l2 , r2 )) = norm((sum(l1 , l2 ), sum(r1 , r2 ))).",
+      "statement": "The sum of two id trees is computed recursively: sum(0, i) = i, sum(i, 0) = i, and sum((l1, r1), (l2, r2)) = norm((sum(l1, l2), sum(r1, r2))). The result is always normalized.",
+      "input": {
+        "id_tree_1": [
+          0,
+          1
+        ],
+        "id_tree_2": [
+          1,
+          0
+        ]
+      },
+      "expect": {
+        "result_id_tree": [
+          1,
+          1
+        ],
+        "reason": "sum((0,1),(1,0)) = norm((0,1)+(1,0)) = (1,1)"
+      }
+    },
+    {
+      "id": "prop-join-event-recursive",
+      "kind": "property",
+      "operation": "join-event",
+      "source": "itc2008",
+      "quote": "join((n1 , l1 , r1 ), (n2 , l2 , r2 )) = norm((n1 , join(l1 , l2 ↑n2 −n1 ), join(r1 , r2 ↑n2 −n1 ))).",
+      "statement": "When both event trees are tuples, join lifts the right subtree of the tree with the smaller root, then recursively joins subtrees, and normalizes the result.",
+      "input": {
+        "event_tree_1": [
+          2,
+          [
+            2,
+            1,
+            0
+          ],
+          3
+        ],
+        "event_tree_2": [
+          4,
+          [
+            0,
+            1,
+            0
+          ],
+          1
+        ]
+      },
+      "expect": {
+        "result_event_tree": [
+          4,
+          [
+            0,
+            1,
+            0
+          ],
+          4
+        ],
+        "reason": "recursive join of two tuples with normalization"
+      }
+    },
+    {
+      "id": "prop-join-event-commutative",
+      "kind": "property",
+      "operation": "join-event",
+      "source": "itc2008",
+      "quote": "join((n1 , l1 , r1 ), (n2 , l2 , r2 )) = join((n2 , l2 , r2 ), (n1 , l1 , r1 )), if n1 > n2 ,",
+      "statement": "When both event trees are tuples and n1 > n2, swap arguments to ensure deterministic recursive processing. The join operation is commutative.",
+      "input": {
+        "event_tree_1": [
+          3,
+          1,
+          2
+        ],
+        "event_tree_2": [
+          5,
+          2,
+          1
+        ]
+      },
+      "expect": {
+        "join_1_2_equals_join_2_1": true,
+        "reason": "join((n1,l1,r1),(n2,l2,r2)) = join((n2,l2,r2),(n1,l1,r1)) when n1 > n2"
+      }
+    },
+    {
+      "id": "ex-protocol-join-departure",
+      "kind": "example",
+      "operation": "protocol-join-departure",
+      "source": "interval-tree-clocks",
+      "quote": "Pick one peer node at random and give its ID back to it for it to be joined into its own. The other node can accept the ID directly. In case of failure or timeout, do not retry to send the ID; it is simply lost.",
+      "input": {
+        "leaving_id": [
+          0,
+          1
+        ],
+        "peer_id": [
+          1,
+          0
+        ]
+      },
+      "expect": {
+        "result": "join((leaving_id, peer_id)) = norm(sum(leaving_id, peer_id))",
+        "failure_handling": "ID is lost, not retried"
+      }
+    },
+    {
+      "id": "prop-peek-send-receive",
+      "kind": "property",
+      "operation": "protocol-send-receive",
+      "source": "interval-tree-clocks",
+      "quote": "send: atomic composition of event+peek. Also not shown\n\nreceive: atomic composition of join+event. Not shown either.",
+      "statement": "send = event ∘ peek (increment then create anonymous copy). receive = event ∘ join (merge then increment). These are the atomic communication primitives built from the core operations.",
+      "input": {
+        "stamp": {
+          "id_tree": [
+            1,
+            0
+          ],
+          "event_tree": 3
+        }
+      },
+      "expect": {
+        "send_local_event": 4,
+        "send_message_event": 4,
+        "message_id_zero": true,
+        "reason": "send = event∘peek: increment then create anonymous copy"
+      }
+    },
+    {
+      "id": "prop-leave-optional-steps",
+      "kind": "property",
+      "operation": "leave-protocol",
+      "source": "interval-tree-clocks",
+      "quote": "Steps a and b are optional (or could be interspersed with the other steps), but nevertheless good ideas to avoid data loss, if any.",
+      "statement": "Steps (a) stop accepting writes and (b) synchronize before leaving are optional but recommended to prevent data loss.",
+      "input": {
+        "local_id": [
+          0,
+          1
+        ],
+        "peer_id": [
+          1,
+          0
+        ]
+      },
+      "expect": {
+        "join_result_id": [
+          1,
+          1
+        ],
+        "reason": "After leave, the leaving node gives its ID to a peer. The peer joins it into its own ID. Steps a-b (stop writes, sync) are optional."
+      }
+    },
+    {
+      "id": "prop-stamp-comparison-leq",
+      "kind": "property",
+      "operation": "compare",
+      "source": "itc2008",
+      "quote": "i.e. (i1 , e1 ) ≤ (i2 , e2 ) ⇐⇒ leq(e1 , e2 ), with leq defined as (where l and r range over the “left” and\n“right” subtrees):\n                              leq(n1 , n2 ) = n1 ≤ n2 ,\n                     leq(n1 , (n2 , l2 , r2 )) = n1 ≤ n2 ,\n                     leq((n1 , l1 , r1 ), n2 ) = n1 ≤ n2 ∧ leq(l1 ↑n1 , n2 ) ∧ leq(r1 ↑n1 , n2 ),\n            leq((n1 , l1 , r1 ), (n2 , l2 , r2 )) = n1 ≤ n2 ∧ leq(l1 ↑n1 , l2 ↑n2 ) ∧ leq(r1 ↑n1 , r2 ↑n2 ).",
+      "statement": "Stamp comparison leq is computed recursively over normalized event trees. For two tuples, it checks the root, then recursively checks lifted subtrees (lifted by the root value).",
+      "input": {
+        "left_stamp": {
+          "id_tree": [
+            1,
+            0
+          ],
+          "event_tree": 3
+        },
+        "right_stamp": {
+          "id_tree": [
+            0,
+            1
+          ],
+          "event_tree": 5
+        }
+      },
+      "expect": {
+        "result": "right_dominates",
+        "reason": "e1=3 < e2=5, so (i1,e1) <= (i2,e2)"
+      }
+    }
+  ],
+  "gaps": [
+    {
+      "id": "gap-encoding",
+      "question": "Should the binary encoding (Appendix A of the paper) be part of the contract? The paper provides enci and ence functions for serializing ITC stamps to bit strings.",
+      "assumption": "Binary encoding is a serialization concern, not part of the core ITC semantics. It is excluded from the contract unless the implementation explicitly includes serialization."
+    },
+    {
+      "id": "gap-max-tree-depth",
+      "question": "The grow operation uses a constant N greater than the maximum tree depth. What should the implementation use for this constant?",
+      "assumption": "The constant N is an implementation detail for cost minimization in grow. The contract does not prescribe a specific value; the implementation should choose a value large enough for practical tree depths."
+    },
+    {
+      "id": "gap-concurrent-fork",
+      "question": "What happens if two nodes simultaneously fork from the same parent, potentially receiving overlapping IDs?",
+      "assumption": "The protocol requires that a node must overwrite its ID in storage before sending the forked ID to the peer. This prevents double-forking from the same parent. If two nodes do concurrently fork from the same parent, the resulting overlap would violate the causality invariant and must be treated as a protocol error."
+    },
+    {
+      "id": "gap-client-writes",
+      "question": "How should external clients with no clock information submit writes? The blog post mentions clients as 'rogue participants'.",
+      "assumption": "External clients must first read data (getting the event counter) before writing. If a client submits a write without an event counter, the system treats it as last-write-wins or declares a conflict. This is a protocol-level concern, not part of the core ITC data structure operations."
+    },
+    {
+      "id": "gap-garbage-collection",
+      "question": "The paper mentions that ITC does not require garbage collection of ids, unlike other approaches. Should GC be part of the contract?",
+      "assumption": "GC of retired IDs is not part of the core ITC operations. The blog post suggests an auditing mechanism to find and fold unused IDs. This is an optional enhancement, not a core operation."
+    }
+  ]
+}

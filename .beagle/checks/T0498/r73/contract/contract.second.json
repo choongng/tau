@@ -1,0 +1,675 @@
+{
+  "sources": {
+    "itc2008": {
+      "path": "references/itc2008.txt"
+    },
+    "itc_blog": {
+      "path": "references/interval-tree-clocks.txt"
+    }
+  },
+  "entries": [
+    {
+      "id": "op-seed-stamp",
+      "kind": "operation",
+      "operation": "seed",
+      "source": "itc2008",
+      "quote": "ITC makes use what we call the seed stamp, (1, 0), from which we can fork as desired to obtain an initial configuration.",
+      "statement": "The seed stamp is (1, 0), providing the initial state from which all forks originate."
+    },
+    {
+      "id": "op-fork",
+      "kind": "operation",
+      "operation": "fork",
+      "source": "itc2008",
+      "quote": "The fork operation allows the cloning of the causal past of a stamp, resulting in a pair of stamps that have identical copies of the event component and distinct ids; fork(i, e) = ((i1, e), (i2, e)) such that i2 ≠ i1.",
+      "statement": "Fork takes a stamp (i, e) and returns two stamps ((i1, e), (i2, e)) where the event component is preserved and the identity is split into two non-overlapping parts."
+    },
+    {
+      "id": "op-peek",
+      "kind": "operation",
+      "operation": "peek",
+      "source": "itc2008",
+      "quote": "A special case of fork when it is enough to obtain an anonymous stamp (0, e), with 'null' identity, that can be used to transmit causal information but cannot register events, peek((i, e)) = ((0, e), (i, e)).",
+      "statement": "Peek produces an anonymous stamp (0, e) and a copy of the original (i, e). The anonymous stamp carries causal info but cannot register events."
+    },
+    {
+      "id": "op-event",
+      "kind": "operation",
+      "operation": "event",
+      "source": "itc2008",
+      "quote": "An event operation adds a new event to the event component, so that if (i, e') results from event((i, e)) the causal ordering is such that e < e'.",
+      "statement": "Event takes a stamp with non-null identity and increments its event component, strictly advancing the causal ordering."
+    },
+    {
+      "id": "op-join",
+      "kind": "operation",
+      "operation": "join",
+      "source": "itc2008",
+      "quote": "This operation merges two stamps, producing a new one. If join((i1, e1), (i2, e2)) = (i3, e3), the resulting event component e3 should be such that e1 ≤ e3 and e2 ≤ e3.",
+      "statement": "Join merges two stamps, producing a stamp whose event component causally dominates both inputs, and whose identity combines both."
+    },
+    {
+      "id": "op-send",
+      "kind": "operation",
+      "operation": "send",
+      "source": "itc2008",
+      "quote": "This operation is the atomic composition of event followed by peek.",
+      "statement": "Send = event then peek. Increments the local counter and creates an anonymous message stamp."
+    },
+    {
+      "id": "op-receive",
+      "kind": "operation",
+      "operation": "receive",
+      "source": "itc2008",
+      "quote": "A receive is the atomic composition of join followed by event.",
+      "statement": "Receive = join then event. Merges with a received stamp and then increments the local counter."
+    },
+    {
+      "id": "op-sync",
+      "kind": "operation",
+      "operation": "sync",
+      "source": "itc2008",
+      "quote": "A sync is the atomic composition of join followed by fork.",
+      "statement": "Sync = join then fork. Merges with a peer and then forks, useful for symmetric synchronization."
+    },
+    {
+      "id": "id-tree-structure",
+      "kind": "operation",
+      "operation": "id-tree",
+      "source": "itc2008",
+      "quote": "The id component is an id tree with the recursive form: i ::= 0 | 1 | (i1, i2).",
+      "statement": "An ID tree is either 0 (empty/anonymous), 1 (full), or a pair of subtrees (i1, i2) representing left and right subintervals."
+    },
+    {
+      "id": "event-tree-structure",
+      "kind": "operation",
+      "operation": "event-tree",
+      "source": "itc2008",
+      "quote": "The event component is a binary event tree with non-negative integers in nodes; using e, e1, e2 to range over event trees and n over non-negative integers: e ::= n | (n, e1, e2).",
+      "statement": "An event tree is either a non-negative integer n, or a tuple (n, e1, e2) where n is the base value and e1, e2 are subtrees."
+    },
+    {
+      "id": "stamp-structure",
+      "kind": "operation",
+      "operation": "stamp",
+      "source": "itc2008",
+      "quote": "A stamp in ITC is a pair (i, e), where i is an id tree and e an event tree.",
+      "statement": "A stamp consists of an identity tree and an event tree."
+    },
+    {
+      "id": "norm-id-zero-zero",
+      "kind": "example",
+      "operation": "norm",
+      "source": "itc2008",
+      "quote": "norm((0, 0)) = 0,",
+      "input": "(0, 0)",
+      "expect": "0"
+    },
+    {
+      "id": "norm-id-one-one",
+      "kind": "example",
+      "operation": "norm",
+      "source": "itc2008",
+      "quote": "norm((1, 1)) = 1,",
+      "input": "(1, 1)",
+      "expect": "1"
+    },
+    {
+      "id": "norm-id-default",
+      "kind": "operation",
+      "operation": "norm",
+      "source": "itc2008",
+      "quote": "norm(i) = i.",
+      "statement": "For any id tree not matching (0,0) or (1,1), normalization returns the tree unchanged."
+    },
+    {
+      "id": "norm-event-integer",
+      "kind": "operation",
+      "operation": "norm-event",
+      "source": "itc2008",
+      "quote": "norm(n) = n,",
+      "statement": "A plain integer event tree normalizes to itself."
+    },
+    {
+      "id": "norm-event-equal-children",
+      "kind": "example",
+      "operation": "norm-event",
+      "source": "itc2008",
+      "quote": "norm((n, m, m)) = n + m,",
+      "input": "(2, 1, 1)",
+      "expect": "3"
+    },
+    {
+      "id": "norm-event-sink",
+      "kind": "operation",
+      "operation": "norm-event",
+      "source": "itc2008",
+      "quote": "norm((n, e1, e2)) = (n + m, e1↓m, e2↓m), where m = min(min(e1), min(e2)),",
+      "statement": "When children differ, sink both subtrees by their minimum and add that minimum to the root."
+    },
+    {
+      "id": "example-normalization-equivalence",
+      "kind": "example",
+      "operation": "normalization",
+      "source": "itc2008",
+      "quote": "1 ∼ 1 ≡ (1, 1) ≡ (1, (1, 1)) ≡ ((1, 1), 1) ≡ . . .",
+      "input": "1, (1, 1), (1, (1, 1)), ((1, 1), 1)",
+      "expect": "All normalize to 1"
+    },
+    {
+      "id": "split-zero",
+      "kind": "example",
+      "operation": "split",
+      "source": "itc2008",
+      "quote": "split(0) = (0, 0),",
+      "input": "0",
+      "expect": "(0, 0)"
+    },
+    {
+      "id": "split-one",
+      "kind": "example",
+      "operation": "split",
+      "source": "itc2008",
+      "quote": "split(1) = ((1, 0), (0, 1)),",
+      "input": "1",
+      "expect": "((1, 0), (0, 1))"
+    },
+    {
+      "id": "split-left-zero",
+      "kind": "example",
+      "operation": "split",
+      "source": "itc2008",
+      "quote": "split((0, i)) = ((0, i1), (0, i2)), where (i1, i2) = split(i),",
+      "input": "(0, 1)",
+      "expect": "((0, (1, 0)), (0, (0, 1)))"
+    },
+    {
+      "id": "split-right-zero",
+      "kind": "example",
+      "operation": "split",
+      "source": "itc2008",
+      "quote": "split((i, 0)) = ((i1, 0), (i2, 0)), where (i1, i2) = split(i),",
+      "input": "(1, 0)",
+      "expect": "(((1, 0), (0, 1)), (0, 0))"
+    },
+    {
+      "id": "split-both-nonzero",
+      "kind": "example",
+      "operation": "split",
+      "source": "itc2008",
+      "quote": "split((i1, i2)) = ((i1, 0), (0, i2))",
+      "input": "(1, 1)",
+      "expect": "((1, 0), (0, 1))"
+    },
+    {
+      "id": "sum-zero-left",
+      "kind": "example",
+      "operation": "sum",
+      "source": "itc2008",
+      "quote": "sum(0, i) = i,",
+      "input": "(0, (1, 0))",
+      "expect": "(1, 0)"
+    },
+    {
+      "id": "sum-zero-right",
+      "kind": "example",
+      "operation": "sum",
+      "source": "itc2008",
+      "quote": "sum(i, 0) = i,",
+      "input": "((1, 0), 0)",
+      "expect": "(1, 0)"
+    },
+    {
+      "id": "sum-recursive",
+      "kind": "operation",
+      "operation": "sum",
+      "source": "itc2008",
+      "quote": "sum((l1, r1), (l2, r2)) = norm((sum(l1, l2), sum(r1, r2))).",
+      "statement": "Sum of two compound id trees recursively sums corresponding subtrees and normalizes the result."
+    },
+    {
+      "id": "join-integers",
+      "kind": "operation",
+      "operation": "join-event",
+      "source": "itc2008",
+      "quote": "join(n1, n2) = max(n1, n2),",
+      "statement": "Join of two integer event trees returns the maximum."
+    },
+    {
+      "id": "join-mixed",
+      "kind": "operation",
+      "operation": "join-event",
+      "source": "itc2008",
+      "quote": "join(n1, (n2, l2, r2)) = join((n1, 0, 0), (n2, l2, r2)),",
+      "statement": "Join of integer with tuple promotes integer to tuple (n1, 0, 0) and recurses. The symmetric case join((n1, l1, r1), n2) is analogous."
+    },
+    {
+      "id": "join-tuple-greater",
+      "kind": "operation",
+      "operation": "join-event",
+      "source": "itc2008",
+      "quote": "join((n1, l1, r1), (n2, l2, r2)) = join((n2, l2, r2), (n1, l1, r1)), if n1 > n2,",
+      "statement": "When joining two tuples and left root is greater, swap arguments so the larger root is processed second."
+    },
+    {
+      "id": "join-tuple-equal-or-less",
+      "kind": "operation",
+      "operation": "join-event",
+      "source": "itc2008",
+      "quote": "join((n1, l1, r1), (n2, l2, r2)) = norm((n1, join(l1, l2↑(n2-n1)), join(r1, r2↑(n2-n1)))),",
+      "statement": "When joining two tuples and n1 ≤ n2, lift right subtrees by (n2-n1), recursively join corresponding subtrees, and normalize."
+    },
+    {
+      "id": "comparison-leq-integer",
+      "kind": "operation",
+      "operation": "comparison",
+      "source": "itc2008",
+      "quote": "leq(n1, n2) = n1 ≤ n2,",
+      "statement": "Comparing two integer event trees uses standard integer ≤."
+    },
+    {
+      "id": "comparison-leq-mixed",
+      "kind": "operation",
+      "operation": "comparison",
+      "source": "itc2008",
+      "quote": "leq((n1, l1, r1), n2) = n1 ≤ n2 ∧ leq(l1↑n1, n2) ∧ leq(r1↑n1, n2),",
+      "statement": "Comparing tuple with integer: root must be ≤, and both lifted subtrees must be ≤ the integer."
+    },
+    {
+      "id": "comparison-leq-tuple-tuple",
+      "kind": "operation",
+      "operation": "comparison",
+      "source": "itc2008",
+      "quote": "leq((n1, l1, r1), (n2, l2, r2)) = n1 ≤ n2 ∧ leq(l1↑n1, l2↑n2) ∧ leq(r1↑n1, r2↑n2).",
+      "statement": "Comparing two tuples: root must be ≤, and both corresponding lifted subtrees must satisfy leq."
+    },
+    {
+      "id": "event-fill-zero-id",
+      "kind": "example",
+      "operation": "fill",
+      "source": "itc2008",
+      "quote": "fill(0, e) = e,",
+      "input": "fill(0, (1, 0, 0))",
+      "expect": "(1, 0, 0)"
+    },
+    {
+      "id": "event-fill-one-id",
+      "kind": "example",
+      "operation": "fill",
+      "source": "itc2008",
+      "quote": "fill(1, e) = max(e),",
+      "input": "fill(1, (2, 0, 0))",
+      "expect": "2"
+    },
+    {
+      "id": "event-fill-integer",
+      "kind": "example",
+      "operation": "fill",
+      "source": "itc2008",
+      "quote": "fill(i, n) = n,",
+      "input": "fill((1, 0), 3)",
+      "expect": "3"
+    },
+    {
+      "id": "event-grow-one",
+      "kind": "example",
+      "operation": "grow",
+      "source": "itc2008",
+      "quote": "grow(1, n) = (n + 1, 0),",
+      "input": "grow(1, 5)",
+      "expect": "(6, 0)"
+    },
+    {
+      "id": "event-grow-integer",
+      "kind": "example",
+      "operation": "grow",
+      "source": "itc2008",
+      "quote": "grow(i, n) = (e', c + N), where (e', c) = grow(i, (n, 0, 0)),",
+      "input": "grow((1, 0), 3)",
+      "expect": "Expands to tuple and grows left subtree"
+    },
+    {
+      "id": "event-grow-left-preferred",
+      "kind": "operation",
+      "operation": "grow",
+      "source": "itc2008",
+      "quote": "grow((il, ir), (n, el, er)) = ((n, e0l, er), cl + 1) if cl < cr, or ((n, el, e0r), cr + 1) if cl ≥ cr,",
+      "statement": "Grow chooses the subtree with smaller cost (prefers left when equal), incrementing cost by 1."
+    },
+    {
+      "id": "event-cannot-anonymous",
+      "kind": "invalid",
+      "operation": "event",
+      "source": "itc2008",
+      "quote": "An event cannot be applied to an anonymous stamp as no element in the domain is available to be inflated.",
+      "statement": "Event requires a non-null identity. Applying event to (0, e) is invalid."
+    },
+    {
+      "id": "id-disjointness-invariant",
+      "kind": "property",
+      "operation": "id-disjointness",
+      "source": "itc2008",
+      "quote": "∀i1 ≠ i2. i1 · i2 = 0.",
+      "statement": "The identity components of all active participants must have non-overlapping graphs (disjoint support)."
+    },
+    {
+      "id": "stamp-ordering",
+      "kind": "property",
+      "operation": "comparison",
+      "source": "itc2008",
+      "quote": "(i1, e1) ≤ (i2, e2) = e1 ≤ e2.",
+      "statement": "Stamp comparison is determined solely by the event component ordering."
+    },
+    {
+      "id": "join-dominates",
+      "kind": "property",
+      "operation": "join",
+      "source": "itc2008",
+      "quote": "the resulting event component e3 should be such that e1 ≤ e3 and e2 ≤ e3.",
+      "statement": "Join result must causally dominate both input event components."
+    },
+    {
+      "id": "join-no-excess",
+      "kind": "property",
+      "operation": "join",
+      "source": "itc2008",
+      "quote": "e3 should not dominate more that either e1 and e2 did. This is obtained by the order theoretical join, e3 = e1 ⊔ e2.",
+      "statement": "Join result must not dominate more than necessary; it is the least upper bound of the two inputs."
+    },
+    {
+      "id": "fork-event-preserved",
+      "kind": "property",
+      "operation": "fork",
+      "source": "itc2008",
+      "quote": "fork((i, e)) = ((i1, e), (i2, e)) subject to i1 + i2 = i and i1 · i2 = 0.",
+      "statement": "Fork preserves the event component exactly and splits the identity into two non-overlapping parts that sum to the original."
+    },
+    {
+      "id": "event-strict-advance",
+      "kind": "property",
+      "operation": "event",
+      "source": "itc2008",
+      "quote": "if (i, e') results from event((i, e)) the causal ordering is such that e < e'.",
+      "statement": "Event strictly advances the causal ordering: the new event component dominates the old one."
+    },
+    {
+      "id": "event-inflation",
+      "kind": "property",
+      "operation": "event",
+      "source": "itc2008",
+      "quote": "event((i, e)) = (i, e'), subject to Je'K = JeK + f · JiK for any f such that f · JiK ≢ 0.",
+      "statement": "Event inflates the event function by adding a non-zero function supported on the identity's available elements."
+    },
+    {
+      "id": "join-event-commutative",
+      "kind": "property",
+      "operation": "join",
+      "source": "itc2008",
+      "quote": "Jjoin(e1, e2)K = Je1K ⊔ Je2K.",
+      "statement": "Join of event components is commutative (join semilattice): join(e1, e2) = join(e2, e1)."
+    },
+    {
+      "id": "join-id-merge",
+      "kind": "property",
+      "operation": "join",
+      "source": "itc2008",
+      "quote": "Jsum(i1, i2)K = Ji1K + Ji2K.",
+      "statement": "Join of identity components sums the corresponding identity functions."
+    },
+    {
+      "id": "initial-id-is-one",
+      "kind": "example",
+      "operation": "initialization",
+      "source": "itc_blog",
+      "quote": "The first initial ID is always 1:",
+      "input": "initial",
+      "expect": "1"
+    },
+    {
+      "id": "fork-divides-halves",
+      "kind": "example",
+      "operation": "fork",
+      "source": "itc_blog",
+      "quote": "When that ID gets forked, it becomes two distinct halves: {1, 0} {0, 1}",
+      "input": "1",
+      "expect": "{(1, 0), (0, 1)}"
+    },
+    {
+      "id": "fork-three-ids",
+      "kind": "example",
+      "operation": "fork",
+      "source": "itc_blog",
+      "quote": "If I fork the one to the left again, I now have 3 IDs: {{1,0},0} {{0,1},0} {0, 1}",
+      "input": "fork((1, 0)) applied to {(1, 0), (0, 1)}",
+      "expect": "{((1, 0), 0), ((0, 1), 0), (0, 1)}"
+    },
+    {
+      "id": "join-absorbs-identity",
+      "kind": "example",
+      "operation": "join",
+      "source": "itc_blog",
+      "quote": "I could, for example, join the first ID with the third one and obtain: {{0,1},0} {{1,0},1}",
+      "input": "join({{1,0},0}, {0, 1})",
+      "expect": "{{0, 1}, 0} and {{1, 0}, 1}"
+    },
+    {
+      "id": "blog-peek-operation",
+      "kind": "operation",
+      "operation": "peek",
+      "source": "itc_blog",
+      "quote": "peek: creates a copy of the timestamp, but with a NULL id, such that the event counter may be read, but not incremented. Not shown on the diagram.",
+      "statement": "Peek creates a copy with NULL id for reading causal info without being able to increment."
+    },
+    {
+      "id": "blog-send-operation",
+      "kind": "operation",
+      "operation": "send",
+      "source": "itc_blog",
+      "quote": "send: atomic composition of event+peek. Also not shown",
+      "statement": "Send is event followed by peek, an atomic operation."
+    },
+    {
+      "id": "blog-receive-operation",
+      "kind": "operation",
+      "operation": "receive",
+      "source": "itc_blog",
+      "quote": "receive: atomic composition of join+event. Not shown either",
+      "statement": "Receive is join followed by event, an atomic operation."
+    },
+    {
+      "id": "blog-sync-operation",
+      "kind": "operation",
+      "operation": "sync",
+      "source": "itc_blog",
+      "quote": "sync: atomic composition of join+fork. This is not shown on the diagram, but can be thought of as leaving the IDs as they are, but merging the event counter.",
+      "statement": "Sync is join followed by fork, merging event counters while keeping IDs separate."
+    },
+    {
+      "id": "blog-cluster-initialization",
+      "kind": "limit",
+      "operation": "initialization",
+      "source": "itc_blog",
+      "quote": "The cluster must be initialised with a single root node given the ID 1.",
+      "statement": "A cluster must be initialized with exactly one root node holding ID 1. Booting multiple nodes simultaneously with the same ID breaks causality."
+    },
+    {
+      "id": "blog-join-protocol",
+      "kind": "operation",
+      "operation": "join-protocol",
+      "source": "itc_blog",
+      "quote": "Any node joining the cluster after the fact must contact at least one other peer and ask for a fork of its ID.",
+      "statement": "A joining node must contact an existing peer and request a fork of that peer's ID."
+    },
+    {
+      "id": "blog-leave-protocol",
+      "kind": "operation",
+      "operation": "leave-protocol",
+      "source": "itc_blog",
+      "quote": "Any node leaving the cluster may, in order to help reduce the ID and event space: stop accepting writes, synchronize its data set with the rest (or part) of the cluster, Read the local id from persistent storage, Delete the id from persistent storage, Pick one peer node at random and give its ID back to it for it to be joined into its own.",
+      "statement": "A leaving node stops writes, syncs, reads and deletes its local ID, then gives the ID back to a random peer for joining."
+    },
+    {
+      "id": "blog-leave-failure",
+      "kind": "limit",
+      "operation": "leave-protocol",
+      "source": "itc_blog",
+      "quote": "In case of failure or timeout, do not retry to send the ID; it is simply lost.",
+      "statement": "If a leaving node fails to deliver its ID to a peer, do not retry. The ID is lost and must be reconciled manually."
+    },
+    {
+      "id": "blog-overlapping-id-corruption",
+      "kind": "limit",
+      "operation": "fork-protocol",
+      "source": "itc_blog",
+      "quote": "Step 2 has to happen in that order to prevent the case where the forking node sends a split id to the remote end, then crash-restarts or loses track of the change. If that happens, causality for the whole cluster is thrown off the mark as ID spaces now overlap; causality is corrupted.",
+      "statement": "The forking node must overwrite its own ID in storage before sending the split to the peer. Reversing this order causes overlapping ID spaces and corrupted causality."
+    },
+    {
+      "id": "blog-version-vector-equivalence",
+      "kind": "property",
+      "operation": "version-vector-equivalence",
+      "source": "itc_blog",
+      "quote": "for equivalence with a version vector, you increment the event-counter when data is modified.",
+      "statement": "ITC can emulate version vectors: increment event counter on data writes, send only event counters during sync (not IDs), and apply merge rules for version vector semantics."
+    },
+    {
+      "id": "blog-vector-clock-equivalence",
+      "kind": "property",
+      "operation": "vector-clock-equivalence",
+      "source": "itc_blog",
+      "quote": "for vector clock equivalence you must increment the event-counter whenever a message is sent or received.",
+      "statement": "ITC can emulate vector clocks: increment event counter on every send and receive, and apply merge rules for vector clock semantics."
+    },
+    {
+      "id": "blog-remote-event-pattern",
+      "kind": "example",
+      "operation": "receive",
+      "source": "itc_blog",
+      "quote": "{_, EventCounter} = explode( % only grab the event, we know the ID already; event( % increment the event counter; join( % merge the event stamps; peek(rebuild(LocalId, RemoteEvent)), % complete the remote stamp as read-only; rebuild(LocalId, LocalEvent) % make a complete local stamp))",
+      "input": "receive with local_id, local_event, remote_event",
+      "expect": "Full local clock updated with merged remote events, incremented locally"
+    },
+    {
+      "id": "blog-backup-abandon-if-uncertain",
+      "kind": "limit",
+      "operation": "backup",
+      "source": "itc_blog",
+      "quote": "If it is not possible to say with full certainty whether the ID was still active and not retired, abandon the ID. The id space will grow fairly indefinitely.",
+      "statement": "When restoring from backup and ID liveness is uncertain, abandon the ID rather than risk reusing it. The ID space grows but causality is preserved."
+    },
+    {
+      "id": "itc-spaces-stabilizes",
+      "kind": "limit",
+      "operation": "space-consumption",
+      "source": "itc2008",
+      "quote": "It shows that space consumption basically stabilizes (with a minor logarithmic component) after a number of iterations.",
+      "statement": "ITC space consumption stabilizes with only a minor logarithmic growth over time, making it practical for dynamic systems."
+    },
+    {
+      "id": "itc-space-128-replicas",
+      "kind": "example",
+      "operation": "space-consumption",
+      "source": "itc2008",
+      "quote": "The mean size of an ITC for this scenario (at the end of the iterations) would be less than 2900 bytes for dynamic scenarios and slightly above 170 bytes for static ones.",
+      "input": "128 replicas, end of iterations",
+      "expect": "Dynamic: <2900 bytes, Static: ~170 bytes"
+    },
+    {
+      "id": "itc-min-event-tree",
+      "kind": "operation",
+      "operation": "min-event-tree",
+      "source": "itc2008",
+      "quote": "min(n) = n, min((n, e1, e2)) = n + min(min(e1), min(e2)),",
+      "statement": "Computes the minimum value of an event tree's function over [0, 1)."
+    },
+    {
+      "id": "itc-max-event-tree",
+      "kind": "operation",
+      "operation": "max-event-tree",
+      "source": "itc2008",
+      "quote": "max(n) = n, max((n, e1, e2)) = n + max(max(e1), max(e2)).",
+      "statement": "Computes the maximum value of an event tree's function over [0, 1)."
+    },
+    {
+      "id": "join-anonymous-id",
+      "kind": "operation",
+      "operation": "join",
+      "source": "itc2008",
+      "quote": "When one stamp is anonymous, join can model message reception, where join((i, e1), (0, e2)) = (i, e1 ⊔ e2).",
+      "statement": "Joining with an anonymous stamp (0, e) preserves the non-anonymous identity and joins the event components."
+    },
+    {
+      "id": "join-both-anonymous",
+      "kind": "operation",
+      "operation": "join",
+      "source": "itc2008",
+      "quote": "joins can be applied when both stamps are anonymous, modeling in-transit aggregation of messages.",
+      "statement": "Join of two anonymous stamps (0, e1) and (0, e2) produces (0, e1 ⊔ e2), aggregating causal information."
+    },
+    {
+      "id": "peek-send-receive",
+      "kind": "property",
+      "operation": "send-receive",
+      "source": "itc2008",
+      "quote": "send = event followed by peek; receive = join followed by event.",
+      "statement": "Send and receive are atomic compositions of core operations, modeling message send and receive in the fork-event-join model."
+    },
+    {
+      "id": "sync-merge-event-counter",
+      "kind": "property",
+      "operation": "sync",
+      "source": "itc_blog",
+      "quote": "sync: atomic composition of join+fork. This is not shown on the diagram, but can be thought of as leaving the IDs as they are, but merging the event counter.",
+      "statement": "Sync merges event counters while keeping IDs separate via join+fork composition."
+    },
+    {
+      "id": "event-fill-simplification",
+      "kind": "property",
+      "operation": "fill",
+      "source": "itc2008",
+      "quote": "Fill either succeeds in doing one or more simplifications, or returns an unmodified tree; it never increments an integer that would not lead to simplifying the tree.",
+      "statement": "Fill only increments when it leads to a tree simplification. It never increments unnecessarily."
+    },
+    {
+      "id": "grow-optimization",
+      "kind": "property",
+      "operation": "grow",
+      "source": "itc2008",
+      "quote": "incrementing an integer is preferable over expanding an integer to a tuple; to disambiguate, an operation near the root is preferable to one farther away.",
+      "statement": "Grow uses dynamic programming to minimize event tree growth cost, preferring integer increments and root-level operations."
+    },
+    {
+      "id": "leave-optional-steps",
+      "kind": "limit",
+      "operation": "leave-protocol",
+      "source": "itc_blog",
+      "quote": "Steps a and b are optional (or could be interspersed with the other steps), but nevertheless good ideas to avoid data loss, if any.",
+      "statement": "Stopping writes and syncing before leaving are optional but recommended to avoid data loss."
+    },
+    {
+      "id": "itc-normalization-comparison",
+      "kind": "property",
+      "operation": "normalization",
+      "source": "itc2008",
+      "quote": "ITC is conceived so as to keep stamps in a normal form, for the representations of both id and event functions.",
+      "statement": "All stamps should be kept in normal form for compact representation and simple operation definitions."
+    }
+  ],
+  "gaps": [
+    {
+      "id": "gap-event-implementation",
+      "question": "The fill and grow functions for the event operation are complex and involve dynamic programming. What is the exact algorithm for grow that chooses the optimal inflation?",
+      "answer": "The grow function uses dynamic programming to find the inflation path with minimum cost, preferring integer increments over tree expansions, and root-level operations over deeper ones. See itc2008.txt section 5.3.4 for the recursive definition."
+    },
+    {
+      "id": "gap-join-anonymous-both",
+      "question": "What is the exact result of joining two anonymous stamps (0, e1) and (0, e2)?",
+      "answer": "The result is (0, e1 ⊔ e2) where ⊔ is the join semilattice operation on event trees. The identity remains 0 (anonymous) and the event component is the join of both event components."
+    },
+    {
+      "id": "gap-node-join-sequence",
+      "question": "What is the exact step-by-step sequence for a node joining a cluster?",
+      "answer": "1) Existing node reads its ID from storage and forks it in memory. 2) Forking node picks either side and overwrites its existing ID in permanent storage. 3) Forking node sends the forked ID to the joining node. 4) Joining node stores the ID to disk."
+    }
+  ]
+}

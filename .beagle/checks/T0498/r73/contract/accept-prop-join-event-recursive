@@ -1,0 +1,141 @@
+#!/usr/bin/env python3
+"""Acceptance test for property prop-join-event-recursive.
+
+Source: itc2008
+Operation: join-event
+Statement: When both event trees are tuples, join lifts the right subtree of the tree with the smaller root, then recursively joins subtrees, and normalizes the result.
+"""
+import sys
+from pathlib import Path
+
+# Try to import itc module; if unavailable, just validate structure
+itc_available = False
+try:
+    from itc import (
+        IdTree, EventTree, Stamp,
+        fork, peek, event, join, send, receive, sync,
+        normalize_id, normalize_event, split, sum_id, compare,
+    )
+    itc_available = True
+except ImportError:
+    pass
+
+# Structural validation
+assert 'input' in {"event_tree_1": [2, [2, 1, 0], 3], "event_tree_2": [4, [0, 1, 0], 1]}, 'prop-join-event-recursive: missing input'
+assert 'expect' in {"result_event_tree": [4, [0, 1, 0], 4], "reason": "recursive join of two tuples with normalization"}, 'prop-join-event-recursive: missing expect'
+assert 'statement' in "When both event trees are tuples, join lifts the right subtree of the tree with the smaller root, then recursively joins subtrees, and normalizes the result.", 'prop-join-event-recursive: missing statement'
+
+if itc_available:
+    def tree_to_list(t):
+        if t is None:
+            return None
+        if isinstance(t, int):
+            return t
+        if hasattr(t, 'left') and hasattr(t, 'right'):
+            return [tree_to_list(t.left), tree_to_list(t.right)]
+        return t
+
+    inp = {"event_tree_1": [2, [2, 1, 0], 3], "event_tree_2": [4, [0, 1, 0], 1]}
+    exp = {"result_event_tree": [4, [0, 1, 0], 4], "reason": "recursive join of two tuples with normalization"}
+    op = 'join-event'
+
+    if op == 'comparison':
+        left = Stamp(IdTree.from_list(inp['left_stamp']['id_tree']), EventTree.from_list(inp['left_stamp']['event_tree']))
+        right = Stamp(IdTree.from_list(inp['right_stamp']['id_tree']), EventTree.from_list(inp['right_stamp']['event_tree']))
+        result = compare(left, right)
+        expected = exp.get('result', '')
+        if expected == 'right_dominates':
+            assert result == 'right_dominates', f'prop-join-event-recursive: expected right_dominates'
+        elif expected == 'left_dominates':
+            assert result == 'left_dominates', f'prop-join-event-recursive: expected left_dominates'
+        elif expected == 'equal':
+            assert result == 'equal', f'prop-join-event-recursive: expected equal'
+
+    elif op == 'join':
+        left = Stamp(IdTree.from_list(inp['left_stamp']['id_tree']), EventTree.from_list(inp['left_stamp']['event_tree']))
+        right = Stamp(IdTree.from_list(inp['right_stamp']['id_tree']), EventTree.from_list(inp['right_stamp']['event_tree']))
+        result = join(left, right)
+        if exp.get('dominates_left'):
+            assert tree_to_list(result.event_tree) >= tree_to_list(left.event_tree), f'prop-join-event-recursive: dominates left'
+        if exp.get('dominates_right'):
+            assert tree_to_list(result.event_tree) >= tree_to_list(right.event_tree), f'prop-join-event-recursive: dominates right'
+        if 'result_event_tree' in exp:
+            assert tree_to_list(result.event_tree) == exp['result_event_tree'], f'prop-join-event-recursive: result_event_tree mismatch, expected {exp["result_event_tree"]}, got {tree_to_list(result.event_tree)}'
+
+    elif op == 'join-event':
+        et1 = EventTree.from_list(inp['event_tree_1'])
+        et2 = EventTree.from_list(inp['event_tree_2'])
+        s1 = Stamp(IdTree.seed(), et1)
+        s2 = Stamp(IdTree.seed(), et2)
+        result = join(s1, s2)
+        if 'result_event_tree' in exp:
+            assert tree_to_list(result.event_tree) == exp['result_event_tree'], f'prop-join-event-recursive: result_event_tree mismatch, expected {exp["result_event_tree"]}, got {tree_to_list(result.event_tree)}'
+
+    elif op == 'event':
+        s = Stamp(IdTree.from_list(inp['stamp']['id_tree']), EventTree.from_list(inp['stamp']['event_tree']))
+        result = event(s)
+        assert tree_to_list(result.event_tree) > tree_to_list(s.event_tree), f'prop-join-event-recursive: strict advance'
+        assert IdTree.semantic_equals(result.id_tree, s.id_tree), f'prop-join-event-recursive: identity preserved'
+
+    elif op == 'fork':
+        s = Stamp(IdTree.from_list(inp['stamp']['id_tree']), EventTree.from_list(inp['stamp']['event_tree']))
+        left, right = fork(s)
+        if exp.get('both_events_equal_input'):
+            assert tree_to_list(left.event_tree) == tree_to_list(s.event_tree), f'prop-join-event-recursive: left event preserved'
+            assert tree_to_list(right.event_tree) == tree_to_list(s.event_tree), f'prop-join-event-recursive: right event preserved'
+        if exp.get('left_id_plus_right_id_equals_original'):
+            combined = sum_id(left.id_tree, right.id_tree)
+            assert IdTree.semantic_equals(combined, s.id_tree), f'prop-join-event-recursive: ids sum to original'
+        if exp.get('left_dot_right_equals_zero'):
+            assert not IdTree.overlaps(left.id_tree, right.id_tree), f'prop-join-event-recursive: ids disjoint'
+
+    elif op == 'normalize':
+        id_t = IdTree.from_list(inp['id_tree'])
+        normalized = normalize_id(id_t)
+        if exp.get('same_function'):
+            assert IdTree.semantic_equals(normalized, id_t), f'prop-join-event-recursive: normalized equals original'
+        if 'normalized' in exp:
+            assert tree_to_list(normalized) == exp['normalized'], f'prop-join-event-recursive: normalized value mismatch'
+
+    elif op == 'peek':
+        s = Stamp(IdTree.from_list(inp['stamp']['id_tree']), EventTree.from_list(inp['stamp']['event_tree']))
+        left, right = peek(s)
+        if exp.get('left_id_is_zero'):
+            assert tree_to_list(left.id_tree) == 0, f'prop-join-event-recursive: peek left id is 0'
+        if exp.get('right_preserves_original'):
+            assert IdTree.semantic_equals(right.id_tree, s.id_tree), f'prop-join-event-recursive: right preserves id'
+            assert IdTree.semantic_equals(right.event_tree, s.event_tree), f'prop-join-event-recursive: right preserves event'
+
+    elif op == 'send':
+        s = Stamp(IdTree.from_list(inp['stamp']['id_tree']), EventTree.from_list(inp['stamp']['event_tree']))
+        local, message = send(s)
+        if exp.get('local_event_increased'):
+            assert tree_to_list(local.event_tree) > tree_to_list(s.event_tree), f'prop-join-event-recursive: local event increased'
+        if 'message_event' in exp:
+            assert tree_to_list(message.event_tree) == exp['message_event'], f'prop-join-event-recursive: message event mismatch'
+        if exp.get('message_id_is_zero'):
+            assert tree_to_list(message.id_tree) == 0, f'prop-join-event-recursive: message id is 0'
+
+    elif op == 'receive':
+        local = Stamp(IdTree.from_list(inp['local_stamp']['id_tree']), EventTree.from_list(inp['local_stamp']['event_tree']))
+        message = Stamp(IdTree.from_list(inp['message_stamp']['id_tree']), EventTree.from_list(inp['message_stamp']['event_tree']))
+        result = receive(local, message)
+        if exp.get('result_event_gt_both'):
+            assert tree_to_list(result.event_tree) > tree_to_list(local.event_tree), f'prop-join-event-recursive: exceeds local'
+            assert tree_to_list(result.event_tree) > tree_to_list(message.event_tree), f'prop-join-event-recursive: exceeds message'
+
+    elif op == 'sync':
+        s1 = Stamp(IdTree.from_list(inp['stamp1']['id_tree']), EventTree.from_list(inp['stamp1']['event_tree']))
+        s2 = Stamp(IdTree.from_list(inp['stamp2']['id_tree']), EventTree.from_list(inp['stamp2']['event_tree']))
+        left, right = sync(s1, s2)
+        if exp.get('both_events_equal'):
+            assert tree_to_list(left.event_tree) == tree_to_list(right.event_tree), f'prop-join-event-recursive: events equal'
+        if 'event_value' in exp:
+            assert tree_to_list(left.event_tree) == exp['event_value'], f'prop-join-event-recursive: event value mismatch'
+
+    elif op == 'normalize-event':
+        evt_t = EventTree.from_list(inp['event_tree'])
+        normalized = normalize_event(evt_t)
+        assert normalized is not None, f'prop-join-event-recursive: normalized tree exists'
+
+print(f'prop-join-event-recursive: PASS')

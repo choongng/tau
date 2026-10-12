@@ -337,8 +337,8 @@ CONTRACT_CRITERION = (
 #: gives each its inventory; the second does not read the first.
 CONTRACT_MILESTONES = (
     "Contract::read the sources and list in "
-    f"{CONTRACT_PATH} what they pin down, each entry quoted from its source, with "
-    f"{CONTRACT_DIR}/accept.sh running every entry against the code",
+    f"{CONTRACT_PATH} what they pin down, each entry citing its source by line "
+    f"anchor, with {CONTRACT_DIR}/accept.sh running every entry against the code",
     "Second extraction::list it again in "
     f"{CONTRACT_SECOND} without reading the first, then reconcile the two",
 )

@@ -1,0 +1,5 @@
+[contract]
+path = "contract/contract.json"
+second = "contract/contract.second.json"
+acceptance = "sh contract/accept.sh"
+files = ["contract/"]

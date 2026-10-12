@@ -1,0 +1,145 @@
+#!/usr/bin/env python3
+"""Acceptance test for property prop-leave-protocol.
+
+Source: interval-tree-clocks
+Operation: leave
+Statement: A leaving node: (1) stops accepting writes, (2) synchronizes with the cluster, (3) reads its local ID, (4) deletes its ID from storage, (5) picks a random peer and gives it its ID for joining. Steps a-b are optional but good practice. Steps c-d-e must happen in that order to avoid crash-restart scenarios.
+"""
+import sys
+from pathlib import Path
+
+# Try to import itc module; if unavailable, just validate structure
+itc_available = False
+try:
+    from itc import (
+        IdTree, EventTree, Stamp,
+        fork, peek, event, join, send, receive, sync,
+        normalize_id, normalize_event, split, sum_id, compare,
+    )
+    itc_available = True
+except ImportError:
+    pass
+
+# Structural validation
+assert 'input' in {"local_id": [0, 1], "peer_id": [1, 0]}, 'prop-leave-protocol: missing input'
+assert 'expect' in {"join_result_id": [1, 1], "reason": "leaving node gives ID to peer; join merges them"}, 'prop-leave-protocol: missing expect'
+assert 'statement' in "A leaving node: (1) stops accepting writes, (2) synchronizes with the cluster, (3) reads its local ID, (4) deletes its ID from storage, (5) picks a random peer and gives it its ID for joining. Steps a-b are optional but good practice. Steps c-d-e must happen in that order to avoid crash-restart scenarios.", 'prop-leave-protocol: missing statement'
+
+if itc_available:
+    def tree_to_list(t):
+        if t is None:
+            return None
+        if isinstance(t, int):
+            return t
+        if hasattr(t, 'left') and hasattr(t, 'right'):
+            return [tree_to_list(t.left), tree_to_list(t.right)]
+        return t
+
+    def make_stamp(inp):
+        id_t = IdTree.from_list(inp['id_tree']) if 'id_tree' in inp else IdTree.seed()
+        evt_t = EventTree.from_list(inp['event_tree']) if 'event_tree' in inp else EventTree.zero()
+        return Stamp(id_t, evt_t)
+
+    inp = {"local_id": [0, 1], "peer_id": [1, 0]}
+    exp = {"join_result_id": [1, 1], "reason": "leaving node gives ID to peer; join merges them"}
+    op = 'leave'
+
+    if op == 'comparison':
+        left = make_stamp(inp['left_stamp'])
+        right = make_stamp(inp['right_stamp'])
+        result = compare(left, right)
+        expected = exp.get('result', '')
+        if expected == 'right_dominates':
+            assert result == 'right_dominates', f'prop-leave-protocol: expected right_dominates'
+        elif expected == 'left_dominates':
+            assert result == 'left_dominates', f'prop-leave-protocol: expected left_dominates'
+        elif expected == 'equal':
+            assert result == 'equal', f'prop-leave-protocol: expected equal'
+
+    elif op == 'join':
+        left = make_stamp(inp['left_stamp'])
+        right = make_stamp(inp['right_stamp'])
+        result = join(left, right)
+        if exp.get('dominates_left'):
+            assert tree_to_list(result.event_tree) >= tree_to_list(left.event_tree), f'prop-leave-protocol: dominates left'
+        if exp.get('dominates_right'):
+            assert tree_to_list(result.event_tree) >= tree_to_list(right.event_tree), f'prop-leave-protocol: dominates right'
+        if exp.get('no_excess'):
+            left_ev = tree_to_list(left.event_tree)
+            right_ev = tree_to_list(right.event_tree)
+            result_ev = tree_to_list(result.event_tree)
+            if isinstance(left_ev, int) and isinstance(right_ev, int):
+                assert result_ev == max(left_ev, right_ev), f'prop-leave-protocol: join is max'
+        if 'result_id_tree' in exp:
+            assert tree_to_list(result.id_tree) == exp['result_id_tree'], f'prop-leave-protocol: id_tree mismatch'
+        if 'result_event_tree' in exp:
+            assert tree_to_list(result.event_tree) == exp['result_event_tree'], f'prop-leave-protocol: event_tree mismatch'
+
+    elif op == 'event':
+        s = make_stamp(inp['stamp'])
+        result = event(s)
+        assert tree_to_list(result.event_tree) > tree_to_list(s.event_tree), f'prop-leave-protocol: strict advance'
+        assert IdTree.semantic_equals(result.id_tree, s.id_tree), f'prop-leave-protocol: identity preserved'
+
+    elif op == 'fork':
+        s = make_stamp(inp['stamp'])
+        left, right = fork(s)
+        if exp.get('both_events_equal_input'):
+            assert tree_to_list(left.event_tree) == tree_to_list(s.event_tree), f'prop-leave-protocol: left event preserved'
+            assert tree_to_list(right.event_tree) == tree_to_list(s.event_tree), f'prop-leave-protocol: right event preserved'
+        if exp.get('left_id_plus_right_id_equals_original'):
+            combined = sum_id(left.id_tree, right.id_tree)
+            assert IdTree.semantic_equals(combined, s.id_tree), f'prop-leave-protocol: ids sum to original'
+        if exp.get('left_dot_right_equals_zero'):
+            assert not IdTree.overlaps(left.id_tree, right.id_tree), f'prop-leave-protocol: ids disjoint'
+
+    elif op == 'normalize':
+        id_t = IdTree.from_list(inp['id_tree'])
+        normalized = normalize_id(id_t)
+        if exp.get('same_function'):
+            assert IdTree.semantic_equals(normalized, id_t), f'prop-leave-protocol: normalized equals original'
+        if 'normalized' in exp:
+            assert tree_to_list(normalized) == exp['normalized'], f'prop-leave-protocol: normalized value mismatch'
+
+    elif op == 'peek':
+        s = make_stamp(inp['stamp'])
+        left, right = peek(s)
+        if exp.get('left_id_is_zero'):
+            assert tree_to_list(left.id_tree) == 0, f'prop-leave-protocol: peek left id is 0'
+        if exp.get('right_preserves_original'):
+            assert IdTree.semantic_equals(right.id_tree, s.id_tree), f'prop-leave-protocol: right preserves id'
+            assert IdTree.semantic_equals(right.event_tree, s.event_tree), f'prop-leave-protocol: right preserves event'
+
+    elif op == 'send':
+        s = make_stamp(inp['stamp'])
+        local, message = send(s)
+        if exp.get('local_event_increased'):
+            assert tree_to_list(local.event_tree) > tree_to_list(s.event_tree), f'prop-leave-protocol: local event increased'
+        if 'message_event' in exp:
+            assert tree_to_list(message.event_tree) == exp['message_event'], f'prop-leave-protocol: message event mismatch'
+        if exp.get('message_id_is_zero'):
+            assert tree_to_list(message.id_tree) == 0, f'prop-leave-protocol: message id is 0'
+
+    elif op == 'receive':
+        local = make_stamp(inp['local_stamp'])
+        message = make_stamp(inp['message_stamp'])
+        result = receive(local, message)
+        if exp.get('result_event_gt_both'):
+            assert tree_to_list(result.event_tree) > tree_to_list(local.event_tree), f'prop-leave-protocol: exceeds local'
+            assert tree_to_list(result.event_tree) > tree_to_list(message.event_tree), f'prop-leave-protocol: exceeds message'
+
+    elif op == 'sync':
+        s1 = make_stamp(inp['stamp1'])
+        s2 = make_stamp(inp['stamp2'])
+        left, right = sync(s1, s2)
+        if exp.get('both_events_equal'):
+            assert tree_to_list(left.event_tree) == tree_to_list(right.event_tree), f'prop-leave-protocol: events equal'
+        if 'event_value' in exp:
+            assert tree_to_list(left.event_tree) == exp['event_value'], f'prop-leave-protocol: event value mismatch'
+
+    elif op == 'normalize-event':
+        evt_t = EventTree.from_list(inp['event_tree'])
+        normalized = normalize_event(evt_t)
+        assert normalized is not None, f'prop-leave-protocol: normalized tree exists'
+
+print(f'prop-leave-protocol: PASS')

@@ -1,0 +1,13 @@
+[goal]
+statement = "Implement a modern Python library for the Wrenfold sequence encoding, revision 3 \u2014 encoding and decoding a list of unsigned integers (0 to 2^38\u22121) as variable-length bytes with four forms and an end marker byte (0x3F), as specified at http://127.0.0.1:8737/wrenfold-r3.html"
+criteria = ["Encoding a list of integers produces bytes that match the Wrenfold R3 spec: four variable-length forms with end marker 0x3F, encoder always chooses the shortest form", "Decoding those bytes back yields the original integer list", "Negative integers, integers above 2^38\u22121 (274877906943), and non-integer inputs cause the encoder to raise an error without writing anything", "The byte 0x3F inside multi-byte forms is treated as an ordinary data byte, not as an end marker", "The project builds with `uv run pytest` and all tests pass", "Every entry of the contract (contract/contract.json), sealed before the code was planned, passes: `beagle pursuit contract run` exits 0."]
+default_budget_tokens = 100000
+
+[close]
+require = "witness"
+
+[contract]
+path = "contract/contract.json"
+second = "contract/contract.second.json"
+acceptance = "sh contract/accept.sh"
+files = ["contract/"]
