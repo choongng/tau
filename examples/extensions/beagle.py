@@ -15310,9 +15310,11 @@ def make_step_tool() -> Any:
             _note_check_run(unproven_key, check, verdict)
             if verdict[0] == 0:
                 proof = await _prove(task, "", scope, root, check_timeout, locks)
-        elif passed_on_disk is not None and check == done_when:
+        elif passed_on_disk is not None and check == done_when and not _judge_kept_open(task, root):
             # Run R20: T0007's check passed at open on T0003's leftovers, and W11
             # passed at turn 2 and spent 29 more: the work was done; prove and close.
+            # q35 R57: not a new route the close judge held: it proved, was held
+            # again with no worker, and its notes reached no one.
             verdict = passed_on_disk
             _note_check_run(unproven_key, check, verdict)
             proof = await _prove(task, "", scope, root, check_timeout, locks)

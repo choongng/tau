@@ -17750,6 +17750,42 @@ async def test_open_closes_without_a_worker_when_uncommitted_work_already_passes
 
 
 @pytest.mark.anyio
+async def test_new_route_held_at_close_sends_its_notes_to_a_worker(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # q35 R57 L45-L48: the source judge held T0003, and two new routes with notes
+    # kept its check, which passed on disk: each proved, was held again, and ran
+    # no worker, so the notes reached no one.
+    project = _git_project(tmp_path, monkeypatch)
+    monkeypatch.chdir(project)
+    (project / "done.txt").write_text("done")
+    opened = {**R06_PREDECESSOR, "status": "open"}
+    (fake_beagle / "next.out").write_text(json.dumps({"open": [{"id": "T0002"}], "ready": []}))
+    (fake_beagle / "show-T0002.out").write_text(json.dumps(opened))
+    (fake_beagle / "show-T0008.out").write_text(json.dumps(R06_SUCCESSOR))
+    (fake_beagle / "spawn.out").write_text("T0002 superseded by T0008\n")
+    (fake_beagle / "prove.out").write_text("T0008: PROVEN — refuses with done.txt gone\n")
+    runtime, _ = _bound(tmp_path)
+    module = _loaded_module()
+    demand = "case fire_event's source quotes its input or prose, not its expected result"
+    module._NOT_DONE_DEMAND[(str(Path.cwd()), "T0002")] = demand
+    notes = "quote the line that gives each case's result"
+
+    await _tool(runtime, "pursuit_step").execute(
+        "c1", {"task": "T0002", "new_route": True, "notes": notes, "attempts": 1}
+    )
+
+    assert len(_pursuit_calls(fake_beagle, "spawn")) == 1
+    [run] = _runs(fake_tau)
+    assert notes in run["stdin"]
+    assert demand in run["stdin"]
+
+
+@pytest.mark.anyio
 async def test_misplaced_on_disk_close_does_not_count_a_step(
     tmp_path: Path,
     beagle: Path,
