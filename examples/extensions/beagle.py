@@ -12865,7 +12865,9 @@ async def _done_by(
     # six workers then ran on its empty scope. A witness here takes away a file
     # `done` committed in this task's paths; with none, the close cannot be met.
     named = f"{title}\n{record.get('criteria') or ''}\n{arguments.get('criteria') or ''}"
-    witness, unwitnessed = _done_by_witness(task, done, check, paths, root, named)
+    witness, unwitnessed = _done_by_witness(
+        task, done, check, paths, root, named, targets=not scope
+    )
     if unwitnessed:
         return unwitnessed
     criteria = (
@@ -12969,6 +12971,8 @@ def _done_by_witness(
     root: Path,
     named: str = "",
     lead: str = "",
+    *,
+    targets: bool = False,
 ) -> tuple[list[str], str]:
     """The files `done` committed in `paths` that can witness a done-by close of `task`,
     and, when the pursuit requires a witness and none can, `_done_by_unwitnessed`'s
@@ -12989,7 +12993,9 @@ def _done_by_witness(
     ]
     if witness:
         return witness, ""
-    return [], _done_by_unwitnessed(task, done, check, paths, committed, root, named, lead)
+    return [], _done_by_unwitnessed(
+        task, done, check, paths, committed, root, named, lead, targets=targets
+    )
 
 
 def _done_by_unwitnessed(
@@ -13001,21 +13007,31 @@ def _done_by_unwitnessed(
     root: Path,
     named: str = "",
     lead: str = "",
+    *,
+    targets: bool = False,
 ) -> str:
     """The up-front refusal of a done-by close the witness rule would refuse; `lead`,
     when given, stands for its opening "pursuit_step: T not closed done by D — ".
 
     Run R28: the offer widened eleven tasks' scope with tests/cases.json, T0002's
     data, and each then closed as done by T0002. A file outside the paths is
-    offered only when the task's title or criteria (`named`) names it.
+    offered only when the task's title or criteria (`named`) names it, or when
+    the paths are the check's `targets`, no scope the call or record chose.
     """
+    # q35 R53: the offered done-by named scope=["tests/", "itc/"]; the call sent
+    # without it took the check's targets, and the refusal, offering only named
+    # files, sent the driver to a new check rather than back to that scope.
     outside = [
         rel
         for rel in committed
         if not _in_scope(rel, paths, root)
         and _can_witness(rel)
         and (root / rel).is_file()
-        and (rel in named or re.search(rf"(?<![\w./-]){re.escape(Path(rel).name)}\b", named))
+        and (
+            targets
+            or rel in named
+            or re.search(rf"(?<![\w./-]){re.escape(Path(rel).name)}\b", named)
+        )
     ]
     said = (
         (lead or f"pursuit_step: {task} not closed done by {done} — ")
@@ -14610,12 +14626,15 @@ def make_step_tool() -> Any:
                     )
                 now = _tree_nodes(root)
                 # The paths `_done_by` takes for the offered call, which names `scope`.
-                paths = scope or _strings(record.get("scope")) or _check_targets(command, root)
+                chosen = scope or _strings(record.get("scope"))
+                paths = chosen or _check_targets(command, root)
                 done_by = _done_task_in_log(paths, task, now, root)
                 named = f"{title}\n{record.get('criteria') or ''}\n{criteria}"
                 refused_lead = f"a close done by {done_by} would be refused: "
                 _, unwitnessed = (
-                    _done_by_witness(task, done_by, command, paths, root, named, refused_lead)
+                    _done_by_witness(
+                        task, done_by, command, paths, root, named, refused_lead, targets=not chosen
+                    )
                     if done_by
                     else ([], "")
                 )

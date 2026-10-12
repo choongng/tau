@@ -20022,6 +20022,45 @@ async def test_done_by_unwitnessed_does_not_offer_unrelated_data_file(
     assert _pursuit_calls(fake_beagle, "open") == [] == _pursuit_calls(fake_beagle, "close")
 
 
+@pytest.mark.anyio
+async def test_done_by_without_scope_offers_the_committed_source_the_check_targets_miss(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # q35 R53 L64-L66: the offer named scope=["tests/", "itc/"]; the call sent
+    # without it was told to bind a new check, not given itc/__init__.py back.
+    project, _ = _done_by_project(tmp_path, fake_beagle, monkeypatch, "T0003: Cases")
+    (project / "itc").mkdir()
+    (project / "itc" / "__init__.py").write_text("X = 1\n")
+    _git(project, "add", "itc/__init__.py")
+    _git(project, "commit", "-q", "-m", "T0003: Clock")
+    _require_witness(project)
+    nodes = json.loads((fake_beagle / "tree.out").read_text())["nodes"]
+    module = _module()
+
+    _done_by_records(fake_beagle, {"title": "Add function", "scope": []}, {})
+    scopeless = await module._done_by("T0004", "T0003", {"done_when": CASES_CHECK}, nodes, project)
+
+    assert "Nothing was opened" in scopeless
+    assert "bind a check that fails now" not in scopeless
+    assert _offered_done_by(scopeless) == {
+        "task": "T0004",
+        "abandon": "done by T0003",
+        "done_when": CASES_CHECK,
+        "scope": ["tests/test_cases.py", "itc/__init__.py"],
+    }
+
+    # A call that names its scope keeps the R28 rule: an unnamed file is not offered.
+    scoped = {"done_when": CASES_CHECK, "scope": ["tests/test_cases.py"]}
+    named = await module._done_by("T0004", "T0003", scoped, nodes, project)
+
+    assert "itc/__init__.py" not in named and "bind a check that fails now" in named
+    assert _pursuit_calls(fake_beagle, "open") == [] == _pursuit_calls(fake_beagle, "close")
+
+
 def _node_guard_project(tmp_path: Path) -> Path:
     project = tmp_path / "node_guard"
     (project / "src").mkdir(parents=True)
