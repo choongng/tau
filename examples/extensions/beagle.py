@@ -314,6 +314,8 @@ WORKER_SCOPE_ENV = "BEAGLE_TAU_WORKER_SCOPE"
 #: guards. Read at call time, so the driver and its workers, which inherit the
 #: environment, agree; set at launch and never changed within a session.
 LEAN_ENV = "BEAGLE_TAU_LEAN"
+#: What founding adds to the goal file under lean (see `_lean`).
+LEAN_AUDIT_OFF = "\n[audit]\nevery = 0\n"
 
 
 def _lean() -> bool:
@@ -4123,7 +4125,7 @@ def make_found_tool(
             '\n[close]\nrequire = "witness"\n'
             # R0002: the lean arm runs no audit sub-agent, so beagle core's
             # cadence (an audit due every 16 closes refuses `open`) is off too.
-            + ("\n[audit]\nevery = 0\n" if _lean() else ""),
+            f"{LEAN_AUDIT_OFF if _lean() else ''}",
             encoding="utf-8",
         )
         _ignore_caches(root)
