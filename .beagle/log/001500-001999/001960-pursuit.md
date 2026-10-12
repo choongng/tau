@@ -1,0 +1,16 @@
++++
+id = "001960-pursuit"
+ordinal = 1960
+kind = "pursuit"
+timestamp = "2026-10-12T04:40:59+00:00"
+summary = "pursuit sweep at close T0451: 2 path(s) changed since open, candidates found"
+metric_command = ""
+drains = []
+hooks = []
++++
+
+sample_similarity: 1803 chunks, 1803 sampled, 0 candidate pair(s) at Jaccard >= 0.25 (docs, k=3)
+  focused on 2 path(s): 0 identical, 0 diverged; every pair touching them is listed, copies across files first
+sample_cruft: 2 sampled, 2 flagged
+  FLAG  dev-notes/tui-stream-cpu/upstream-pr.md  <- untracked-not-ignored
+  FLAG  dev-notes/upstreaming-candidates.md  <- untracked-not-ignored
