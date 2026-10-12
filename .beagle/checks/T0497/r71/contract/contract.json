@@ -1,0 +1,261 @@
+{
+  "sources": {
+    "wrenfold-r3": {
+      "path": "references/wrenfold-r3.txt"
+    }
+  },
+  "entries": [
+    {
+      "id": "E001",
+      "kind": "example",
+      "operation": "encode",
+      "source": "wrenfold-r3",
+      "quote": "(none) | 3F",
+      "input": [],
+      "expect": "3f"
+    },
+    {
+      "id": "E002",
+      "kind": "example",
+      "operation": "encode",
+      "source": "wrenfold-r3",
+      "quote": "0 | 00 3F\n\n5 | 05 3F",
+      "input": [0],
+      "expect": "003f"
+    },
+    {
+      "id": "E003",
+      "kind": "example",
+      "operation": "encode",
+      "source": "wrenfold-r3",
+      "quote": "5 | 05 3F\n\n1, 300, 5 | 01 41 2C 05 3F",
+      "input": [5],
+      "expect": "053f"
+    },
+    {
+      "id": "E004",
+      "kind": "example",
+      "operation": "encode",
+      "source": "wrenfold-r3",
+      "quote": "1, 300, 5 | 01 41 2C 05 3F",
+      "input": [1, 300, 5],
+      "expect": "01412c053f"
+    },
+    {
+      "id": "E005",
+      "kind": "example",
+      "operation": "encode",
+      "source": "wrenfold-r3",
+      "quote": "9000 | 63 28 3F",
+      "input": [9000],
+      "expect": "63283f"
+    },
+    {
+      "id": "E006",
+      "kind": "example",
+      "operation": "encode",
+      "source": "wrenfold-r3",
+      "quote": "70000 | 81 11 70 3F",
+      "input": [70000],
+      "expect": "8111703f"
+    },
+    {
+      "id": "E007",
+      "kind": "example",
+      "operation": "encode",
+      "source": "wrenfold-r3",
+      "quote": "5000000 | C0 00 4C 4B 40 3F",
+      "input": [5000000],
+      "expect": "c0004c4b403f"
+    },
+    {
+      "id": "E008",
+      "kind": "example",
+      "operation": "encode",
+      "source": "wrenfold-r3",
+      "quote": "2, 2, 2 | 02 02 02 3F",
+      "input": [2, 2, 2],
+      "expect": "0202023f"
+    },
+    {
+      "id": "L001",
+      "kind": "limit",
+      "operation": "encode",
+      "source": "wrenfold-r3",
+      "quote": "An integer in a Wrenfold sequence is at least 0",
+      "input": 0,
+      "expect": "valid minimum value",
+      "statement": "An integer in a Wrenfold sequence is at least 0"
+    },
+    {
+      "id": "L002",
+      "kind": "limit",
+      "operation": "encode",
+      "source": "wrenfold-r3",
+      "quote": "at most\n274877906943 (2^38 − 1).",
+      "input": 274877906943,
+      "expect": "valid maximum value",
+      "statement": "An integer in a Wrenfold sequence is at most 274877906943 (2^38 − 1)"
+    },
+    {
+      "id": "L003",
+      "kind": "limit",
+      "operation": "encode",
+      "source": "wrenfold-r3",
+      "quote": "00 | 1 | 6 | 0 to 62",
+      "input": 62,
+      "expect": "one-byte form (00 3e 3f)",
+      "statement": "The one-byte form (tag 00) encodes values 0 to 62"
+    },
+    {
+      "id": "L004",
+      "kind": "limit",
+      "operation": "encode",
+      "source": "wrenfold-r3",
+      "quote": "01 | 2 | 14 | 0 to 16383",
+      "input": 16383,
+      "expect": "two-byte form",
+      "statement": "The two-byte form (tag 01) encodes values 0 to 16383"
+    },
+    {
+      "id": "L005",
+      "kind": "limit",
+      "operation": "encode",
+      "source": "wrenfold-r3",
+      "quote": "10 | 3 | 22 | 0 to 4194303",
+      "input": 4194303,
+      "expect": "three-byte form",
+      "statement": "The three-byte form (tag 10) encodes values 0 to 4194303"
+    },
+    {
+      "id": "L006",
+      "kind": "limit",
+      "operation": "encode",
+      "source": "wrenfold-r3",
+      "quote": "11 | 5 | 38 | 0 to 274877906943",
+      "input": 274877906943,
+      "expect": "five-byte form",
+      "statement": "The five-byte form (tag 11) encodes values 0 to 274877906943"
+    },
+    {
+      "id": "I001",
+      "kind": "invalid",
+      "operation": "encode",
+      "source": "wrenfold-r3",
+      "quote": "An encoder given any other value, a\nnegative one included, must fail rather than write anything.",
+      "input": -1,
+      "expect": "raises error"
+    },
+    {
+      "id": "I002",
+      "kind": "invalid",
+      "operation": "encode",
+      "source": "wrenfold-r3",
+      "quote": "An encoder given any other value, a\nnegative one included, must fail rather than write anything.",
+      "input": 274877906944,
+      "expect": "raises error"
+    },
+    {
+      "id": "I003",
+      "kind": "invalid",
+      "operation": "decode",
+      "source": "wrenfold-r3",
+      "quote": "ends before its end marker, or ends inside an integer (the input\n05 has no end marker; in C0 00 00 3F the five-byte\nform runs past the end);",
+      "input": "05",
+      "expect": "raises error"
+    },
+    {
+      "id": "I004",
+      "kind": "invalid",
+      "operation": "decode",
+      "source": "wrenfold-r3",
+      "quote": "ends before its end marker, or ends inside an integer (the input\n05 has no end marker; in C0 00 00 3F the five-byte\nform runs past the end);",
+      "input": "c000003f",
+      "expect": "raises error"
+    },
+    {
+      "id": "I005",
+      "kind": "invalid",
+      "operation": "decode",
+      "source": "wrenfold-r3",
+      "quote": "has any byte after its end marker (05 3F 00)",
+      "input": "053f00",
+      "expect": "raises error"
+    },
+    {
+      "id": "I006",
+      "kind": "invalid",
+      "operation": "decode",
+      "source": "wrenfold-r3",
+      "quote": "holds an integer in a longer form than the shortest that holds it: the\ninput 40 05 3F writes 5 in the two-byte form, and is rejected.",
+      "input": "40053f",
+      "expect": "raises error"
+    },
+    {
+      "id": "P001",
+      "kind": "property",
+      "operation": "encode",
+      "source": "wrenfold-r3",
+      "quote": "An encoder writes every integer in the shortest form that holds it.",
+      "statement": "An encoder writes every integer in the shortest form that holds it."
+    },
+    {
+      "id": "P002",
+      "kind": "property",
+      "operation": "decode",
+      "source": "wrenfold-r3",
+      "quote": "A byte 0x3F where an\ninteger would begin is always the end marker; inside a two-, three- or\nfive-byte form it is an ordinary byte of the value.",
+      "statement": "A byte 0x3F where an integer would begin is always the end marker; inside a two-, three- or five-byte form it is an ordinary byte of the value."
+    },
+    {
+      "id": "P003",
+      "kind": "property",
+      "operation": "encode",
+      "source": "wrenfold-r3",
+      "quote": "the one-byte form never\nholds 63, although six bits could: 63 is written in the two-byte form, as\n0x40 0x3F.",
+      "statement": "63 is written in the two-byte form as 0x40 0x3F, not in the one-byte form."
+    },
+    {
+      "id": "P004",
+      "kind": "property",
+      "operation": "decode",
+      "source": "wrenfold-r3",
+      "quote": "The empty sequence is the single byte 0x3F.",
+      "statement": "The empty sequence is the single byte 0x3F."
+    },
+    {
+      "id": "P005",
+      "kind": "property",
+      "operation": "count",
+      "source": "wrenfold-r3",
+      "quote": "rejects exactly the inputs a decoder rejects.",
+      "statement": "count rejects exactly the inputs a decoder rejects.",
+      "acceptance": "tests/test_wrenfold.py"
+    },
+    {
+      "id": "O001",
+      "kind": "operation",
+      "operation": "encode",
+      "source": "wrenfold-r3",
+      "quote": "A sequence is its integers' encodings in order, followed by one end marker\nbyte, 0x3F.",
+      "statement": "encode takes a list of unsigned integers and returns their Wrenfold R3 encoded bytes."
+    },
+    {
+      "id": "O002",
+      "kind": "operation",
+      "operation": "decode",
+      "source": "wrenfold-r3",
+      "quote": "A decoder reads integers until it reaches the end marker and returns them\nin order.",
+      "statement": "decode takes bytes and returns the list of integers encoded in them."
+    },
+    {
+      "id": "O003",
+      "kind": "operation",
+      "operation": "count",
+      "source": "wrenfold-r3",
+      "quote": "A reader that needs only how many integers a sequence holds uses\ncount, which returns that number without building the list, and\nrejects exactly the inputs a decoder rejects.",
+      "statement": "count takes bytes and returns the number of integers in the sequence without building the list."
+    }
+  ],
+  "gaps": []
+}

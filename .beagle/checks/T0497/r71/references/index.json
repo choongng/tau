@@ -1,0 +1,7 @@
+{
+  "request": "set this project up for beagle pursuit, then implement a modern python implementation of the wrenfold sequence encoding, revision 3 (spec link below). use your judgement to do the setup without further discussion, and use beagle's pursuit-run to structure and orchestrate the work.\n\nhttp://127.0.0.1:8737/wrenfold-r3.html\n",
+  "fetched": {
+    "wrenfold-r3.txt": "http://127.0.0.1:8737/wrenfold-r3.html"
+  },
+  "failed": {}
+}
