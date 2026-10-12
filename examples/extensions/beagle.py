@@ -16312,9 +16312,24 @@ def _pursuit_verb(argv: list[str]) -> str | None:
     return words[1]
 
 
+#: The `beagle pursuit contract` verbs that only read the contract, as beagle's
+#: own guard reads them. R71-R75's contract workers were refused `contract check`
+#: and `contract refs` 34 times, and R75's cited bare line numbers for want of
+#: the anchors `refs` prints.
+_CONTRACT_READ_VERBS = frozenset({"status", "check", "refs", "diff", "run"})
+
+
 def _pursuit_write_verb(argv: list[str]) -> str | None:
-    """The verb of a `beagle pursuit <verb>` argv that changes the pursuit, or None."""
+    """The verb of a `beagle pursuit <verb>` argv that changes the pursuit, or None.
+
+    A `contract` verb is named with what follows it (`contract seal`), and its
+    reads pass.
+    """
     verb = _pursuit_verb(argv)
+    if verb == "contract":
+        words = [arg for arg in argv[argv.index("contract") + 1 :] if not arg.startswith("-")]
+        then = words[0] if words else None
+        return None if then is None or then in _CONTRACT_READ_VERBS else f"contract {then}"
     return None if verb in _PURSUIT_READ_VERBS else verb
 
 

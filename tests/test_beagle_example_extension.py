@@ -8033,6 +8033,10 @@ async def test_history_guard_holds_every_session_in_a_pursuit(
         ("beagle pursuit brief T0003", None),
         ("beagle pursuit show T0003 && beagle pursuit tree", None),
         ("beagle --root /p pursuit status", None),
+        # R75's contract worker, refused the anchors it was asked to cite.
+        ("beagle pursuit contract refs itc2008 --grep fork", None),
+        ("beagle pursuit contract check --draft --json", None),
+        ("beagle pursuit contract seal", "contract seal"),
         ("beagle doctor", None),
         ("echo 'beagle pursuit close T0003'", None),
     ],
