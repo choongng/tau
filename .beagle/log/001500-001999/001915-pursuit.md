@@ -1,0 +1,14 @@
++++
+id = "001915-pursuit"
+ordinal = 1915
+kind = "pursuit"
+timestamp = "2026-10-12T04:13:14+00:00"
+summary = "pursuit open T0448: Source judge never offers an input row as a result line (R52)"
+metric_command = ""
+drains = []
+hooks = []
++++
+
+criteria: The known-answers source judge never offers a row's input (or an example-index + input fragment) as the result a case should quote: _unanswered_case_note names no candidate result lines, and _unquoted_cases does not accept an example-index row fragment such as '1 | 00' as the source of an expected output when it is the row's input column. Correct sources are still accepted. q35 R52; a bug in a mechanism both R0002 arms keep. Tests named in the check; whole file passes; ruff clean. (The fix 14f59569 was merged before this open, which the due audit refused; the check, 33f3cf61, predates it.)
+decided by: sh -c 'echo "ec47201eb9604df53fab818b4e895bfd912292063dbfec52a18be42071f3084b  .beagle/checks/T0448/T0448.sh" | sha256sum -c --quiet && bash .beagle/checks/T0448/T0448.sh'
+budget: 150000 tokens
