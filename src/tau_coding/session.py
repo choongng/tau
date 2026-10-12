@@ -287,7 +287,9 @@ TEXT_TOOL_CALL_NUDGE = (
 # (from REASONING_LOOP_MIN_LINES lines on) or over its last REASONING_LOOP_WINDOW
 # lines, which catches a loop after a long sound start. A line that is one unit
 # of at most REASONING_LOOP_RUN_UNIT chars repeated for REASONING_LOOP_RUN_CHARS
-# chars is a loop too. Reasoning that repeats a short line a few times among
+# chars is a loop too, and so is a line whose sentences loop as lines would
+# (R58, dev-notes/itc-runs/R58.md, class 1: two sentences 193 times each on one
+# 67,301-char line). Reasoning that repeats a short line a few times among
 # varied ones meets none of these.
 REASONING_LOOP_REPEATS = 8
 REASONING_LOOP_DISTINCT_FRACTION = 0.25
@@ -295,6 +297,7 @@ REASONING_LOOP_MIN_LINES = 40
 REASONING_LOOP_WINDOW = 64
 REASONING_LOOP_RUN_CHARS = 2_000
 REASONING_LOOP_RUN_UNIT = 40
+_SENTENCE_END = re.compile(r"(?<=[.!?])\s+")
 TREE_RUNNING_MESSAGE = "Tau is still working. Press Escape to interrupt before using /tree."
 
 
@@ -354,6 +357,9 @@ class _ReasoningLoopDetector:
         self._line_chars = 0
         self._line_checked_at = 0
         self._tail = ""
+        self._sentence: list[str] = []
+        self._sentence_counts: Counter[str] = Counter()
+        self._sentences = 0
         self._counts: Counter[str] = Counter()
         self._lines = 0
         self._top = 0
@@ -368,6 +374,8 @@ class _ReasoningLoopDetector:
             ended[0] = "".join((*self._line, ended[0]))
             self._line, self._line_chars, self._line_checked_at = [], 0, 0
             self._tail = ""
+            self._sentence, self._sentences = [], 0
+            self._sentence_counts.clear()
             for line in ended:
                 if self._add(line.strip()):
                     return True
@@ -375,7 +383,7 @@ class _ReasoningLoopDetector:
             self._line.append(rest)
             self._line_chars += len(rest)
             self._tail = (self._tail + rest)[-REASONING_LOOP_RUN_CHARS:]
-        return self._run_loops()
+        return self._run_loops() or self._sentences_loop(rest)
 
     def _add(self, line: str) -> bool:
         if not line:
@@ -423,6 +431,37 @@ class _ReasoningLoopDetector:
                 self.details = {"kind": "run", "unit": tail[:unit], "chars": self._line_chars}
                 return True
         return False
+
+    def _sentences_loop(self, text: str) -> bool:
+        """Whether the line being written loops in its sentences as lines would."""
+        last = self._sentence[-1][-1:] if self._sentence else ""
+        *ended, rest = _SENTENCE_END.split(last + text)
+        if not ended:
+            if text:
+                self._sentence.append(text)
+            return False
+        ended[0] = "".join(self._sentence) + ended[0][len(last) :]
+        self._sentence = [rest] if rest else []
+        for sentence in ended:
+            if sentence := sentence.strip():
+                self._sentences += 1
+                self._sentence_counts[sentence] += 1
+        if (
+            self._sentences < REASONING_LOOP_MIN_LINES
+            or len(self._sentence_counts) >= REASONING_LOOP_DISTINCT_FRACTION * self._sentences
+        ):
+            return False
+        repeated, count = self._sentence_counts.most_common(1)[0]
+        if count < REASONING_LOOP_REPEATS:
+            return False
+        self.details = {
+            "kind": "sentences",
+            "sentence": repeated[:200],
+            "repeats": count,
+            "sentences": self._sentences,
+            "distinct": len(self._sentence_counts),
+        }
+        return True
 
     def _found(self, line: str, repeats: int, *, lines: int, distinct: int) -> bool:
         self.details = {

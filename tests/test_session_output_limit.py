@@ -214,6 +214,41 @@ async def test_degenerate_token_run_is_cut(tmp_path: Path, looping: str) -> None
     assert len(provider.calls) == 2
 
 
+# R58 driver session (dev-notes/itc-runs/R58.md, class 1): one 67,301-char
+# line of reasoning, 400 sentences of which 386 were these two, alternating.
+R58_OPENING = (
+    "For position 0, the offset is 0x11 (17), which would place the zero at position 18. "
+    "Looking at the Wikipedia example with the byte positions and their values, I need to "
+    "reconsider what the offset actually represents. "
+)
+R58_ROUND = (
+    "I'm realizing the offset byte at position i indicates where the next zero byte should "
+    "appear in the output, so I track my current position and insert zeros at the calculated "
+    "locations. The offset value tells me how far ahead to place the next zero, and I need to "
+    "copy bytes until I reach that position, then insert the zero and continue. "
+)
+
+
+@pytest.mark.anyio
+async def test_sentences_repeated_within_one_line_are_cut(tmp_path: Path) -> None:
+    looping = R58_OPENING + R58_ROUND * 193
+    assert "\n" not in looping
+    provider = ClosingStreams(
+        [_streamed_reasoning(looping, then=AssistantMessage(content="x")), _answers()]
+    )
+    session = await _session(tmp_path, provider)
+
+    await _run(session)
+
+    cut = session.messages[1]
+    assert isinstance(cut, AssistantMessage)
+    assert cut.stop_reason == "length"
+    assert [diagnostic.type for diagnostic in cut.diagnostics or []] == ["reasoning_loop_cut"]
+    assert 0 < len(cut.thinking_text) < len(looping) // 4
+    assert provider.calls[1][-1].text == OUTPUT_LIMIT_NUDGE
+    assert len(provider.calls) == 2
+
+
 def _varied_reasoning(lines: int) -> str:
     """Long reasoning that comes back to a short line now and then."""
     out = []
@@ -233,6 +268,11 @@ def _varied_reasoning(lines: int) -> str:
         _varied_reasoning(400),
         # A long paragraph with no line breaks, varied throughout.
         " ".join(f"step {i} gives {i * i % 97}." for i in range(1_500)),
+        # One long line of varied sentences that comes back to a short one often.
+        " ".join(
+            f"Byte {i} maps to {i * 7 % 256}." + (" Wait." if i % 5 == 0 else "")
+            for i in range(600)
+        ),
         # A short line said a few times among varied ones, in a short reply.
         "Hmm.\nThe left half is 1.\nHmm.\nThe right half is 0.\nHmm.\nSo the id is (1, 0).\n" * 3,
     ],
