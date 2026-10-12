@@ -14512,6 +14512,31 @@ async def test_lean_switch_turns_off_audit(
     ]
     assert ": sound." in full.text
 
+    # Founding under lean turns beagle core's audit cadence off with it, or
+    # a lean run could open nothing once 16 leaves had closed.
+    (fake_beagle / "add.out").write_text("T0001  Ship it\n")
+    args = {
+        "statement": "Ship it",
+        "criteria": ["`make test` exits 0"],
+        "milestones": ["Code::does it"],
+        "user_confirmed": True,
+    }
+    for lean_on, name in ((True, "lean"), (False, "full")):
+        if lean_on:
+            _lean_on(monkeypatch)
+        else:
+            monkeypatch.delenv(_module().LEAN_ENV, raising=False)
+        # Outside tmp_path, whose own pursuit would make this one nested.
+        base = tmp_path.parent / f"{tmp_path.name}-found-{name}"
+        project = base / "project"
+        project.mkdir(parents=True)
+        monkeypatch.chdir(project)
+        runtime, _ = _bound(base)
+        found = await _tool(runtime, "pursuit_found").execute(f"f-{name}", args)
+        assert "root task T0001" in found.text, found.text
+        goal = tomllib.loads((project / ".beagle" / "pursuit.toml").read_text())
+        assert goal.get("audit") == ({"every": 0} if lean_on else None)
+
 
 def test_lean_switch_turns_off_own_copy_rule(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch

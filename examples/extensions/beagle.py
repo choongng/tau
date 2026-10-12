@@ -4120,7 +4120,10 @@ def make_found_tool(
             # pursuit_step opens, works and closes in one call, so nothing
             # else stands where `prove` goes; beagle holds every done close
             # to a witnessed check only when told to.
-            '\n[close]\nrequire = "witness"\n',
+            '\n[close]\nrequire = "witness"\n'
+            # R0002: the lean arm runs no audit sub-agent, so beagle core's
+            # cadence (an audit due every 16 closes refuses `open`) is off too.
+            + ("\n[audit]\nevery = 0\n" if _lean() else ""),
             encoding="utf-8",
         )
         _ignore_caches(root)
