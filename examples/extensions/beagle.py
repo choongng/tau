@@ -7503,22 +7503,31 @@ def _locked_test_unrun(command: str, scope: list[str], goal: Path) -> tuple[str,
     imported = _locked_test_imports(goal)
     if not imported or not scope:
         return None
-    entries = [e.rstrip("/") for e in scope]
-
-    def held(module: str) -> bool:
-        rel = module.replace(".", "/")
-        for base in ("", "src/"):
-            for path in (f"{base}{rel}.py", f"{base}{rel}/__init__.py"):
-                if any(e in {"", "."} or path == e or path.startswith(f"{e}/") for e in entries):
-                    return True
-            if any(e == f"{base}{rel}" or e.startswith(f"{base}{rel}/") for e in entries):
-                return True
-        return False
-
-    judged = [(module, test) for module, test in imported.items() if held(module)]
+    judged = [(module, test) for module, test in imported.items() if _holds_module(scope, module)]
     if not judged or any(_runs_test_file(command, test) for _, test in judged):
         return None
     return judged[0]
+
+
+def _holds_module(scope: list[str], module: str) -> bool:
+    """Whether an entry of `scope` holds `module`'s file, at the root or under src/."""
+    entries = [e.rstrip("/") for e in scope]
+    rel = module.replace(".", "/")
+    for base in ("", "src/"):
+        for path in (f"{base}{rel}.py", f"{base}{rel}/__init__.py"):
+            if any(e in {"", "."} or path == e or path.startswith(f"{e}/") for e in entries):
+                return True
+        if any(e == f"{base}{rel}" or e.startswith(f"{base}{rel}/") for e in entries):
+            return True
+    return False
+
+
+def _runs_no_test(command: str) -> bool:
+    """Whether `command` runs neither pytest nor python: a linter, say."""
+    return not any(
+        Path(word).name in {"pytest", "py.test"} or _PYTHON_NAME.fullmatch(Path(word).name)
+        for word in re.split(r"[\s'\"]+", command)
+    )
 
 
 def _locked_test_unrun_said(module: str, test: str) -> str:
@@ -7567,10 +7576,21 @@ async def _locked_test_refusal(
     refused = await passing_refused(f"python3 -m pytest -q {test}")
     if refused is None:
         return _locked_test_problem(command, scope, goal)
-    return (
+    said = (
         f"{_locked_test_unrun_said(module, test)}, and binding the locked test is no "
         f"way on either: {refused}"
     )
+    if _runs_no_test(command):
+        # q35 R54 L53-L59: T0005's ruff check failed now and its scope named the
+        # files, so "bind a check that fails now" named the refused call; only
+        # cobs/ in scope was wrong, and the driver found that after 3.6 min.
+        rest = [entry for entry in scope if not _holds_module([entry], module)]
+        keep = f": scope={json.dumps(rest)}" if rest else ", naming only the files it changes"
+        said += (
+            f" `{command}` runs no test, so the locked test need not judge this task: "
+            f"call again with the same done_when and {module} out of scope{keep}."
+        )
+    return said
 
 
 #: The known-answers task's scope and locks, as the cases-first hint gives them.

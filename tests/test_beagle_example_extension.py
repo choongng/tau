@@ -12619,6 +12619,40 @@ async def test_locked_test_offer_does_not_name_a_locked_test_that_already_passes
 
 
 @pytest.mark.anyio
+async def test_locked_test_refusal_for_a_lint_check_offers_a_scope_without_the_judged_module(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # q35 R54 L53-L59: T0005's ruff check failed now and its scope named the files,
+    # and the refusal said to bind a check that fails now with such a scope.
+    code = f"def encode(value):\n    return value + 1  # {'x' * 90}\n"
+    _locked_codec_project(tmp_path, monkeypatch, code=code)
+    _ready_task(fake_beagle)
+    runtime, _ = _bound(tmp_path)
+    step = _tool(runtime, "pursuit_step")
+    lint = "ruff check --select E501 codec.py tests/"
+    args = {**_open_args(["pyproject.toml", "codec.py"]), "done_when": lint}
+
+    refused = await step.execute("c1", args)
+
+    assert "the scope holds codec, which the locked tests/test_cases.py judges" in refused.text
+    assert (
+        f"`{lint}` runs no test, so the locked test need not judge this task: call again "
+        'with the same done_when and codec out of scope: scope=["pyproject.toml"].'
+    ) in refused.text
+    offered = await step.execute("c2", {**args, "scope": ["pyproject.toml"]})
+    assert "not opened" not in offered.text, offered.text
+
+    ran = 'python3 -c "import codec; assert codec.encode(1) == 2"'
+    runs_code = await step.execute("c3", {**args, "done_when": ran})
+    assert "the scope holds codec, which the locked tests/test_cases.py judges" in runs_code.text
+    assert "out of scope" not in runs_code.text
+
+
+@pytest.mark.anyio
 async def test_locked_test_offer_names_the_fix_route_for_a_locked_test_passing_without_code(
     tmp_path: Path,
     beagle: Path,
