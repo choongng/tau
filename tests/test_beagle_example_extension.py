@@ -14914,6 +14914,39 @@ def test_lean_switch_is_off_unless_set(monkeypatch: pytest.MonkeyPatch) -> None:
         assert (module._abandon_problem("T0004", "already done", []) is None) is lean, value
 
 
+@pytest.mark.anyio
+async def test_lean_switch_drops_lock_promises_from_driver_texts(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # R55: under lean nothing is locked, but the founding note and the system
+    # prompt (CASES_FIRST_NOTE), the `locks` parameter and the source hold still
+    # promised locks. The texts are fixed at load, so no prefix changes mid-session.
+    promises = (
+        "Once it closes they are locked",
+        "Locked when the task closes done",
+        "would be locked as known",
+    )
+    for lean_on, name in ((False, "full"), (True, "lean")):
+        if lean_on:
+            _lean_on(monkeypatch)
+        base = tmp_path / name
+        hold, _ = await _unsourced_result_step(base, fake_beagle, monkeypatch)
+        runtime = _load(base)
+        [prompt] = [s.body for s in runtime.prompt_sections if s.title == "Beagle"]
+        locks = _tool(runtime, "pursuit_step").parameters["properties"]["locks"]
+        texts = f"{prompt}\n{locks['description']}\n{hold.text}"
+        assert "nothing is locked" in hold.text
+        for promise in promises:
+            assert (promise in texts) is not lean_on, (name, promise)
+    assert "so a wrong answer would pass as known" in hold.text
+    assert "It passes `locks`" not in prompt
+    assert "Nothing is locked" in locks["description"]
+
+
 @pytest.mark.parametrize(
     "command",
     [
