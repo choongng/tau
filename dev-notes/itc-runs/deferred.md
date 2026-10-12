@@ -62,3 +62,14 @@ All three [tau] classes were fixed before the freeze:
   - T0461: raw tool-call markup reached the driver as a report.
 - **The source judge held W1's correct event case** (class 5). Deferred; joins R53's classes 1 and 5.
   - M15 is on in both arms, so the pairs don't measure it.
+
+## R56
+
+- **Outright bugs, landing at the R57–R60 boundary:**
+  - T0463: the source judge misses results under encoded_hex/decoded_hex keys.
+  - T0464: the cut-off kill note says "without acting" after the worker made calls, and a second wording says a killed attempt "reported".
+- **T0004's check could not pass on any route it was given** (class 3). Deferred.
+  - The src layout was not importable by the system python3, the wrong example 11 was outside every later scope, and no verdict named either cause.
+  - It joins the "check can't pass, no verdict says why" family.
+  - Candidate test: test_step_result_names_a_src_layout_module_the_check_cannot_import.
+- **R54's revisit-if condition is not met.** It said to revisit if both arms keep missing cobs boundary cases. R56 got the boundary rows only because the driver read the reference before founding.
