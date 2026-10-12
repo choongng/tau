@@ -14367,6 +14367,301 @@ def test_locked_ignores_files_not_in_the_manifest(tmp_path: Path) -> None:
     assert (project / "tests" / "test_cases.py").read_bytes() == R14_FORMATTED_TEST
 
 
+def _lean_on(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv(_module().LEAN_ENV, "1")
+
+
+def test_lean_switch_turns_off_known_answers_locks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # R0002's lean arm: M14 locked files caught nothing across the q35 runs.
+    module = _module()
+    project, goal = _locked_repo(tmp_path)
+    module._lock(goal, project, ["tests/test_cases.py"])
+    assert module._locked(goal) == ["tests/test_cases.py"]
+    scope = ["parser.py", "./tests/test_cases.py"]
+    assert module._locked_scope_problem(scope, project, "Parser", "T0002") is not None
+
+    _lean_on(monkeypatch)
+    (project / "tests" / "test_cases.py").write_bytes(R14_FORMATTED_TEST)
+
+    assert module._locked(goal) == [] and module._lock_manifest(goal) == {}
+    assert module._locked_scope_problem(scope, project, "Parser", "T0002") is None
+    assert module._restore_locked(goal, project) == []
+    assert (project / "tests" / "test_cases.py").read_bytes() == R14_FORMATTED_TEST
+    store = project / ".beagle" / "locked" / "tests"
+    (project / "tests" / "new.py").write_text("x = 1\n")
+    assert module._lock(goal, project, ["tests/new.py"]) == ([], [])
+    assert not (store / "new.py").exists()
+
+
+@pytest.mark.anyio
+async def test_lean_switch_turns_off_plan_guards(
+    tmp_path: Path, beagle: Path, fake_beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # M20: the commit before a split, the live-title clash and the re-run-only part.
+    module = _module()
+    clash = ["Docs::x", "B::y"]
+    assert module._live_title_clash("T0002", clash, _r28_nodes()) is not None
+    assert module._rerun_only_part(["Verify::confirm the tests pass"]) is not None
+    _, pending = _split_with_a_check_that_last_exited(
+        tmp_path / "full", fake_beagle, monkeypatch, 0
+    )
+    full = await pending
+    assert "was committed as 'T0007: work in progress before split'" in full.text
+    assert len(_pursuit_calls(fake_beagle, "commit")) == 1
+
+    _lean_on(monkeypatch)
+    project, pending = _split_with_a_check_that_last_exited(
+        tmp_path / "lean", fake_beagle, monkeypatch, 0
+    )
+    lean = await pending
+
+    assert "beagle refused" not in lean.text
+    assert "Uncommitted in T0007's scope: tests/test_x.py. Give each to the part" in lean.text
+    assert "work in progress before split" not in lean.text
+    assert len(_pursuit_calls(fake_beagle, "commit")) == 1
+    assert "?? tests/test_x.py" in _git(project, "status", "--porcelain", "-uall")
+    assert module._live_title_clash("T0002", clash, _r28_nodes()) is None
+    assert module._rerun_only_part(["Verify::confirm the tests pass"]) is None
+
+
+@pytest.mark.anyio
+async def test_lean_switch_turns_off_abandon_and_done_by(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # M19: the abandon screen and the done-by route; the abandon is a plain close.
+    project, _ = _done_by_project(tmp_path, fake_beagle, monkeypatch, "add the cases test")
+    args = {"task": "T0004", "abandon": "done by T0003", "done_when": CASES_CHECK}
+    runtime, _ = _bound(tmp_path)
+    refused = await _tool(runtime, "pursuit_step").execute("c1", args)
+    assert "T0004 not closed done by T0003" in refused.text
+    assert _module()._abandon_problem("T0004", "already done", []) is not None
+    assert _pursuit_calls(fake_beagle, "close") == []
+
+    _lean_on(monkeypatch)
+    runtime, _ = _bound(tmp_path)
+    await _tool(runtime, "pursuit_step").execute("c2", args)
+
+    assert _pursuit_calls(fake_beagle, "close") == [
+        ["T0004", "--outcome", "abandoned", "--reason", "done by T0003"]
+    ]
+    assert _module()._abandon_problem("T0004", "already done", []) is None
+    assert _runs(fake_tau) == []
+
+
+@pytest.mark.anyio
+async def test_lean_switch_turns_off_escalation(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # M18: after three not-done steps the fourth still runs a sub-agent.
+    module = _module()
+    assert module._escalation("T0002", 3)
+    _lean_on(monkeypatch)
+    assert module._escalation("T0002", 3) == ""
+    monkeypatch.chdir(_pursuit_project(tmp_path))
+    _failing_open_task(fake_beagle, monkeypatch)
+    runtime, _ = _bound(tmp_path)
+    step = _tool(runtime, "pursuit_step")
+
+    results = await _stays_open(step, fake_beagle, 3)
+    fourth = await step.execute("s4", {"task": "T0002", "attempts": 1})
+
+    assert len(_runs(fake_tau)) == 4
+    assert all("stays open" in r.text for r in [*results, fourth])
+    assert not any("runs no sub-agent" in r.text for r in [*results, fourth])
+    assert "not run — call instead" not in fourth.text
+    assert _pursuit_calls(fake_beagle, "close") == []
+
+
+@pytest.mark.anyio
+async def test_lean_switch_turns_off_audit(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # M07: a due audit is not run by a sub-agent, nor recorded.
+    report = "T0002 MEETS.\nT0003 MEETS.\nSOUND"
+    monkeypatch.chdir(_pursuit_project(tmp_path))
+    monkeypatch.setenv("FAKE_TAU_REPORT", report)
+    _audit_due(fake_beagle)
+
+    _lean_on(monkeypatch)
+    runtime, _ = _bound(tmp_path)
+    lean = await _tool(runtime, "pursuit_step").execute("c1", {"task": "T0005"})
+    assert _pursuit_calls(fake_beagle, "audit") == []
+    assert not any("Audit of 16" in run["stdin"] for run in _runs(fake_tau))
+    assert ": sound." not in lean.text
+
+    monkeypatch.delenv(_module().LEAN_ENV)
+    runtime, _ = _bound(tmp_path)
+    full = await _tool(runtime, "pursuit_step").execute("c2", {"task": "T0005"})
+    assert _pursuit_calls(fake_beagle, "audit") == [
+        [],
+        ["--record", "--verdict", "sound", "--note", report],
+    ]
+    assert ": sound." in full.text
+
+
+def test_lean_switch_turns_off_own_copy_rule(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # M16, own-copy only: a cases test computing results with its own function.
+    module = _module()
+    source = Q35_LOADER_DATA_TEST + (
+        "\n\ndef fork(stamp):\n    return [stamp, stamp]\n\n\n"
+        "def test_cases():\n"
+        "    for case in _load_cases():\n"
+        '        got = fork(case["input"])\n'
+        '        assert got == case["expected"]\n'
+    )
+    found = module._cases_test_problem(tmp_path, _write_cases(tmp_path, source))
+    assert found is not None and found[1].startswith("checks its own copy of the algorithm")
+
+    _lean_on(monkeypatch)
+
+    assert module._cases_test_problem(tmp_path, _write_cases(tmp_path, source)) is None
+    # The rest of the cases-test screen still refuses: R51's twin cases.
+    ticking = R51_CASES_TEST.replace("clock.event()", "clock.tick()")
+    found = module._cases_test_problem(tmp_path, _write_r51(tmp_path, ticking))
+    assert found is not None and "double_event and event_on_full" in found[1]
+
+
+@pytest.mark.anyio
+async def test_lean_switch_turns_off_already_passes(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # M09: a task whose check already passes is opened and worked.
+    project = _pursuit_project(tmp_path)
+    monkeypatch.chdir(project)
+    (project / "done.txt").write_text("done by T0001")
+    _ready_task(fake_beagle)
+    args = {"task": "T0002", "criteria": "done.txt exists", "done_when": "grep -q done done.txt"}
+    runtime, _ = _bound(tmp_path)
+    full = await _tool(runtime, "pursuit_step").execute("c1", args)
+    assert "already passes" in full.text
+    assert _pursuit_calls(fake_beagle, "open") == [] and _runs(fake_tau) == []
+
+    _lean_on(monkeypatch)
+    runtime, _ = _bound(tmp_path)
+    lean = await _tool(runtime, "pursuit_step").execute("c2", args)
+
+    assert "already passes" not in lean.text
+    assert len(_pursuit_calls(fake_beagle, "open")) == 1 and len(_runs(fake_tau)) == 1
+
+
+@pytest.mark.anyio
+async def test_lean_switch_turns_off_cases_first(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # M12: a new source module opens before any cases test is locked.
+    project = _r12_project(tmp_path)
+    monkeypatch.chdir(project)
+    _ready_task(fake_beagle)
+    goal = project / ".beagle" / "pursuit.toml"
+    module = _module()
+    runtime, _ = _bound(tmp_path)
+    refused = await _tool(runtime, "pursuit_step").execute("c1", _open_args(["src/"]))
+    assert "not opened" in refused.text and "Cases first" in refused.text
+    assert module._cases_first_problem(["src/itc/"], "T0002", "Parser", goal) is not None
+    assert _pursuit_calls(fake_beagle, "open") == []
+
+    _lean_on(monkeypatch)
+    runtime, _ = _bound(tmp_path)
+    opened = await _tool(runtime, "pursuit_step").execute("c2", _open_args(["src/"]))
+
+    assert "Cases first" not in opened.text
+    assert module._cases_first_problem(["src/itc/"], "T0002", "Parser", goal) is None
+    assert len(_pursuit_calls(fake_beagle, "open")) == 1
+
+
+@pytest.mark.anyio
+async def test_lean_switch_turns_off_worker_read_guards(
+    tmp_path: Path, beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # M22: the late re-read and idle-bash refusals.
+    module = _module()
+    runtime, project = _reference_worker(tmp_path, monkeypatch, cap=8, scope="tests/x.py")
+    goal = project / ".beagle" / "pursuit.toml"
+    scope = ("tests/x.py",)
+    assert module._reread_refusal("read", {"path": "notes.txt"}, project, scope, 6) is not None
+    assert module._idle_bash_refusal("grep -rn value .", goal, "T0003", scope, 7) is not None
+
+    _lean_on(monkeypatch)
+    read = _tool_with_hooks(runtime, "read")
+    bash = _tool_with_hooks(runtime, "bash")
+    reads = [await read.execute(f"r{i}", {"path": "references/paper.txt"}) for i in range(5)]
+    runs = [await bash.execute(f"b{i}", {"command": "grep -rn value ."}) for i in range(3)]
+
+    assert all(result.text == "ran" for result in [*reads, *runs])
+    assert module._reread_refusal("read", {"path": "notes.txt"}, project, scope, 6) is None
+    assert module._idle_bash_refusal("grep -rn value .", goal, "T0003", scope, 7) is None
+
+
+@pytest.mark.anyio
+async def test_lean_switch_keeps_the_other_guards(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The check screen, the witness at close and the worker scope guard stay on.
+    _lean_on(monkeypatch)
+    module = _module()
+    found = module._check_problem("python3 -m pytest -q tests/ | tail -1")
+    assert found is not None and "bare '|'" in found
+
+    monkeypatch.chdir(_git_project(tmp_path, monkeypatch))
+    monkeypatch.setenv("FAKE_TAU_REPORT", WITNESSED_REPORT)
+    _ready_task(fake_beagle)
+    (fake_beagle / "prove.out").write_text("T0002: NOT PROVEN — src/clock.py is not there\n")
+    (fake_beagle / "prove.rc").write_text("9")
+    runtime, _ = _bound(tmp_path)
+    result = await _tool(runtime, "pursuit_step").execute(
+        "c1",
+        {"task": "T0002", "criteria": "c", "done_when": "grep -q done done.txt"}
+        | {"scope": ["done.txt"], "attempts": 3},
+    )
+    assert len(_runs(fake_tau)) == 1
+    assert _pursuit_calls(fake_beagle, "close") == []
+    assert "no defect could be put back" in result.text
+
+    worker = _scoped_worker(tmp_path, monkeypatch)
+    written = await _tool_with_hooks(worker, "write").execute(
+        "w1", {"path": ".gitignore", "content": "tests/\n"}
+    )
+    assert "outside T0003's scope (tests/x.py)" in written.text
+
+
+def test_lean_switch_is_off_unless_set(monkeypatch: pytest.MonkeyPatch) -> None:
+    module = _module()
+    monkeypatch.delenv(module.LEAN_ENV, raising=False)
+    assert module._lean() is False
+    for value, lean in (("", False), ("0", False), ("1", True), ("yes", True)):
+        monkeypatch.setenv(module.LEAN_ENV, value)
+        assert module._lean() is lean, value
+        assert (module._abandon_problem("T0004", "already done", []) is None) is lean, value
+
+
 @pytest.mark.parametrize(
     "command",
     [
