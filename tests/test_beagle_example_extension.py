@@ -1051,7 +1051,7 @@ def test_driver_is_told_to_steer_and_a_worker_to_go_piece_by_piece(
     assert "Ship it" in worker.body and "Write the concrete cases first" in worker.body
     assert "Ship it" not in driver.body
     assert "this session steers" not in worker.body
-    assert "Cases first" in driver.body and "Cases first" not in worker.body
+    assert "Contract first" in driver.body and "Contract first" not in worker.body
     assert "Never set a git identity" in driver.body
     assert "Never set a git identity" in worker.body
     # Run 11c ran `/pursuit-run`, named here, through bash.
@@ -1530,6 +1530,14 @@ def _pursuit_calls(fake: Path, verb: str) -> list[list[str]]:
     return [c["argv"][2:] for c in _calls(fake) if c["argv"][:2] == ["pursuit", verb]]
 
 
+def _milestone_splits(fake: Path) -> list[list[str]]:
+    """Founding's split calls, each checked to seed the contract first, then without it."""
+    contract = list(_module().CONTRACT_MILESTONES)
+    calls = _pursuit_calls(fake, "split")
+    assert all(call[1 : 1 + len(contract)] == contract for call in calls), calls
+    return [[call[0], *call[1 + len(contract) :]] for call in calls]
+
+
 @pytest.mark.anyio
 async def test_pursuit_found_waits_for_the_user_then_roots_and_splits(
     tmp_path: Path, beagle: Path, fake_beagle: Path, monkeypatch: pytest.MonkeyPatch
@@ -1555,16 +1563,103 @@ async def test_pursuit_found_waits_for_the_user_then_roots_and_splits(
 
     goal = tomllib.loads((project / ".beagle" / "pursuit.toml").read_text())["goal"]
     assert goal["statement"] == 'Ship the "tool"'
-    assert goal["criteria"] == args["criteria"]
+    assert goal["criteria"] == [*args["criteria"], _module().CONTRACT_CRITERION]
     assert _pursuit_calls(fake_beagle, "add") == [
         ['Ship the "tool"', "--root-task", "--intent", 'Ship the "tool"']
     ]
-    assert _pursuit_calls(fake_beagle, "split") == [
+    assert _milestone_splits(fake_beagle) == [
         ["T0001", "Parser::reads input", "CLI::wires it up", "--ordered"]
     ]
     assert "root task T0001" in result.text and "pursuit_step" in result.text
     again = await found.execute("c3", {**args, "user_confirmed": True})
     assert "already exists" in again.text
+
+
+@pytest.mark.anyio
+async def test_founding_declares_the_contract_and_seeds_it_first(
+    tmp_path: Path, beagle: Path, fake_beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # R0003: in every low q35 run founding planned from memory, and done meant
+    # the checks it wrote. The contract is read from the sources first.
+    module = _module()
+    project = tmp_path / "project"
+    project.mkdir()
+    monkeypatch.chdir(project)
+    (fake_beagle / "add.out").write_text("T0001  Greet\n")
+    runtime, _ = _bound(tmp_path)
+    found = _tool(runtime, "pursuit_found")
+    args = {
+        "statement": "Greet",
+        "criteria": ["hello.txt says hi"],
+        "milestones": ["Write::make hello.txt", "Docs::say how"],
+    }
+
+    asked = await found.execute("c1", {**args, "user_confirmed": False})
+    # The user is read the criterion the contract adds before anything is written.
+    assert module.CONTRACT_CRITERION in asked.text
+
+    result = await found.execute("c2", {**args, "user_confirmed": True})
+
+    written = tomllib.loads((project / ".beagle" / "pursuit.toml").read_text())
+    assert written["contract"] == {
+        "path": "contract/contract.json",
+        "second": "contract/contract.second.json",
+        "acceptance": "sh contract/accept.sh",
+        "files": ["contract/"],
+    }
+    assert written["goal"]["criteria"] == ["hello.txt says hi", module.CONTRACT_CRITERION]
+    assert written["close"] == {"require": "witness"}
+    [split] = _pursuit_calls(fake_beagle, "split")
+    assert split == [
+        "T0001",
+        *module.CONTRACT_MILESTONES,
+        "Write::make hello.txt",
+        "Docs::say how",
+        "--ordered",
+    ]
+    assert split[1].startswith("Contract::") and split[2].startswith("Second extraction::")
+    assert module.DRIVER_STEERS_NOTE in result.text
+    assert module.CONTRACT_FIRST_NOTE in result.text and "Cases first" not in result.text
+    assert "beagle pursuit contract check --draft" in module.CONTRACT_FIRST_NOTE
+
+
+@pytest.mark.anyio
+async def test_founding_drops_a_known_answers_milestone_for_the_contract(
+    tmp_path: Path, beagle: Path, fake_beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = _module()
+    project = tmp_path / "project"
+    project.mkdir()
+    monkeypatch.chdir(project)
+    (fake_beagle / "add.out").write_text("T0001  Greet\n")
+    runtime, _ = _bound(tmp_path)
+
+    result = await _tool(runtime, "pursuit_found").execute(
+        "c1",
+        {
+            "statement": "Greet",
+            "criteria": ["hello.txt says hi"],
+            "milestones": [
+                "Known answers::tests/cases.json from the reference",
+                "Edge cases::empty and huge inputs",
+                "Write::make hello.txt",
+            ],
+            "user_confirmed": True,
+        },
+    )
+
+    assert "Dropped the milestone 'Known answers'" in result.text
+    # R10's 'edge cases' is code, not the known answers.
+    assert _milestone_splits(fake_beagle) == [
+        ["T0001", "Edge cases::empty and huge inputs", "Write::make hello.txt", "--ordered"]
+    ]
+    assert module._after_the_contract(["Cases::from the paper"]) == (
+        [module.CONTRACT_BUILD_MILESTONE],
+        [
+            "Dropped the milestone 'Cases': founding seeds the contract, which is the "
+            "known answers read from the sources."
+        ],
+    )
 
 
 @pytest.mark.anyio
@@ -1825,7 +1920,7 @@ async def test_pursuit_found_takes_a_delegated_goal_and_makes_a_repo(
     assert (project / ".git").is_dir()
     assert "git init" in result.text and "criteria you chose" in result.text
     assert "Do not fetch or read the reference" in result.text
-    assert "Cases first" in result.text
+    assert "Contract first" in result.text
     assert "git has no user.name or user.email" in result.text
 
 
@@ -1982,7 +2077,7 @@ async def test_pursuit_plan_adds_to_a_container_it_cannot_split(
 
 
 @pytest.mark.anyio
-async def test_pursuit_found_adds_a_lone_milestone_beagle_would_not_split(
+async def test_pursuit_found_splits_a_lone_milestone_after_the_contract(
     tmp_path: Path, beagle: Path, fake_beagle: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     project = tmp_path / "project"
@@ -2001,14 +2096,9 @@ async def test_pursuit_found_adds_a_lone_milestone_beagle_would_not_split(
         },
     )
 
-    assert _pursuit_calls(fake_beagle, "split") == []
-    assert _pursuit_calls(fake_beagle, "add")[1] == [
-        "Write",
-        "--parent",
-        "T0001",
-        "--intent",
-        "make hello.txt",
-    ]
+    # beagle refuses a one-part split, but founding's has the contract's two too.
+    assert _milestone_splits(fake_beagle) == [["T0001", "Write::make hello.txt", "--ordered"]]
+    assert len(_pursuit_calls(fake_beagle, "add")) == 1
     assert "Founded the pursuit" in result.text
 
 
@@ -2038,7 +2128,7 @@ async def test_found_shortens_long_milestone_title(
 
     assert "Founded the pursuit" in result.text
     assert "Milestone 2" in result.text and f"{len(long_title)}-character" in result.text
-    split = _pursuit_calls(fake_beagle, "split")
+    split = _milestone_splits(fake_beagle)
     assert len(split) == 1 and split[0][1] == "Parser::reads input"
     title, sep, intent = split[0][2].partition("::")
     assert sep and len(title) <= limit
@@ -2072,7 +2162,7 @@ async def test_found_accepts_max_length_milestone(
 
     assert "Founded the pursuit" in result.text
     assert (project / ".beagle" / "pursuit.toml").exists()
-    assert _pursuit_calls(fake_beagle, "split") == [["T0001", *milestones, "--ordered"]]
+    assert _milestone_splits(fake_beagle) == [["T0001", *milestones, "--ordered"]]
 
 
 def _tiny_pdf(text: str) -> bytes:
@@ -6436,7 +6526,7 @@ async def test_founding_seeds_milestones_from_criteria_when_every_one_is_setup(
     assert "Dropped the setup milestone 'setup', 'init project'" in setup.text
     assert "one per criterion" in setup.text
     module = _module()
-    [split] = _pursuit_calls(fake_beagle, "split")
+    [split] = _milestone_splits(fake_beagle)
     assert split == [
         "T0001",
         "`python3 -m pytest -q` exits 0::`python3 -m pytest -q` exits 0",
@@ -6494,9 +6584,8 @@ async def test_r07_setup_only_milestone_founds_from_its_criterion(
     assert "Dropped the setup milestone 'setup'" in founded.text
     [criterion] = R07_FOUND["criteria"]
     title = _module()._task_title(criterion)
-    adds = _pursuit_calls(fake_beagle, "add")
-    assert adds[1:] == [[title, "--parent", "T0001", "--intent", criterion]]
-    assert _pursuit_calls(fake_beagle, "split") == []
+    assert len(_pursuit_calls(fake_beagle, "add")) == 1
+    assert _milestone_splits(fake_beagle) == [["T0001", f"{title}::{criterion}", "--ordered"]]
 
 
 @pytest.mark.anyio
@@ -6523,9 +6612,7 @@ async def test_found_drops_setup_milestone_and_says_so(
 
     assert "Founded the pursuit" in result.text
     assert "Dropped the setup milestone 'setup'" in result.text
-    assert _pursuit_calls(fake_beagle, "split") == [
-        ["T0001", "reference::", "impl::itc.py", "--ordered"]
-    ]
+    assert _milestone_splits(fake_beagle) == [["T0001", "reference::", "impl::itc.py", "--ordered"]]
 
 
 @pytest.mark.anyio
@@ -6555,7 +6642,7 @@ async def test_founding_drops_a_rerun_only_milestone_with_a_note(
 
     assert "Founded the pursuit" in result.text
     assert "Dropped a milestone: 'Run all tests and confirm they pass' only re-runs" in result.text
-    assert _pursuit_calls(fake_beagle, "split") == [
+    assert _milestone_splits(fake_beagle) == [
         ["T0001", "reference::", "impl::itc.py", "tests::tests/test_itc.py", "--ordered"]
     ]
 
@@ -6648,16 +6735,19 @@ async def test_founding_r10_milestones_drops_only_the_setup_one(
 
     assert "Founded the pursuit" in result.text
     assert f"Dropped the setup milestone {R10_MILESTONES[0]!r}" in result.text
-    [split] = _pursuit_calls(fake_beagle, "split")
+    [split] = _milestone_splits(fake_beagle)
     assert split[0] == "T0001" and split[-1] == "--ordered"
     kept = split[1:-1]
-    assert len(kept) == 5
-    for milestone, part in zip(R10_MILESTONES[1:], kept, strict=True):
+    # Reading and design fold into the work after them: the contract reads.
+    assert len(kept) == 3
+    assert kept[0].startswith("Implement core clock operations")
+    assert R10_MILESTONES[1] in kept[0] and R10_MILESTONES[2] in kept[0]
+    for milestone, part in zip(R10_MILESTONES[3:], kept, strict=True):
         assert milestone in part
     assert not any("beagle" in part for part in kept)
 
 
-def test_found_first_note_names_known_answers_not_read_and_design(
+def test_found_first_note_names_the_contract_not_read_and_design(
     tmp_path: Path, beagle: Path
 ) -> None:
     # R15: the note and the founding line called reading the reference and
@@ -6667,8 +6757,8 @@ def test_found_first_note_names_known_answers_not_read_and_design(
     [section] = [s for s in runtime.prompt_sections if s.title == "Beagle"]
     for text in (_module().FOUND_FIRST_NOTE, section.body):
         flat = " ".join(text.split())
-        assert "the first milestone is the known answers" in flat
-        assert "writes the cases file and its test" in flat
+        assert "founding puts the contract first" in flat
+        assert "your milestones are the work after it" in flat
         assert "not a milestone of its own" in flat
         assert "choosing a design are" not in flat
         assert "reading the reference and choosing" not in flat
@@ -6681,7 +6771,7 @@ R15_FOUNDING_MILESTONE = (
 
 
 @pytest.mark.anyio
-async def test_founding_read_and_design_milestone_is_retitled_known_answers(
+async def test_founding_read_and_design_milestone_is_folded_into_the_work(
     tmp_path: Path, beagle: Path, fake_beagle: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     project = tmp_path / "project"
@@ -6701,14 +6791,9 @@ async def test_founding_read_and_design_milestone_is_retitled_known_answers(
     )
 
     assert "Founded the pursuit" in result.text
-    assert "is now 'Known answers from the reference'" in result.text
-    assert _pursuit_calls(fake_beagle, "split") == [
-        [
-            "T0001",
-            f"Known answers from the reference::{R15_FOUNDING_MILESTONE}",
-            "Implement the clock operations",
-            "--ordered",
-        ]
+    assert "Folded the design milestone" in result.text
+    assert _milestone_splits(fake_beagle) == [
+        ["T0001", f"Implement the clock operations::{R15_FOUNDING_MILESTONE}", "--ordered"]
     ]
     only_reads = _module()._read_or_design_only
     assert only_reads("Study the paper and take notes")
@@ -6821,7 +6906,7 @@ async def test_founding_milestone_with_a_bare_label_takes_its_title_from_the_int
     )
 
     assert "Founded the pursuit" in result.text
-    split = _pursuit_calls(fake_beagle, "split")
+    split = _milestone_splits(fake_beagle)
     assert len(split) == 1
     title, sep, intent = split[0][1].partition("::")
     assert title.startswith("Read the paper")
@@ -15149,8 +15234,9 @@ async def test_lean_switch_drops_lock_promises_from_driver_texts(
     # R55: under lean nothing is locked, but the founding note and the system
     # prompt (CASES_FIRST_NOTE), the `locks` parameter and the source hold still
     # promised locks. The texts are fixed at load, so no prefix changes mid-session.
+    # R0003: the prompt carries CONTRACT_FIRST_NOTE now, which promises no lock.
+    assert "Once it closes they are locked" in _module().CASES_FIRST_NOTE
     promises = (
-        "Once it closes they are locked",
         "Locked when the task closes done",
         "would be locked as known",
     )

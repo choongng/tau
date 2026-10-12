@@ -317,6 +317,40 @@ LEAN_ENV = "BEAGLE_TAU_LEAN"
 #: What founding adds to the goal file under lean (see `_lean`).
 LEAN_AUDIT_OFF = "\n[audit]\nevery = 0\n"
 
+#: R0003: setup is gather, then contract, then plan. Founding declares the
+#: contract before anyone knows the project's language, so it seals one
+#: directory, and the contract task writes its acceptance test there, in
+#: whatever language the work takes, run by one shell script.
+CONTRACT_DIR = "contract"
+CONTRACT_PATH = f"{CONTRACT_DIR}/contract.json"
+CONTRACT_SECOND = f"{CONTRACT_DIR}/contract.second.json"
+CONTRACT_ACCEPTANCE = f"sh {CONTRACT_DIR}/accept.sh"
+#: What founding adds to the goal file: beagle's [contract] table.
+CONTRACT_TABLE = (
+    "\n[contract]\n"
+    f'path = "{CONTRACT_PATH}"\n'
+    f'second = "{CONTRACT_SECOND}"\n'
+    f'acceptance = "{CONTRACT_ACCEPTANCE}"\n'
+    f'files = ["{CONTRACT_DIR}/"]\n'
+)
+#: The criterion founding adds, so the goal's end is the contract passing.
+CONTRACT_CRITERION = (
+    f"Every entry of the contract ({CONTRACT_PATH}), sealed before the code was "
+    "planned, passes: `beagle pursuit contract run` exits 0."
+)
+#: The tasks founding seeds ahead of the milestones, in order. beagle's brief
+#: gives each its inventory; the second does not read the first.
+CONTRACT_MILESTONES = (
+    "Contract::read the sources and list in "
+    f"{CONTRACT_PATH} what they pin down, each entry quoted from its source, with "
+    f"{CONTRACT_DIR}/accept.sh running every entry against the code",
+    "Second extraction::list it again in "
+    f"{CONTRACT_SECOND} without reading the first, then reconcile the two",
+)
+#: The milestone founding seeds when the driver named none but known answers,
+#: which the contract now is.
+CONTRACT_BUILD_MILESTONE = f"Build to the contract::make every entry of {CONTRACT_PATH} pass"
+
 
 def _lean() -> bool:
     """Whether `LEAN_ENV` is on: set to anything but "" or "0"."""
@@ -4062,6 +4096,34 @@ def _unconfirmed_refusal(statement: str, criteria: list[str], *, interactive: bo
     )
 
 
+def _after_the_contract(milestones: list[str]) -> tuple[list[str], list[str]]:
+    """The driver's milestones, to follow the contract; a note for each dropped.
+
+    The contract is the known answers, so a milestone that names them is that
+    work done twice. With none left, the one milestone is building to the
+    contract. Run before `_repair_milestones`, so a design it folds is not
+    folded into a milestone dropped here.
+    """
+
+    def known_answers(part: str) -> bool:
+        # Not every 'cases': R10's 'edge cases' milestone is code.
+        title, text = part.partition("::")[0].strip().lower(), part.lower()
+        return (
+            "known answer" in text
+            or re.search(r"\bcases(\.json| file)\b", text) is not None
+            or title in ("cases", "test cases")
+        )
+
+    kept = [part for part in milestones if not known_answers(part)]
+    notes = [
+        f"Dropped the milestone {part.partition('::')[0].strip()!r}: founding seeds the "
+        "contract, which is the known answers read from the sources."
+        for part in milestones
+        if part not in kept
+    ]
+    return kept or [CONTRACT_BUILD_MILESTONE], notes
+
+
 def make_found_tool(
     on_founded: Callable[[Path], None] | None = None,
     interactive: Callable[[], bool] = lambda: True,
@@ -4099,6 +4161,7 @@ def make_found_tool(
                 "already see, each '<title>::<what it is for>'."
             )
         criteria, criteria_notes = _drop_setup_criteria(criteria)
+        milestones, contract_notes = _after_the_contract(milestones)
         # Run R03's driver, refused for a setup first milestone, sent the same
         # call fourteen times: what founding can repair itself, it repairs.
         given = milestones
@@ -4109,7 +4172,11 @@ def make_found_tool(
             milestones, repairs = _milestones_from_criteria(given, criteria, repairs)
             if not milestones:
                 return _step_result(f"pursuit_found: nothing written — {repairs[0]}")
-        repairs = [*criteria_notes, *repairs]
+        # After the milestones are settled: R07's fallback makes milestones
+        # of the criteria, and this one is the contract's, seeded already.
+        if CONTRACT_CRITERION not in criteria:
+            criteria = [*criteria, CONTRACT_CRITERION]
+        repairs = [*criteria_notes, *repairs, *contract_notes]
         repaired = "".join(f"{note}\n\n" for note in repairs)
         delegated = arguments.get("user_delegated") is True
         inferred = None
@@ -4140,7 +4207,8 @@ def make_found_tool(
             '\n[close]\nrequire = "witness"\n'
             # R0002: the lean arm runs no audit sub-agent, so beagle core's
             # cadence (an audit due every 16 closes refuses `open`) is off too.
-            f"{LEAN_AUDIT_OFF if _lean() else ''}",
+            f"{LEAN_AUDIT_OFF if _lean() else ''}"
+            f"{CONTRACT_TABLE}",
             encoding="utf-8",
         )
         _ignore_caches(root)
@@ -4158,15 +4226,12 @@ def make_found_tool(
         references = await asyncio.to_thread(_references_for, root, _LAST_PROMPT)
         if on_founded is not None:
             on_founded(goal)
-        if len(milestones) == 1:
-            # beagle refuses a one-part split as a rename; one milestone is
-            # one child of the root, which `add --parent` takes.
-            rc, out = _add_children(root_task, milestones, root)
-        else:
-            split = ["split", root_task, *milestones]
-            if arguments.get("ordered", True) is not False:
-                split.append("--ordered")
-            rc, out = _pursuit(split, root)
+        # The contract comes first whatever the driver's order: beagle opens
+        # nothing else until it is sealed.
+        split = ["split", root_task, *CONTRACT_MILESTONES, *milestones]
+        if arguments.get("ordered", True) is not False:
+            split.append("--ordered")
+        rc, out = _pursuit(split, root)
         if rc != 0:
             return _step_result(
                 f"pursuit_found: founded {goal} with root task {root_task}, but the "
@@ -4207,7 +4272,7 @@ def make_found_tool(
         return _step_result(
             f"Founded the pursuit in {goal}, root task {root_task}.\n\n"
             f"{_goal_text(goal) or ''}\n\n{_tree(root)}\n\n"
-            f"{noted}{DRIVER_STEERS_NOTE}\n\n{CASES_FIRST_NOTE}\n\n"
+            f"{noted}{DRIVER_STEERS_NOTE}\n\n{CONTRACT_FIRST_NOTE}\n\n"
             "Next: call pursuit_step with no arguments to see the first ready task. A "
             "milestone too big for one sub-agent's sitting: split it into steps with "
             "pursuit_plan first. The goal file is now the user's; never edit it."
@@ -9607,26 +9672,22 @@ def _repair_milestones(milestones: list[str]) -> tuple[list[str], list[str]]:
     for _part, why in reruns:
         notes.append(f"Dropped a milestone: {why}")
     repaired: list[str] = []
-    # Run R17 retitled its docs milestone as a second known-answers task
-    # although milestone 1 already wrote tests/cases.json.
-    retitled = any(_names_known_answers(part) for part in kept)
-    # 'edge cases' (R10) names no known answers: fold only beside real ones.
-    if any(re.search(r"known answer|\bcases(\.json| file)\b", p.lower()) for p in kept):
-        kept, fold_notes = _fold_design_milestones(kept)
-        notes.extend(fold_notes)
+    # R0003: founding seeds the contract, which is the known answers, so a
+    # milestone that only reads or designs is folded into the work after it.
+    kept, fold_notes = _fold_design_milestones(kept)
+    notes.extend(fold_notes)
     for index, part in enumerate(kept, 1):
         title, sep, intent = part.partition("::")
         title = title.strip()
-        if not retitled and _read_or_design_only(part):
-            retitled = True
+        if len(kept) == 1 and _read_or_design_only(part):
+            build = CONTRACT_BUILD_MILESTONE.partition("::")[0]
             detail = f"{title} — {intent.strip()}" if sep and intent.strip() else title
-            repaired.append(f"{KNOWN_ANSWERS_TITLE}::{detail}")
+            repaired.append(f"{CONTRACT_BUILD_MILESTONE}; {detail}")
             notes.append(
                 f"Milestone {index} {title!r} only reads the reference or chooses a "
-                f"design, so it is now {KNOWN_ANSWERS_TITLE!r}, with its text after "
-                "'::': a sub-agent reads the reference and writes the cases file and "
-                "its test. The design is part of the implementation, not a milestone "
-                "of its own."
+                f"design, so it is now {build!r}, with its text after '::': reading "
+                "the sources is the contract's work, and the design is part of the "
+                "implementation, not a milestone of its own."
             )
             continue
         labelled = _split_part(part)[0]
@@ -18031,9 +18092,9 @@ FOUND_FIRST_SETUP_CALLS = 6
 FOUND_FIRST_NOTE = (
     "Beagle: this project is not a pursuit yet. Found it before anything else: "
     "`beagle init` if `.beagle/` is missing, then `pursuit_found`. Do not read "
-    "references or design the solution first: the first milestone is the known "
-    "answers, which a `pursuit_step` sub-agent does: it reads the reference and "
-    "writes the cases file and its test. The design is part of the implementation, "
+    "references or design the solution first: founding puts the contract first, "
+    "which `pursuit_step` sub-agents read from the sources, and your milestones are "
+    "the work after it. The design is part of the implementation, "
     "not a milestone of its own. Name the "
     f"reference (URL) in the milestones. After {FOUND_FIRST_SETUP_CALLS} setup "
     "tool calls, every tool but the pursuit tools is refused until it is founded."
@@ -19165,6 +19226,23 @@ CASES_FIRST_NOTE = (
     )
 )
 
+#: R0003: founding seeds the contract ahead of the milestones (CONTRACT_MILESTONES).
+#: The driver writes each step's check and scope, so it is told what they are.
+CONTRACT_FIRST_NOTE = (
+    "Contract first. Founding puts two tasks ahead of the milestones. 'Contract': a "
+    "sub-agent reads the sources (the references, the repo's docs, tests and types, a "
+    "named standard, experiments it runs) and lists in "
+    f"{CONTRACT_PATH} every worked example, stated limit, invalid input and operation "
+    f"they define, each quoting its source, and writes {CONTRACT_DIR}/accept.sh, which "
+    "runs every entry against the code. 'Second extraction': another sub-agent lists "
+    f"them again in {CONTRACT_SECOND} without reading the first, then reconciles the "
+    f"two. Give both the scope `{CONTRACT_DIR}/`; the Contract's check is `beagle "
+    "pursuit contract check --draft`, the second's `beagle pursuit contract check`. "
+    "Nothing else opens until the contract is sealed; then plan each milestone from "
+    "it with pursuit_plan. Done is every entry passing (`beagle pursuit contract "
+    "run`), not the tests a task wrote."
+)
+
 #: Commits need an identity; a model that meets "Please tell me who you are"
 #: makes one up (the qwen trial set "Developer <dev@example.com>").
 GIT_IDENTITY_NOTE = (
@@ -19249,7 +19327,7 @@ DRIVER_PROCEDURE = [
     "into steps with `pursuit_plan` first.",
     "Do not edit project files in this session; put what you want changed in the step's `notes`.",
     DRIVER_STEERS_NOTE,
-    CASES_FIRST_NOTE,
+    CONTRACT_FIRST_NOTE,
     GIT_IDENTITY_NOTE,
     "",
     # No slash commands here: run 11c's driver read `/pursuit-run` in this
@@ -19293,9 +19371,9 @@ def _unfounded_section(root: Path) -> str | None:
     lines += [
         "- Found it first. Asked to set beagle up and build something, call "
         "`pursuit_found` as your first move, before you read any reference or design "
-        "anything: the first milestone is the known answers: a sub-agent reads the "
-        "reference and writes the cases file and its test; the design is part of the "
-        "implementation, not a milestone of its own. Your part is to steer, a few "
+        "anything: founding puts the contract first, read from the sources by "
+        "sub-agents, and your milestones are the work after it; the design is part of "
+        "the implementation, not a milestone of its own. Your part is to steer, a few "
         "steps at a time.",
         "- Pass `pursuit_found` the user's goal, their acceptance criteria and the "
         "milestones you can already name. The goal and the criteria are the user's: use "
