@@ -18035,6 +18035,78 @@ async def test_data_test_route_is_not_offered_when_the_data_test_already_passes(
         assert "closes on that work" not in result.text
 
 
+R59_CASES_TEST = (
+    "import json\nfrom pathlib import Path\n\n"
+    "CASES = json.loads(Path(__file__).with_name('cases.json').read_text())\n\n\n"
+    "def test_cases():\n    from itc import Node\n\n    assert Node and CASES\n"
+)
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("lean", [False, True])
+async def test_tests_only_task_importing_unwritten_module_is_offered_the_cases_first_route(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    lean: bool,
+) -> None:
+    # q35 R59 L47-L53: T0003's scope held only tests/test_cases.py, which imports the
+    # unwritten itc. prove's next step said to mutate the module the test imports, and
+    # the new-route refusal to name a new data test; prove refused a WITNESS in a test
+    # either way. The route that works writes the code and the test in one task.
+    if lean:
+        _lean_on(monkeypatch)
+    project = _witnessed_pursuit(tmp_path, monkeypatch)
+    monkeypatch.chdir(project)
+    check = "python3 -m pytest --co -q tests/test_cases.py"
+    scope = ["tests/test_cases.py"]
+    monkeypatch.setenv("FAKE_TAU_WRITES", json.dumps({"tests/test_cases.py": R59_CASES_TEST}))
+    monkeypatch.setenv(
+        "FAKE_TAU_REPORT",
+        "wrote it\n\nWITNESS: tests/test_cases.py\nNEEDLE:\n    assert Node and CASES\n"
+        "REPLACEMENT:\n    assert not Node\nEND WITNESS",
+    )
+    (project / "tests").mkdir()
+    (project / "tests" / "cases.json").write_text('[{"name": "seed", "result": 1}]\n')
+    _ready_task(fake_beagle, check)
+    runtime, _ = _bound(tmp_path)
+    step = _tool(runtime, "pursuit_step")
+
+    closed = await step.execute(
+        "c1", {"task": "T0002", "criteria": "c", "done_when": check, "scope": scope}
+    )
+    _case_data_test(project)
+    _commit(project, "tests/cases.json", "tests/test_case_data.py")
+    record = {"id": "T0002", "title": "Parser", "status": "open"}
+    (fake_beagle / "show.out").write_text(
+        json.dumps({**record, "done_when": check, "scope": scope})
+    )
+    (fake_beagle / "next.out").write_text(json.dumps({"open": [{"id": "T0002"}], "ready": []}))
+    cases_check = "python3 -m pytest -q tests/test_cases.py"
+    refused = await step.execute(
+        "c2",
+        {"task": "T0002", "new_route": True, "done_when": cases_check, "scope": scope}
+        | {"notes": "Bind the cases test."},
+    )
+
+    joint = (
+        "Write tests/test_cases.py and the code it imports, `itc`, in one task"
+        + ("" if lean else ", and lock tests/test_cases.py at its close")
+        + ': scope=["tests/test_cases.py", "itc/"], '
+        'done_when="python3 -m pytest -q tests/test_cases.py"'
+        + ("" if lean else ', locks=["tests/test_cases.py"]')
+    )
+    assert "the WITNESS is in a test file" in closed.text
+    assert f"no new route for T0002 — If work is left: {joint}." in refused.text
+    for text in (closed.text, refused.text):
+        assert joint in text
+        assert "mutate the module the test imports" not in text
+        assert "name a new data test file" not in text
+        assert ("locks=" in text) is not lean
+
+
 @pytest.mark.anyio
 @pytest.mark.parametrize("committed", [False, True])
 async def test_amend_to_a_check_passing_only_by_own_uncommitted_work_is_accepted(
