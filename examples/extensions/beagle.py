@@ -4728,7 +4728,10 @@ STEP_PARAMETERS: dict[str, Any] = {
             "type": "array",
             "items": {"type": "string"},
             "description": (
-                "Files this task writes that no later task may change, such as the "
+                "Files this task writes, such as the known-answer cases from the reference. "
+                "Nothing is locked: a later task may change them."
+                if _lean()
+                else "Files this task writes that no later task may change, such as the "
                 "known-answer cases from the reference. Locked when the task closes done; "
                 "after that a sub-agent's change to them is undone before every check."
             ),
@@ -15771,10 +15774,10 @@ def make_step_tool() -> Any:
                 scope,
                 f"{route}{undid}{task} — {title}: the check passes, but the task {state} "
                 f"and nothing is locked: {missing} of {total} cases in {data} have a source "
-                "that does not give the case's expected result, so a wrong answer would be "
-                f"locked as known: case {named[0]}'s source quotes its input or prose, not "
-                "its expected result: quote the line that gives the result, where the "
-                "reference has one"
+                "that does not give the case's expected result, so a wrong answer would "
+                f"{'pass' if _lean() else 'be locked'} as known: case {named[0]}'s source "
+                "quotes its input or prose, not its expected result: quote the line that "
+                "gives the result, where the reference has one"
                 + (f" (also {', '.join(named[1:])})" if named[1:] else "")
                 + f". {unanswered} A source holds the result when it, or the line of "
                 f"{REFERENCES_DIR}/*.txt after the one it quotes, gives every value of it, "
@@ -19046,8 +19049,14 @@ CASES_FIRST_NOTE = (
     "of them); not `python3 -m json.tool`, which passes once the file parses and is "
     "refused as a check. That data test imports no code and no other test, and must "
     "pass now: an ImportError from it is a defect to fix, not the pre-implementation "
-    "state. It passes `locks` with the data file and both tests. Once it "
-    "closes they are locked, and every later task's done_when runs the cases test."
+    "state."
+    # R55: lean locks nothing; fixed at load, so no prefix changes mid-session.
+    + (
+        ""
+        if _lean()
+        else " It passes `locks` with the data file and both tests. Once it "
+        "closes they are locked, and every later task's done_when runs the cases test."
+    )
 )
 
 #: Commits need an identity; a model that meets "Please tell me who you are"
