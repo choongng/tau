@@ -10842,8 +10842,9 @@ class _Proof:
     #: A defect was put back and the check still passed: the check, not the
     #: work, is what falls short.
     weak: bool = False
-    #: A tests-only task had no WITNESS in the module its tests import, named in
-    #: `text`: another worker can give one, so the task is not unproven.
+    #: A tests-only task had no WITNESS in the module its tests import, or taking
+    #: a source away failed the check only on its import; named in `text`:
+    #: another worker can give one, so the task is not unproven.
     ask_module: bool = False
     #: Proven only by taking away a source file: that shows the check needs the
     #: import, not that it tests the behaviour.
@@ -11077,6 +11078,9 @@ async def _prove(
                     "failed only on importing it, which any file of that name passes. Give "
                     "a WITNESS: a NEEDLE in that code which a test the check runs must catch."
                 )
+                # q35 R55: the check's test imports that code, so the next worker
+                # can give that WITNESS on this check; no new route is needed.
+                ask_module = True
                 continue
             return _Proof(proven=True, text=tail, by_absent_source=by_absent_source)
         if verdicts.get(task) == "NOT PROVEN" and "STILL PASSES" in out:
@@ -15239,8 +15243,8 @@ def make_step_tool() -> Any:
                 "pursuit_plan.\n"
                 "This check already passes and cannot be "
                 f"shown to refuse, since no defect could be put back into a file in its "
-                f"scope ({', '.join(scope) or 'none'}). Another sub-agent would change "
-                "nothing, whatever check or scope this task is sent with. "
+                f"scope ({', '.join(scope) or 'none'}). Another sub-agent on this route "
+                "would change nothing. "
                 + how
                 + ". Its notes say what the new route does differently.",
                 ran=False,
