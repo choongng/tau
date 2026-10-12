@@ -5782,11 +5782,21 @@ def _absent_case_lookup(tree: ast.AST, labels: set[str], keys: Collection[str] =
 
 
 def _method_and_value(tree: ast.AST) -> str | None:
-    called = {
-        node.func.attr
+    """An attribute the test both calls, `.x()`, and reads as a value it checks.
+
+    Run R20: `result.event == n` beside `clock.event()`. q35 R51: `clock.event()`
+    then `actual = {"event": clock.event}` and `assert _stamp_eq(actual, ...)`.
+    Besides a direct comparison or arithmetic operand, a read of the same object's
+    attribute counts when it is carried, through dict, list, tuple or set
+    literals, assignments to names and arguments to the module's own functions,
+    into an assert or comparison.
+    """
+    calls = [
+        node.func
         for node in ast.walk(tree)
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
-    }
+    ]
+    called = {func.attr for func in calls}
     for node in ast.walk(tree):
         if isinstance(node, ast.Compare):
             operands = [node.left, *node.comparators]
@@ -5799,6 +5809,321 @@ def _method_and_value(tree: ast.AST) -> str | None:
         for operand in operands:
             if isinstance(operand, ast.Attribute) and operand.attr in called:
                 return operand.attr
+    methods = {(ast.unparse(func.value), func.attr) for func in calls}
+    parents = {child: node for node in ast.walk(tree) for child in ast.iter_child_nodes(node)}
+    own = {
+        node.name
+        for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef)
+    }
+    loads: dict[str, list[ast.Name]] = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load):
+            loads.setdefault(node.id, []).append(node)
+
+    def checked(node: ast.AST, seen: set[str]) -> bool:
+        while True:
+            parent = parents.get(node)
+            carries = (
+                isinstance(parent, ast.List | ast.Tuple | ast.Set | ast.Starred | ast.keyword)
+                or (isinstance(parent, ast.Dict) and node in parent.values)
+                or (
+                    isinstance(parent, ast.Call)
+                    and node is not parent.func
+                    and isinstance(parent.func, ast.Name)
+                    and parent.func.id in own
+                )
+            )
+            if parent is None or not carries:
+                break
+            node = parent
+        if isinstance(parent, ast.Compare | ast.BinOp):
+            return True
+        if isinstance(parent, ast.Assert) and node is parent.test:
+            return True
+        if isinstance(parent, ast.Assign | ast.AnnAssign) and node is parent.value:
+            targets = parent.targets if isinstance(parent, ast.Assign) else [parent.target]
+            names = [t.id for t in targets if isinstance(t, ast.Name) and t.id not in seen]
+            return any(
+                checked(load, seen | {name}) for name in names for load in loads.get(name, [])
+            )
+        return False
+
+    for node in ast.walk(tree):
+        parent = parents.get(node)
+        if (
+            isinstance(node, ast.Attribute)
+            and isinstance(node.ctx, ast.Load)
+            and (ast.unparse(node.value), node.attr) in methods
+            and not (isinstance(parent, ast.Call) and parent.func is node)
+            and checked(node, set())
+        ):
+            return node.attr
+    return None
+
+
+#: Fixtures a parametrized cases test may take beside the case that carry nothing of it.
+_NEUTRAL_FIXTURES = frozenset(
+    {"self", "tmp_path", "tmp_path_factory", "monkeypatch", "capsys", "capfd", "caplog", "recwarn"}
+)
+#: Case keys that label or describe a case and reach no call.
+_CASE_LABEL_KEYS = frozenset(
+    {"name", "id", "title", "case", "description", "desc", "notes", "note", "comment"}
+)
+_MISSING = object()
+
+
+def _case_at(case: object, path: tuple[str, ...]) -> object:
+    for key in path:
+        if not isinstance(case, dict) or key not in case:
+            return _MISSING
+        case = case[key]
+    return case
+
+
+def _case_test_holds(test: ast.AST, case: object, name: str) -> bool:
+    """Whether `test`, a condition on the case `name` alone, holds for `case`.
+
+    Comparisons of constant-key reads of the case with constants, under
+    and/or/not, are evaluated; anything else raises ValueError.
+    """
+    if isinstance(test, ast.BoolOp):
+        held = [_case_test_holds(value, case, name) for value in test.values]
+        return all(held) if isinstance(test.op, ast.And) else any(held)
+    if isinstance(test, ast.UnaryOp) and isinstance(test.op, ast.Not):
+        return not _case_test_holds(test.operand, case, name)
+    if not (isinstance(test, ast.Compare) and len(test.ops) == 1):
+        raise ValueError(ast.unparse(test))
+
+    def value(node: ast.AST) -> object:
+        path: list[str] = []
+        while isinstance(node, ast.Subscript) and _str_const(node.slice) is not None:
+            path.insert(0, str(_str_const(node.slice)))
+            node = node.value
+        if isinstance(node, ast.Name) and node.id == name and path:
+            return _case_at(case, tuple(path))
+        try:
+            return ast.literal_eval(node)
+        except ValueError as error:
+            raise ValueError(ast.unparse(node)) from error
+
+    left, right, op = value(test.left), value(test.comparators[0]), test.ops[0]
+    if isinstance(op, ast.Eq | ast.Is):
+        return left == right
+    if isinstance(op, ast.NotEq | ast.IsNot):
+        return left != right
+    if isinstance(op, ast.In | ast.NotIn) and isinstance(right, tuple | list | set | str):
+        return (left in right) is isinstance(op, ast.In)
+    raise ValueError(ast.unparse(test))
+
+
+#: Calls whose arguments are a message, not something a case's call is made from.
+_MESSAGE_CALLS = frozenset({"skip", "fail", "xfail", "print"})
+
+
+def _case_reads(function: ast.AST, name: str) -> list[tuple[tuple[str, ...], bool]] | None:
+    """Each constant-key path the function reads under the case `name`, and whether
+    the read sits only in a message (f-string, assert message, skip/fail text).
+
+    None when the case is used other than by constant keys, as a whole or by a
+    computed key, so which of its keys reach a call cannot be told.
+    """
+    parents = {child: node for node in ast.walk(function) for child in ast.iter_child_nodes(node)}
+
+    def step(node: ast.AST) -> tuple[ast.AST, str | None] | None:
+        parent = parents.get(node)
+        if isinstance(parent, ast.Subscript) and parent.value is node:
+            return parent, _str_const(parent.slice)
+        call = parents.get(parent) if isinstance(parent, ast.Attribute) else None
+        if (
+            isinstance(parent, ast.Attribute)
+            and parent.attr == "get"
+            and isinstance(call, ast.Call)
+            and call.func is parent
+            and call.args
+        ):
+            return call, _str_const(call.args[0])
+        return None
+
+    def in_message(node: ast.AST) -> bool:
+        while node in parents:
+            parent = parents[node]
+            if isinstance(parent, ast.JoinedStr) or (
+                isinstance(parent, ast.Assert) and node is parent.msg
+            ):
+                return True
+            if (
+                isinstance(parent, ast.Call)
+                and ast.unparse(parent.func).split(".")[-1] in _MESSAGE_CALLS
+            ):
+                return True
+            node = parent
+        return False
+
+    reads: list[tuple[tuple[str, ...], bool]] = []
+    for node in ast.walk(function):
+        if not (isinstance(node, ast.Name) and node.id == name):
+            continue
+        path: tuple[str, ...] = ()
+        top: ast.AST = node
+        while (taken := step(top)) is not None and taken[1] is not None:
+            top, path = taken[0], (*path, taken[1])
+        if not path or taken is not None:
+            return None
+        reads.append((path, in_message(top)))
+    return reads
+
+
+def _reaching_cases(
+    function: ast.FunctionDef | ast.AsyncFunctionDef, name: str, cases: list[object]
+) -> list[dict[str, object]] | None:
+    """The cases that get past the function's skip or return guards, or None.
+
+    A guard is a top-level `if` on the case alone whose body skips, fails or
+    returns (`if case["operation"] != "event": pytest.skip(...)`). None when an
+    exit sits anywhere else or a guard cannot be evaluated on a case.
+    """
+    exits = [
+        node
+        for node in ast.walk(function)
+        if isinstance(node, ast.Return | ast.Raise)
+        or (
+            isinstance(node, ast.Call)
+            and ast.unparse(node.func).split(".")[-1] in _MESSAGE_CALLS - {"print"}
+        )
+    ]
+    guards = {
+        stmt.test: {node for sub in stmt.body for node in ast.walk(sub)}
+        for stmt in function.body
+        if isinstance(stmt, ast.If) and not stmt.orelse
+    }
+    if any(not any(node in body for body in guards.values()) for node in exits):
+        return None
+    tests = [test for test, body in guards.items() if any(node in body for node in exits)]
+    try:
+        return [
+            case
+            for case in cases
+            if isinstance(case, dict)
+            and not any(_case_test_holds(test, case, name) for test in tests)
+        ]
+    except ValueError:
+        return None
+
+
+def _unread_input_keys(
+    first: dict[str, object],
+    second: dict[str, object],
+    routing: set[tuple[str, ...]],
+    answers: Collection[str],
+) -> list[str]:
+    """The input keys on which the two cases differ that the test never reads."""
+    read_under: dict[str, set[str]] = {}
+    for path in routing:
+        read_under.setdefault(path[0], set()).update(path[1:2])
+    unread: list[str] = []
+    for key in dict.fromkeys([*first, *second]):
+        if key in answers or key in _CASE_LABEL_KEYS or (key,) in routing:
+            continue
+        if any(part in key.lower() for part in SOURCE_KEY_PARTS):
+            continue
+        left, right = first.get(key, _MISSING), second.get(key, _MISSING)
+        if key in read_under and isinstance(left, dict) and isinstance(right, dict):
+            unread += [
+                sub
+                for sub in dict.fromkeys([*left, *right])
+                if sub not in read_under[key]
+                and left.get(sub, _MISSING) != right.get(sub, _MISSING)
+            ]
+        elif key not in read_under and left != right:
+            unread.append(key)
+    return unread
+
+
+def _indistinguishable_cases(tree: ast.Module, cases: list[object]) -> str | None:
+    """Two cases a parametrized test makes the same call for that expect different answers.
+
+    q35 R51: test_case_event read only case["operation"] and case["input"]["node"],
+    and a later step added "initial_id"/"initial_event" to double_event, so it
+    and event_on_full made one call and expected events 2 and 1. A test is
+    judged only when it is parametrized over one case, from an unfiltered list,
+    and reads the case only by constant keys; the keys it reads outside
+    messages, operation names included, are what tell two cases' calls apart.
+    Cases its skip guards drop never reach the call.
+    """
+    answers = _answer_keys(cases)
+    values = {
+        value
+        for case in cases
+        if isinstance(case, dict)
+        for value in case.values()
+        if isinstance(value, str)
+    }
+    module_values = {
+        target.id: node.value
+        for node in tree.body
+        if isinstance(node, ast.Assign)
+        for target in node.targets
+        if isinstance(target, ast.Name)
+    }
+    functions = [
+        node
+        for top in tree.body
+        for node in (top.body if isinstance(top, ast.ClassDef) else [top])
+        if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef) and node.name.startswith("test")
+    ]
+    for function in functions:
+        params = [*function.args.posonlyargs, *function.args.args, *function.args.kwonlyargs]
+        carried = [a.arg for a in params if a.arg not in _NEUTRAL_FIXTURES]
+        if len(carried) != 1 or function.args.vararg or function.args.kwarg:
+            continue
+        name = carried[0]
+        source = None
+        for decorator in function.decorator_list:
+            if (
+                isinstance(decorator, ast.Call)
+                and ast.unparse(decorator.func).endswith("parametrize")
+                and len(decorator.args) >= 2
+                and _str_const(decorator.args[0]) == name
+            ):
+                source = decorator.args[1]
+        if isinstance(source, ast.Name):
+            source = module_values.get(source.id)
+        if not isinstance(source, ast.Call | ast.Subscript) or any(
+            (isinstance(sub, ast.comprehension) and sub.ifs)
+            or isinstance(sub, ast.Lambda)
+            or (isinstance(sub, ast.Name) and sub.id == "filter")
+            or _str_const(sub) in values
+            for sub in ast.walk(source)
+        ):
+            continue
+        if any(isinstance(sub, ast.Global | ast.Nonlocal) for sub in ast.walk(function)):
+            continue
+        reads = _case_reads(function, name)
+        held = _reaching_cases(function, name, cases) if reads else None
+        if not reads or held is None:
+            continue
+        routing = {path for path, message in reads if path[0] not in answers and not message}
+        judged = {path for path, _ in reads if path[0] in answers}
+        if not judged:
+            continue
+        for index, first in enumerate(held):
+            for second in held[index + 1 :]:
+                if any(_case_at(first, p) != _case_at(second, p) for p in routing):
+                    continue
+                if all(_case_at(first, p) == _case_at(second, p) for p in judged):
+                    continue
+                unread = _unread_input_keys(first, second, routing, answers)
+                pair = sorted(_case_label(case, cases.index(case)) for case in (first, second))
+                why = (
+                    f"it never reads their input keys {', '.join(unread)}"
+                    if unread
+                    else "they agree on every input key it reads"
+                )
+                return (
+                    f"makes the same call in {function.name} for cases {pair[0]} and "
+                    f"{pair[1]}, which expect different answers ({why})"
+                )
     return None
 
 
@@ -6023,6 +6348,11 @@ def _cases_problem_fix(root: Path, test: str, problem: str) -> str:
             "delete the functions it defines, import the code under test, and compare each "
             "case's answer with the code's result"
         )
+    elif problem.startswith("makes the same call "):
+        fix = (
+            "make it pass the code every input key that tells the two cases apart, or "
+            "drop the case whose answer the reference does not give"
+        )
     elif problem.startswith("uses ") and " without importing " in problem:
         fix = f"import {problem.rpartition(' without importing ')[2]} in it"
     else:
@@ -6165,6 +6495,8 @@ def _cases_test_problem(root: Path, entries: list[str]) -> tuple[str, str] | Non
     test importing no project module that compared the answers with the results
     of functions it defined itself checked its own copy, not the code. q35
     10-11: only functions given a case's input count; a data loader does not.
+    q35 R51: two cases the test cannot tell apart that expect different answers
+    are refused (`_indistinguishable_cases`).
     """
     files = []
     for entry in entries:
@@ -6232,11 +6564,14 @@ def _cases_test_problem(root: Path, entries: list[str]) -> tuple[str, str] | Non
                     "assert or comparison uses them, so a wrong result the test never checks "
                     "against an answer passes"
                 )
+            same = _indistinguishable_cases(tree, cases)
+            if same is not None and _test_project_imports(root / test):
+                return test, same
             both = _method_and_value(tree)
             if both is not None:
                 return test, (
-                    f"uses .{both} both as a method, .{both}(), and as a value in a "
-                    "comparison or arithmetic, so it cannot pass against any one code"
+                    f"uses .{both} both as a method, .{both}(), and as a value it "
+                    "compares or computes with, so it cannot pass against any one code"
                 )
     return None
 
@@ -14639,6 +14974,8 @@ def make_step_tool() -> Any:
                 "reference. Read them; do not edit them. Any change is undone before the "
                 "check runs, so make the code pass them as they are:\n"
                 + "\n".join(f"- {rel}" for rel in locked)
+                + "\n"
+                + LOCKED_UNPASSABLE_NOTE
             )
         try:
             attempts = max(1, int(arguments.get("attempts") or DEFAULT_STEP_ATTEMPTS))
@@ -15812,6 +16149,15 @@ NO_BEAGLE_REASON = (
 )
 #: What a worker is told in its brief, to the same end.
 NO_BEAGLE_NOTE = "Do not inspect .beagle/ or run beagle."
+#: What a worker is told to do with a locked test no code can pass. q35 R51:
+#: W4 spent 15.7 min fitting code to test_cases.py, which made one call for
+#: double_event and event_on_full; W5 saw why and circled until it was killed.
+LOCKED_UNPASSABLE_NOTE = (
+    "If a locked test can pass against no code (it makes the same call for two cases "
+    "that expect different answers, or uses one attribute both as a method and as a "
+    "value), do not work around it: report that it cannot be passed, naming the two "
+    "cases or the attribute, and end the step there."
+)
 #: Programs that only show what a path holds: a worker reading `.beagle/` with one
 #: is orienting, not working. A check script under it (`bash .beagle/checks/...`)
 #: is run, not read, and passes.
