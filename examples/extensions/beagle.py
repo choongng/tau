@@ -14957,6 +14957,8 @@ def make_step_tool() -> Any:
                     ):
                         # Run R18: the T0151 refusal had the open's blind spot.
                         route += _on_disk_note(done_when, task)
+                        # q35 R57: and the amend's worker got no witness note.
+                        passed_on_disk = (pre_rc, pre_out)
                     elif pre_rc == 0 and not _lean():
                         keep = (
                             f" Keep the bound check `{bound_check}`: leave done_when out to "
@@ -15017,6 +15019,8 @@ def make_step_tool() -> Any:
                 _UNPROVEN.discard((str(root), task))
                 _LAST_CHECK_EXIT.pop((str(root), task), None)
                 _LAST_CHECK_FAILURE.pop((str(root), task), None)
+                # q35 R57: the old check's close demand is not the new check's.
+                _NOT_DONE_DEMAND.pop((str(root), task), None)
                 kept = _strings(record.get("scope"))
                 route += (
                     f"{task}'s check is now `{done_when}`, run on scope {json.dumps(own_scope)}"
