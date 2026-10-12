@@ -38,6 +38,15 @@ assert not bad, "classes without 'Seen in:': " + "; ".join(bad)
 untested = [c.splitlines()[0] for c in classes
             if "[tau]" in c.splitlines()[0] and not re.search(r"tests/[\w/]+\.py::test_\w+", c)]
 assert not untested, "[tau] classes naming no test function: " + "; ".join(untested)
+unwritten = []
+for c in classes:
+    if "[tau]" not in c.splitlines()[0]:
+        continue
+    names = set(re.findall(r"tests/[\w/]+\.py::(test_\w+)", c))
+    absent = [n for n in names if subprocess.run(['git', 'grep', '-qE', rf'def {n}\b', '--', 'tests'], capture_output=True).returncode]
+    if absent and not re.search(r"^(Deferred|Filed as): \S", c, re.M):
+        unwritten.append(c.splitlines()[0] + " -> " + ", ".join(sorted(absent)))
+assert not unwritten, "[tau] classes citing tests that do not exist, with no 'Deferred: <why>' or 'Filed as: TNNNN' line (audit 2026-10-12): " + "; ".join(unwritten)
 assert re.search(r"^### Timeline\s*\n(?:.*\n){3,}", md, re.M), "no ### Timeline with entries"
 assert re.search(r"^### The questions\s*\n(?:.*\n){3,}", md, re.M), "no ### The questions with answers"
 noind = [c.splitlines()[0] for c in classes if not re.search(r"^Prompt- and model-independent: \S", c, re.M)]
