@@ -15483,7 +15483,10 @@ def make_step_tool() -> Any:
                     )
             if missing:
                 retry_note += "\n\n" + missing.rstrip()
-            notes = report.strip()
+            # q35 R58: W2's cut-off kill note was briefed as its notes. A cut-off
+            # kill's notes are what it wrote before the note, if anything.
+            cut_off = run.stop_reason == "length" and CUT_OFF_TWICE in report
+            notes = (run.last_words if cut_off else report).strip()
             preamble = len(notes) < PREAMBLE_REPORT_CHARS and not _REPORT_FILE_NAME.search(notes)
             if notes and not notes.startswith(NO_REPORT) and not preamble:
                 # Run R15: W5 and W6 re-read both references from line 1, though
