@@ -15284,6 +15284,13 @@ def make_step_tool() -> Any:
                 break
             verdict = await _run_check(check, root, check_timeout)
             _note_check_run(unproven_key, check, verdict)
+            # q35 R53: W4 was killed at its second cut-off and wrote no report, and
+            # W5's brief said "An earlier attempt reported back".
+            ended = (
+                "ended without a report"
+                if run.unreported or (run.stop_reason == "length" and CUT_OFF_TWICE in report)
+                else "reported back"
+            )
             if verdict[0] == 0:
                 if _absent_locks(locks, root):
                     break
@@ -15296,7 +15303,7 @@ def make_step_tool() -> Any:
                     _UNPROVEN.add(unproven_key)
                     break
                 retry_note = (
-                    "\n\nAn earlier attempt reported back and the check passes, but `prove` "
+                    f"\n\nAn earlier attempt {ended} and the check passes, but `prove` "
                     "could not show the check catches a defect in the work:\n"
                     f"{proof.text}\n"
                     + (
@@ -15314,7 +15321,7 @@ def make_step_tool() -> Any:
                 )
                 continue
             retry_note = (
-                f"\n\nAn earlier attempt reported back, but the check still fails (exit "
+                f"\n\nAn earlier attempt {ended}, but the check still fails (exit "
                 f"{verdict[0]}). Its output ends:\n{verdict[1][-CHECK_TAIL_CHARS:]}\n"
             )
             cannot_pass = _data_test_route(check, scope, root)

@@ -12267,6 +12267,51 @@ async def test_retry_note_skips_a_preamble_only_report(
 
 
 @pytest.mark.anyio
+async def test_retry_note_after_killed_attempt_does_not_say_reported_back(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # q35 R53: W4 was killed at its second cut-off with no report, and W5's
+    # brief said "An earlier attempt reported back, but the check still fails".
+    monkeypatch.chdir(_pursuit_project(tmp_path))
+    _ready_task(fake_beagle)
+    runtime, _ = _bound(tmp_path)
+    module = _loaded_module()
+    briefs: list[str] = []
+    killed = f"(the sub-agent was ended: {module.CUT_OFF_TWICE}: nothing filled. Split it.)"
+    runs = [
+        module._WorkerRun(returncode=-9, report=killed, stop_reason="length"),
+        module._WorkerRun(returncode=0, report="Wrote notes.txt.", stop_reason="stop"),
+        module._WorkerRun(returncode=0, report="Gave up.", stop_reason="stop"),
+    ]
+
+    async def run_worker(brief: str, *args: Any, **kwargs: Any) -> Any:
+        briefs.append(brief)
+        return runs[len(briefs) - 1]
+
+    monkeypatch.setattr(module, "_run_worker", run_worker)
+    await _tool(runtime, "pursuit_step").execute(
+        "c1",
+        {
+            "task": "T0002",
+            "criteria": "done.txt exists",
+            "done_when": "grep -q done done.txt",
+            "scope": ["done.txt"],
+            "attempts": 3,
+        },
+    )
+
+    assert len(briefs) == 3
+    after_killed, after_report = briefs[1], briefs[2]
+    assert "An earlier attempt reported back" not in after_killed
+    assert "An earlier attempt ended without a report, but the check still fails" in after_killed
+    assert "An earlier attempt reported back, but the check still fails" in after_report
+
+
+@pytest.mark.anyio
 async def test_worker_guard_refuses_python_one_liner_write_out_of_scope(
     tmp_path: Path, beagle: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
