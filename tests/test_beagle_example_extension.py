@@ -12405,6 +12405,60 @@ async def test_retry_note_after_killed_attempt_does_not_say_reported_back(
 
 
 @pytest.mark.anyio
+async def test_cut_off_kill_note_is_not_briefed_as_reference_notes(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # q35 R58: W2 was cut-off-killed with no report, and W3's brief carried its kill
+    # note as "An earlier attempt read the references; its notes:".
+    monkeypatch.chdir(_pursuit_project(tmp_path))
+    _ready_task(fake_beagle)
+    runtime, _ = _bound(tmp_path)
+    module = _loaded_module()
+    briefs: list[str] = []
+    killed = (
+        f"(the sub-agent was ended: {module.CUT_OFF_TWICE}: {module.REASONING_FILLED}; "
+        f"the next sub-agent on T0002 runs thinking-off. {module.NO_CALL_CUT})"
+    )
+    said = "The reference in refs/cobs.c encodes each run of non-zero bytes. " * 6
+    runs = [
+        module._WorkerRun(returncode=-9, report=killed, stop_reason="length"),
+        module._WorkerRun(
+            returncode=-9, report=f"{said}\n\n{killed}", stop_reason="length", last_words=said
+        ),
+        module._WorkerRun(returncode=0, report="Gave up.", stop_reason="stop"),
+    ]
+
+    async def run_worker(brief: str, *args: Any, **kwargs: Any) -> Any:
+        briefs.append(brief)
+        return runs[len(briefs) - 1]
+
+    monkeypatch.setattr(module, "_run_worker", run_worker)
+    await _tool(runtime, "pursuit_step").execute(
+        "c1",
+        {
+            "task": "T0002",
+            "criteria": "done.txt exists",
+            "done_when": "grep -q done done.txt",
+            "scope": ["done.txt"],
+            "attempts": 3,
+        },
+    )
+
+    assert len(briefs) == 3
+    assert len(killed) > module.PREAMBLE_REPORT_CHARS
+    assert "An earlier attempt read the references" not in briefs[1]
+    assert "the sub-agent was ended" not in briefs[1]
+    # What the worker wrote before its kill is still its notes; the kill note is not.
+    notes = briefs[2].split("An earlier attempt read the references; its notes:\n", 1)
+    assert len(notes) == 2 and notes[1].startswith(said.strip())
+    assert "the sub-agent was ended" not in briefs[2]
+
+
+@pytest.mark.anyio
 async def test_worker_guard_refuses_python_one_liner_write_out_of_scope(
     tmp_path: Path, beagle: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
