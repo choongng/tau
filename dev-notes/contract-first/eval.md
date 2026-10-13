@@ -25,6 +25,7 @@ branch and sha. Grades come from `grade_<task>.py` over `runs/RNN/adapter.py`;
 | R91 | q35 | cobs | contract-first 6ff1dd0 (T0524–T0526) | 5/44 at the 60 min cap (encode never closed) | R90 39/44; R86 42/44; B05 plain 41/44 in 48.8 min |
 | R92 | q35 | cobs | contract-first 1684138 (T0529); tau 7cb40c5e (T0527, T0528) | void: another session switched ~/tautest/tau's branch at 18 min, removing the beagle extension | — |
 | R93 | q35 | cobs | the same, tau pinned in ~/tautest/tau-harness | 0/44 at the 60 min cap (contract not sealed) | R92 sealed at 30.6 min; R91 5/44; R90 39/44; B05 plain 41/44 in 48.8 min |
+| R94 | q35 | cobs | contract-first e02f316 (T0529, T0530); tau 7cb40c5e pinned | 13/44 at the 60 min cap (working tree; encode 11/11, decode 0/11) | R93 0/44; R90 39/44; B05 plain 41/44 in 48.8 min |
 
 ## B06 — the invented spec was not hard
 
@@ -508,4 +509,38 @@ extraction) took 3 min; Reconcile was mid-way at the cap. No code.
 - No tool calls written as text, no loop cuts.
 - The driver's own criterion `len(encode(b"a"*300)) <= 301` is wrong for COBS
   (300 non-zero bytes need two code bytes); nothing graded it here.
+
+## R94 — q35 cobs: 13/44 at the cap; the contract sealed at 18.5 min
+
+T0530 held: one contract worker (1.1–10.2 min) closed T0002 at 9.6 min, the
+second extraction closed at 13.4 and Reconcile at 18.4, 39 entries (R93 never
+sealed; R91 20.6 min; R90 30.3). T0005 closed on T0004's commit. Then T0006
+(Core COBS encoding) was open from 19 min to the cap over four workers:
+
+| Encode worker | Minutes | How it ended |
+|---|---|---|
+| cfcce259 | 20.1–32.0 | 31-turn cap (one reply at the output limit, 347 s, not counted against its wall) |
+| 5505d769 | 32.1–41.0 | 31-turn cap: "install the cobs package in the Python that `contract run` uses" |
+| 31a1381e | 42.4–57.3 | the 900 s wall, fixing decode |
+| a2bd3074 | 57.8– | the cap |
+
+- The acceptance hid its own failure. `contract/accept.sh` imports
+  `from cobs import encode, decode` under `except ImportError:` and prints
+  `FAIL <id>: cobs module not found` for every entry. The encode milestone ran
+  before decode existed, so every entry failed with that line though
+  `cobs/__init__.py` imported fine. The driver spent its eight bash calls on
+  pip, uv, sys.path and grepping beagle for the message, and a worker reported
+  the fix as installing the package. Two general fixes: the contract brief
+  asks the acceptance to load each operation on its own and print the
+  exception it caught; and `contract run` can say when every entry failed
+  with one identical reason that the acceptance itself is failing, not the
+  cases.
+- At the cap: encode passes the grader's 11 Wikipedia cases; decode
+  appends a zero after a 0xFF group and fails all 11. Acceptance 30 ok.
+- Three acceptance properties ("output contains no zero byte") test the
+  encoded frame with its delimiter, so a correct encoder fails them: the
+  contract's delimiter convention and its properties disagree, and the seal
+  did not catch it.
+- Turn cap: 3 of 7 workers ended at it (R93: 3 of 6), the next worker
+  re-reading the tree for 5–8 turns each time.
 
