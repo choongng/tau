@@ -29,6 +29,7 @@ branch and sha. Grades come from `grade_<task>.py` over `runs/RNN/adapter.py`;
 | R95 | q35 | itc | contract-first e02f316 (T0529, T0530); tau 7cb40c5e pinned | 22/42 at the 60 min cap (working tree; uncommitted) | R87 0/42; R83 18/42; R57 lean cases-first 23/42; B04 plain 0/42 |
 | R96 | q35 | wrenfold | contract-first e02f316 (T0529, T0530); tau 7cb40c5e pinned | 50/54 at the 60 min cap (working tree; package ~/wrenfold/wrenfold, uncommitted) | R71 0/54; B06 plain 54/54 in 9.1 min |
 | B07 | q35 | semver (bare goal) | none (plain tau, no extensions) | 75/76 in 8.1 min, ended on its own | — (baseline for the bare-goal pursuit runs) |
+| R97 | q35 | semver (bare goal) | contract-first 24bd167 (T0536, T0537, T0541); tau e66018d7 pinned | 58/76 at the 60 min cap (working tree; T0006 Core Version class open, uncommitted) | B07 plain 75/76 in 8.1 min |
 
 ## B06 — the invented spec was not hard
 
@@ -624,4 +625,49 @@ What a bare-goal pursuit run must beat: 75/76 in 8 min, on a problem the
 model already knows. There are no sources to read, so the contract stage
 has nothing to cite but what the driver saves; the runs say whether beagle
 still pays its way when the spec is the model's own memory.
+
+## R97 — q35 semver, bare goal: 58/76 at the cap; a sealed acceptance that could not fail
+
+The first bare-goal pursuit run (criterion 8). The driver founded from the
+one-line prompt, saved semver.org's 2.0.0 page itself into contract/, and
+sealed a 134-entry contract at 31.6 min (Contract 11 min, Second extraction
+7.4, Reconcile 11). Scaffolding took 11 min, and the Core Version class worker
+was still open at the cap. Graded through an adapter over `Version(s)`, its
+`<` and `str`: 58/76. The misses are 15 precedence cases (prerelease
+identifiers compare equal), one build case, and two inputs with surrounding
+whitespace (`Version` strips them).
+
+Time went to:
+
+1. **An acceptance that passes whatever the code does.** accept.sh prints
+   `ok` for every `property` and `operation` entry unconditionally ("tested
+   by hand" is a comment), and checks examples only for not raising: every
+   example's expect is `valid`. Precedence, the spec's own example chain
+   included, is a property, so nothing ever asked the code to compare two
+   versions. Sealing let it through: without code every entry fails to
+   import, one shared load reason, so T0541's outlier test sees no outlier
+   and T0536's codeless test sees no pass.
+2. **Reconcile copied the second extraction in whole.** 56 of the 134
+   entries came from contract.second.json with `operation` set to the
+   entry's own id (`semver-100` … `semver-155`), 13 statements duplicate
+   another's. The milestone check is `contract run`, whose acceptance
+   imports each operation as a module, so the T0006 worker wrote a meta-path
+   finder that makes `semver-NNN` importable and a `Version(s)` that
+   evaluates `"1.0.0 < 2.0.0"`. Both are code shaped to the acceptance, not
+   to the goal.
+3. **Scaffolding dispatched twice.** The first worker passed the
+   file-existence check in 1.2 min; a second worker on the same task, with
+   the work already done, spent 9.5 min, twice hitting the output limit,
+   deciding what WITNESS a scaffold could have. Why the extension sent it
+   is not yet read.
+4. **The contract stage on a known problem.** 31.6 min before any code,
+   against B07's 8.1 min for the whole job. The owner's bar is problems
+   above ~100k tokens, which semver is not; the bare-goal runs are here to
+   show beagle still works without a spec, and R97 shows it found and cited
+   one by itself.
+
+Fixes filed under T0531: the contract check refuses an operation that is
+its own entry's id and a statement that duplicates another; sealing must
+show each entry's test can fail once the code loads; and why a
+task whose check passed was dispatched again is read before it is fixed.
 
