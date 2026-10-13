@@ -21,6 +21,7 @@ branch and sha. Grades come from `grade_<task>.py` over `runs/RNN/adapter.py`;
 | R87 | q35 | itc | contract-first 6e25585 (T0516, T0518, T0519) | 0/42 | R83 18/42; B04 plain 0/42 |
 | R88 | q35 | cobs | contract-first eccdcac (T0509, T0510, T0520, T0522) | — (OOM-killed at 23 min, in Contract) | R86 42/44; B05 plain 41/44 |
 | R89 | q35 | cobs | contract-first 676ffd1 (T0524) | 2/44 in 49.8 min (ended, not capped) | R86 42/44; B05 plain 41/44 in 48.8 min |
+| R90 | q35 | cobs | contract-first 271a767 (T0524, T0525) | 39/44 at the 60 min cap (working tree; 31/44 committed) | R86 42/44; R89 2/44; B05 plain 41/44 in 48.8 min |
 
 ## B06 — the invented spec was not hard
 
@@ -388,3 +389,40 @@ The contract sealed at 13.8 min (R86: 14). Stages closed at:
 - Open: the driver's output-limit spiral when a milestone stalls. R90 repeats
   on 271a767.
 
+## R90 — q35 cobs: 39/44 at the cap; Reconcile lost 13 min to a name (T0526)
+
+Capped at 60 min. Graded on the working tree, 39/44; the committed tree, whose
+decode the last worker was still fixing, 31/44. All five failures are malformed
+input that decode returns instead of raising (B05 and R86 fail two of these);
+the reference states no rule for it, so no contract entry holds it.
+
+| Stage | Closed at |
+|---|---|
+| Contract (25 entries) | 13.8 min |
+| Second extraction | 16.9 min |
+| Reconcile (sealed) | 30.3 min |
+| T0010 Encode | 53.3 min |
+| T0011 Decode | open at the cap |
+
+- T0525 holds: every case is concrete (EX-7 is 254 bytes in, 256 out, in
+  full hex) and every bound became a property with a `prop-*.sh` test. accept.sh
+  prints `ok`/`FAIL` lines; Encode's check was `contract run --operation
+  encode` and it passed.
+- Reconcile took 13 min (17.0–30.2). The contract named its reference by
+  `cat references/…txt` with the file's text as output, the second named it by
+  path, and spans were compared by ident: `contract check` reported all 22 of
+  the second's entries as cited by no entry of the first. The worker matched
+  cites by hand, added entries, tried to rewrite the second (refused), and the
+  next worker switched the contract's source to the path form, which passed.
+  T0526 (beagle contract-same-document 6ff1dd0): a file matches any source of
+  the same lines, hashed in comparison form; two experiments are still told
+  apart by command. On R90's two files: 22 problems to 0 (`diff` 26/22 to 0/0).
+- The first Encode worker (31.7–42.6) hit q35's 16k output limit thinking the
+  algorithm through, three replies running, and tau ended it with nothing
+  written; the second wrote it in 10 min. The same spiral ended R89's driver.
+- T0005, the goal's first milestone, was titled "T0001: Build contract …": the
+  driver's seeding repeated the contract stage as a milestone. Refused an
+  abandon (a milestone is the goal's), it split it into encode, decode and
+  tests, which worked, at a minute's cost.
+- Open: the output-limit spiral (q35 max_tokens 16384 in the krang catalog;
+  B05 ran under the same limit), and a repeat of R90 on T0526.
