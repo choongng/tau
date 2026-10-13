@@ -39,6 +39,12 @@
 # criteria 1 and 7 added to.
 # 2026-10-12 (ruling R0003): R61 stopped in flight, R62-R70 dropped for contract-first
 # setup (T0478, R0004); criteria 1, 4 and 7 amended to match, as for R45-R50.
+# 2026-10-13: "keep cycling between the itc, cobs, and wrenfold tasks, fixing
+# issues to polish tau + beagle pursuit effectiveness" and "how can i make this
+# a pursuit run that can run overnight?" -> criterion 8 read back and accepted
+# ("criteria is fine, accept your guidance"), with the owner's addition: "we
+# want beagle to still function when there's not a detailed spec, and just as
+# concise goal" -> a fourth, bare-goal prompt with no references.
 [goal]
 statement = "Make tau+beagle give a small local model (9-12B) enough structure to take a small implementation prompt (~/tautest/itc_prompt.txt, interval tree clocks; ~/tautest/cobs_prompt.txt, consistent overhead byte stuffing; each in Python via a beagle pursuit) toward a correct, committed result, learning from the traces of unattended runs and fixing tau between runs, with fixes that hold across prompts and models rather than fitting one. The small models are a stress test: they surface often, and cheaply, failure behaviours that larger models show rarely, so the aim is tau+beagle that works better across models, and for each small model to complete the task at least some of the time."
 criteria = [
@@ -49,6 +55,7 @@ criteria = [
   "dev-notes/itc-runs holds summaries with a table of every run's scorecard and the failure classes that recurred: summary.md (R01-R10), summary-R11-R20.md, and a summary of R21-R44 that compares the two prompts and the three models and says which failure classes and fixes carried across them. For each model and prompt it gives how many runs completed (every hidden test passed), how many passed any, and the best grade.",
   "dev-notes/itc-runs/mining.md reports what the existing traces (every driver and worker session of R01-R44 and B01-B03) show across runs, found by scripts in itc-harness that anyone can rerun: each beagle refusal that sent the driver to a call beagle then refused, each refusal repeated without progress, and the other bug and opportunity indicators the traces carry (time sinks, worker failure modes, tau-level stops and errors, recoveries beagle could have offered). Each finding gives its count, runs and models, and whether today's tau and beagle code still produces it; each one still live has a fix committed with a regression test or a recorded reason it was deferred.",
   "dev-notes/itc-runs holds a summary of R51-R60 that compares each q35 pursuit run with the q35 baseline for its prompt (hidden-grader result, wall time, worker and driver tokens, tasks spawned per task done) and names, for each tau or beagle mechanism the q35 traces show costing time without catching a defect, whether it was fixed, gated by model, or kept with the reason.",
+  "Runs R96-R105 rotate q35 (qwen3.6-35b-q6-mtp-thinking-coding) contract-first pursuit runs over wrenfold_prompt.txt, a bare-goal prompt (one sentence, no spec or reference given), itc_prompt.txt and cobs_prompt.txt, each from a clean directory under the one-hour cap and scored by its hidden grader, with a plain-tau q35 baseline B07 for the bare-goal prompt run before its first pursuit run. Each run has a row and section in dev-notes/contract-first/eval.md naming what cost it the most time and comparing grade and wall time with the plain-tau baseline for its prompt (B04 itc, B05 cobs, B06 wrenfold, B07 bare goal). Before the next run starts, that failure has a fix committed with a regression test (tau on choong-dev, beagle on contract-first, never pushed) or a recorded reason it was deferred.",
 ]
 default_budget_tokens = 150000
 
