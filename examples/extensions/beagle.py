@@ -431,6 +431,27 @@ def _seal_when_ready(root: Path) -> str:
     )
 
 
+async def _settle_after_seal(task: str, root: Path) -> str:
+    """Close each contract milestone the seal left with nothing to do, done by `task`.
+
+    R85: the two extractions agreed, so the contract sealed when the second's
+    task closed, and Reconcile's check passed before any work. The driver could
+    neither open it nor drop it, and stopped after eight refusals with no code.
+    Each closes here as a done-by close does, its own check proven to refuse
+    with `task`'s work taken away; one that cannot is left for the driver.
+    """
+    nodes = _tree_nodes(root)
+    said = []
+    for node in nodes:
+        if node.get("status") != "pending" or str(node.get("title") or "").strip() not in (
+            CONTRACT_STEPS
+        ):
+            continue
+        reply = await _done_by(str(node.get("id")), task, {}, nodes, root)
+        said.append(reply if reply.startswith("pursuit_step:") else reply.split("\n\n")[0])
+    return "".join(f"{s}\n\n" for s in said)
+
+
 def _contract_verdict(gate: Any, root: Path) -> str:
     """What beagle's contract says of done when nothing is ready, for the driver; "".
 
@@ -12999,6 +13020,13 @@ async def _done_by(
         return f"pursuit_step: cannot read {task} (exit {rc}):\n{out}"
     given = str(arguments.get("done_when") or "").strip()
     check = given or str(record.get("done_when") or "").strip()
+    title = str(record.get("title") or "")
+    # R85: offered `contract check`, the driver bound --draft to Reconcile's
+    # done-by close; it could not refuse with the second taken away.
+    fixed = CONTRACT_STEPS.get(title.strip()) if _contract_declared(root) else None
+    if fixed is not None:
+        check = fixed[1]
+        arguments = {**arguments, "scope": list(fixed[0])}
     if not check:
         return (
             f"{refused}it has no check: pass done_when, ONE command that exits 0 on "
@@ -13008,7 +13036,6 @@ async def _done_by(
     if prose is not None or chained is None:
         return f"{refused}{prose}"
     check = chained
-    title = str(record.get("title") or "")
     changes = _changes_done_work(task, done, title, record, nodes)
     if changes:
         return (
@@ -16063,6 +16090,8 @@ def make_step_tool() -> Any:
                 lock_note += f"Not locked: {'; '.join(skipped)}.\n\n"
         superseded = _SUPERSEDED_REPORT_NOTE if rc == 0 and _report_claims_failure(shown) else ""
         seal_note = _seal_when_ready(root) if rc == 0 else ""
+        if seal_note.startswith("Sealed"):
+            seal_note += await _settle_after_seal(task, root)
         return _step_result(
             f"{route}{task} — {title}: {state}.\n\n{committed}\n\n{closed}\n\n"
             f"{undid}{lock_note}{seal_note}{unrun_note}"

@@ -24249,6 +24249,9 @@ async def test_a_close_seals_the_contract_once_beagle_reads_it_ready(
     _ready_task(fake_beagle)
     (fake_beagle / "contract-status.out").write_text(json.dumps({"state": state}))
     (fake_beagle / "contract-seal.out").write_text("sealed 3 file(s)\n")
+    # A Reconcile left pending: the seal tries it as done by the task that closed.
+    reconcile = {"id": "T0004", "parent": "T0001", "title": "Reconcile", "status": "pending"}
+    (fake_beagle / "tree.out").write_text(json.dumps({"goal": "Ship it", "nodes": [reconcile]}))
     runtime, _ = _bound(tmp_path)
 
     result = await _tool(runtime, "pursuit_step").execute(
@@ -24268,8 +24271,90 @@ async def test_a_close_seals_the_contract_once_beagle_reads_it_ready(
     calls = _pursuit_calls(fake_beagle, "contract")
     if state == "ready":
         assert sealed and calls == [["status", "--json"], ["seal"]]
+        assert "pursuit_step: T0004 not closed done by T0002" in result.text
     else:
         assert not sealed and calls == [["status", "--json"]]
+        assert "T0004" not in result.text
+
+
+def _reconcile_project(tmp_path: Path, fake: Path, monkeypatch: pytest.MonkeyPatch) -> str:
+    """A contract project whose T0003, Second extraction, committed the second and is
+    done, with T0004, Reconcile, pending; beagle's checks pass. Returns the commit."""
+    module = _module()
+    project, _ = _done_by_project(tmp_path, fake, monkeypatch, "T0001: setup")
+    goal = project / ".beagle" / "pursuit.toml"
+    close = '\n[close]\nrequire = "witness"\n'
+    goal.write_text(goal.read_text() + close + module.CONTRACT_TABLE, encoding="utf-8")
+    (project / module.CONTRACT_SECOND).parent.mkdir(exist_ok=True)
+    (project / module.CONTRACT_SECOND).write_text("[]\n")
+    _git(project, "add", module.CONTRACT_SECOND)
+    _git(project, "commit", "-q", "-m", "T0003: Second extraction")
+    nodes = [
+        {"id": "T0001", "parent": "", "title": "Goal", "status": "open", "container": True},
+        {"id": "T0002", "parent": "T0001", "title": "Contract", "status": "done"},
+        {"id": "T0003", "parent": "T0001", "title": "Second extraction", "status": "done"},
+        {"id": "T0004", "parent": "T0001", "title": "Reconcile", "status": "pending"},
+        {"id": "T0005", "parent": "T0001", "title": "Encode", "status": "pending"},
+    ]
+    (fake / "tree.out").write_text(json.dumps({"goal": "Ship it", "nodes": nodes}))
+    record = {"id": "T0004", "title": "Reconcile", "status": "pending", "done_when": ""}
+    (fake / "show-T0004.out").write_text(json.dumps(record))
+    (fake / "prove.out").write_text("T0004: PROVEN — refuses with the second gone\n")
+    monkeypatch.setenv("PATH", f"{fake}{os.pathsep}{os.environ['PATH']}")
+    return _git(project, "rev-parse", "HEAD").strip()
+
+
+@pytest.mark.anyio
+async def test_reconcile_closes_done_by_on_its_own_check(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # R85: offered `contract check`, the driver bound --draft to Reconcile's
+    # done-by close, which could not refuse with the second taken away.
+    _reconcile_project(tmp_path, fake_beagle, monkeypatch)
+    runtime, _ = _bound(tmp_path)
+
+    result = await _tool(runtime, "pursuit_step").execute(
+        "c1",
+        {
+            "task": "T0004",
+            "abandon": "done by T0003",
+            "done_when": "beagle pursuit contract check --draft",
+            "scope": ["contract/contract.json"],
+        },
+    )
+
+    [opened] = _pursuit_calls(fake_beagle, "open")
+    assert opened[opened.index("--done-when") + 1] == "beagle pursuit contract check", result.text
+    assert opened[opened.index("--scope") + 1] == "contract/"
+    [proved] = _pursuit_calls(fake_beagle, "prove")
+    assert proved[proved.index("--absent") + 1] == _module().CONTRACT_SECOND
+    assert "T0004 — Reconcile: closed done" in result.text
+
+
+@pytest.mark.anyio
+async def test_the_seal_closes_reconcile_done_by_the_task_that_sealed(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # R85: the extractions agreed, the contract sealed when T0003 closed, and
+    # Reconcile could be neither opened nor dropped; the run stopped with no code.
+    sha = _reconcile_project(tmp_path, fake_beagle, monkeypatch)
+
+    said = await _module()._settle_after_seal("T0003", Path.cwd())
+
+    assert [c[0] for c in _pursuit_calls(fake_beagle, "open")] == ["T0004"]
+    assert [c[0] for c in _pursuit_calls(fake_beagle, "close")] == ["T0004"]
+    assert said == (
+        f"T0004 — Reconcile: closed done, satisfied by T0003's commit {sha[:12]}; "
+        "no sub-agent ran.\n\n"
+    )
 
 
 @pytest.mark.anyio
