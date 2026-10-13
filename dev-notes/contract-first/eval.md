@@ -14,6 +14,8 @@ branch and sha. Grades come from `grade_<task>.py` over `runs/RNN/adapter.py`;
 | R74 | qwen 9B | cobs | contract-first 01db8e9 | 11/44 | qwen cobs best 7/44 (R22 3, R43 5); B01 0/44 |
 | R81 | q35 | itc | contract-first fce5dac (anchors) | 0/42 | R73 0/42; R57 lean cases-first 23/42 |
 | R82 | q35 | cobs | contract-first fce5dac (anchors) | 0/44 | R72 0/44; R60 42/44 (cases-first) |
+| R83 | q35 | itc | contract-first a80193c (add, listing, bare names) | 18/42 | R81 0/42; R57 lean cases-first 23/42 |
+| R84 | q35 | cobs | contract-first a80193c (add, listing, bare names) | 39/44 | R82 0/44; R60 42/44; B05 plain 41/44 |
 
 ## B06 — the invented spec was not hard
 
@@ -169,3 +171,57 @@ entries; the retry worker (T0009) re-read every file and ran out of time.
 Next: T0509, T0510, the operation-name match, and a cheaper contract stage
 (entries added one at a time and checked as they go; a second extraction
 that lists anchors rather than rewriting entries).
+
+## A cheaper contract stage: R83–R84 (T0515)
+
+Both ran on beagle a80193c and tau 96b9beb9 or later. Changes since R81–R82:
+`contract add` (T0513), a second extraction that lists anchors only (T0514),
+and operations matched by bare name (T0512). Both runs hit the 60-minute cap.
+Both contracts sealed, and both runs produced code that grades.
+
+| | R81 itc | R83 itc | R82 cobs | R84 cobs |
+|---|---|---|---|---|
+| Founding to seal | 45 min | 30 min | never | 19 min |
+| First Contract worker | 14 min (51 KB written whole, cut off, redone) | 8.5 min, 71 added, 17 refused | — | 5 min, 26 added, 7 refused |
+| Second extraction | 11 min, 39 KB | written by a Contract worker (below) | — | 14 min over two workers, 25 listing entries |
+| Implementation time | 15 min | 26 min | 0 | 39 min |
+| Grade | 0/42 | 18/42 | 0/44 | 39/44 |
+
+- Every Contract worker used `contract add`, and no run wrote `contract.json`
+  whole. Refused entries were fixed in the same turn they were refused, so
+  there was no separate fixing pass like R81's 17 minutes.
+- R83's code is a real ITC (id and event trees on tuples). It passes the
+  per-operation cases and fails the traces and the paper's worked run. It is
+  uncommitted in the working tree: the scaffolding task was still open at the
+  cap.
+- R84 fails only the five malformed-input cases. The Wikipedia reference says
+  nothing about malformed input, so the contract has no invalid entries and
+  no gap for it. That is knowledge the source does not hold, the regime this
+  series is for. Nothing asked the reader what the source leaves unsaid about
+  invalid input.
+
+### The second extraction was not independent
+
+- R83: the second Contract worker read `contract.json` and ran the full check.
+  The check said "second extraction does not exist yet: have a reader who has
+  not seen contract.json write it", and the worker wrote it itself, as full
+  entries (20 KB). The Second extraction task then closed in a minute on that
+  file.
+- R84: both second-extraction workers began with `cat contract/contract.json`.
+  The listing has the first's ids and cites, minus one.
+- Cause: tau's founding note tells the driver to give both tasks the scope
+  `contract/`. Beagle recognises a second extraction only when its scope is
+  the second file (plus references), so these workers got the Contract brief.
+  "Without reading the first" reached them only as criteria text the driver
+  wrote.
+
+## What R83–R84 say
+
+- With `add`, the stage still costs time, but less of it: about a third to a
+  half of the hour, down from all of it.
+- Independence is not held by anything yet. The fix belongs in the scope
+  founding gives the second extraction, and in a refusal when a worker reads or
+  writes the other extraction.
+- Invalid input the sources do not state needs to become a gap the reader is
+  asked about, not silence.
+
