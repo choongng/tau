@@ -275,3 +275,13 @@ tau's in tests/test_beagle_example_extension.py.
 
 Then R98, q35 on wrenfold, then semver, recording time to first code
 beside R96 and R97 in eval.md.
+
+## Owner decisions (2026-10-13)
+
+- Coverage is a hard gate on done.
+- An excluded passage may span up to 40 lines, each with a reason.
+- Strict append-only: a sealed entry is fixed only by an upheld dispute
+  retiring it and a superseding entry in a later slice.
+- The single-file contract mode (`[contract] path`/`second`, the second
+  extraction and Reconcile) is removed, not kept beside slices: task 1
+  retires it in beagle, task 4 drops `second`, task 6 in tau.
