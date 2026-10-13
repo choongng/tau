@@ -19486,7 +19486,7 @@ CASES_FIRST_NOTE = (
 #: R0003: founding seeds the contract ahead of the milestones (CONTRACT_MILESTONES).
 #: The driver writes each step's check and scope, so it is told what they are.
 CONTRACT_FIRST_NOTE = (
-    "Contract first. Founding puts two tasks ahead of the milestones. 'Contract': a "
+    "Contract first. Founding puts three tasks ahead of the milestones. 'Contract': a "
     "sub-agent reads the sources (the references, the repo's docs, tests and types, a "
     "named standard, experiments it runs) and lists in "
     f"{CONTRACT_PATH} every worked example, stated limit, invalid input and operation "
