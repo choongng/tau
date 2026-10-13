@@ -1927,9 +1927,12 @@ _REFUSED = "Not run: "
 _BREAKER_STOP = "Not run, and the run is stopped"
 #: How the refusal of a call cut off at the output limit begins (`_truncated_call`).
 CUT_OFF_REFUSAL = "This call's arguments were cut off"
-#: The turns over a run cut off at the output limit that end the worker.
-WORKER_CUT_OFFS = 2
-CUT_OFF_TWICE = "cut off twice at the output limit"
+#: The turns over a run cut off at the output limit that end the worker. q35
+#: R91: a worker was ended at its second, two 16384-token turns of hand-tracing
+#: an encoder, when the reply after a cut-off can act on its reasoning (tau
+#: replays it).
+WORKER_CUT_OFFS = 3
+CUT_OFF_ENDED = f"cut off {WORKER_CUT_OFFS} times at the output limit"
 #: How a kill note and the next worker's note say reasoning alone filled the limit.
 REASONING_FILLED = "its reasoning filled the output limit before any reply or call"
 #: What filled a cut-off turn: reasoning with no reply or call, reply text with no
@@ -2000,6 +2003,9 @@ class _WorkerEvents:
     reasoning_cut_offs: int = 0
     #: What filled each cut-off turn, in order: CUT_THINKING, CUT_REPLY or CUT_CALL.
     cut_fills: list[str] = field(default_factory=list)
+    #: The milliseconds the cut-off turns took, as tau timed them: the wall does
+    #: not count them (q35 R91: two 16384-token turns took 10 of a 15 min wall).
+    cut_ms: int = 0
     #: How many tool calls its turns made, over the whole run (q35 R56).
     calls: int = 0
     #: Output tokens, and the milliseconds after each turn's first output: its decode.
@@ -2010,6 +2016,8 @@ class _WorkerEvents:
     #: The count before the last turn, and whether that turn was counted as cut off.
     _before_turn: int = 0
     _turn_cut: bool = False
+    #: The last turn's milliseconds, as tau timed it.
+    _turn_ms: int = 0
     #: The last `message_update` line since the last message ended: the turn in flight.
     _in_flight: bytes = b""
 
@@ -2039,7 +2047,10 @@ class _WorkerEvents:
             # of the run once per turn. The largest request is what the run
             # held at its peak, which is how Claude Code reports a subagent.
             self.spent = max(self.spent or 0, total)
-        self._note_decode(usage, message.get("timing"))
+        timing = message.get("timing")
+        self._note_decode(usage, timing)
+        took = timing.get("totalDurationMs") if isinstance(timing, dict) else None
+        self._turn_ms = took if isinstance(took, int) and took > 0 else 0
         blocks = _blocks(message)
         text, self.thinking = _said(blocks)
         if text:
@@ -2059,6 +2070,7 @@ class _WorkerEvents:
         self._turn_cut = stop == "length"
         self.length_stops = self._before_turn + 1 if self._turn_cut else 0
         self.cut_offs += self._turn_cut
+        self.cut_ms += self._turn_ms if self._turn_cut else 0
         self.reasoning_cut_offs += self._turn_cut and bool(self.thinking) and not (text or calls)
         if self._turn_cut:
             self.cut_fills.append(CUT_CALL if calls else CUT_REPLY if text else CUT_THINKING)
@@ -2111,6 +2123,7 @@ class _WorkerEvents:
                 self._turn_cut = True
                 self.length_stops = self._before_turn + 1
                 self.cut_offs += 1
+                self.cut_ms += self._turn_ms
                 self.cut_fills.append(CUT_CALL)
         if text.startswith(_BREAKER_STOP):
             self.stopped = True
@@ -2319,7 +2332,12 @@ def _wall_problem(
     q38fn 10-11: the result said "Split the task, or lower its turn cap", but the
     workers ran out of wall in long turns at ~20 tok/s, not in many turns.
     """
-    problem = f"the step-executor exceeded its wall-clock budget of {timeout:.0f}s and was killed"
+    problem = f"the step-executor exceeded its wall-clock budget of {timeout:.0f}s"
+    if events.cut_ms:
+        problem += (
+            f", not counting {events.cut_ms / 1000:.0f}s in turns cut off at the output limit,"
+        )
+    problem += " and was killed"
     if events.length_stops:
         problem += (
             f": its last {events.length_stops} turn(s) ended at the output limit, writing "
@@ -2462,7 +2480,7 @@ async def _run_worker(
                 else NO_CALL_CUT
             )
             cause = "; ".join(filled) or NOTHING_FILLED
-            ended = f"(the sub-agent was ended: {CUT_OFF_TWICE}: {cause}{retry}. {advice})"
+            ended = f"(the sub-agent was ended: {CUT_OFF_ENDED}: {cause}{retry}. {advice})"
             return _WorkerRun(
                 returncode=proc.returncode,
                 report=f"{events.report}\n\n{ended}\n\n{thinking_off_note}".strip(),
@@ -2474,7 +2492,7 @@ async def _run_worker(
         if signal is not None and signal.is_cancelled():
             problem = "cancelled; the worker was killed and its partial work is in the tree."
             break
-        remaining = deadline - loop.time()
+        remaining = deadline + events.cut_ms / 1000 - loop.time()
         if remaining <= 0:
             walled = True
             break
@@ -15671,7 +15689,7 @@ def make_step_tool() -> Any:
             # W5's brief said "An earlier attempt reported back".
             ended = (
                 "ended without a report"
-                if run.unreported or (run.stop_reason == "length" and CUT_OFF_TWICE in report)
+                if run.unreported or (run.stop_reason == "length" and CUT_OFF_ENDED in report)
                 else "reported back"
             )
             if verdict[0] == 0:
@@ -15747,7 +15765,7 @@ def make_step_tool() -> Any:
                 retry_note += "\n\n" + missing.rstrip()
             # q35 R58: W2's cut-off kill note was briefed as its notes. A cut-off
             # kill's notes are what it wrote before the note, if anything.
-            cut_off = run.stop_reason == "length" and CUT_OFF_TWICE in report
+            cut_off = run.stop_reason == "length" and CUT_OFF_ENDED in report
             notes = (run.last_words if cut_off else report).strip()
             preamble = len(notes) < PREAMBLE_REPORT_CHARS and not _REPORT_FILE_NAME.search(notes)
             if notes and not notes.startswith(NO_REPORT) and not preamble:
