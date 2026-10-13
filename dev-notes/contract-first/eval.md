@@ -660,8 +660,10 @@ Time went to:
 3. **Scaffolding dispatched twice.** The first worker passed the
    file-existence check in 1.2 min; a second worker on the same task, with
    the work already done, spent 9.5 min, twice hitting the output limit,
-   deciding what WITNESS a scaffold could have. Why the extension sent it
-   is not yet read.
+   deciding what WITNESS a scaffold could have. The extension sent it
+   because its prove gave up on the first worker's mutation, which the
+   file-existence check passed, before trying the removal of the new
+   files (T0550 fixed that).
 4. **The contract stage on a known problem.** 31.6 min before any code,
    against B07's 8.1 min for the whole job. The owner's bar is problems
    above ~100k tokens, which semver is not; the bare-goal runs are here to

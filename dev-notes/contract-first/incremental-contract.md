@@ -192,7 +192,7 @@ re-reads.
   `dispute_entry` and `brief_lines` (contract.py:2316) read entries merged
   across sealed slices and the draft. `add` writes to the draft.
 - `seal --slice NAME`: the checks above, the move, per-file shas; `--reason`
-  is retired in slice mode. `check` refuses an unearned `supersedes` and
+  is removed (T0554). `check` refuses an unearned `supersedes` and
   conflicting expects. `codeless_refusal` gains the stand-in run.
 - New: the normative rule, `contract coverage`, an acceptance run history.
   `DoneGate.met` needs coverage and judges verdict lines.
@@ -201,8 +201,8 @@ re-reads.
 - The brief gives each slice its kind's inventory (examples; one
   operation's limits and invalid inputs; properties; re-read; coverage), not
   INVENTORY's all-at-once list (contract.py:2267-2279).
-- Legacy single-file pursuits (`path`, `second`, one seal) keep working,
-  out of the docs.
+- The single-file mode (`path`, `second`, one seal) is removed, per the
+  owner's decisions below; `check` names its keys as retired (T0554).
 
 ## What changes in tau
 
