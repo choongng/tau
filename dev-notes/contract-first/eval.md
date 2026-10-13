@@ -16,6 +16,7 @@ branch and sha. Grades come from `grade_<task>.py` over `runs/RNN/adapter.py`;
 | R82 | q35 | cobs | contract-first fce5dac (anchors) | 0/44 | R72 0/44; R60 42/44 (cases-first) |
 | R83 | q35 | itc | contract-first a80193c (add, listing, bare names) | 18/42 | R81 0/42; R57 lean cases-first 23/42 |
 | R84 | q35 | cobs | contract-first a80193c (add, listing, bare names) | 39/44 | R82 0/44; R60 42/44; B05 plain 41/44 |
+| R85 | q35 | cobs | contract-first 6e25585 (independent second, T0516) | 0/44 | R84 39/44; B05 plain 41/44 |
 
 ## B06 — the invented spec was not hard
 
@@ -225,3 +226,39 @@ Both contracts sealed, and both runs produced code that grades.
 - Invalid input the sources do not state needs to become a gap the reader is
   asked about, not silence.
 
+## An independent second extraction: R85 (T0516, T0518, T0519)
+
+R85 ran on beagle 6e25585 and tau 22b198e8 (T0516). Founding seeds three contract
+milestones (Contract, Second extraction, Reconcile), and pursuit_step gives each
+its scope and check itself. The guard keeps the second's worker from
+`contract.json` and every other worker from the second.
+
+- Independence held. T0003's worker had the scope `contract/contract.second.json`.
+  Its one attempt to read the first (`cat contract/contract.json`) was refused,
+  and it built 22 entries from the reference with `contract add`. The first had
+  25. The full check passed on the two, so the contract sealed when T0003
+  closed, at 18.5 min (R84: 19 min).
+- Then the run stopped itself at 31.1 min with no code: 0/44. Reconcile's check,
+  `contract check`, already passed, so it could not be opened. Tau offered a
+  done-by close with `done_when="beagle pursuit contract check"`. The driver
+  bound `--draft`, which still passes with the second taken away, so the close
+  was not proven and T0004 closed blocked. A milestone cannot be abandoned. Every
+  later route was refused as "already passes", and eight refusals in a row
+  stopped the run.
+- Fix (T0519, 7a77a357): a close that seals the contract closes each pending
+  contract milestone done by the task that sealed it, proven on the milestone's
+  own check with that task's work taken away. A done-by close of a contract
+  milestone takes the milestone's fixed scope and check, whatever the driver
+  passes.
+
+### R84's last 25 minutes (T0518)
+
+R84's code graded 39/44 at about 35 min. The rest went to T0004 "Project
+structure", bound to `python -m pytest -q --co -q`. `python` is not on PATH
+here, and `systemd-run` reports a missing program as exit 1, not 127. So the
+check read as failing rather than as unable to start. One worker was killed at
+its 900 s budget and a second ran on; together they took 32 minutes. The driver
+then made a host symlink `~/.local/bin/python -> /usr/bin/python3` (removed after
+R85, which ran with it). T0518 (24d24895) looks a check's first word up before
+running it, and refuses one that is not a program here. The refusal names
+`python3` or `.venv/bin/python` when they are there.
