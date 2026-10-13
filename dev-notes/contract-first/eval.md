@@ -26,7 +26,7 @@ branch and sha. Grades come from `grade_<task>.py` over `runs/RNN/adapter.py`;
 | R92 | q35 | cobs | contract-first 1684138 (T0529); tau 7cb40c5e (T0527, T0528) | void: another session switched ~/tautest/tau's branch at 18 min, removing the beagle extension | — |
 | R93 | q35 | cobs | the same, tau pinned in ~/tautest/tau-harness | 0/44 at the 60 min cap (contract not sealed) | R92 sealed at 30.6 min; R91 5/44; R90 39/44; B05 plain 41/44 in 48.8 min |
 | R94 | q35 | cobs | contract-first e02f316 (T0529, T0530); tau 7cb40c5e pinned | 13/44 at the 60 min cap (working tree; encode 11/11, decode 0/11) | R93 0/44; R90 39/44; B05 plain 41/44 in 48.8 min |
-| R95 | q35 | itc | contract-first e02f316 (T0529, T0530); tau 7cb40c5e pinned | 22/42 at the 60 min cap (working tree; uncommitted) | R87 0/42; B04 plain 0/42 |
+| R95 | q35 | itc | contract-first e02f316 (T0529, T0530); tau 7cb40c5e pinned | 22/42 at the 60 min cap (working tree; uncommitted) | R87 0/42; R83 18/42; R57 lean cases-first 23/42; B04 plain 0/42 |
 
 ## B06 — the invented spec was not hard
 
@@ -545,10 +545,10 @@ sealed; R91 20.6 min; R90 30.3). T0005 closed on T0004's commit. Then T0006
 - Turn cap: 3 of 7 workers ended at it (R93: 3 of 6), the next worker
   re-reading the tree for 5–8 turns each time.
 
-## R95 — q35 itc: 22/42 at the cap; the first itc stamps that pass
+## R95 — q35 itc: 22/42 at the cap, the best contract-first itc yet
 
-The first contract-first itc run since R87 (0/42), and the first q35 itc run
-to pass any case. Contract closed at 13.6 min, Second extraction at 18.6,
+Best contract-first q35 itc so far (R83 18/42, R87 0/42; lean cases-first
+R57 23/42; plain B04 0/42). Contract closed at 13.6 min, Second extraction at 18.6,
 then Reconcile took 29 min: the contract sealed at 46.5 min, 201 entries.
 The code was written in the last 8 min (11:46–11:53) by two workers on the
 scaffolding and data-model tasks: ~/itc/src/itc/clock.py (529 lines),
