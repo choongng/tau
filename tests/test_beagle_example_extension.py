@@ -8359,6 +8359,39 @@ async def test_a_check_whose_program_is_not_here_could_not_start(
 
 
 @pytest.mark.anyio
+async def test_open_refuses_a_check_whose_program_is_not_here(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # R84: under systemd-run a missing program exited 1 and read as failing; the
+    # open refuses it, naming what is here instead.
+    project = _pursuit_project(tmp_path)
+    monkeypatch.chdir(project)
+    subprocess.run(["git", "init", "-q"], cwd=project, check=True)
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    (bin_dir / "t0518tool3").symlink_to(sys.executable)
+    (project / ".venv" / "bin").mkdir(parents=True)
+    (project / ".venv" / "bin" / "t0518tool").symlink_to(sys.executable)
+    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
+    _ready_task(fake_beagle)
+    runtime, _ = _bound(tmp_path)
+
+    result = await _tool(runtime, "pursuit_step").execute(
+        "c1", {"task": "T0002", "criteria": "c", "done_when": "t0518tool -m pytest -q"}
+    )
+
+    assert (
+        "T0002 not opened — the check could not run: `the check could not start: no "
+        "`t0518tool` on PATH; t0518tool3 and .venv/bin/t0518tool are` (exit 127)"
+    ) in result.text
+    assert _pursuit_calls(fake_beagle, "open") == [] and _runs(fake_tau) == []
+
+
+@pytest.mark.anyio
 async def test_a_check_over_the_memory_cap_is_killed_and_says_why(
     tmp_path: Path, beagle: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -14407,6 +14440,55 @@ async def test_pursuit_step_scopes_the_contract_milestones_itself(
     assert opened[opened.index("--done-when") + 1] == (
         f"beagle pursuit contract check --file {module.CONTRACT_SECOND}"
     )
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("title", "given", "check"),
+    [
+        ("Contract", "beagle pursuit contract check", "beagle pursuit contract check --draft"),
+        ("Reconcile", "beagle pursuit contract check --draft", "beagle pursuit contract check"),
+    ],
+)
+async def test_pursuit_step_scopes_the_contract_and_reconcile_itself(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    title: str,
+    given: str,
+    check: str,
+) -> None:
+    # The Contract and Reconcile tasks get the whole contract/ and their own
+    # check at open, whatever scope and check the driver passes.
+    module = _module()
+    project = _pursuit_project(tmp_path)
+    goal = project / ".beagle" / "pursuit.toml"
+    goal.write_text(goal.read_text() + module.CONTRACT_TABLE, encoding="utf-8")
+    monkeypatch.chdir(project)
+    _ready_task(fake_beagle)
+    record = json.loads((fake_beagle / "show.out").read_text())
+    (fake_beagle / "show.out").write_text(json.dumps({**record, "title": title}))
+    monkeypatch.setenv("PATH", f"{fake_beagle}{os.pathsep}{os.environ['PATH']}")
+    (fake_beagle / "contract.rc").write_text("1")
+    runtime, _ = _bound(tmp_path)
+
+    result = await _tool(runtime, "pursuit_step").execute(
+        "c1",
+        {
+            "task": "T0002",
+            "criteria": "the contract is written",
+            "done_when": given,
+            "scope": [module.CONTRACT_SECOND],
+        },
+    )
+
+    opens = _pursuit_calls(fake_beagle, "open")
+    assert len(opens) == 1, result.text
+    [opened] = opens
+    assert opened[opened.index("--scope") + 1] == "contract/"
+    assert opened[opened.index("--done-when") + 1] == check
 
 
 @pytest.mark.anyio
