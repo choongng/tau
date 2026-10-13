@@ -8624,11 +8624,12 @@ async def test_worker_argv_caps_turns(
     dispatch = _tool(runtime, "pursuit_dispatch")
 
     await dispatch.execute("c1", {"brief": "Write notes"})
+    assert "You have 60 tool calls in all" in _module()._turn_cap_note()
     monkeypatch.setenv("BEAGLE_TAU_WORKER_MAX_TURNS", "12")
     await dispatch.execute("c2", {"brief": "Write notes"})
 
     default, pinned = (run["argv"] for run in _runs(fake_tau))
-    assert default[default.index("--max-turns") + 1] == "30"
+    assert default[default.index("--max-turns") + 1] == "60"
     assert pinned[pinned.index("--max-turns") + 1] == "12"
 
 

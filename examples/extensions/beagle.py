@@ -244,8 +244,10 @@ WORKER_PROVIDER_ENV = "BEAGLE_TAU_DISPATCH_PROVIDER"
 #: Turns a worker gets before it is told to stop and report (`tau --max-turns`).
 #: R01's 9B workers ran 43 and 51 turns into the kill and handed back nothing;
 #: a turn cap ends the run with a report instead.
+#: R94: 3 of 7 contract workers ended at a 30-turn cap mid-edit while the
+#: worker's wall clock (~900 s) already bounds it, so the cap is 60.
 WORKER_MAX_TURNS_ENV = "BEAGLE_TAU_WORKER_MAX_TURNS"
-DEFAULT_WORKER_MAX_TURNS = 30
+DEFAULT_WORKER_MAX_TURNS = 60
 
 #: The worker's output limit in tokens, which sizes the parts a call cut off at
 #: it is told to write in. Runs R15 and R33 were cut off at 8192.
