@@ -1,0 +1,218 @@
+{
+  "sources": {
+    "Consistent_Overhead_Byte_Stuffing": {
+      "path": "references/Consistent_Overhead_Byte_Stuffing.txt"
+    }
+  },
+  "entries": [
+    {
+      "id": "ex1",
+      "kind": "example",
+      "operation": "encode",
+      "source": "Consistent_Overhead_Byte_Stuffing",
+      "cite": "70#3e2",
+      "input": "0x00",
+      "expect": "0x01 01 00"
+    },
+    {
+      "id": "ex2",
+      "kind": "example",
+      "operation": "encode",
+      "source": "Consistent_Overhead_Byte_Stuffing",
+      "cite": "73#dc6",
+      "input": "0x00 00",
+      "expect": "0x01 01 01 00"
+    },
+    {
+      "id": "ex3",
+      "kind": "example",
+      "operation": "encode",
+      "source": "Consistent_Overhead_Byte_Stuffing",
+      "cite": "76#d10",
+      "input": "0x00 11 00",
+      "expect": "0x01 02 11 01 00"
+    },
+    {
+      "id": "ex4",
+      "kind": "example",
+      "operation": "encode",
+      "source": "Consistent_Overhead_Byte_Stuffing",
+      "cite": "79#d5c",
+      "input": "0x11 22 00 33",
+      "expect": "0x03 11 22 02 33 00"
+    },
+    {
+      "id": "ex5",
+      "kind": "example",
+      "operation": "encode",
+      "source": "Consistent_Overhead_Byte_Stuffing",
+      "cite": "82#ca8",
+      "input": "0x11 22 33 44",
+      "expect": "0x05 11 22 33 44 00"
+    },
+    {
+      "id": "ex6",
+      "kind": "example",
+      "operation": "encode",
+      "source": "Consistent_Overhead_Byte_Stuffing",
+      "cite": "85#a99",
+      "input": "0x11 00 00 00",
+      "expect": "0x02 11 01 01 01 00"
+    },
+    {
+      "id": "ex7",
+      "kind": "example",
+      "operation": "encode",
+      "source": "Consistent_Overhead_Byte_Stuffing",
+      "cite": "88#9e2",
+      "input": "0xFF 01 02 03 ... FD FE 00",
+      "expect": "0x01 02 03 ... FD FE 00"
+    },
+    {
+      "id": "ex8",
+      "kind": "example",
+      "operation": "encode",
+      "source": "Consistent_Overhead_Byte_Stuffing",
+      "cite": "91#d30",
+      "input": "0x01 FF 01 02 ... FC FD FE 00",
+      "expect": "0x00 01 02 ... FC FD FE"
+    },
+    {
+      "id": "ex9",
+      "kind": "example",
+      "operation": "encode",
+      "source": "Consistent_Overhead_Byte_Stuffing",
+      "cite": "94#0f2",
+      "input": "0xFF 01 02 03 ... FD FE 02 FF 00",
+      "expect": "0x01 02 03 ... FD FE FF"
+    },
+    {
+      "id": "ex10",
+      "kind": "example",
+      "operation": "encode",
+      "source": "Consistent_Overhead_Byte_Stuffing",
+      "cite": "97#146",
+      "input": "0xFF 02 03 04 ... FE FF 01 01 00",
+      "expect": "0x02 03 04 ... FE FF 00"
+    },
+    {
+      "id": "ex11",
+      "kind": "example",
+      "operation": "encode",
+      "source": "Consistent_Overhead_Byte_Stuffing",
+      "cite": "100#dc6",
+      "input": "0xFE 03 04 05 ... FF 02 01 00",
+      "expect": "0x03 04 05 ... FF 00 01"
+    },
+    {
+      "id": "limit-max-overhead",
+      "kind": "limit",
+      "operation": "encode",
+      "source": "Consistent_Overhead_Byte_Stuffing",
+      "cite": "21#a24",
+      "input": "",
+      "expect": "",
+      "statement": "COBS requires a maximum of ceil(n/254) bytes overhead for n data bytes"
+    },
+    {
+      "id": "prop-no-zero-bytes",
+      "kind": "property",
+      "operation": "encode",
+      "source": "Consistent_Overhead_Byte_Stuffing",
+      "cite": "31#b70",
+      "input": "",
+      "expect": "",
+      "statement": "COBS transforms bytes in [0,255] into bytes in [1,255]; no zero bytes in output"
+    },
+    {
+      "id": "op-encode",
+      "kind": "operation",
+      "operation": "encode",
+      "source": "Consistent_Overhead_Byte_Stuffing",
+      "cite": "41#5d6",
+      "input": "",
+      "expect": "",
+      "statement": "Encode: append zero, break into groups of 254 non-zero or 0-253 non-zero followed by zero, delete trailing zero, prepend count+1"
+    },
+    {
+      "id": "op-decode",
+      "kind": "operation",
+      "operation": "decode",
+      "source": "Consistent_Overhead_Byte_Stuffing",
+      "cite": "49#591",
+      "input": "",
+      "expect": "",
+      "statement": "Decode: reverse the encoding by reading offsets and expanding zero bytes accordingly"
+    },
+    {
+      "id": "limit-min-overhead",
+      "kind": "limit",
+      "operation": "encode",
+      "source": "Consistent_Overhead_Byte_Stuffing",
+      "cite": "21#a24",
+      "input": "",
+      "expect": "",
+      "statement": "COBS requires a minimum of 1 byte overhead"
+    },
+    {
+      "id": "prop-roundtrip",
+      "kind": "property",
+      "operation": "decode",
+      "source": "Consistent_Overhead_Byte_Stuffing",
+      "cite": "47#012",
+      "input": "",
+      "expect": "",
+      "statement": "Decode reverses encode: given COBS-encoded data, the decoder recovers the original bytes"
+    },
+    {
+      "id": "prop-decode-stops-at-delimiter",
+      "kind": "property",
+      "operation": "decode",
+      "source": "Consistent_Overhead_Byte_Stuffing",
+      "cite": "163#5d7",
+      "input": "",
+      "expect": "",
+      "statement": "Decode stops when it encounters a delimiter (zero) code, i.e. block length of 0"
+    },
+    {
+      "id": "limit-max-offset",
+      "kind": "limit",
+      "operation": "decode",
+      "source": "Consistent_Overhead_Byte_Stuffing",
+      "cite": "51#79f",
+      "input": "",
+      "expect": "",
+      "statement": "Each offset in COBS encoding is guaranteed to be at most 255"
+    },
+    {
+      "id": "lookahead",
+      "kind": "limit",
+      "operation": "encode",
+      "source": "Consistent_Overhead_Byte_Stuffing",
+      "cite": "22#5ab",
+      "input": "",
+      "expect": "",
+      "statement": "COBS requires up to 254 bytes of lookahead before transmitting its first byte"
+    },
+    {
+      "id": "encode_op",
+      "kind": "operation",
+      "operation": "encode",
+      "source": "Consistent_Overhead_Byte_Stuffing",
+      "cite": "133#5c8",
+      "input": "",
+      "expect": "",
+      "statement": "Encode function: size_t cobsEncode(const void *data, size_t length, uint8_t *buffer)"
+    },
+    {
+      "id": "decode_op",
+      "kind": "operation",
+      "operation": "decode",
+      "source": "Consistent_Overhead_Byte_Stuffing",
+      "cite": "165#a21",
+      "input": "",
+      "expect": "",
+      "statement": "Decode function: size_t cobsDecode(const uint8_t *buffer, size_t length, void *data)"
+    }
+  ]
+}
