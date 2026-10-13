@@ -14492,6 +14492,48 @@ async def test_pursuit_step_scopes_the_contract_and_reconcile_itself(
 
 
 @pytest.mark.anyio
+async def test_pursuit_step_keeps_an_open_contract_milestone_on_its_check(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # R87: Contract opened on `contract check --draft`; the driver's next call
+    # passed notes with a done_when of its own, which amended the check, and the
+    # worker's 15 minutes ended on a check that could not refuse.
+    module = _module()
+    project = _pursuit_project(tmp_path)
+    goal = project / ".beagle" / "pursuit.toml"
+    goal.write_text(goal.read_text() + module.CONTRACT_TABLE, encoding="utf-8")
+    monkeypatch.chdir(project)
+    monkeypatch.setenv("PATH", f"{fake_beagle}{os.pathsep}{os.environ['PATH']}")
+    (fake_beagle / "contract.rc").write_text("1")
+    _ready_task(fake_beagle)
+    (fake_beagle / "next.out").write_text(
+        json.dumps({"open": ["T0002"], "ready": [], "ready_total": 0})
+    )
+    forced = module.CONTRACT_STEPS["Contract"][1]
+    weak = "test -f contract/contract.json"
+    record = {"id": "T0002", "title": "Contract", "status": "open", "scope": ["contract/"]}
+    show = fake_beagle / "show.out"
+    step = {"task": "T0002", "done_when": weak, "scope": ["contract/", "references/"]}
+
+    show.write_text(json.dumps({**record, "done_when": forced}))
+    kept = await _tool(_bound(tmp_path)[0], "pursuit_step").execute(
+        "c1", {**step, "notes": "add the properties' tests"}
+    )
+    assert _pursuit_calls(fake_beagle, "amend") == [], kept.text
+    assert f"Contract keeps its check `{forced}`" in kept.text
+    assert "is worked on this call's scope" not in kept.text
+    # A check the driver already put in its place is put back.
+    show.write_text(json.dumps({**record, "done_when": weak}))
+    await _tool(_bound(tmp_path)[0], "pursuit_step").execute("c2", step)
+    [amend] = _pursuit_calls(fake_beagle, "amend")
+    assert amend[:3] == ["T0002", "--done-when", forced]
+
+
+@pytest.mark.anyio
 async def test_nth_reread_of_a_reference_window_is_still_refused(
     tmp_path: Path, beagle: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -24489,11 +24531,14 @@ async def test_a_task_on_the_contract_witnesses_a_quote_not_code(
 ) -> None:
     monkeypatch.chdir(_contract_project(tmp_path))
     monkeypatch.setenv("FAKE_TAU_SUCCEEDS_ON", "99")
+    # Its check is the contract's own, which pursuit_step keeps (T0522).
     record = {"id": "T0002", "title": "Contract", "status": "open", "scope": ["contract/"]}
-    record |= {"criteria": "c", "done_when": "grep -q done done.txt"}
+    record |= {"criteria": "c", "done_when": _module().CONTRACT_STEPS["Contract"][1]}
     (fake_beagle / "show.out").write_text(json.dumps(record))
     (fake_beagle / "next.out").write_text(json.dumps({"open": ["T0002"], "ready": []}))
     (fake_beagle / "brief.out").write_text("# T0002: Contract\n")
+    monkeypatch.setenv("PATH", f"{fake_beagle}{os.pathsep}{os.environ['PATH']}")
+    (fake_beagle / "contract.rc").write_text("1")
     runtime, _ = _bound(tmp_path)
 
     await _tool(runtime, "pursuit_step").execute("c1", {"task": "T0002", "attempts": 1})

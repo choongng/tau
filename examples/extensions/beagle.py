@@ -363,6 +363,11 @@ CONTRACT_STEPS = {
     ),
     "Reconcile": ([f"{CONTRACT_DIR}/"], "beagle pursuit contract check"),
 }
+#: What pursuit_step says when a driver passes a contract step a check of its own.
+CONTRACT_CHECK_KEPT_NOTE = (
+    "{title} keeps its check `{check}`: the contract's own check judges it, so the "
+    "done_when passed is not used. Pass notes alone to say what the work still needs.\n\n"
+)
 #: How long sealing may take: it runs the contract's full check first.
 CONTRACT_SEAL_TIMEOUT = 300.0
 #: What pursuit_step says when it drops the locks a driver passed under a contract.
@@ -14610,8 +14615,15 @@ def make_step_tool() -> Any:
         done_when = str(arguments.get("done_when") or "").strip()
         scope = _strings(arguments.get("scope"))
         fixed = CONTRACT_STEPS.get(title.strip()) if _contract_declared(root) else None
-        if fixed is not None and record.get("status") != "open":
+        if fixed is not None:
+            # R87: the Contract step opened on its check, then the driver passed
+            # `test -f ... && assert len(entries) > 0` with its notes, which
+            # amended it; the worker's 15 minutes ended on a check prove showed
+            # could not refuse, and the driver's next guess asked for 50 entries.
+            if done_when and " ".join(done_when.split()) != " ".join(fixed[1].split()):
+                kept_lead.append(CONTRACT_CHECK_KEPT_NOTE.format(title=title, check=fixed[1]))
             scope, done_when = list(fixed[0]), fixed[1]
+            arguments = {**arguments, "scope": scope, "done_when": done_when}
         notes = str(arguments.get("notes") or "").strip()
         opened = route = taken = ""
         retrying = False
