@@ -18,6 +18,7 @@ branch and sha. Grades come from `grade_<task>.py` over `runs/RNN/adapter.py`;
 | R84 | q35 | cobs | contract-first a80193c (add, listing, bare names) | 39/44 | R82 0/44; R60 42/44; B05 plain 41/44 |
 | R85 | q35 | cobs | contract-first 6e25585 (independent second, T0516) | 0/44 | R84 39/44; B05 plain 41/44 |
 | R86 | q35 | cobs | contract-first 6e25585 (T0516, T0518, T0519) | 42/44 | R84 39/44; B05 plain 41/44 in 48.8 min |
+| R87 | q35 | itc | contract-first 6e25585 (T0516, T0518, T0519) | 0/42 | R83 18/42; B04 plain 0/42 |
 
 ## B06 — the invented spec was not hard
 
@@ -302,3 +303,28 @@ What it says: the contract stage is now about 14 min on cobs. After the seal,
 the time goes to checks the driver writes by hand, and to milestones the
 contract's acceptance could decide. The next step is to bind those milestones
 to `beagle pursuit contract run`, or a per-operation part of it.
+
+## R87 — q35 itc: 0/42, the Contract task's check replaced (T0522)
+
+Capped at 3600 s in Core data structures, with `src/itc/__init__.py` holding Protocol stubs and
+functions whose bodies are `pass`.
+
+| stage | closed at |
+|---|---|
+| Contract T0002 | 37.6 min |
+| Second extraction T0003 | 42.7 min |
+| Reconcile T0004 (110 entries) | 52.6 min |
+| Project scaffolding T0005 | 56.6 min |
+
+About 20 of the Contract's 37 minutes were lost to one gap. The task opened on its own check,
+`contract check --draft`, and two workers left it failing on properties no acceptance file named.
+The driver's next `pursuit_step` passed notes with a `done_when` of its own (`test -f ... &&
+assert len(entries) > 0`), and that amended the check: T0516 kept the contract milestones'
+check only at open. The worker's 15 minutes closed on a check `prove` showed could not refuse;
+the driver's next guess asked for at least 50 entries, and the worker padded the contract from
+30 to 56. T0522 keeps the check on an open task too and tells the driver its `done_when` is not
+used.
+
+Even without it, itc's contract stage is long: Second extraction and Reconcile took 15 minutes
+after the Contract closed, against 14 minutes for cobs's whole stage in R86.
+
