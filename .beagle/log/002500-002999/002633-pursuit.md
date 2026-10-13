@@ -1,0 +1,15 @@
++++
+id = "002633-pursuit"
+ordinal = 2633
+kind = "pursuit"
+timestamp = "2026-10-13T04:24:58+00:00"
+summary = "pursuit open T0519: the seal closes Reconcile, and a contract milestone's done-by close takes its own check (R85)"
+metric_command = ""
+drains = []
+hooks = []
++++
+
+criteria: a close that seals the contract closes each pending contract milestone (Reconcile) done by the closing task, proven on its own check; a done-by close of a contract milestone uses CONTRACT_STEPS' scope and check whatever the driver passed
+decided by: sh -c 'echo "2e926877b21c9bc9409a9aff9fdb94e77ebde21a92549ace6afb1aa6902b515d  .beagle/checks/T0519/T0519.sh" | sha256sum -c --quiet && bash .beagle/checks/T0519/T0519.sh'
+budget: 60000 tokens
+opened over T0493: 7a77a357
