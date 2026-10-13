@@ -25,7 +25,7 @@ from tau_coding import (
     CodingSession,
     CodingSessionConfig,
 )
-from tau_coding.session import OUTPUT_LIMIT_NUDGE
+from tau_coding.session import LOOP_CUT_NUDGE, OUTPUT_LIMIT_NUDGE
 
 # R36 driver session, turn E76 (dev-notes/itc-runs/R36.md, class 1): gemma's
 # reasoning opened like this, then went round the same block until the
@@ -161,7 +161,7 @@ def _nudges(session: CodingSession) -> list[UserMessage]:
     return [
         message
         for message in session.messages
-        if isinstance(message, UserMessage) and message.text == OUTPUT_LIMIT_NUDGE
+        if isinstance(message, UserMessage) and message.text in {OUTPUT_LIMIT_NUDGE, LOOP_CUT_NUDGE}
     ]
 
 
@@ -185,8 +185,13 @@ async def test_reasoning_repetition_stops_turn_as_output_limit(tmp_path: Path) -
     assert looping.startswith(cut.thinking_text)
     assert provider.read[0] < len(looping) // 9 // 4
     assert provider.closed[0]
-    # Handled as a cut-off at the cap: nudged, and the reply acted.
-    assert provider.calls[1][-1].text == OUTPUT_LIMIT_NUDGE
+    # Handled as a cut-off at the cap: nudged, and the reply acted. A loop's
+    # reasoning is not replayed, and the nudge says so.
+    assert provider.calls[1][-1].text == LOOP_CUT_NUDGE
+    assert not any(
+        isinstance(message, AssistantMessage) and message.thinking_text
+        for message in provider.calls[1]
+    )
     assert len(provider.calls) == 3
     assert session.messages[-1].text == "Done."
 
@@ -245,7 +250,7 @@ async def test_sentences_repeated_within_one_line_are_cut(tmp_path: Path) -> Non
     assert cut.stop_reason == "length"
     assert [diagnostic.type for diagnostic in cut.diagnostics or []] == ["reasoning_loop_cut"]
     assert 0 < len(cut.thinking_text) < len(looping) // 4
-    assert provider.calls[1][-1].text == OUTPUT_LIMIT_NUDGE
+    assert provider.calls[1][-1].text == LOOP_CUT_NUDGE
     assert len(provider.calls) == 2
 
 

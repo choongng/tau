@@ -28,6 +28,7 @@ from tau_agent.messages import (
     ToolCall,
     ToolResultMessage,
     UserMessage,
+    reasoning_loop_cut,
 )
 from tau_agent.provider import CancellationToken, ModelProvider
 from tau_agent.provider_events import (
@@ -262,9 +263,13 @@ def _provider_context(messages: list[AgentMessage]) -> list[AgentMessage]:
     persists terminal failures for diagnostics, but an empty failed or aborted
     turn is not model context and must not poison the next request.
 
-    A turn cut off at the output limit keeps its reasoning in history but not
-    in the replay: a model that ran out mid-thought, handed its own unfinished
-    reasoning, tends to pick the same thread up and run out again.
+    A turn cut off at the output limit is replayed with its reasoning, so the
+    reply after it builds on that reasoning instead of starting over. R91 (q35,
+    cobs): with it dropped, a worker cut off at 16k tokens of reasoning (43k
+    characters, two thirds of its lines distinct) began its next reply "Let me
+    take a step back and carefully trace through the C algorithm" and was cut off
+    again. A turn the reasoning-loop guard cut keeps its reasoning in history
+    only: handed a loop, a model picks the same thread up (R36, gemma).
     """
     replayable = tuple(
         message
@@ -279,8 +284,8 @@ def _provider_context(messages: list[AgentMessage]) -> list[AgentMessage]:
 
 
 def _without_truncated_thinking(message: AgentMessage) -> AgentMessage:
-    """Drop the reasoning of a turn that stopped at the output limit."""
-    if not isinstance(message, AssistantMessage) or message.stop_reason != "length":
+    """Drop the reasoning of a turn the reasoning-loop guard cut."""
+    if not isinstance(message, AssistantMessage) or not reasoning_loop_cut(message):
         return message
     content = [block for block in message.content if not isinstance(block, ThinkingContent)]
     if len(content) == len(message.content):

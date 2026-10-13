@@ -152,6 +152,9 @@ class AssistantMessageDiagnostic(WireModel):
 
 
 StopReason = Literal["stop", "length", "toolUse", "error", "aborted"]
+#: The diagnostic on a turn ended at the output limit because its reasoning
+#: looped rather than because it ran out: its reasoning is not replayed.
+REASONING_LOOP_CUT = "reasoning_loop_cut"
 
 
 class AssistantMessage(WireModel):
@@ -315,3 +318,10 @@ def message_text(message: AgentMessage) -> str:
     if isinstance(message, BashExecutionMessage):
         return message.output
     return ""
+
+
+def reasoning_loop_cut(message: AssistantMessage) -> bool:
+    """Whether the reasoning-loop guard ended this turn at the output limit."""
+    return message.stop_reason == "length" and any(
+        diagnostic.type == REASONING_LOOP_CUT for diagnostic in message.diagnostics or []
+    )

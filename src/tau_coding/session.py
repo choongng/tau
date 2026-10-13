@@ -25,6 +25,7 @@ from tau_agent.events import (
 )
 from tau_agent.harness import AgentHarness, AgentHarnessConfig, QueuedMessages
 from tau_agent.messages import (
+    REASONING_LOOP_CUT,
     AgentMessage,
     AssistantMessage,
     AssistantMessageDiagnostic,
@@ -35,6 +36,7 @@ from tau_agent.messages import (
     Usage,
     UserMessage,
     message_text,
+    reasoning_loop_cut,
     sum_usage,
 )
 from tau_agent.provider import CancellationToken, ModelProvider
@@ -259,7 +261,16 @@ COMPACTION_SUMMARY_MAX_CHARS = 8_000
 COMPACTION_SUMMARY_TRUNCATED = "\n\n[Summary truncated to fit the compaction budget.]"
 MAX_OUTPUT_LIMIT_CONTINUATIONS = 2
 MAX_OUTPUT_LIMIT_CONTINUATIONS_PER_RUN = 6
+#: The follow-up to a turn cut off at the output limit. Its reasoning is
+#: replayed (`_provider_context`), so the nudge says to act on it.
 OUTPUT_LIMIT_NUDGE = (
+    "Your last reply hit the output limit before you acted. Your reasoning so far "
+    "is kept above: do not start it over or work the rest out in your head. Take "
+    "the next concrete step now with a tool call, or answer briefly."
+)
+#: The follow-up to a turn the reasoning-loop guard cut, whose reasoning is not
+#: replayed.
+LOOP_CUT_NUDGE = (
     "Your last reply hit the output limit before you acted, and its reasoning was "
     "dropped. Do not work the whole problem out again in your head: take the next "
     "concrete step now with a tool call, or answer briefly."
@@ -536,7 +547,7 @@ async def _cut_looping_reasoning(
                     content_index=event.content_index, content=block.thinking, partial=partial
                 )
             diagnostic = AssistantMessageDiagnostic(
-                type="reasoning_loop_cut", details=detector.details
+                type=REASONING_LOOP_CUT, details=detector.details
             )
             message = partial.model_copy(
                 update={
@@ -2214,8 +2225,8 @@ class CodingSession:
         A reasoning model can spend the whole output budget thinking and stop
         with no reply and no tool call; the loop would end the run there, and
         an unattended run would sit idle. The nudge goes in as a follow-up, so
-        the loop sends one more request (the truncated reasoning is left out
-        of it), and the between-turn compaction still applies. The request
+        the loop sends one more request (with the truncated reasoning, unless
+        the reasoning-loop guard cut it), and the between-turn compaction still applies. The request
         keeps the session's thinking level: a thinking switch mid-session
         changes the prompt from its first turn on a template that renders it
         there, and costs a full re-prefill for the nudge and another for the
@@ -2253,7 +2264,9 @@ class CodingSession:
         ):
             return
         self._length_continuations += 1
-        nudge = UserMessage(content=OUTPUT_LIMIT_NUDGE)
+        nudge = UserMessage(
+            content=LOOP_CUT_NUDGE if reasoning_loop_cut(message) else OUTPUT_LIMIT_NUDGE
+        )
         self._queued_nudge = nudge
         self._record_message_origin(nudge, delivery="follow_up", source="extension")
         self._harness.follow_up_message(nudge)

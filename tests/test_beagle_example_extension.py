@@ -1504,6 +1504,8 @@ if attempt >= int(os.environ.get("FAKE_TAU_HANGS_ON") or 99):
             call = {"type": "toolCall", "id": "t1", "name": "write", "arguments": args}
             content = content + [call]
         cut = {"role": "assistant", "content": content, "stopReason": "length"}
+        if os.environ.get("FAKE_TAU_CUT_MS"):  # q35 R91: how long the cut-off turn took
+            cut["timing"] = {"totalDurationMs": int(os.environ["FAKE_TAU_CUT_MS"])}
         print(json.dumps({"type": "message_end", "message": cut}), flush=True)
         if os.environ.get("FAKE_TAU_SPACED"):  # R33: a normal turn after each cut-off
             turn = {"role": "assistant", "content": [], "stopReason": "toolUse"}
@@ -11087,12 +11089,49 @@ async def test_worker_ended_on_second_output_cap_cutoff_over_run(
     # ran to the 900 s wall.
     monkeypatch.setenv("FAKE_TAU_SPACED", "1")
     monkeypatch.setenv("FAKE_TAU_CUT_FILL", "call")
-    text = await _hung_second_worker(tmp_path, fake_beagle, monkeypatch, 2, timeout=30)
+    text = await _hung_second_worker(tmp_path, fake_beagle, monkeypatch, 3, timeout=30)
 
     assert "wall-clock" not in text
-    assert "the sub-agent was ended: cut off twice at the output limit" in text
+    assert "the sub-agent was ended: cut off 3 times at the output limit" in text
     assert "Split the task or have the notes say to write in parts." in text
     assert "`grep -q done done.txt` exit 2" in text
+
+
+@pytest.mark.anyio
+async def test_worker_is_not_ended_at_its_second_cut_off(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # q35 R91: 8d863128 was ended at its second 16384-token turn of tracing an
+    # encoder by hand; tau now replays that reasoning, so the next turn can act.
+    monkeypatch.setenv("FAKE_TAU_SPACED", "1")
+    text = await _hung_second_worker(tmp_path, fake_beagle, monkeypatch, 2, timeout=3)
+
+    assert "cut off 3 times" not in text
+    assert "wall-clock budget of 3s" in text
+
+
+@pytest.mark.anyio
+async def test_worker_wall_does_not_count_cut_off_turns(
+    tmp_path: Path, beagle: Path, fake_tau: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # q35 R91: two cut-off turns took ~10 min of 4dea9856's and 8d863128's 15 min
+    # walls, and the turn after each was killed before it could act.
+    project = _git_project(tmp_path, monkeypatch)
+    monkeypatch.setenv("FAKE_TAU_HANGS_ON", "1")
+    monkeypatch.setenv("FAKE_TAU_LENGTH_STOPS", "1")
+    monkeypatch.setenv("FAKE_TAU_CUT_MS", "2000")
+    run_worker = _worker_module(monkeypatch)._run_worker
+
+    started = time.monotonic()
+    run = await run_worker("Write cases", project, "", "", 1, None, "T0002", ["a.txt"])
+
+    assert time.monotonic() - started >= 2.5
+    assert run.problem is not None
+    assert "budget of 1s, not counting 2s in turns cut off at the output limit," in run.problem
 
 
 def test_worker_events_count_cut_offs_over_run() -> None:
@@ -11139,13 +11178,13 @@ async def test_reasoning_only_cut_off_named_in_worker_note(
     project = _git_project(tmp_path, monkeypatch)
     monkeypatch.setenv("BEAGLE_TAU_DISPATCH_THINKING", "medium")
     monkeypatch.setenv("FAKE_TAU_HANGS_ON", "1")
-    monkeypatch.setenv("FAKE_TAU_LENGTH_STOPS", "2")
+    monkeypatch.setenv("FAKE_TAU_LENGTH_STOPS", "3")
     monkeypatch.setenv("FAKE_TAU_THINKS", "1")
     run_worker = _worker_module(monkeypatch)._run_worker
 
     run = await run_worker("Write cases", project, "", "", 30, None, "T0002", ["a.txt"])
 
-    assert "the sub-agent was ended: cut off twice at the output limit" in run.report
+    assert "the sub-agent was ended: cut off 3 times at the output limit" in run.report
     assert "its reasoning filled the output limit before any reply or call" in run.report
     assert "the next sub-agent on T0002 runs thinking-off" in run.report
     assert "write in parts" not in run.report
@@ -11172,7 +11211,7 @@ async def test_cut_off_kill_note_names_reply_text_reasoning(
     project = _git_project(tmp_path, monkeypatch)
     monkeypatch.setenv("BEAGLE_TAU_DISPATCH_THINKING", "medium")
     monkeypatch.setenv("FAKE_TAU_HANGS_ON", "1")
-    monkeypatch.setenv("FAKE_TAU_LENGTH_STOPS", "2")
+    monkeypatch.setenv("FAKE_TAU_LENGTH_STOPS", "3")
     monkeypatch.setenv("FAKE_TAU_THINKS", "1")
     run_worker = _worker_module(monkeypatch)._run_worker
     await run_worker("Write cases", project, "", "", 30, None, "T0002", ["a.txt"])
@@ -11181,7 +11220,7 @@ async def test_cut_off_kill_note_names_reply_text_reasoning(
 
     retry = await run_worker("Write cases", project, "", "", 30, None, "T0002", ["a.txt"])
 
-    assert "the sub-agent was ended: cut off twice at the output limit" in retry.report
+    assert "the sub-agent was ended: cut off 3 times at the output limit" in retry.report
     assert "its reply text filled the output limit before any call" in retry.report
     assert "reasoning in prose without acting" in retry.report
     assert "the next notes should say what to do first" in retry.report
@@ -11202,18 +11241,18 @@ async def test_cut_off_kill_note_says_write_in_parts_only_for_a_call_argument(
     run_worker = _worker_module(monkeypatch)._run_worker
     notes = {}
     for name, fill, length_stops, refusals in (
-        ("call", "call", "2", "0"),
-        ("refused call", "", "0", "2"),
-        ("call and text", "text", "1", "1"),
-        ("text", "text", "2", "0"),
-        ("thinking", "", "2", "0"),
+        ("call", "call", "3", "0"),
+        ("refused call", "", "0", "3"),
+        ("call and text", "text", "2", "1"),
+        ("text", "text", "3", "0"),
+        ("thinking", "", "3", "0"),
     ):
         monkeypatch.setenv("FAKE_TAU_CUT_FILL", fill)
         monkeypatch.setenv("FAKE_TAU_LENGTH_STOPS", length_stops)
         monkeypatch.setenv("FAKE_TAU_CUT_OFFS", refusals)
         monkeypatch.setenv("FAKE_TAU_THINKS", "1" if name == "thinking" else "")
         run = await run_worker("Write cases", project, "", "", 30, None, "T0002", ["a.txt"])
-        assert "the sub-agent was ended: cut off twice at the output limit" in run.report
+        assert "the sub-agent was ended: cut off 3 times at the output limit" in run.report
         notes[name] = run.report
 
     for name in ("call", "refused call", "call and text"):
@@ -11233,14 +11272,14 @@ async def test_cut_off_kill_note_omits_without_acting_when_the_worker_made_calls
     # note said "It spent its turns reasoning in prose without acting".
     project = _git_project(tmp_path, monkeypatch)
     monkeypatch.setenv("FAKE_TAU_HANGS_ON", "1")
-    monkeypatch.setenv("FAKE_TAU_LENGTH_STOPS", "2")
+    monkeypatch.setenv("FAKE_TAU_LENGTH_STOPS", "3")
     monkeypatch.setenv("FAKE_TAU_THINKS", "1")
     run_worker = _worker_module(monkeypatch)._run_worker
     notes = {}
     for name, spaced in (("calls", "call"), ("no calls", "")):
         monkeypatch.setenv("FAKE_TAU_SPACED", spaced)
         run = await run_worker("Write cases", project, "", "", 30, None, "T0002", ["a.txt"])
-        assert "the sub-agent was ended: cut off twice at the output limit" in run.report
+        assert "the sub-agent was ended: cut off 3 times at the output limit" in run.report
         assert "No call was cut off, so writing in smaller pieces would not help." in run.report
         notes[name] = run.report
 
@@ -11263,7 +11302,7 @@ async def test_killed_attempt_context_says_the_attempt_before_ended_without_a_re
     _ready_task(fake_beagle)
     runtime, _ = _bound(tmp_path)
     module = _loaded_module()
-    killed = f"Tracing example 1.\n\n(the sub-agent was ended: {module.CUT_OFF_TWICE}: x.)"
+    killed = f"Tracing example 1.\n\n(the sub-agent was ended: {module.CUT_OFF_ENDED}: x.)"
     runs = [
         module._WorkerRun(returncode=-9, report=killed, stop_reason="length"),
         module._WorkerRun(problem="it exceeded its wall-clock budget of 3s."),
@@ -11297,7 +11336,7 @@ async def test_reasoning_cut_off_kill_leaves_thinking_off_and_default_runs(
     project = _git_project(tmp_path, monkeypatch)
     monkeypatch.setenv("BEAGLE_TAU_DISPATCH_THINKING", level)
     monkeypatch.setenv("FAKE_TAU_HANGS_ON", "1")
-    monkeypatch.setenv("FAKE_TAU_LENGTH_STOPS", "2")
+    monkeypatch.setenv("FAKE_TAU_LENGTH_STOPS", "3")
     monkeypatch.setenv("FAKE_TAU_THINKS", "1")
     run_worker = _worker_module(monkeypatch)._run_worker
 
@@ -11324,7 +11363,7 @@ async def test_next_attempt_runs_thinking_off_after_reasoning_cut_offs(
     project = _git_project(tmp_path, monkeypatch)
     monkeypatch.setenv("BEAGLE_TAU_DISPATCH_THINKING", "medium")
     monkeypatch.setenv("FAKE_TAU_HANGS_ON", "1")
-    monkeypatch.setenv("FAKE_TAU_LENGTH_STOPS", "2")
+    monkeypatch.setenv("FAKE_TAU_LENGTH_STOPS", "3")
     monkeypatch.setenv("FAKE_TAU_THINKS", "1")
     run_worker = _worker_module(monkeypatch)._run_worker
     await run_worker("Write cases", project, "", "", 30, None, "T0002", ["a.txt"])
@@ -12452,7 +12491,7 @@ async def test_retry_note_after_killed_attempt_does_not_say_reported_back(
     runtime, _ = _bound(tmp_path)
     module = _loaded_module()
     briefs: list[str] = []
-    killed = f"(the sub-agent was ended: {module.CUT_OFF_TWICE}: nothing filled. Split it.)"
+    killed = f"(the sub-agent was ended: {module.CUT_OFF_ENDED}: nothing filled. Split it.)"
     runs = [
         module._WorkerRun(returncode=-9, report=killed, stop_reason="length"),
         module._WorkerRun(returncode=0, report="Wrote notes.txt.", stop_reason="stop"),
@@ -12498,7 +12537,7 @@ async def test_cut_off_kill_note_is_not_briefed_as_reference_notes(
     module = _loaded_module()
     briefs: list[str] = []
     killed = (
-        f"(the sub-agent was ended: {module.CUT_OFF_TWICE}: {module.REASONING_FILLED}; "
+        f"(the sub-agent was ended: {module.CUT_OFF_ENDED}: {module.REASONING_FILLED}; "
         f"the next sub-agent on T0002 runs thinking-off. {module.NO_CALL_CUT})"
     )
     said = "The reference in refs/cobs.c encodes each run of non-zero bytes. " * 6

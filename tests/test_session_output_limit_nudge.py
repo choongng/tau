@@ -16,7 +16,11 @@ from tau_agent import AssistantMessage
 from tau_ai import FakeProvider
 from tau_coding import CodingSession, OpenAICompatibleProviderConfig, ProviderSettings
 from tau_coding import session as coding_session_module
-from tau_coding.session import MAX_OUTPUT_LIMIT_CONTINUATIONS, OUTPUT_LIMIT_NUDGE
+from tau_coding.session import (
+    LOOP_CUT_NUDGE,
+    MAX_OUTPUT_LIMIT_CONTINUATIONS,
+    OUTPUT_LIMIT_NUDGE,
+)
 from test_session_output_limit import (
     R36_OPENING,
     R36_ROUND,
@@ -127,7 +131,7 @@ async def test_loop_cut_nudge_keeps_the_session_provider(
     cut = session.messages[1]
     assert isinstance(cut, AssistantMessage)
     assert [diagnostic.type for diagnostic in cut.diagnostics or []] == ["reasoning_loop_cut"]
-    assert [call[2][-1].text for call in main.calls] == ["Design it.", OUTPUT_LIMIT_NUDGE]
+    assert [call[2][-1].text for call in main.calls] == ["Design it.", LOOP_CUT_NUDGE]
     assert built == []
     assert session.messages[-1].text == "Acted on the nudge."
     assert session.thinking_level == "medium"

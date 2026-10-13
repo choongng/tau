@@ -5201,15 +5201,11 @@ async def test_session_continues_a_turn_cut_off_at_the_output_limit(tmp_path: Pa
     # keeps running out.
     assert len(provider.calls) == 3
     sent = provider.calls[1][2]
-    assert [message.role for message in sent] == ["user", "user"]
-    assert sent[1].text.startswith("Your last reply hit the output limit")
-    # The truncated reasoning stays in history but is not replayed.
-    assert all(
-        not isinstance(block, ThinkingContent)
-        for message in provider.calls[2][2]
-        if isinstance(message, AssistantMessage)
-        for block in message.content
-    )
+    assert [message.role for message in sent] == ["user", "assistant", "user"]
+    assert sent[2].text.startswith("Your last reply hit the output limit")
+    # The truncated reasoning is replayed, so the next reply builds on it (R91).
+    assert sent[1].content == [ThinkingContent(thinking="Going in circles. " * 50)]
+    assert "kept above" in sent[2].text
     assert isinstance(session.messages[1].content[0], ThinkingContent)
 
 
