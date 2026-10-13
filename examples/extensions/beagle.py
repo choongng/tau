@@ -339,7 +339,8 @@ CONTRACT_MILESTONES = (
     "Contract::read the sources and list in "
     f"{CONTRACT_PATH} what they pin down, each entry citing its source by line "
     "anchor and added with `beagle pursuit contract add` as it is read, with "
-    f"{CONTRACT_DIR}/accept.sh running every entry against the code",
+    f"{CONTRACT_DIR}/accept.sh running every entry against the code and printing one "
+    "line per entry, `ok <id>` or `FAIL <id>: why`, even before the code exists",
     # R81: written as a second whole contract it took 11 minutes and 39 KB, when
     # it is compared only by the lines its entries cite and the operations.
     "Second extraction::without reading the first, list in "
@@ -362,6 +363,11 @@ CONTRACT_STEPS = {
     ),
     "Reconcile": ([f"{CONTRACT_DIR}/"], "beagle pursuit contract check"),
 }
+#: What pursuit_step says when a driver passes a contract step a check of its own.
+CONTRACT_CHECK_KEPT_NOTE = (
+    "{title} keeps its check `{check}`: the contract's own check judges it, so the "
+    "done_when passed is not used. Pass notes alone to say what the work still needs.\n\n"
+)
 #: How long sealing may take: it runs the contract's full check first.
 CONTRACT_SEAL_TIMEOUT = 300.0
 #: What pursuit_step says when it drops the locks a driver passed under a contract.
@@ -427,7 +433,7 @@ def _seal_when_ready(root: Path) -> str:
         )
     return (
         f"Sealed the contract ({CONTRACT_PATH}): from here it is what done means, and "
-        "the work after it opens.\n\n"
+        f"the work after it opens. {_contract_run_note(root)}\n\n"
     )
 
 
@@ -4889,12 +4895,85 @@ CONTRACT_CHECKS = (
 
 def _contract_command(words: list[str]) -> bool:
     """Whether `words` is `beagle pursuit contract check [--draft]`, the second
-    extraction's `check --file`, or `... contract run`."""
-    return (
+    extraction's `check --file`, or `... contract run [--operation OP]...`."""
+    if not (
         len(words) >= 4
         and Path(words[0]).name == "beagle"
         and words[1:3] == ["pursuit", "contract"]
-        and tuple(words[3:]) in CONTRACT_CHECKS
+    ):
+        return False
+    rest = tuple(words[3:])
+    if rest in CONTRACT_CHECKS:
+        return True
+    pairs = [w for word in rest[1:] for w in word.split("=", 1)]
+    return (
+        rest[0] == "run"
+        and len(pairs) >= 2
+        and len(pairs) % 2 == 0
+        and all(flag == "--operation" for flag in pairs[::2])
+        and all(pairs[1::2])
+    )
+
+
+#: Where beagle keeps the seal, which exists once the contract is what done means.
+CONTRACT_SEAL = Path(".beagle") / "contract-seal.json"
+#: Interpreters a check may hand code to inline, and the flag that does it.
+_INLINE_CODE = {"python": "-c", "python3": "-c", "node": "-e", "ruby": "-e", "perl": "-e"}
+
+
+def _contract_operations(root: Path) -> list[str]:
+    """The operations the contract names, by bare name, in its order; [] if none."""
+    try:
+        data = json.loads((root / CONTRACT_PATH).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return []
+    entries = data.get("entries") if isinstance(data, dict) else None
+    names: list[str] = []
+    for entry in entries if isinstance(entries, list) else []:
+        op = str(entry.get("operation") or "") if isinstance(entry, dict) else ""
+        name = op.split("(")[0].strip().rsplit(".", 1)[-1]
+        if name and name not in names:
+            names.append(name)
+    return names
+
+
+def _contract_run_note(root: Path) -> str:
+    """How each milestone is checked once the contract is sealed (T0510)."""
+    ops = _contract_operations(root)
+    named = f" (its operations: {', '.join(ops)})" if ops else ""
+    return (
+        "Check each milestone against the part of the contract it builds: done_when "
+        f"`beagle pursuit contract run --operation <op>`, once per operation{named}. "
+        "Work the contract does not cover, such as tests or packaging, takes the goal's "
+        "own command. Do not copy entries into a check: the contract holds them, and a "
+        "copy can be wrong."
+    )
+
+
+def _copied_answers_problem(command: str, title: str, root: Path) -> str | None:
+    """Why a check that asserts answers inline may not open under a sealed contract.
+
+    R86: after the seal the driver wrote T0006's check as `python3 -c` asserts
+    of its own, `encode(b'')` with no delimiter and `encode(b'\\x00')` with one.
+    The second worker's code met the contract and failed the check; two
+    workers and nine minutes went to it before the driver amended it.
+    """
+    if title.strip() in CONTRACT_STEPS or not (root / CONTRACT_SEAL).is_file():
+        return None
+
+    def inline(argv: list[str]) -> str | None:
+        flag = _INLINE_CODE.get(Path(argv[0]).name)
+        if flag is None or flag not in argv[1:]:
+            return None
+        at = argv.index(flag) + 1
+        code = argv[at] if at < len(argv) else ""
+        return code if re.search(r"\bassert\b|==", code) else None
+
+    if _bash_find(command, inline) is None:
+        return None
+    return (
+        "done_when asserts answers of its own inline, and the sealed contract holds "
+        f"them. {_contract_run_note(root)} Call pursuit_step again with that."
     )
 
 
@@ -14536,8 +14615,15 @@ def make_step_tool() -> Any:
         done_when = str(arguments.get("done_when") or "").strip()
         scope = _strings(arguments.get("scope"))
         fixed = CONTRACT_STEPS.get(title.strip()) if _contract_declared(root) else None
-        if fixed is not None and record.get("status") != "open":
+        if fixed is not None:
+            # R87: the Contract step opened on its check, then the driver passed
+            # `test -f ... && assert len(entries) > 0` with its notes, which
+            # amended it; the worker's 15 minutes ended on a check prove showed
+            # could not refuse, and the driver's next guess asked for 50 entries.
+            if done_when and " ".join(done_when.split()) != " ".join(fixed[1].split()):
+                kept_lead.append(CONTRACT_CHECK_KEPT_NOTE.format(title=title, check=fixed[1]))
             scope, done_when = list(fixed[0]), fixed[1]
+            arguments = {**arguments, "scope": scope, "done_when": done_when}
         notes = str(arguments.get("notes") or "").strip()
         opened = route = taken = ""
         retrying = False
@@ -14698,6 +14784,7 @@ def make_step_tool() -> Any:
                         done_when or old_check, route_scope, task, nodes, root
                     )
                     or _oracle_with_code_problem(route_scope, goal, task, done_when or old_check)
+                    or _copied_answers_problem(done_when, title, root)
                     or await _locked_test_refusal(
                         done_when or old_check, route_scope, goal, route_passing
                     )
@@ -14944,6 +15031,7 @@ def make_step_tool() -> Any:
                     or _locked_scope_problem(scope, root, title, task, done_when)
                     or _sibling_owned_check_problem(done_when, scope, task, nodes, root)
                     or _oracle_with_code_problem(scope, goal, task, done_when)
+                    or _copied_answers_problem(done_when, title, root)
                     or _doc_only_check_problem(done_when, scope, task, root)
                     or _cases_first_problem(
                         scope, task, title, goal, nodes, _strings(arguments.get("locks"))
@@ -16716,7 +16804,8 @@ NO_BEAGLE_REASON = (
 #: What a worker is told in its brief, to the same end.
 NO_BEAGLE_NOTE = (
     "Do not inspect .beagle/ or run beagle, apart from reading the contract "
-    "(`beagle pursuit contract refs`, `check`, `status`)."
+    "(`beagle pursuit contract refs`, `check`, `status`, `diff`) and running it against "
+    "the code (`beagle pursuit contract run --operation <op>`)."
 )
 #: What a worker is told to do with a locked test no code can pass. q35 R51:
 #: W4 spent 15.7 min fitting code to test_cases.py, which made one call for
