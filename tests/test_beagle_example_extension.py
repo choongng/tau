@@ -13025,14 +13025,112 @@ async def test_prove_does_not_offer_absent_for_a_source_that_predates_the_task(
 
     await module._prove("T0007", "done, no witness", scope, project, 60)
 
-    assert _pursuit_calls(fake_beagle, "prove") == []
+    # T0538: the edit since the open may be put back; the file is never taken away.
+    before = _pursuit_calls(fake_beagle, "prove")
+    assert [how[:3] for how in before] == [["T0007", "--mutate", "interval_tree_clocks.py"]]
 
     (project / "itc_extra.py").write_text("X = 1\n")
     await module._prove("T0007", "done, no witness", scope, project, 60)
 
-    prove = _pursuit_calls(fake_beagle, "prove")
-    assert len(prove) == 1 and prove[0][:3] == ["T0007", "--absent", "itc_extra.py"]
+    prove = _pursuit_calls(fake_beagle, "prove")[len(before) :]
+    assert prove[0][:3] == ["T0007", "--absent", "itc_extra.py"]
     assert "interval_tree_clocks.py" not in prove[0]
+    assert all("--absent" not in how for how in prove[1:])
+
+
+@pytest.mark.anyio
+async def test_auto_prove_reverts_a_scope_file_changed_since_open(
+    tmp_path: Path, fake_beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # R95: Reconcile's first worker hit the wall with contract/contract.json, tracked
+    # before the task opened, edited so the check passed; the next changed nothing
+    # and gave no WITNESS, prove had nothing to try, and the task was superseded.
+    project = _git_project(tmp_path, monkeypatch)
+    (project / "contract").mkdir()
+    (project / "tests").mkdir()
+    at_open = '{\n "names": ["fork"],\n "joins": []\n}\n'
+    (project / "contract" / "contract.json").write_text(at_open)
+    (project / "contract" / "blob.bin").write_bytes(b"\x00\xff\x00")
+    (project / "tests" / "test_contract.py").write_text("def test_it():\n    pass\n")
+    _git(project, "add", "contract", "tests")
+    _git(project, "commit", "-q", "-m", "T0009: contract")
+    opened = _git(project, "rev-parse", "HEAD").strip()
+    record = {"id": "T0010", "status": "open", "opened_commit": opened}
+    (fake_beagle / "show.out").write_text(
+        json.dumps({**record, "done_when": "beagle pursuit contract check"})
+    )
+    merged = at_open.replace('"joins": []', '"joins": ["join"]')
+    (project / "contract" / "contract.json").write_text(merged)
+    (project / "contract" / "blob.bin").write_bytes(b"\x00\xfe\x00")
+    (project / "tests" / "test_contract.py").write_text("def test_it():\n    assert 1\n")
+    (project / "contract" / "notes.md").write_text("merged\n")
+    module = _module()
+    real = module._run
+    proved: list[list[str]] = []
+
+    def run(cmd: list[str], *args: Any, **kwargs: Any) -> tuple[int, str]:
+        if "prove" not in cmd:
+            return real(cmd, *args, **kwargs)
+        proved.append(cmd[cmd.index("prove") + 2 :])
+        if "--absent" in cmd:
+            return 1, "T0010: NOT PROVEN — the check refused for another reason\n"
+        if "--predates-because" not in cmd:
+            return 1, "T0010: refused; say why with --predates-because\n"
+        return 0, "T0010: PROVEN — refuses with contract/contract.json as it was\n"
+
+    monkeypatch.setattr(module, "_run", run)
+    scope = ["contract/", "tests/"]
+
+    proof = await module._prove("T0010", "found it passing, changed nothing", scope, project, 60)
+
+    assert proof is not None and proof.proven, proof
+    assert [how[:2] for how in proved] == [
+        ["--absent", "contract/notes.md"],
+        ["--mutate", "contract/contract.json"],
+        ["--mutate", "contract/contract.json"],
+    ]
+    how = proved[-1]
+    assert how.count("--mutate") == 1, how  # not the binary file, not the test
+    needle = how[how.index("--needle") + 1]
+    replacement = how[how.index("--replacement") + 1]
+    assert merged.count(needle) == 1 and merged.replace(needle, replacement) == at_open
+    assert how[how.index("--predates-because") + 1] == module.REVERSION_BECAUSE
+
+    # Committed by the attempt that hit the wall, the change is still put back.
+    (project / "contract" / "notes.md").unlink()
+    _git(project, "add", "contract")
+    _git(project, "commit", "-q", "-m", "T0010: wip")
+    proved.clear()
+    proof = await module._prove("T0010", "nothing to add", scope, project, 60)
+
+    assert proof is not None and proof.proven, proof
+    assert [how[:2] for how in proved] == [["--mutate", "contract/contract.json"]] * 2
+
+
+@pytest.mark.anyio
+async def test_auto_prove_reports_no_witness_and_no_change(
+    tmp_path: Path, fake_beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # With nothing new and nothing edited since the open, there is nothing to try.
+    project = _git_project(tmp_path, monkeypatch)
+    toml = project / ".beagle" / "pursuit.toml"
+    toml.write_text(toml.read_text() + '\n[close]\nrequire = "witness"\n')
+    (project / "contract").mkdir()
+    (project / "contract" / "contract.json").write_text('{"names": []}\n')
+    _git(project, "add", "contract")
+    _git(project, "commit", "-q", "-m", "T0009: contract")
+    opened = _git(project, "rev-parse", "HEAD").strip()
+    record = {"id": "T0010", "status": "open", "opened_commit": opened}
+    (fake_beagle / "show.out").write_text(json.dumps(record))
+    module = _module()
+    monkeypatch.setattr(module, "BEAGLE_BIN", str(fake_beagle / "beagle"))
+
+    proof = await module._prove("T0010", "changed nothing", ["contract/"], project, 60)
+
+    assert proof is not None and not proof.proven
+    assert proof.text.startswith("The worker gave no WITNESS block"), proof.text
+    assert "none was edited that could be put back" in proof.text
+    assert _pursuit_calls(fake_beagle, "prove") == []
 
 
 @pytest.mark.anyio

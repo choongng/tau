@@ -10088,6 +10088,13 @@ PREDATES_BECAUSE = (
     "this task's check tests code an earlier task wrote; the defect is put back there "
     "to show the check this task added catches it"
 )
+#: The `--predates-because` for putting back a scope file's content at the open.
+REVERSION_BECAUSE = (
+    "the file was in the tree when this task opened, and an attempt at this task "
+    "changed it; putting back its content at the open shows the check needs that change"
+)
+#: A scope file larger than this, now or at the open, is not put back by `prove`.
+REVERSION_MAX_BYTES = 512 * 1024
 #: How much of a `prove` reply the driver and the next worker see.
 PROVE_TAIL_CHARS = 1_500
 
@@ -11207,7 +11214,9 @@ async def _prove(
     defect (`WITNESS_NOTE`); a missing or misshapen one falls back to taking
     away the source files the task changed that were not in the tree when it
     opened, or with none, its data files; a task with locks it wrote takes those
-    away. None
+    away. Last, each source file in scope that changed since the task opened is
+    put back as the open held it, so a change an earlier, stopped attempt made
+    is judged too. None
     when neither can be tried — no witness and no changed file — and the close
     decides.
 
@@ -11300,6 +11309,14 @@ async def _prove(
     sources = [rel for rel in sources if os.path.normpath(rel) not in scripts]
     if sources:
         attempts.append([arg for rel in sources for arg in ("--absent", rel)])
+    # R95: Reconcile's first worker hit the wall with contract/contract.json,
+    # tracked before the task opened, edited so the check passed; the next
+    # worker changed nothing and gave no WITNESS, and nothing was new to take
+    # away. Putting back what changed since the open judges the task's change,
+    # not only the last worker's.
+    reversion = _open_reversion(opened, scope, root, carried, scripts)
+    if reversion:
+        attempts.append(reversion)
     still_passes = ""
     for how in attempts:
         argv = [BEAGLE_BIN, "pursuit", "prove", task, *how, "--check-timeout", f"{timeout:.0f}"]
@@ -11314,7 +11331,13 @@ async def _prove(
             # A task that adds tests for code an earlier task wrote: its
             # witness is a defect in that code, which beagle takes when said.
             # A part's witness in what its parent's split committed is its own.
-            because = carried.because(task) if split_work else PREDATES_BECAUSE
+            because = (
+                carried.because(task)
+                if split_work
+                else REVERSION_BECAUSE
+                if how is reversion
+                else PREDATES_BECAUSE
+            )
             argv += ["--predates-because", because]
             rc, out = await asyncio.to_thread(
                 _run, _capped(argv, _memory_max()), root, 2 * timeout + 120
@@ -11360,10 +11383,52 @@ async def _prove(
             return None
         return _Proof(
             proven=False,
-            text="The worker gave no WITNESS block, and changed no source file in the "
-            "task's scope that is new since it opened and could be taken away instead.",
+            text="The worker gave no WITNESS block, and no source file in the task's "
+            "scope has changed since it opened: none is new that could be taken away, "
+            "and none was edited that could be put back as it was.",
         )
     return _Proof(proven=False, text="\n\n".join(refused))
+
+
+def _open_reversion(
+    opened: str, scope: list[str], root: Path, carried: _SplitCarry, scripts: set[str]
+) -> list[str] | None:
+    """`prove` arguments putting each source file in `scope` that changed since the
+    task opened back as the open held it: the task's whole change, whichever
+    attempt made it. None when no such file can be put back.
+
+    A test, the check's own script, a file new since the open (taken away with
+    `--absent` instead), and a binary or oversized file are left out.
+    """
+    if not opened:
+        return None
+    rc, out = _run(["git", "diff", "--name-only", "--no-renames", opened, "--"], root, 30.0)
+    argv: list[str] = []
+    for rel in out.splitlines() if rc == 0 else []:
+        path = root / rel
+        if (
+            not rel
+            or Path(rel).parts[0] == ".beagle"
+            or _CACHE_DIRS & set(Path(rel).parts)
+            or not _in_scope(rel, scope, root)
+            or _is_test_path(rel)
+            or os.path.normpath(rel) in scripts
+            or not path.is_file()
+        ):
+            continue
+        with contextlib.suppress(OSError):
+            if path.stat().st_size > REVERSION_MAX_BYTES:
+                continue
+        was = _committed_bytes(root, carried.base(rel, opened), rel)
+        if was is None or len(was) > REVERSION_MAX_BYTES:
+            continue
+        try:
+            edit = _reversion_edit(path.read_text(encoding="utf-8"), was.decode("utf-8"))
+        except (OSError, UnicodeDecodeError):
+            continue
+        if edit is not None and "\0" not in edit[0]:
+            argv += ["--mutate", rel, "--needle", edit[0], "--replacement", edit[1]]
+    return argv or None
 
 
 def _reversion_edit(current: str, locked: str) -> tuple[str, str] | None:
