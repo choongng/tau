@@ -3400,7 +3400,10 @@ FOUND_PARAMETERS: dict[str, Any] = {
             "items": {"type": "string"},
             "description": (
                 "Two to six acceptance criteria, the user's: each about the product, "
-                "checkable by someone else (a command that exits 0, a file that exists)."
+                "checkable by someone else (a command that exits 0, a file that exists). "
+                "Drafting them yourself, say what must pass and leave exact values, sizes, "
+                "bounds and worked examples to the contract read from the sources: a value "
+                "written from memory can contradict it."
             ),
         },
         "milestones": {
@@ -20131,7 +20134,9 @@ def setup(tau: ExtensionAPI) -> None:
                     "The pursuit's goal and criteria are the user's: use their words, and set "
                     "user_confirmed only when they gave or approved them. When they told you "
                     "to decide the details yourself, draft the criteria from their request "
-                    "and set user_delegated instead of asking.",
+                    "and set user_delegated instead of asking. Then say what must pass and "
+                    "leave exact values, sizes, bounds and worked examples to the contract read "
+                    "from the sources: a value written from memory can contradict it.",
                 ),
             )
         )

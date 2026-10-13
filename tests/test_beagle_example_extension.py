@@ -1601,6 +1601,19 @@ async def test_pursuit_found_waits_for_the_user_then_roots_and_splits(
     assert "already exists" in again.text
 
 
+def test_found_criteria_leave_values_to_the_contract(tmp_path: Path) -> None:
+    # R94: drafting the criteria itself (user_delegated), the driver wrote a size
+    # bound that contradicted the contract later sealed from the spec.
+    runtime, _ = _bound(tmp_path)
+    found = _tool(runtime, "pursuit_found")
+    criteria = found.parameters["properties"]["criteria"]["description"]
+    for text in (criteria, " ".join(found.prompt_guidelines)):
+        flat = " ".join(text.split())
+        assert "say what must pass" in flat, text
+        assert "leave exact values, sizes, bounds and worked examples to the contract" in flat
+        assert "a value written from memory can contradict it" in flat
+
+
 @pytest.mark.anyio
 async def test_founding_declares_the_contract_and_seeds_it_first(
     tmp_path: Path, beagle: Path, fake_beagle: Path, monkeypatch: pytest.MonkeyPatch
