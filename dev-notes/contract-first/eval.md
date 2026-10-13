@@ -28,6 +28,7 @@ branch and sha. Grades come from `grade_<task>.py` over `runs/RNN/adapter.py`;
 | R94 | q35 | cobs | contract-first e02f316 (T0529, T0530); tau 7cb40c5e pinned | 13/44 at the 60 min cap (working tree; encode 11/11, decode 0/11) | R93 0/44; R90 39/44; B05 plain 41/44 in 48.8 min |
 | R95 | q35 | itc | contract-first e02f316 (T0529, T0530); tau 7cb40c5e pinned | 22/42 at the 60 min cap (working tree; uncommitted) | R87 0/42; R83 18/42; R57 lean cases-first 23/42; B04 plain 0/42 |
 | R96 | q35 | wrenfold | contract-first e02f316 (T0529, T0530); tau 7cb40c5e pinned | 50/54 at the 60 min cap (working tree; package ~/wrenfold/wrenfold, uncommitted) | R71 0/54; B06 plain 54/54 in 9.1 min |
+| B07 | q35 | semver (bare goal) | none (plain tau, no extensions) | 75/76 in 8.1 min, ended on its own | — (baseline for the bare-goal pursuit runs) |
 
 ## B06 — the invented spec was not hard
 
@@ -607,4 +608,20 @@ twice), and the one real miss twice, `decode(05)` not raising.
   entry that fails for any reason other than the missing code is named as
   the acceptance's own defect; and a recorded route for a worker to
   dispute a sealed entry's test against its cited source.
+
+## B07 — plain q35 on the bare-goal semver prompt: 75/76 in 8.1 min
+
+The control for the bare-goal rotation (criterion 8): one sentence, "implement
+a modern python library for parsing, validating and comparing semantic
+versions", no spec link. Plain tau (`--no-extensions`) ended on its own after
+8.1 min with ~/semver/src/semver (a frozen SemVer dataclass, regex parse,
+precedence by key, 102 tests of its own). Graded through an adapter over
+`SemVer.parse`, its comparison operators and `from_parts`/`str`: 75/76. The
+one miss: `parse("1.2.3\n")` is accepted (`re.match` with `$`, which matches
+before a trailing newline).
+
+What a bare-goal pursuit run must beat: 75/76 in 8 min, on a problem the
+model already knows. There are no sources to read, so the contract stage
+has nothing to cite but what the driver saves; the runs say whether beagle
+still pays its way when the spec is the model's own memory.
 
