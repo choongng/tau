@@ -24217,6 +24217,11 @@ def test_a_check_may_run_the_contract_and_nothing_else_of_beagle() -> None:
     assert problem("beagle pursuit contract check --draft") is None
     assert problem("beagle pursuit contract check") is None
     assert problem("beagle pursuit contract run") is None
+    # T0510: a milestone after the seal is checked by its operations' entries.
+    assert problem("beagle pursuit contract run --operation encode") is None
+    assert problem("beagle pursuit contract run --operation=encode --operation decode") is None
+    assert "runs beagle itself" in str(problem("beagle pursuit contract run --operation"))
+    assert "runs beagle itself" in str(problem("beagle pursuit contract run --all x"))
     assert "runs beagle itself" in str(problem("beagle pursuit contract seal"))
     assert "runs beagle itself" in str(problem("beagle pursuit close T0002"))
 
@@ -24272,6 +24277,7 @@ async def test_a_close_seals_the_contract_once_beagle_reads_it_ready(
     if state == "ready":
         assert sealed and calls == [["status", "--json"], ["seal"]]
         assert "pursuit_step: T0004 not closed done by T0002" in result.text
+        assert "done_when `beagle pursuit contract run --operation <op>`" in result.text
     else:
         assert not sealed and calls == [["status", "--json"]]
         assert "T0004" not in result.text
@@ -24404,3 +24410,62 @@ async def test_a_task_on_the_contract_witnesses_a_quote_not_code(
 
     assert _module().CONTRACT_WITNESS_NOTE in run["stdin"]
     assert _module().WITNESS_NOTE not in run["stdin"]
+
+
+def _sealed_contract(project: Path) -> Path:
+    """`project` with a contract of encode and decode entries, and beagle's seal."""
+    module = _module()
+    (project / module.CONTRACT_PATH).parent.mkdir(exist_ok=True)
+    entries = [
+        {"id": "op", "kind": "operation", "operation": "encode(data: bytes) -> bytes"},
+        {"id": "ex1", "kind": "example", "operation": "encode", "input": "00"},
+        {"id": "ex2", "kind": "example", "operation": "cobs.decode", "input": "0100"},
+    ]
+    (project / module.CONTRACT_PATH).write_text(json.dumps({"entries": entries}))
+    (project / module.CONTRACT_SEAL).write_text("{}\n")
+    return project
+
+
+def test_a_sealed_contract_refuses_a_check_that_asserts_answers_inline(tmp_path: Path) -> None:
+    # R86: T0006's check was the driver's own `python3 -c` asserts, which
+    # contradicted the contract; two workers went to code that met it.
+    module = _module()
+    project = _contract_project(tmp_path)
+    copied = "python3 -c \"import cobs; assert cobs.encode(b'') == b'\\\\x01'\""
+    assert module._copied_answers_problem(copied, "Core encoding", project) is None  # not sealed
+    _sealed_contract(project)
+    problem = str(module._copied_answers_problem(copied, "Core encoding", project))
+    assert problem.startswith("done_when asserts answers of its own inline")
+    assert "`beagle pursuit contract run --operation <op>`" in problem
+    assert "(its operations: encode, decode)" in problem
+    wrapped = f"bash -c {shlex.quote('cd . && ' + copied)}"
+    assert module._copied_answers_problem(wrapped, "Core encoding", project) is not None
+    assert module._copied_answers_problem("node -e 'assert(f(1)==2)'", "X", project) is not None
+    # Not answers: an import or a version, and the contract's own steps.
+    plain = "python3 -c 'import cobs; print(cobs.__version__)'"
+    assert module._copied_answers_problem(plain, "Package", project) is None
+    assert module._copied_answers_problem(copied, "Reconcile", project) is None
+    assert module._copied_answers_problem("python3 -m pytest -q", "Tests", project) is None
+
+
+@pytest.mark.anyio
+async def test_pursuit_step_refuses_copied_answers_once_the_contract_is_sealed(
+    tmp_path: Path, beagle: Path, fake_beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(_sealed_contract(_contract_project(tmp_path)))
+    _ready_task(fake_beagle)
+    runtime, _ = _bound(tmp_path)
+
+    result = await _tool(runtime, "pursuit_step").execute(
+        "c1",
+        {
+            "task": "T0002",
+            "criteria": "c",
+            "done_when": "python3 -c \"import parser; assert parser.parse('1') == 1\"",
+            "scope": ["parser.py"],
+        },
+    )
+
+    assert "T0002 not opened" in result.text
+    assert "asserts answers of its own inline" in result.text
+    assert _pursuit_calls(fake_beagle, "open") == []
