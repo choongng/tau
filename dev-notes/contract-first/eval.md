@@ -22,6 +22,7 @@ branch and sha. Grades come from `grade_<task>.py` over `runs/RNN/adapter.py`;
 | R88 | q35 | cobs | contract-first eccdcac (T0509, T0510, T0520, T0522) | — (OOM-killed at 23 min, in Contract) | R86 42/44; B05 plain 41/44 |
 | R89 | q35 | cobs | contract-first 676ffd1 (T0524) | 2/44 in 49.8 min (ended, not capped) | R86 42/44; B05 plain 41/44 in 48.8 min |
 | R90 | q35 | cobs | contract-first 271a767 (T0524, T0525) | 39/44 at the 60 min cap (working tree; 31/44 committed) | R86 42/44; R89 2/44; B05 plain 41/44 in 48.8 min |
+| R91 | q35 | cobs | contract-first 6ff1dd0 (T0524–T0526) | 5/44 at the 60 min cap (encode never closed) | R90 39/44; R86 42/44; B05 plain 41/44 in 48.8 min |
 
 ## B06 — the invented spec was not hard
 
@@ -426,3 +427,32 @@ the reference states no rule for it, so no contract entry holds it.
   tests, which worked, at a minute's cost.
 - Open: the output-limit spiral (q35 max_tokens 16384 in the krang catalog;
   B05 ran under the same limit), and a repeat of R90 on T0526.
+
+## R91 — q35 cobs: 5/44 at the cap; five encode workers, none closed it
+
+Repeat of R90 on 6ff1dd0. The contract sealed at 20.6 min (R90: 30.3), 36
+entries, all concrete; Reconcile took 3.9 min (R90: 13) and added 8 entries
+the second extraction had and the first lacked. T0526 holds.
+
+| Encode worker | Minutes | How it ended |
+|---|---|---|
+| dde44317 | 20.9–21.8 | tool calls written as text without `<tool_call>`, twice |
+| 5befdf85 | 21.8–22.2 | the same |
+| 8d863128 | 22.4–34.6 | two replies at the 16k output limit (5 min each), then the 900 s wall |
+| 9e04ae2e | 34.6–41.8 | wrote encode/decode; IndexError, overhead bound failed |
+| 4dea9856 | 42.8–56.8 | the 900 s wall, its last reply at the output limit |
+
+At the cap ~/cobs/cobs/__init__.py was uncommitted, with no decode: 5/44.
+
+- The cut-off replies were hand traces: 43k and 45k characters of reasoning
+  stepping the C encoder byte by byte, and tracing EX-10 (255 bytes in) to
+  decide whether the contract's expected output was right, without running
+  either. At ~55 tokens/s a 16k reply takes 5 min, so two end a worker at its
+  900 s wall. Plain tau's one session has no wall: B05 had two length stops
+  and went on. R89 and R90 each lost a worker the same way; here it was two.
+- The driver, refused the code, wrote "the correct COBS encoding algorithm"
+  into the notes without having read the reference, and at 58 min "Do NOT do
+  any reasoning or testing. Here is the exact code to write".
+- Open: the worker wall against reasoning-length replies; the text-written
+  tool calls (R37's class, unparsed by the server when the opening tag is
+  missing).
