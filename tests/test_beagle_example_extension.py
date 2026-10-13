@@ -1642,11 +1642,14 @@ async def test_founding_declares_the_contract_and_seeds_it_first(
         "--ordered",
     ]
     assert split[1].startswith("Contract::") and split[2].startswith("Second extraction::")
+    assert split[3].startswith("Reconcile::")
     assert "each entry only an id, kind, operation, source and line-anchor cite" in split[2]
+    assert "reconcile" not in split[2]
     assert "by line anchor and operation only (no inputs or results)" in module.CONTRACT_FIRST_NOTE
     assert module.DRIVER_STEERS_NOTE in result.text
     assert module.CONTRACT_FIRST_NOTE in result.text and "Cases first" not in result.text
-    assert "beagle pursuit contract check --draft" in module.CONTRACT_FIRST_NOTE
+    assert "gives these three their scope and check itself" in module.CONTRACT_FIRST_NOTE
+    assert [m.partition("::")[0] for m in module.CONTRACT_MILESTONES] == list(module.CONTRACT_STEPS)
 
 
 @pytest.mark.anyio
@@ -14253,6 +14256,120 @@ async def test_contract_worker_adds_entries_by_contract_add(
     assert cut is not None and "add its entries to contract/contract.json a few" in cut
     other = module._truncated_call({"_raw_arguments": '{"path": "src/x.py", "content": "'})
     assert other is not None and "contract add" not in other
+
+
+@pytest.mark.anyio
+async def test_the_second_extraction_reads_nothing_of_the_first(
+    tmp_path: Path, beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # R84: both second-extraction workers began with `cat contract/contract.json`,
+    # and the listing copied the first's ids and cites.
+    module = _module()
+    runtime, project = _reference_worker(
+        tmp_path, monkeypatch, cap=30, scope=module.CONTRACT_SECOND
+    )
+    goal = project / ".beagle" / "pursuit.toml"
+    goal.write_text(goal.read_text() + module.CONTRACT_TABLE, encoding="utf-8")
+    (project / "contract").mkdir()
+    (project / "contract" / "contract.json").write_text('{"entries": []}\n')
+    bash = _tool_with_hooks(runtime, "bash")
+    read = _tool_with_hooks(runtime, "read")
+    second, first = module.CONTRACT_SECOND, module.CONTRACT_PATH
+    add = "beagle pursuit contract add"
+
+    refused = [
+        await read.execute("r1", {"path": "contract/contract.json"}),
+        await bash.execute("b1", {"command": "cat contract/contract.json"}),
+        await bash.execute("b2", {"command": f"python3 -c 'open(\"{project}/{first}\").read()'"}),
+        await bash.execute("b3", {"command": f"beagle pursuit contract diff a {second}"}),
+        await bash.execute("b4", {"command": "beagle pursuit contract add <<'EOF'\n{}\nEOF"}),
+        await bash.execute("b5", {"command": "beagle pursuit contract check --draft"}),
+    ]
+    taken = [
+        await bash.execute("t1", {"command": f"{add} --file {second} <<'EOF'\n{{}}\nEOF"}),
+        await bash.execute("t2", {"command": f"beagle pursuit contract check --file={second}"}),
+        await bash.execute("t3", {"command": "beagle pursuit contract refs paper --grep value"}),
+    ]
+
+    assert all("second, independent extraction" in r.text for r in refused), [
+        r.text for r in refused
+    ]
+    assert "without `--file contract/contract.second.json`" in refused[4].text
+    assert all(r.text == "ran" for r in taken), [r.text for r in taken]
+
+
+@pytest.mark.anyio
+async def test_only_the_second_extraction_writes_it(
+    tmp_path: Path, beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # R83: the Contract worker read the full check's "second extraction does not
+    # exist yet" and wrote it itself, 20 KB of full entries, after the first.
+    module = _module()
+    runtime, project = _reference_worker(tmp_path, monkeypatch, cap=30, scope="contract/")
+    goal = project / ".beagle" / "pursuit.toml"
+    goal.write_text(goal.read_text() + module.CONTRACT_TABLE, encoding="utf-8")
+    bash = _tool_with_hooks(runtime, "bash")
+    write = _tool_with_hooks(runtime, "write")
+    second = module.CONTRACT_SECOND
+    add = "beagle pursuit contract add"
+
+    refused = [
+        await write.execute("w1", {"path": second, "content": "{}"}),
+        await bash.execute("b1", {"command": f"cat > {second} <<'EOF'\n{{}}\nEOF"}),
+        await bash.execute("b2", {"command": f"{add} --file {second} <<'EOF'\n{{}}\nEOF"}),
+    ]
+    taken = [
+        await bash.execute("t1", {"command": "beagle pursuit contract add <<'EOF'\n{}\nEOF"}),
+        await bash.execute("t2", {"command": f"cat {second}"}),
+        await write.execute("t3", {"path": "contract/accept.sh", "content": "true\n"}),
+    ]
+
+    assert all("refusing to" in r.text and "another reader's" in r.text for r in refused), [
+        r.text for r in refused
+    ]
+    assert [r.text for r in taken] == ["ran", "ran", "ran"]
+
+
+@pytest.mark.anyio
+async def test_pursuit_step_scopes_the_contract_milestones_itself(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # R83, R84: the driver gave the second extraction the scope contract/, so
+    # beagle briefed it as contract work, and nothing kept it from the first.
+    module = _module()
+    project = _pursuit_project(tmp_path)
+    goal = project / ".beagle" / "pursuit.toml"
+    goal.write_text(goal.read_text() + module.CONTRACT_TABLE, encoding="utf-8")
+    monkeypatch.chdir(project)
+    _ready_task(fake_beagle)
+    record = json.loads((fake_beagle / "show.out").read_text())
+    (fake_beagle / "show.out").write_text(json.dumps({**record, "title": "Second extraction"}))
+    # The check is probed before the open: it runs the fake, and fails.
+    monkeypatch.setenv("PATH", f"{fake_beagle}{os.pathsep}{os.environ['PATH']}")
+    (fake_beagle / "contract.rc").write_text("1")
+    runtime, _ = _bound(tmp_path)
+
+    result = await _tool(runtime, "pursuit_step").execute(
+        "c1",
+        {
+            "task": "T0002",
+            "criteria": "the listing is written",
+            "done_when": "beagle pursuit contract check",
+            "scope": ["contract/"],
+        },
+    )
+
+    opens = _pursuit_calls(fake_beagle, "open")
+    assert len(opens) == 1, result.text
+    [opened] = opens
+    assert opened[opened.index("--scope") + 1] == module.CONTRACT_SECOND
+    assert opened[opened.index("--done-when") + 1] == (
+        f"beagle pursuit contract check --file {module.CONTRACT_SECOND}"
+    )
 
 
 @pytest.mark.anyio

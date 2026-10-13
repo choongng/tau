@@ -344,8 +344,24 @@ CONTRACT_MILESTONES = (
     # it is compared only by the lines its entries cite and the operations.
     "Second extraction::without reading the first, list in "
     f"{CONTRACT_SECOND} where the sources pin something, each entry only an id, "
-    "kind, operation, source and line-anchor cite, then reconcile the two",
+    "kind, operation, source and line-anchor cite",
+    # R83, R84: reconciling in the second's own task, its workers read the first
+    # before they wrote, and the two agreed by copying.
+    f"Reconcile::add to {CONTRACT_PATH} what the second extraction cites that it does "
+    "not, or exclude the passage with why, until `beagle pursuit contract check` passes",
 )
+#: Each contract milestone's scope and check, which pursuit_step gives it whatever
+#: the driver passed. R83, R84: the driver gave the second extraction the scope
+#: contract/, so beagle briefed it as contract work, with nothing to keep it from
+#: the first; R83's Contract worker then wrote the second itself.
+CONTRACT_STEPS = {
+    "Contract": ([f"{CONTRACT_DIR}/"], "beagle pursuit contract check --draft"),
+    "Second extraction": (
+        [CONTRACT_SECOND],
+        f"beagle pursuit contract check --file {CONTRACT_SECOND}",
+    ),
+    "Reconcile": ([f"{CONTRACT_DIR}/"], "beagle pursuit contract check"),
+}
 #: How long sealing may take: it runs the contract's full check first.
 CONTRACT_SEAL_TIMEOUT = 300.0
 #: What pursuit_step says when it drops the locks a driver passed under a contract.
@@ -4842,11 +4858,17 @@ _FILE_TESTS = frozenset({"-f", "-e", "-s"})
 
 #: The beagle commands a check may be: each judges the contract's files and the
 #: code they run against, never what beagle recorded about the work.
-CONTRACT_CHECKS = (("check",), ("check", "--draft"), ("run",))
+CONTRACT_CHECKS = (
+    ("check",),
+    ("check", "--draft"),
+    ("check", "--file", CONTRACT_SECOND),
+    ("run",),
+)
 
 
 def _contract_command(words: list[str]) -> bool:
-    """Whether `words` is `beagle pursuit contract check [--draft]` or `... contract run`."""
+    """Whether `words` is `beagle pursuit contract check [--draft]`, the second
+    extraction's `check --file`, or `... contract run`."""
     return (
         len(words) >= 4
         and Path(words[0]).name == "beagle"
@@ -9880,13 +9902,14 @@ CONTRACT_WITNESS_NOTE = (
     "When the check passes, end your report with the WITNESS block below. It names one "
     "small defect the check must catch, in the contract file you wrote "
     f"({CONTRACT_PATH}, or {CONTRACT_SECOND} for the second extraction): one entry's "
-    "quote with a word changed, so it is no longer what its source says. `prove` puts "
-    "it back, and if the check still passes, the task is not done. The NEEDLE is text "
-    "copied exactly from the file that occurs there only once; the REPLACEMENT is the "
-    "same text with the word changed.\n\n"
+    'cite with its anchor\'s hash changed ("83#a1f" made "83#a1e"), so it no longer '
+    "names its source line. `prove` puts it back, and if the check still passes, the "
+    "task is not done. The NEEDLE is text copied exactly from the file that occurs "
+    "there only once, the cite with enough of its entry around it; the REPLACEMENT is "
+    "the same text with the hash changed.\n\n"
     "WITNESS: <path of the contract file>\n"
     "NEEDLE:\n<exact text from the file>\n"
-    "REPLACEMENT:\n<that text with one word changed>\n"
+    "REPLACEMENT:\n<that text with the hash changed>\n"
     "END WITNESS"
 )
 WITNESS_NOTE = (
@@ -14461,6 +14484,9 @@ def make_step_tool() -> Any:
         criteria = str(arguments.get("criteria") or "").strip()
         done_when = str(arguments.get("done_when") or "").strip()
         scope = _strings(arguments.get("scope"))
+        fixed = CONTRACT_STEPS.get(title.strip()) if _contract_declared(root) else None
+        if fixed is not None and record.get("status") != "open":
+            scope, done_when = list(fixed[0]), fixed[1]
         notes = str(arguments.get("notes") or "").strip()
         opened = route = taken = ""
         retrying = False
@@ -16379,6 +16405,91 @@ def _contract_add(argv: list[str]) -> str | None:
     return " ".join(argv) if words[at + 1 : at + 2] == ["add"] else None
 
 
+def _contract_file(argv: list[str]) -> tuple[str, str] | None:
+    """The verb and `--file` (or "") of a `beagle pursuit contract` argv, or None."""
+    if _pursuit_verb(argv) != "contract":
+        return None
+    rest = argv[argv.index("contract") + 1 :]
+    verb = next((arg for arg in rest if not arg.startswith("-")), "")
+    given = ""
+    for at, arg in enumerate(rest):
+        if arg == "--file" and at + 1 < len(rest):
+            given = rest[at + 1]
+        elif arg.startswith("--file="):
+            given = arg.partition("=")[2]
+    return verb, os.path.normpath(given) if given else ""
+
+
+def _second_extraction(scope: list[str]) -> bool:
+    """Whether `scope` is the second extraction's: its file, references aside."""
+    own = {os.path.normpath(e.rstrip("/")) for e in scope}
+    return {e for e in own if Path(e).parts[:1] != (REFERENCES_DIR,)} == {CONTRACT_SECOND}
+
+
+def _extraction_crossing(
+    tool: str, arguments: dict[str, Any], command: str, cwd: Path, scope: tuple[str, ...]
+) -> str | None:
+    """Why a worker on one extraction of the contract may not take this call, or None.
+
+    R83: the Contract worker read the full check's "second extraction does not
+    exist yet" and wrote it. R84: both second-extraction workers began with
+    `cat contract/contract.json`. Two readers who missed different things are
+    the point, and the second written after reading the first is its copy. So
+    the second's worker reads nothing of the first, and only it writes the
+    second.
+    """
+    goal = _find_goal(cwd)
+    if goal is None:
+        return None
+    root = _resolved(goal.parent.parent)
+    if not _contract_declared(root):
+        return None
+    first = Path(CONTRACT_PATH).name
+    calls: list[tuple[str, str]] = []
+
+    def contract(argv: list[str]) -> str | None:
+        found = _contract_file(argv)
+        if found is not None:
+            calls.append(found)
+        return None
+
+    if command:
+        _bash_find(command, contract)
+    if _second_extraction(list(scope)):
+        why = (
+            "this task is the second, independent extraction: it is written from the "
+            f"sources without reading {CONTRACT_PATH}, and a later task reconciles the two."
+        )
+        path = str(arguments.get("path") or "") if tool == "read" else ""
+        if path and _own_path(_resolved(cwd / path), root) == root / CONTRACT_PATH:
+            return f"refusing to read {CONTRACT_PATH}: {why}"
+        if first in command:
+            return f"refusing a command that names {first}: {why}"
+        for verb, given in calls:
+            if verb == "diff":
+                return f"refusing `beagle pursuit contract diff`: {why}"
+            if verb in ("add", "check") and given != CONTRACT_SECOND:
+                return (
+                    f"refusing `beagle pursuit contract {verb}` without `--file "
+                    f"{CONTRACT_SECOND}`: without it, it {verb}s {CONTRACT_PATH}, and {why}"
+                )
+        return None
+    why = (
+        f"the second extraction is another reader's, one who has not seen {CONTRACT_PATH}, "
+        "in a task of its own; one written here agrees with the first by copying it. "
+        "Leave it, and say in your report if it is missing."
+    )
+    if any(verb == "add" and given == CONTRACT_SECOND for verb, given in calls):
+        return f"refusing to add to {CONTRACT_SECOND}: {why}"
+    targets = _write_targets(tool, arguments, cwd, resolve=False)
+    script = _bash_find(command, _driver_change) if command else None
+    if script is not None and script.startswith(_INTERPRETERS):
+        targets += _script_write_targets(command, _cwd_after_cd(command, cwd))
+    if any(_own_path(target, root) == root / CONTRACT_SECOND for target in targets):
+        return f"refusing to write {CONTRACT_SECOND}: {why}"
+    return None
+
+
 def _contract_refs_call(command: str) -> bool:
     """Whether a bash command only prints a source with `beagle pursuit contract
     refs`, after at most a `cd` and piped into filters such as head.
@@ -17329,6 +17440,9 @@ def make_worker_scope_guard() -> Any:
             if sent is None:
                 return None
             task, scope = sent
+            crossed = _extraction_crossing(event.tool_name, arguments, command, cwd, scope)
+            if crossed is not None:
+                return ToolCallHookResult(block=True, reason=crossed)
             known = _only_data_and_tests(list(scope))
             free = _free_reference_call(event.tool_name, arguments, command, cwd, windows)
             # R79: `contract refs` is how a contract worker reads the references.
@@ -19327,9 +19441,9 @@ CONTRACT_FIRST_NOTE = (
     f"`beagle pursuit contract add`, and writes {CONTRACT_DIR}/accept.sh, which "
     "runs every entry against the code. 'Second extraction': another sub-agent, "
     f"without reading the first, lists in {CONTRACT_SECOND} where the sources pin "
-    "something, by line anchor and operation only (no inputs or results), then "
-    f"reconciles the two. Give both the scope `{CONTRACT_DIR}/`; the Contract's check is `beagle "
-    "pursuit contract check --draft`, the second's `beagle pursuit contract check`. "
+    "something, by line anchor and operation only (no inputs or results). "
+    f"'Reconcile': a third adds to {CONTRACT_PATH} what the second cites that it does "
+    "not. pursuit_step gives these three their scope and check itself. "
     "Nothing else opens until the contract is sealed; then plan each milestone from "
     "it with pursuit_plan. Done is every entry passing (`beagle pursuit contract "
     "run`), not the tests a task wrote."
