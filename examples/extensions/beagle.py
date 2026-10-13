@@ -414,24 +414,34 @@ def _contract_work(scope: list[str], root: Path) -> bool:
     return within and _contract_declared(root)
 
 
-def _seal_when_ready(root: Path) -> str:
+def _seal_when_ready(root: Path, title: str = "") -> str:
     """Seal the contract once beagle reads it ready; a note saying so, or "".
 
     The work founding planned waits on the contract and its second extraction,
     and beagle opens none of it before the seal. A close that leaves the
-    contract ready seals it, so the driver never needs the verb.
+    contract ready seals it, so the driver never needs the verb. A close of
+    the task titled `title` that amends a test a judge found wrong leaves it
+    altered, and seals it again with that dispute's reason.
     """
     if not _contract_declared(root):
         return ""
     rc, out = _pursuit(["contract", "status", "--json"], root)
     status = _json_reply(out)
-    if rc != 0 or not isinstance(status, dict) or status.get("state") != "ready":
+    state = status.get("state") if rc == 0 and isinstance(status, dict) else None
+    reason = _amend_reason(title, root) if state == "altered" else ""
+    if state != "ready" and not reason:
         return ""
-    rc, out = _pursuit(["contract", "seal"], root, timeout=CONTRACT_SEAL_TIMEOUT)
+    argv = ["contract", "seal", *(["--reason", reason] if reason else [])]
+    rc, out = _pursuit(argv, root, timeout=CONTRACT_SEAL_TIMEOUT)
     if rc != 0:
         return (
-            f"The contract reads ready, but sealing it failed (exit {rc}):\n"
-            f"{out[-PROVE_TAIL_CHARS:]}\n\n"
+            f"The contract reads {'amended' if reason else 'ready'}, but sealing it failed "
+            f"(exit {rc}):\n{out[-PROVE_TAIL_CHARS:]}\n\n"
+        )
+    if reason:
+        return (
+            f"Sealed the contract ({CONTRACT_PATH}) again, kept with why: {reason}. The "
+            "tasks that waited on this fix open again.\n\n"
         )
     return (
         f"Sealed the contract ({CONTRACT_PATH}): from here it is what done means, and "
@@ -4544,12 +4554,14 @@ def _live_leaves(task: str, nodes: list[dict[str, Any]]) -> list[str]:
 
 
 def _steppable(ids: list[str], nodes: list[dict[str, Any]]) -> list[str]:
-    """`ids` without the containers the tree shows: those are not a task to step.
+    """`ids` without the containers the tree shows, nor a task that waits on another.
 
     Run R28 listed open container T0012 as workable; the driver stepped it
-    seven times in a row and the breaker stopped the run.
+    seven times in a row and the breaker stopped the run. An open task made to
+    wait on the amend of a test it disputed (T0547) stays open, and waits.
     """
-    return [t for t in ids if not _is_container(t, nodes)]
+    waits = _hard_waits(nodes)
+    return [t for t in ids if not _is_container(t, nodes) and t not in waits]
 
 
 def _live_title_clash(task: str, parts: list[str], nodes: list[dict[str, Any]]) -> str | None:
@@ -5028,7 +5040,10 @@ def _check_problem(command: str) -> str | None:
     one_command = _ONE_COMMAND
     if _contract_command(words):
         return None
-    if _bash_find(command, lambda argv: "beagle" if _named(argv, "beagle") else None):
+    if _bash_find(
+        command,
+        lambda argv: "beagle" if _named(argv, "beagle") and not _contract_command(argv) else None,
+    ):
         # The close runs the check, so a check that runs beagle can only ever
         # answer how it was called, never whether the work is done.
         return (
@@ -12269,6 +12284,252 @@ async def _audit(
     )
 
 
+#: A worker's last line disputing a sealed test, as beagle's brief asks for it.
+_DISPUTE_LINE = re.compile(r"^\W*DISPUTE\W+([\w.:-]*\w)\W*$")
+#: The title of the task that amends a sealed test a judge found wrong; its entry follows.
+AMEND_TITLE = "Amend contract: "
+#: Where beagle keeps each verdict on a disputed entry, one JSON object per line.
+CONTRACT_DISPUTES = Path(".beagle") / "contract-disputes.jsonl"
+#: Lines either side of an acceptance line naming the entry, as beagle's judge
+#: brief shows them: the amend's check reads the same lines.
+DISPUTE_CONTEXT = 4
+#: What the judging sub-agent is told beyond beagle's dispute brief.
+JUDGE_NOTE = (
+    "\n\nRead only this brief and the source file it names; change nothing, and run no "
+    "beagle command: the session that sent you records your verdict. On TEST WRONG, give "
+    "the value alone, as the test would write it, then ` instead of ` and the value the "
+    "test expects."
+)
+
+
+def _disputed_entry(report: str, output: str) -> str:
+    """The entry `report` ends by disputing, when the check's `output` has it FAIL; "".
+
+    R96: a sealed test expected 319 where the spec its entry cites gives 81664,
+    and the worker spent its wall concluding that the contract was wrong. Only
+    the id is taken from the report, and only of an entry the check failed, so
+    a confused worker cannot open a dispute on one that passes.
+    """
+    lines = [line.strip() for line in report.splitlines() if line.strip()]
+    said = _DISPUTE_LINE.match(lines[-1]) if lines else None
+    if said is None:
+        return ""
+    eid = said.group(1)
+    failed = re.search(rf"(?m)^\W*FAIL\s+{re.escape(eid)}(?![\w.-])", output)
+    return eid if failed else ""
+
+
+def _disputes(root: Path) -> list[dict[str, Any]]:
+    """beagle's kept verdicts on disputed entries, oldest first."""
+    try:
+        text = (root / CONTRACT_DISPUTES).read_text(encoding="utf-8")
+    except OSError:
+        return []
+    kept = []
+    for line in text.splitlines():
+        with contextlib.suppress(ValueError):
+            item = json.loads(line)
+            if isinstance(item, dict):
+                kept.append(item)
+    return kept
+
+
+def _seals(root: Path) -> int:
+    """How many times beagle has sealed the contract; 0 when it never has."""
+    try:
+        record = json.loads((root / CONTRACT_SEAL).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return 0
+    return int(record.get("seals") or 0) if isinstance(record, dict) else 0
+
+
+def _judge_verdict(report: str) -> tuple[str, str]:
+    """`wrong` or `right` and the rest of the judge's last verdict line; ("", "") if none."""
+    for line in reversed(report.splitlines()):
+        found = re.match(r"^\W*TEST\s+(WRONG|RIGHT)\b[\s:*`]*(.*)$", line.strip(), re.I)
+        if found:
+            return found.group(1).lower(), found.group(2).strip().strip("`*").strip()
+    return "", ""
+
+
+def _judged_values(said: str) -> tuple[str, str]:
+    """The value the source gives and the one the test expects, from `<new> instead of <old>`."""
+    parts = re.split(r"\s+instead\s+of\s+", said, maxsplit=1, flags=re.I)
+
+    def clean(text: str) -> str:
+        return text.strip().strip("`'\"").rstrip(".").strip()
+
+    return clean(parts[0]), clean(parts[1]) if len(parts) > 1 else ""
+
+
+def _amend_check(eid: str, new: str, old: str, root: Path) -> str:
+    """The amend's check: the contract's own, with the test of `eid` pinned to `new`.
+
+    The seal reruns the full check and refuses an entry that passes with no
+    code, but a softened test that accepts both values gets past both; so the
+    acceptance lines naming `eid` must hold the judge's value and no longer the
+    one the test expected. An entry no acceptance file names is tested from its
+    own input and expect, so then the contract's JSON is read instead.
+    """
+    pattern = rf"(?<![\w-]){re.escape(eid)}(?![\w-])"
+    named = re.compile(pattern)
+    in_acceptance = any(
+        path.is_file()
+        and path.suffix != ".json"
+        and named.search(path.read_text(encoding="utf-8", errors="replace"))
+        for path in sorted((root / CONTRACT_DIR).rglob("*"))
+    )
+    excluded = ["--exclude=*.json"] if in_acceptance else []
+    lines = shlex.join(
+        ["grep", "-rhP", f"-C{DISPUTE_CONTEXT}", *excluded, "--", pattern, f"{CONTRACT_DIR}/"]
+    )
+    parts = ["beagle pursuit contract check"]
+    if new:
+        parts.append(f"{lines} | grep -qwF -- {shlex.quote(new)}")
+    if old and old != new:
+        parts.append(f"! {lines} | grep -qwF -- {shlex.quote(old)}")
+    return f"bash -c {shlex.quote(' && '.join(parts))}"
+
+
+def _amend_reason(title: str, root: Path) -> str:
+    """Why the contract is sealed again when the task titled `title` closes; "" if not an amend."""
+    if not title.startswith(AMEND_TITLE):
+        return ""
+    eid = title[len(AMEND_TITLE) :].strip()
+    upheld = [d for d in _disputes(root) if d.get("entry") == eid and d.get("verdict") == "wrong"]
+    return f"{eid}: {upheld[-1].get('reason') or 'its test was wrong'}" if upheld else ""
+
+
+def _stands_note(task: str, root: Path) -> str:
+    """What `task`'s worker is told of the tests a judge upheld against its dispute; ""."""
+    ids = sorted(
+        {
+            str(d.get("entry"))
+            for d in _disputes(root)
+            if d.get("task") == task and d.get("verdict") == "right"
+        }
+    )
+    if not ids:
+        return ""
+    return (
+        f"\n\nA judge read the sealed test of {', '.join(ids)} against the source it cites "
+        "and found it right: the test stands. Make the code pass it."
+    )
+
+
+async def _judge_dispute(
+    task: str,
+    eid: str,
+    record: Mapping[str, Any],
+    root: Path,
+    signal: ToolCancellationToken | None,
+    on_update: ToolUpdateCallback | None,
+) -> tuple[bool, str]:
+    """Have a fresh sub-agent judge the sealed test of `eid` that `task`'s worker disputed.
+
+    Run as `_audit` is, pinned to the reviewer role, on beagle's brief alone:
+    the entry, the lines it cites and the acceptance lines naming it, none of
+    the code or the worker's argument, so a right test cannot be argued toward
+    what the code does. Its verdict is kept by beagle. A test found wrong gets
+    a task on the contract that `task` waits on. Returns whether it was found
+    wrong, and what the driver is told.
+    """
+    lead = f"Its sub-agent disputed the sealed test of entry {eid}"
+    seals = _seals(root)
+    for kept in _disputes(root):
+        if kept.get("entry") == eid and kept.get("seals") == seals:
+            said = f"TEST {str(kept.get('verdict')).upper()}: {kept.get('reason', '')}"
+            return False, f"{lead}, which a judge already read under this seal ({said}).\n\n"
+    rc, brief = _pursuit(["contract", "dispute", eid, "--brief"], root, CONTRACT_SEAL_TIMEOUT)
+    if rc != 0:
+        return False, f"{lead}, and beagle would not take it (exit {rc}): {brief.strip()}\n\n"
+    if on_update is not None:
+        with contextlib.suppress(Exception):
+            on_update(_step_result(f"A sub-agent is judging the disputed test of {eid}."))
+    pin = _dispatch_pin(REVIEWER_ROLE, root)
+    model, provider = _worker_target(pin=pin)
+    run = await _run_worker(
+        brief + JUDGE_NOTE,
+        root,
+        model,
+        provider,
+        _worker_wall(root, model, provider),
+        signal,
+        thinking=_worker_thinking(model, provider, pin=pin),
+    )
+    verdict, said = ("", "") if run.problem is not None else _judge_verdict(run.report)
+    if not verdict:
+        why = run.problem or "its report ends with no TEST WRONG or TEST RIGHT line"
+        return False, f"{lead}; the judging sub-agent gave no verdict ({why}).\n\n"
+    reason = said or f"the cited source {'agrees with' if verdict == 'right' else 'contradicts'} it"
+    argv = ["contract", "dispute", eid, "--record", "--verdict", verdict, "--reason", reason]
+    rc, kept_out = _pursuit([*argv, "--task", task], root, CONTRACT_SEAL_TIMEOUT)
+    if rc != 0:
+        kept_out = kept_out.strip()
+        return (
+            False,
+            f"{lead}; the judge said TEST {verdict.upper()}, but beagle did not keep it "
+            f"(exit {rc}): {kept_out}\n\n",
+        )
+    shown = f": {said}" if said and verdict == "wrong" else ""
+    judged = (
+        f"{lead}, and a judging sub-agent read it against the source the entry cites: "
+        f"TEST {verdict.upper()}{shown}."
+    )
+    if verdict == "right":
+        return False, f"{judged} The test stands, and the next sub-agent on {task} is told so.\n\n"
+    return True, judged + "\n\n" + _amend_task(task, eid, said, brief, record, root)
+
+
+def _amend_task(
+    task: str, eid: str, said: str, brief: str, record: Mapping[str, Any], root: Path
+) -> str:
+    """Open a task on the contract to fix the test of `eid`, and have `task` wait on it."""
+    new, old = _judged_values(said)
+    # The entry and the lines it cites, as beagle's judge brief has them.
+    cited = brief.split("\nEntry (", 1)
+    tail = r"\n(?:Acceptance lines naming|No acceptance line names) "
+    sourced = re.split(tail, "Entry (" + cited[1])[0] if len(cited) > 1 else ""
+    intent = (
+        f"A judge read the sealed test of entry {eid} against the source it cites: TEST "
+        f"WRONG: {said}. Change that test to what the cited words give.\n{sourced.strip()}"
+    )
+    parent = str(record.get("parent") or "") or next(
+        (str(n.get("id")) for n in _tree_nodes(root) if not n.get("parent")), ""
+    )
+    title = f"{AMEND_TITLE}{eid}"
+    rc, added = _pursuit(["add", title, "--parent", parent, "--intent", intent[:1000]], root)
+    found = _TASK_ID.search(added) if rc == 0 else None
+    if found is None:
+        return f"Adding the task to fix that test failed (exit {rc}):\n{added}\n\n"
+    amend = found.group()
+    criteria = (
+        f"The acceptance's test of {eid} expects {new or 'what its cited source gives'}"
+        f"{f', not {old}' if old else ''}, and `beagle pursuit contract check` passes."
+    )
+    argv = ["open", amend, "--criteria", criteria, "--done-when", _amend_check(eid, new, old, root)]
+    argv += [
+        "--scope",
+        f"{CONTRACT_DIR}/",
+        "--over",
+        f"{task} waits on it: its test of {eid} is wrong",
+    ]
+    rc, opened = _pursuit(argv, root, timeout=DEFAULT_CHECK_TIMEOUT + 60)
+    if rc != 0:
+        return f"{amend} ({title}) was added, but opening it failed (exit {rc}):\n{opened}\n\n"
+    why = f"its test of {eid} is wrong; {amend} fixes it"
+    rc, waits = _pursuit(["depend", task, amend, "--hard", "--reason", why], root)
+    if rc != 0:
+        return (
+            f"{amend} ({title}) is open, but {task} does not wait on it (exit {rc}):\n{waits}\n\n"
+        )
+    return (
+        f"{amend} ({title}) is open on {CONTRACT_DIR}/ to fix that test, and the contract is "
+        f"sealed again when it closes; {task} waits on it.\n\n"
+        f'Next: pursuit_step task="{amend}".'
+    )
+
+
 def _abandon(task: str, why: str, root: Path, goal: Path) -> str:
     """Close `task` as abandoned and release what waited on it; what happened."""
     argv = ["close", task, "--outcome", "abandoned", "--reason", why[:500]]
@@ -15462,6 +15723,7 @@ def make_step_tool() -> Any:
                 _without_commit_steps(brief),
                 _command_bound(_memory_max(), _worker_timeout(arguments.get("timeout"))[0]),
             )
+        brief += _stands_note(task, root)
         if scope and {os.path.normpath(e) for e in scope} != {
             os.path.normpath(e) for e in _strings(record.get("scope"))
         }:
@@ -15802,6 +16064,9 @@ def make_step_tool() -> Any:
                     )
                 )
                 continue
+            if _disputed_entry(report, verdict[1]):
+                # T0547: a disputed sealed test goes to a judge, not to another worker.
+                break
             retry_note = (
                 f"\n\nAn earlier attempt {ended}, but the check still fails (exit "
                 f"{verdict[0]}). Its output ends:\n{verdict[1][-CHECK_TAIL_CHARS:]}\n"
@@ -15878,6 +16143,18 @@ def make_step_tool() -> Any:
                 f"Last report:\n{shown}\n\n"
                 f'Next: pursuit_step with task="{task}" and notes saying to write {named}.',
             )
+        disputed = (
+            _disputed_entry(report, verdict[1])
+            if worker_ran and check and verdict[0] != 0 and (root / CONTRACT_SEAL).is_file()
+            else ""
+        )
+        dispute_note = ""
+        if disputed and not _contract_work(scope, root):
+            upheld, dispute_note = await _judge_dispute(
+                task, disputed, record, root, signal, on_update
+            )
+            if upheld:
+                return _step_result(f"{route}{undid}{task} — {title}: {dispute_note}")
         if check and verdict[0] != 0:
             state = "stays blocked" if retrying else "stays open"
             fix_check = (
@@ -15974,6 +16251,7 @@ def make_step_tool() -> Any:
                 + ("" if collection else _implementation_in_tests_lead(root, scope, check))
                 + _unreported_runs(unreported, attempt)
                 + f"Last report:\n{shown}\n\n"
+                + dispute_note
                 + next_step,
             )
         if proof is not None and not proof.proven:
@@ -16265,7 +16543,7 @@ def make_step_tool() -> Any:
             if skipped:
                 lock_note += f"Not locked: {'; '.join(skipped)}.\n\n"
         superseded = _SUPERSEDED_REPORT_NOTE if rc == 0 and _report_claims_failure(shown) else ""
-        seal_note = _seal_when_ready(root) if rc == 0 else ""
+        seal_note = _seal_when_ready(root, title) if rc == 0 else ""
         if seal_note.startswith("Sealed"):
             seal_note += await _settle_after_seal(task, root)
         return _step_result(

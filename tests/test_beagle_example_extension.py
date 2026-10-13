@@ -1444,12 +1444,15 @@ for rel, text in json.loads(os.environ.get("FAKE_TAU_WRITES") or "{}").items():
 tamper = os.environ.get("FAKE_TAU_TAMPERS")
 if tamper:
     Path(tamper).write_text("tampered")
+reports = json.loads(os.environ.get("FAKE_TAU_REPORTS") or "[]")  # one per run, in order
 message = {
     "role": "assistant",
     "content": [
         {
             "type": "text",
-            "text": os.environ.get("FAKE_TAU_REPORT") or f"attempt {attempt}: wrote done.txt",
+            "text": (reports[attempt - 1 :] or [""])[0]
+            or os.environ.get("FAKE_TAU_REPORT")
+            or f"attempt {attempt}: wrote done.txt",
         }
     ],
     "usage": {"totalTokens": 1000},
@@ -24756,3 +24759,232 @@ async def test_pursuit_step_refuses_copied_answers_once_the_contract_is_sealed(
     assert "T0002 not opened" in result.text
     assert "asserts answers of its own inline" in result.text
     assert _pursuit_calls(fake_beagle, "open") == []
+
+
+#: R96's sealed test of prop-marker-inside, cut down: the code's answer is
+#: [81664], as the cited spec gives, and the test expected [319].
+WRENFOLD_ACCEPT = """\
+#!/bin/sh
+# prop-marker-inside: 0x3F inside a multi-byte form is an ordinary byte
+got='[81664]'
+want='[319]'
+[ "$got" = "$want" ] && echo "ok prop-marker-inside" && exit 0
+echo "FAIL prop-marker-inside: decode(81 3f 00) gave $got, expected $want"
+exit 1
+"""
+#: What beagle's `contract dispute <id> --brief` prints, cut down.
+WRENFOLD_JUDGE_BRIEF = """\
+Judge one test of a sealed contract against its source.
+
+Entry (contract/contract.json):
+{"id": "prop-marker-inside", "kind": "property", "statement": "inside a form 0x3F is a byte"}
+
+Cited: spec.txt, lines 7-9 (references/spec.txt):
+  7| A byte 0x3F where an integer would begin is always the end
+  8| marker; inside a two-, three- or five-byte form it is an ordinary byte.
+
+Acceptance lines naming prop-marker-inside, with 4 either side:
+contract/accept.sh:
+    4| want='[319]'
+"""
+
+
+def _disputed_project(
+    tmp_path: Path, fake_beagle: Path, fake_tau: Path, monkeypatch: pytest.MonkeyPatch
+) -> Path:
+    """A sealed contract whose test of prop-marker-inside fails, and open T0002 on the
+    code, its check that test."""
+    project = _sealed_contract(_contract_project(tmp_path))
+    (project / _module().CONTRACT_SEAL).write_text(json.dumps({"seals": 1}))
+    (project / "contract" / "accept.sh").write_text(WRENFOLD_ACCEPT)
+    monkeypatch.chdir(project)
+    record = {"id": "T0002", "parent": "T0001", "title": "Decode", "status": "open"}
+    record |= {"criteria": "c", "done_when": "sh contract/accept.sh", "scope": ["wrenfold.py"]}
+    (fake_beagle / "show.out").write_text(json.dumps(record))
+    (fake_beagle / "next.out").write_text(json.dumps({"open": ["T0002"], "ready": []}))
+    (fake_beagle / "brief.out").write_text("# T0002: Decode\n")
+    (fake_beagle / "contract-dispute.out").write_text(WRENFOLD_JUDGE_BRIEF)
+    (fake_beagle / "add.out").write_text("T0009  Amend contract: prop-marker-inside\n")
+    monkeypatch.setenv("PATH", f"{fake_beagle}{os.pathsep}{os.environ['PATH']}")
+    monkeypatch.setenv("FAKE_TAU_SUCCEEDS_ON", "99")
+    return project
+
+
+@pytest.mark.anyio
+async def test_pursuit_step_dispute_is_judged_and_an_upheld_one_amends_the_contract(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # R96: the sealed test invented decode(81 3f 00) == [319]; the spec gives 81664,
+    # and the worker spent its wall deciding the contract was wrong but sealed.
+    module = _module()
+    project = _disputed_project(tmp_path, fake_beagle, fake_tau, monkeypatch)
+    worker = "The spec makes 0x81 a three-byte form: 81664.\nDISPUTE `prop-marker-inside`."
+    judge = "Lines 7-8 make 0x81 open a three-byte form.\nTEST WRONG: [81664] instead of [319]"
+    monkeypatch.setenv("FAKE_TAU_REPORTS", json.dumps([worker, judge]))
+    runtime, _ = _bound(tmp_path)
+
+    result = await _tool(runtime, "pursuit_step").execute("c1", {"task": "T0002", "attempts": 3})
+
+    # One worker, then the judge: a fresh sub-agent on beagle's brief alone.
+    [_, judged] = _runs(fake_tau)
+    assert judged["stdin"].startswith(WRENFOLD_JUDGE_BRIEF.strip())
+    assert judged["stdin"].endswith(module.JUDGE_NOTE)
+    assert "81664" not in judged["stdin"].split(module.JUDGE_NOTE)[0]  # not the worker's word
+    contract = _pursuit_calls(fake_beagle, "contract")
+    assert contract == [
+        ["dispute", "prop-marker-inside", "--brief"],
+        [
+            "dispute",
+            "prop-marker-inside",
+            "--record",
+            "--verdict",
+            "wrong",
+            "--reason",
+            "[81664] instead of [319]",
+            "--task",
+            "T0002",
+        ],
+    ]
+    # A task on the contract, its brief carrying the entry, the cited words and the line.
+    [added] = _pursuit_calls(fake_beagle, "add")
+    assert added[:3] == ["Amend contract: prop-marker-inside", "--parent", "T0001"]
+    intent = added[added.index("--intent") + 1]
+    assert "TEST WRONG: [81664] instead of [319]" in intent
+    assert '"statement": "inside a form 0x3F is a byte"' in intent
+    assert "inside a two-, three- or five-byte form it is an ordinary byte" in intent
+    [opened] = _pursuit_calls(fake_beagle, "open")
+    assert opened[0] == "T0009" and opened[opened.index("--scope") + 1] == "contract/"
+    check = opened[opened.index("--done-when") + 1]
+    assert module._check_problem(check) is None
+    assert _pursuit_calls(fake_beagle, "depend")[0][:3] == ["T0002", "T0009", "--hard"]
+    assert "TEST WRONG: [81664] instead of [319]" in result.text
+    assert 'Next: pursuit_step task="T0009"' in result.text
+
+    # Its check is the contract's own and the judge's value: the sealed test and a
+    # softened one that takes both values fail it; the test the source gives passes.
+    accept = project / "contract" / "accept.sh"
+
+    async def passes(want: str) -> bool:
+        accept.write_text(WRENFOLD_ACCEPT.replace("want='[319]'", want))
+        return (await module._run_check(check, project, 30.0))[0] == 0
+
+    assert not await passes("want='[319]'")
+    assert not await passes("want='[319]' # or '[81664]'")
+    assert await passes("want='[81664]'")
+    (fake_beagle / "contract.rc").write_text("1")  # the contract's own check fails
+    assert not await passes("want='[81664]'")
+
+    # T0002 waits on the amend: stepped again, it runs no worker.
+    nodes = [{"id": "T0002", "status": "open", "waiting_on": ["T0009"]}]
+    nodes += [{"id": "T0009", "status": "open", "title": "Amend contract: prop-marker-inside"}]
+    (fake_beagle / "tree.out").write_text(json.dumps({"goal": "Ship it", "nodes": nodes}))
+    (fake_beagle / "next.out").write_text(json.dumps({"open": ["T0002", "T0009"], "ready": []}))
+    again = await _tool(runtime, "pursuit_step").execute("c2", {"task": "T0002"})
+    assert 'work T0009 first: pursuit_step task="T0009"' in again.text
+    assert len(_runs(fake_tau)) == 2
+
+
+@pytest.mark.anyio
+async def test_pursuit_step_dispute_without_a_failing_entry_is_not_judged(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _disputed_project(tmp_path, fake_beagle, fake_tau, monkeypatch)
+    monkeypatch.setenv("FAKE_TAU_REPORT", "The contract is wrong.\nDISPUTE prop-end-marker")
+    runtime, _ = _bound(tmp_path)
+
+    result = await _tool(runtime, "pursuit_step").execute("c1", {"task": "T0002", "attempts": 1})
+
+    assert len(_runs(fake_tau)) == 1  # no judge
+    assert _pursuit_calls(fake_beagle, "contract") == []
+    assert _pursuit_calls(fake_beagle, "add") == [] and _pursuit_calls(fake_beagle, "depend") == []
+    assert "the check still fails" in result.text
+    disputed = _module()._disputed_entry
+    assert disputed("x\nDISPUTE prop-a", "FAIL prop-a: got 1") == "prop-a"
+    assert disputed("x\nDISPUTE prop-a", "ok prop-a\nFAIL prop-ab: got 1") == ""
+    assert disputed("DISPUTE prop-a\nthen more", "FAIL prop-a: got 1") == ""
+
+
+@pytest.mark.anyio
+async def test_pursuit_step_dispute_found_right_tells_the_next_worker_the_test_stands(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project = _disputed_project(tmp_path, fake_beagle, fake_tau, monkeypatch)
+    worker = "DISPUTE prop-marker-inside"
+    monkeypatch.setenv("FAKE_TAU_REPORTS", json.dumps([worker, "It agrees.\nTEST RIGHT"]))
+    runtime, _ = _bound(tmp_path)
+
+    result = await _tool(runtime, "pursuit_step").execute("c1", {"task": "T0002", "attempts": 1})
+
+    [*_, recorded] = _pursuit_calls(fake_beagle, "contract")
+    assert recorded[:5] == ["dispute", "prop-marker-inside", "--record", "--verdict", "right"]
+    assert _pursuit_calls(fake_beagle, "add") == []
+    assert "TEST RIGHT. The test stands" in result.text
+    # beagle kept the verdict; the next worker on T0002 is told the test stands.
+    kept = {"entry": "prop-marker-inside", "verdict": "right", "reason": "r", "seals": 1}
+    (project / _module().CONTRACT_DISPUTES).write_text(json.dumps(kept | {"task": "T0002"}) + "\n")
+    monkeypatch.setenv("FAKE_TAU_REPORTS", "[]")
+    await _tool(runtime, "pursuit_step").execute("c2", {"task": "T0002", "attempts": 1})
+    assert (
+        "prop-marker-inside against the source it cites and found it right: the test stands"
+        in (_runs(fake_tau)[-1]["stdin"])
+    )
+    assert len(_runs(fake_tau)) == 3  # judged once under this seal, not again
+
+
+@pytest.mark.anyio
+async def test_a_close_reseals_an_altered_contract_with_the_dispute_reason(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _module()
+    project = _sealed_contract(_contract_project(tmp_path))
+    monkeypatch.chdir(project)
+    _ready_task(fake_beagle)
+    title = f"{module.AMEND_TITLE}prop-marker-inside"
+    record = {"id": "T0002", "title": title, "intent": "fix it", "status": "pending"}
+    (fake_beagle / "show.out").write_text(
+        json.dumps({**record, "done_when": "grep -q done done.txt"})
+    )
+    (fake_beagle / "contract-status.out").write_text(json.dumps({"state": "altered"}))
+    upheld = {
+        "entry": "prop-marker-inside",
+        "verdict": "wrong",
+        "reason": "[81664] instead of [319]",
+    }
+    (project / module.CONTRACT_DISPUTES).write_text(json.dumps(upheld | {"seals": 1}) + "\n")
+    runtime, _ = _bound(tmp_path)
+
+    result = await _tool(runtime, "pursuit_step").execute(
+        "c1",
+        {
+            "task": "T0002",
+            "criteria": "c",
+            "done_when": "grep -q done done.txt",
+            "scope": ["done.txt"],
+        },
+    )
+
+    assert "closed done" in result.text
+    assert _pursuit_calls(fake_beagle, "contract") == [
+        ["status", "--json"],
+        ["seal", "--reason", "prop-marker-inside: [81664] instead of [319]"],
+    ]
+    assert "Sealed the contract (contract/contract.json) again" in result.text
+    # Altered by any other close, it is not sealed: that is drift, not an amend.
+    assert module._seal_when_ready(project, "Decode") == ""
+    assert _pursuit_calls(fake_beagle, "contract")[-1] == ["status", "--json"]
