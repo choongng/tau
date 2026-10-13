@@ -1,0 +1,1681 @@
+{
+  "sources": {
+    "itc2008": {
+      "path": "references/itc2008.txt"
+    },
+    "interval-tree-clocks": {
+      "path": "references/interval-tree-clocks.txt"
+    }
+  },
+  "entries": [
+    {
+      "id": "OP-SEED",
+      "kind": "operation",
+      "operation": "seed",
+      "source": "itc2008",
+      "cite": "269#6e3-270#68d",
+      "statement": "ITC uses the seed stamp (1, 0) as the initial state from which forks are made to obtain an initial configuration."
+    },
+    {
+      "id": "OP-FORK",
+      "kind": "operation",
+      "operation": "fork",
+      "source": "itc2008",
+      "cite": "82#be4-87#ab2",
+      "statement": "fork takes a stamp (i, e) and returns two stamps ((i1, e), (i2, e)) such that i2 != i1, i1 + i2 = i, and i1 * i2 = 0. The event component is preserved and the identity is split into two non-overlapping parts."
+    },
+    {
+      "id": "OP-EVENT",
+      "kind": "operation",
+      "operation": "event",
+      "source": "itc2008",
+      "cite": "94#d59-99#69a",
+      "statement": "event takes a stamp (i, e) and returns (i, e0) such that e < e0 in the causal order. In version vectors, event increments the counter associated to the identity: e0[k] = e[k] for k != i, and e0[i] = e[i] + 1. Event has the precondition that i != 0 (non-null identity)."
+    },
+    {
+      "id": "OP-JOIN",
+      "kind": "operation",
+      "operation": "join",
+      "source": "itc2008",
+      "cite": "101#6a0-108#69e",
+      "statement": "join takes two stamps ((i1, e1), (i2, e2)) and returns (i3, e3) where e3 = e1 ⊔ e2 (the join semilattice join), i3 = f(i1, i2). The resulting event component must dominate both e1 and e2, and must not dominate more than either did."
+    },
+    {
+      "id": "OP-PEEK",
+      "kind": "operation",
+      "operation": "peek",
+      "source": "itc2008",
+      "cite": "89#3ec-92#7ef",
+      "statement": "peek is a special case of fork: peek((i, e)) = ((0, e), (i, e)). It returns an anonymous stamp (0, e) with null identity and a copy with the original identity."
+    },
+    {
+      "id": "OP-SEND",
+      "kind": "operation",
+      "operation": "send",
+      "source": "itc2008",
+      "cite": "119#6b9-120#193",
+      "statement": "send is the atomic composition of event followed by peek. In vector clock systems, message sending is modeled by incrementing the local counter and then creating a new message."
+    },
+    {
+      "id": "OP-RECEIVE",
+      "kind": "operation",
+      "operation": "receive",
+      "source": "itc2008",
+      "cite": "122#820-123#170",
+      "statement": "receive is the atomic composition of join followed by event. In vector clocks, taking the pointwise maximum is followed by an increment of the local counter."
+    },
+    {
+      "id": "OP-SYNC",
+      "kind": "operation",
+      "operation": "sync",
+      "source": "itc2008",
+      "cite": "125#3f9-126#a1b",
+      "statement": "sync is the atomic composition of join followed by fork. In version vector systems and bounded version vectors, it models the atomic synchronization of two replicas."
+    },
+    {
+      "id": "ID-TREE-RECURSIVE",
+      "kind": "operation",
+      "operation": "id tree structure",
+      "source": "itc2008",
+      "cite": "228#524-230#4d8",
+      "statement": "The id component is an id tree with recursive form: i ::= 0 | 1 | (i1, i2) where i, i1, i2 are id trees."
+    },
+    {
+      "id": "ID-TREE-SEMANTICS",
+      "kind": "operation",
+      "operation": "id tree semantics",
+      "source": "itc2008",
+      "cite": "232#5b2-236#de0",
+      "statement": "Semantic interpretation of id trees as functions: J0K = 0, J1K = 1, J(i1, i2)K = λx. Ji1K(2x) + Ji2K(2x − 1). For (i1, i2), i1 maps to [0, 1/2) and i2 maps to [1/2, 1)."
+    },
+    {
+      "id": "EVENT-TREE-RECURSIVE",
+      "kind": "operation",
+      "operation": "event tree structure",
+      "source": "itc2008",
+      "cite": "248#2c3-250#98e",
+      "statement": "The event component is a binary event tree: e ::= n | (n, e1, e2) where e, e1, e2 are event trees and n is a non-negative integer."
+    },
+    {
+      "id": "EVENT-TREE-SEMANTICS",
+      "kind": "operation",
+      "operation": "event tree semantics",
+      "source": "itc2008",
+      "cite": "252#7e5-255#dda",
+      "statement": "Semantic interpretation of event trees: JnK = n · 1, J(n, e1, e2)K = n · 1 + λx. Je1K(2x) + Je2K(2x − 1)."
+    },
+    {
+      "id": "ID-NORM",
+      "kind": "operation",
+      "operation": "id tree normalization",
+      "source": "itc2008",
+      "cite": "295#ce4-300#2ed",
+      "statement": "Id tree normalization: norm((0, 0)) = 0, norm((1, 1)) = 1, norm(i) = i otherwise."
+    },
+    {
+      "id": "EVENT-NORM",
+      "kind": "operation",
+      "operation": "event tree normalization",
+      "source": "itc2008",
+      "cite": "314#509-319#4ca",
+      "statement": "Event tree normalization: norm(n) = n; norm((n, m, m)) = n + m; norm((n, e1, e2)) = (n + m, e1↓m, e2↓m) where m = min(min(e1), min(e2))."
+    },
+    {
+      "id": "SPLIT-FUNC",
+      "kind": "operation",
+      "operation": "split function",
+      "source": "itc2008",
+      "cite": "363#6e5-370#48c",
+      "statement": "Split function for fork: split(0) = (0, 0); split(1) = ((1, 0), (0, 1)); split((0, i)) = ((0, i1), (0, i2)) where (i1, i2) = split(i); split((i, 0)) = ((i1, 0), (i2, 0)) where (i1, i2) = split(i); split((i1, i2)) = ((i1, 0), (0, i2))."
+    },
+    {
+      "id": "SUM-FUNC",
+      "kind": "operation",
+      "operation": "sum function (id)",
+      "source": "itc2008",
+      "cite": "384#475-388#e7c",
+      "statement": "Sum function for join: sum(0, i) = i; sum(i, 0) = i; sum((l1, r1), (l2, r2)) = norm((sum(l1, l2), sum(r1, r2)))."
+    },
+    {
+      "id": "EVENT-JOIN-FUNC",
+      "kind": "operation",
+      "operation": "event join function",
+      "source": "itc2008",
+      "cite": "390#dae-396#4f9",
+      "statement": "Event tree join: join(n1, n2) = max(n1, n2); join(n1, (n2, l2, r2)) = join((n1, 0, 0), (n2, l2, r2)); join((n1, l1, r1), n2) = join((n1, l1, r1), (n2, 0, 0)); join((n1, l1, r1), (n2, l2, r2)) = join((n2, l2, r2), (n1, l1, r1)) if n1 > n2; join((n1, l1, r1), (n2, l2, r2)) = norm((n1, join(l1, l2↑(n2−n1)), join(r1, r2↑(n2−n1))))."
+    },
+    {
+      "id": "COMPARE-FUNC",
+      "kind": "operation",
+      "operation": "comparison function",
+      "source": "itc2008",
+      "cite": "345#d07-355#17e",
+      "statement": "Comparison: (i1, e1) ≤ (i2, e2) iff leq(e1, e2). leq(n1, n2) = n1 ≤ n2; leq(n1, (n2, l2, r2)) = n1 ≤ n2; leq((n1, l1, r1), n2) = n1 ≤ n2 ∧ leq(l1↑n1, n2) ∧ leq(r1↑n1, n2); leq((n1, l1, r1), (n2, l2, r2)) = n1 ≤ n2 ∧ leq(l1↑n1, l2↑n2) ∧ leq(r1↑n1, r2↑n2)."
+    },
+    {
+      "id": "FILL-FUNC",
+      "kind": "operation",
+      "operation": "fill function (event)",
+      "source": "itc2008",
+      "cite": "426#7f5-434#5fe",
+      "statement": "Fill function: fill(0, e) = e; fill(1, e) = max(e); fill(i, n) = n; fill((1, ir), (n, el, er)) = norm((n, max(max(el), min(e0r)), e0r)) where e0r = fill(ir, er); fill((il, 1), (n, el, er)) = norm((n, e0l, max(max(er), min(e0l)))) where e0l = fill(il, el); fill((il, ir), (n, el, er)) = norm((n, fill(il, el), fill(ir, er)))."
+    },
+    {
+      "id": "GROW-FUNC",
+      "kind": "operation",
+      "operation": "grow function (event)",
+      "source": "itc2008",
+      "cite": "453#7e0-462#955",
+      "statement": "Grow function: grow(1, n) = (n + 1, 0); grow(i, n) = (e0, c + N) where (e0, c) = grow(i, (n, 0, 0)) and N is a large constant; grow((0, ir), (n, el, er)) = ((n, el, e0r), cr + 1) where (e0r, cr) = grow(ir, er); grow((il, 0), (n, el, er)) = ((n, e0l, er), cl + 1) where (e0l, cl) = grow(il, el); grow((il, ir), (n, el, er)) = ((n, e0l, er), cl + 1) if cl < cr, or ((n, el, e0r), cr + 1) if cl >= cr."
+    },
+    {
+      "id": "EVENT-FULL",
+      "kind": "operation",
+      "operation": "event full definition",
+      "source": "itc2008",
+      "cite": "417#32e-420#02d",
+      "statement": "Event: event((i, e)) = (i, fill(i, e)) if fill(i, e) ≠ e, otherwise (i, e0) where (e0, c) = grow(i, e). Subject to: Je0K = JeK + f · JiK for any f such that f · JiK ≠ 0. Event cannot be applied to anonymous stamps (i = 0)."
+    },
+    {
+      "id": "EXPLODE-OP",
+      "kind": "operation",
+      "operation": "explode",
+      "source": "interval-tree-clocks",
+      "cite": "118#0cf-119#e3b",
+      "statement": "Explode splits a single ID+event counter part of a clock into independent components (local ID and event counter separately). Used to avoid rewriting all records on fork."
+    },
+    {
+      "id": "REBUILD-OP",
+      "kind": "operation",
+      "operation": "rebuild",
+      "source": "interval-tree-clocks",
+      "cite": "118#0cf-119#e3b",
+      "statement": "Rebuild reassembles the ID and event counter parts of a clock. At each operation, the node's ID is submitted on each operation and the event counter on the rest."
+    },
+    {
+      "id": "RECEIVE-ITC-OP",
+      "kind": "operation",
+      "operation": "receive (ITC variant)",
+      "source": "interval-tree-clocks",
+      "cite": "190#bd4-198#c4b",
+      "statement": "ITC receive variant: explode to get only the event counter, event to increment, join to merge, peek to complete the remote stamp as read-only, then rebuild to make a complete local stamp."
+    },
+    {
+      "id": "RECEIVE-VC-OP",
+      "kind": "operation",
+      "operation": "receive vector clock variant",
+      "source": "interval-tree-clocks",
+      "cite": "212#394-218#26e",
+      "statement": "Vector clock equivalence receive: fetch current stamp; if current >= received, merge both counters and increment with local id; if current < received, store new data with merged counters incremented with local id."
+    },
+    {
+      "id": "SYNC-ITC-OP",
+      "kind": "operation",
+      "operation": "sync (ITC variant)",
+      "source": "interval-tree-clocks",
+      "cite": "58#7ed-59#e3b",
+      "statement": "sync in ITC: leave the IDs as they are, but merge the event counter. Atomic composition of join + fork."
+    },
+    {
+      "id": "EXAMPLE-SEED",
+      "kind": "example",
+      "operation": "seed",
+      "source": "interval-tree-clocks",
+      "cite": "17#f3b-19#075",
+      "input": {},
+      "expect": {
+        "initial_id": 1
+      }
+    },
+    {
+      "id": "EXAMPLE-FORK-1",
+      "kind": "example",
+      "operation": "fork from 1",
+      "source": "interval-tree-clocks",
+      "cite": "21#4c8-24#134",
+      "input": {
+        "id_tree": 1,
+        "event_tree": 0
+      },
+      "expect": {
+        "fork_result": [
+          {
+            "id_tree": {
+              "left": 1,
+              "right": 0
+            },
+            "event_tree": 0
+          },
+          {
+            "id_tree": {
+              "left": 0,
+              "right": 1
+            },
+            "event_tree": 0
+          }
+        ]
+      }
+    },
+    {
+      "id": "EXAMPLE-FORK-2",
+      "kind": "example",
+      "operation": "fork left again",
+      "source": "interval-tree-clocks",
+      "cite": "26#9de-29#ef4",
+      "input": {
+        "id_tree": {
+          "left": 1,
+          "right": 0
+        },
+        "event_tree": 0
+      },
+      "expect": {
+        "fork_result": [
+          {
+            "id_tree": {
+              "left": {
+                "left": 1,
+                "right": 0
+              },
+              "right": 0
+            },
+            "event_tree": 0
+          },
+          {
+            "id_tree": {
+              "left": 0,
+              "right": 0
+            },
+            "event_tree": 0
+          }
+        ]
+      }
+    },
+    {
+      "id": "EXAMPLE-JOIN-1",
+      "kind": "example",
+      "operation": "join",
+      "source": "interval-tree-clocks",
+      "cite": "31#c56-34#5f1",
+      "input": {
+        "stamp1": {
+          "id_tree": {
+            "left": {
+              "left": 1,
+              "right": 0
+            },
+            "right": 0
+          },
+          "event_tree": 0
+        },
+        "stamp2": {
+          "id_tree": {
+            "left": 0,
+            "right": {
+              "left": 0,
+              "right": 1
+            }
+          },
+          "event_tree": 0
+        }
+      },
+      "expect": {
+        "join_result": {
+          "id_tree": {
+            "left": 1,
+            "right": 1
+          },
+          "event_tree": 0
+        }
+      }
+    },
+    {
+      "id": "EXAMPLE-NORM-ID-1",
+      "kind": "example",
+      "operation": "normalization (id)",
+      "source": "itc2008",
+      "cite": "293#bdc-294#e3b",
+      "input": {
+        "id_tree": 1
+      },
+      "expect": {
+        "normalized": 1
+      }
+    },
+    {
+      "id": "EXAMPLE-NORM-ID-2",
+      "kind": "example",
+      "operation": "normalization (id)",
+      "source": "itc2008",
+      "cite": "293#bdc-294#e3b",
+      "input": {
+        "id_tree": {
+          "left": 1,
+          "right": {
+            "left": 1,
+            "right": 1
+          }
+        }
+      },
+      "expect": {
+        "normalized": 1
+      }
+    },
+    {
+      "id": "EXAMPLE-NORM-ID-3",
+      "kind": "example",
+      "operation": "normalization (id)",
+      "source": "itc2008",
+      "cite": "293#bdc-294#e3b",
+      "input": {
+        "id_tree": {
+          "left": {
+            "left": 1,
+            "right": 1
+          },
+          "right": 1
+        }
+      },
+      "expect": {
+        "normalized": 1
+      }
+    },
+    {
+      "id": "EXAMPLE-NORM-EVENT-1",
+      "kind": "example",
+      "operation": "normalization (event)",
+      "source": "itc2008",
+      "cite": "304#2fc-305#494",
+      "input": {
+        "event_tree": {
+          "base": 2,
+          "left": 1,
+          "right": 1
+        }
+      },
+      "expect": {
+        "normalized_event": 3
+      }
+    },
+    {
+      "id": "EXAMPLE-NORM-EVENT-2",
+      "kind": "example",
+      "operation": "normalization (event)",
+      "source": "itc2008",
+      "cite": "305#494-306#e3b",
+      "input": {
+        "event_tree": {
+          "base": 2,
+          "left": {
+            "base": 2,
+            "left": 1,
+            "right": 0
+          },
+          "right": 3
+        }
+      },
+      "expect": {
+        "normalized_event": {
+          "base": 4,
+          "left": {
+            "left": 0,
+            "right": 1
+          },
+          "right": 1
+        }
+      }
+    },
+    {
+      "id": "EXAMPLE-ID-SEM-1",
+      "kind": "example",
+      "operation": "id tree semantics",
+      "source": "itc2008",
+      "cite": "244#d4a-246#e3b",
+      "input": {
+        "id_tree": {
+          "left": 1,
+          "right": {
+            "left": 0,
+            "right": 1
+          }
+        }
+      },
+      "expect": {
+        "description": "(1, (0, 1)) covers full [0, 1)",
+        "normalized": 1
+      }
+    },
+    {
+      "id": "EXAMPLE-ID-SEM-2",
+      "kind": "example",
+      "operation": "id tree semantics deep",
+      "source": "itc2008",
+      "cite": "245#289-246#e3b",
+      "input": {
+        "id_tree": {
+          "left": {
+            "left": {
+              "left": 0,
+              "right": {
+                "left": 1,
+                "right": 0
+              }
+            },
+            "right": {
+              "left": 1,
+              "right": 0
+            }
+          },
+          "right": {
+            "left": 1,
+            "right": 0
+          }
+        }
+      },
+      "expect": {
+        "description": "((0, (1, 0)), (1, 0)) covers full [0, 1)",
+        "normalized": 1
+      }
+    },
+    {
+      "id": "EXAMPLE-PEEK",
+      "kind": "example",
+      "operation": "peek",
+      "source": "itc2008",
+      "cite": "189#695-192#582",
+      "input": {
+        "id_tree": {
+          "left": 1,
+          "right": 0
+        },
+        "event_tree": 5
+      },
+      "expect": {
+        "peek_result": [
+          {
+            "id_tree": 0,
+            "event_tree": 5
+          },
+          {
+            "id_tree": {
+              "left": 1,
+              "right": 0
+            },
+            "event_tree": 5
+          }
+        ]
+      }
+    },
+    {
+      "id": "EXAMPLE-FILL-0",
+      "kind": "example",
+      "operation": "fill(0, e)",
+      "source": "itc2008",
+      "cite": "429#b73-430#ab9",
+      "input": {
+        "id_tree": 0,
+        "event_tree": 5
+      },
+      "expect": {
+        "fill_result": 5
+      }
+    },
+    {
+      "id": "EXAMPLE-FILL-1",
+      "kind": "example",
+      "operation": "fill(1, e)",
+      "source": "itc2008",
+      "cite": "430#ab9-431#6de",
+      "input": {
+        "id_tree": 1,
+        "event_tree": {
+          "base": 3,
+          "left": {
+            "base": 1,
+            "left": 0,
+            "right": 0
+          },
+          "right": {
+            "base": 2,
+            "left": 0,
+            "right": 0
+          }
+        }
+      },
+      "expect": {
+        "fill_result": 4
+      }
+    },
+    {
+      "id": "EXAMPLE-FILL-N",
+      "kind": "example",
+      "operation": "fill(i, n)",
+      "source": "itc2008",
+      "cite": "431#6de-432#28b",
+      "input": {
+        "id_tree": {
+          "left": 1,
+          "right": 0
+        },
+        "event_tree": 5
+      },
+      "expect": {
+        "fill_result": 5
+      }
+    },
+    {
+      "id": "EXAMPLE-SEND",
+      "kind": "example",
+      "operation": "send",
+      "source": "interval-tree-clocks",
+      "cite": "54#0b4-55#e3b",
+      "input": {
+        "description": "send = event + peek"
+      },
+      "expect": {
+        "sequence": [
+          "event(local)",
+          "peek(result)"
+        ]
+      }
+    },
+    {
+      "id": "EXAMPLE-RECEIVE",
+      "kind": "example",
+      "operation": "receive",
+      "source": "interval-tree-clocks",
+      "cite": "56#3aa-57#e3b",
+      "input": {
+        "description": "receive = join + event"
+      },
+      "expect": {
+        "sequence": [
+          "join(local, remote)",
+          "event(result)"
+        ]
+      }
+    },
+    {
+      "id": "EXAMPLE-CLUSTER-INIT",
+      "kind": "example",
+      "operation": "cluster initialization",
+      "source": "interval-tree-clocks",
+      "cite": "92#682-94#74a",
+      "input": {},
+      "expect": {
+        "initial_state": "single root node with ID 1",
+        "note": "Cluster must be first initialised with a single root node"
+      }
+    },
+    {
+      "id": "EXAMPLE-NODE-JOIN",
+      "kind": "example",
+      "operation": "node join",
+      "source": "interval-tree-clocks",
+      "cite": "126#fcb-137#e3b",
+      "input": {
+        "existing_node_id": {
+          "left": 1,
+          "right": 0
+        },
+        "existing_event": 3
+      },
+      "expect": {
+        "steps": [
+          "existing node reads ID from storage",
+          "existing node forks ID in memory",
+          "existing node picks side and overwrites",
+          "existing node sends forked ID to joining node",
+          "joining node stores id to disk"
+        ],
+        "result": {
+          "existing_id": {
+            "left": 1,
+            "right": 0
+          },
+          "new_id": {
+            "left": 0,
+            "right": 1
+          },
+          "both_events": 3
+        }
+      }
+    },
+    {
+      "id": "EXAMPLE-3NODES",
+      "kind": "example",
+      "operation": "three node id space",
+      "source": "interval-tree-clocks",
+      "cite": "26#9de-29#ef4",
+      "input": {
+        "description": "Start with ID 1, fork to get {1,0} and {0,1}, fork {1,0} to get {{1,0},0} and {0,{1,0}}"
+      },
+      "expect": {
+        "node1": {
+          "id_tree": {
+            "left": {
+              "left": 1,
+              "right": 0
+            },
+            "right": 0
+          },
+          "event_tree": 0
+        },
+        "node2": {
+          "id_tree": {
+            "left": 0,
+            "right": 1
+          },
+          "event_tree": 0
+        },
+        "node3": {
+          "id_tree": {
+            "left": 0,
+            "right": {
+              "left": 1,
+              "right": 0
+            }
+          },
+          "event_tree": 0
+        }
+      }
+    },
+    {
+      "id": "EXAMPLE-CONFLICT",
+      "kind": "example",
+      "operation": "conflict detection",
+      "source": "interval-tree-clocks",
+      "cite": "82#46d-87#e3b",
+      "input": {
+        "description": "A writes (id=1, event=1), B writes (id=1, event=1) independently"
+      },
+      "expect": {
+        "stamp_a": {
+          "id_tree": 1,
+          "event_tree": 1
+        },
+        "stamp_b": {
+          "id_tree": 1,
+          "event_tree": 1
+        },
+        "causal_relation": "unknown",
+        "note": "The system can only assume both data sets are equivalent since the clocks are the same."
+      }
+    },
+    {
+      "id": "EXAMPLE-A-B-SCENARIO",
+      "kind": "example",
+      "operation": "scenario A and B",
+      "source": "interval-tree-clocks",
+      "cite": "74#46d-80#044",
+      "input": {
+        "description": "A writes (id=1, event=1), syncs with B (fork), B writes (event=2)"
+      },
+      "expect": {
+        "a_final": {
+          "id": {
+            "left": 1,
+            "right": 0
+          },
+          "event": 1
+        },
+        "b_final": {
+          "id": {
+            "left": 0,
+            "right": 1
+          },
+          "event": 2
+        }
+      }
+    },
+    {
+      "id": "EXAMPLE-REWRITE-COST",
+      "kind": "limit",
+      "operation": "rewrite cost",
+      "source": "interval-tree-clocks",
+      "cite": "96#d59-107#e3b",
+      "statement": "If timestamps are stored as id + event counter per record and the node splits its ID, all records must be rewritten. The solution is to store the ID globally per node and only the event counter per record.",
+      "input": {
+        "description": "Node with 10 million records splits its ID"
+      },
+      "expect": {
+        "problem": "must rewrite 10 million timestamps right away",
+        "solution": "store the ID globally per node and only the event counter per record"
+      }
+    },
+    {
+      "id": "LIMIT-NON-ANONYMOUS-EVENT",
+      "kind": "invalid",
+      "operation": "event",
+      "source": "itc2008",
+      "cite": "199#f36-200#e3b",
+      "input": {
+        "stamp": {
+          "id_tree": 0,
+          "event_tree": 5
+        }
+      },
+      "expect": {
+        "error": "event cannot be applied to anonymous stamps (id = 0)"
+      },
+      "statement": "An event cannot be applied to an anonymous stamp as no element in the domain is available to be inflated."
+    },
+    {
+      "id": "LIMIT-SEED-REQUIREMENT",
+      "kind": "limit",
+      "operation": "initialization",
+      "source": "interval-tree-clocks",
+      "cite": "130#b60-130#b60",
+      "statement": "The cluster must be initialised with a single root node given the ID 1.",
+      "input": {
+        "cluster_state": "uninitialized"
+      },
+      "expect": {
+        "requirement": "single root node with ID 1",
+        "note": "Avoid booting a new cluster with many nodes starting simultaneously"
+      }
+    },
+    {
+      "id": "LIMIT-ID-DISJOINT",
+      "kind": "limit",
+      "operation": "id disjointness",
+      "source": "itc2008",
+      "cite": "169#297-173#108",
+      "statement": "Non-overlapping identity parts between participants: ∀i1 ≠ i2. i1 · i2 = 0.",
+      "input": {
+        "description": "Two participants with IDs i1 and i2 where i1 != i2"
+      },
+      "expect": {
+        "invariant": "i1 · i2 = 0 (non-overlapping graphs for any pair of id functions)"
+      }
+    },
+    {
+      "id": "LIMIT-ID-MERGE-ORDER",
+      "kind": "limit",
+      "operation": "join order",
+      "source": "interval-tree-clocks",
+      "cite": "154#412-156#e60",
+      "statement": "Fork step 2 must happen in order (pick side and overwrite before sending) to prevent overlap. Leave step 3 must happen in order (read id, delete id, pick peer) to avoid crash-restart issues.",
+      "input": {
+        "description": "Fork step: pick side and overwrite before sending to peer"
+      },
+      "expect": {
+        "requirement": "Step 2 must happen in order to prevent overlap; Step 3 must happen in order to avoid crash-restart issues"
+      }
+    },
+    {
+      "id": "PROPERTY-CAUSALITY",
+      "kind": "property",
+      "operation": "causality tracking",
+      "source": "itc2008",
+      "cite": "78#3f2-80#c30",
+      "statement": "Causality is characterized by a partial order over event components. For ITC: (i1, e1) ≤ (i2, e2) iff Je1K ≤ Je2K pointwise.",
+      "test_id": "TEST-PROPERTY-CAUSALITY"
+    },
+    {
+      "id": "PROPERTY-JOIN-DOMINANCE",
+      "kind": "property",
+      "operation": "join dominance",
+      "source": "itc2008",
+      "cite": "102#a65-106#fc0",
+      "statement": "The join result e3 must satisfy: e1 ≤ e3, e2 ≤ e3, and e3 should not dominate more than either e1 or e2 did. e3 = e1 ⊔ e2 must be defined for all pairs.",
+      "test_id": "TEST-PROPERTY-JOIN-DOMINANCE"
+    },
+    {
+      "id": "PROPERTY-FORK-EVENT-PRESERVE",
+      "kind": "property",
+      "operation": "fork preserves event",
+      "source": "itc2008",
+      "cite": "357#e22-363#6e5",
+      "statement": "Fork preserves the event component: fork((i, e)) = ((i1, e), (i2, e)) where (i1, i2) = split(i) and Ji1K · Ji2K = 0 ∧ Ji1K + Ji2K = JiK.",
+      "test_id": "TEST-PROPERTY-FORK-EVENT-PRESERVE"
+    },
+    {
+      "id": "PROPERTY-EVENT-STRICT-ADVANCE",
+      "kind": "property",
+      "operation": "event strict advance",
+      "source": "itc2008",
+      "cite": "95#95e-98#a8a",
+      "statement": "Event does a strict advance: e < e0. e0 is not dominated by any other entity and does not dominate more events than needed.",
+      "test_id": "TEST-PROPERTY-EVENT-STRICT-ADVANCE"
+    },
+    {
+      "id": "PROPERTY-NORMAL-FORM",
+      "kind": "property",
+      "operation": "normal form required",
+      "source": "itc2008",
+      "cite": "287#dc8-291#3b6",
+      "statement": "ITC keeps stamps in normal form for both id and event functions. This is important for compact representations and simple operation definitions.",
+      "test_id": "TEST-PROPERTY-NORMAL-FORM"
+    },
+    {
+      "id": "PROPERTY-SPACE-STABLE",
+      "kind": "property",
+      "operation": "space consumption",
+      "source": "itc2008",
+      "cite": "507#100-512#9f9",
+      "statement": "Space consumption of ITC stabilizes (with minor logarithmic component) after a number of iterations. For 128 replicas in dynamic scenarios, mean size < 2900 bytes; in static, slightly above 170 bytes.",
+      "test_id": "TEST-PROPERTY-SPACE-STABLE"
+    },
+    {
+      "id": "EXAMPLE-ANONYMOUS-JOIN",
+      "kind": "example",
+      "operation": "anonymous join",
+      "source": "itc2008",
+      "cite": "112#503-113#d96",
+      "input": {
+        "stamp1": {
+          "id_tree": {
+            "left": 1,
+            "right": 0
+          },
+          "event_tree": 3
+        },
+        "stamp2": {
+          "id_tree": 0,
+          "event_tree": 5
+        }
+      },
+      "expect": {
+        "join_result": {
+          "id_tree": {
+            "left": 1,
+            "right": 0
+          },
+          "event_tree": 5
+        },
+        "note": "join((i, e1), (0, e2)) = (i, e1 ⊔ e2)"
+      }
+    },
+    {
+      "id": "EXAMPLE-ANON-ANON-JOIN",
+      "kind": "example",
+      "operation": "anonymous-anonymous join",
+      "source": "itc2008",
+      "cite": "114#bae-115#b39",
+      "input": {
+        "stamp1": {
+          "id_tree": 0,
+          "event_tree": 3
+        },
+        "stamp2": {
+          "id_tree": 0,
+          "event_tree": 5
+        }
+      },
+      "expect": {
+        "join_result": {
+          "id_tree": 0,
+          "event_tree": 5
+        },
+        "note": "in-transit aggregation of messages"
+      }
+    },
+    {
+      "id": "EXAMPLE-JOIN-TERMINATE",
+      "kind": "example",
+      "operation": "join for termination",
+      "source": "itc2008",
+      "cite": "113#d96-114#bae",
+      "input": {
+        "stamp1": {
+          "id_tree": {
+            "left": 1,
+            "right": 0
+          },
+          "event_tree": 3
+        },
+        "stamp2": {
+          "id_tree": {
+            "left": 0,
+            "right": 1
+          },
+          "event_tree": 5
+        }
+      },
+      "expect": {
+        "join_result": {
+          "id_tree": {
+            "left": 1,
+            "right": 1
+          },
+          "event_tree": 5
+        },
+        "note": "join can terminate an entity and collect its causal past"
+      }
+    },
+    {
+      "id": "EXAMPLE-LEAVE-PROTOCOL",
+      "kind": "example",
+      "operation": "leave protocol",
+      "source": "interval-tree-clocks",
+      "cite": "142#5bb-152#fe4",
+      "input": {
+        "operation": "leave"
+      },
+      "expect": {
+        "steps": [
+          "stop accepting writes",
+          "synchronize data set with cluster",
+          "read local id from persistent storage",
+          "delete the id from persistent storage",
+          "pick one peer and give its ID back for join"
+        ]
+      }
+    },
+    {
+      "id": "EXAMPLE-VERSION-VARIANT-WRITE",
+      "kind": "example",
+      "operation": "version vector write",
+      "source": "interval-tree-clocks",
+      "cite": "178#5ec-179#e3b",
+      "input": {
+        "operation": "write"
+      },
+      "expect": {
+        "action": "increment the event counter"
+      }
+    },
+    {
+      "id": "EXAMPLE-VERSION-VARIANT-PUSH",
+      "kind": "example",
+      "operation": "version vector push",
+      "source": "interval-tree-clocks",
+      "cite": "179#e3b-180#def",
+      "input": {
+        "operation": "push"
+      },
+      "expect": {
+        "action": "only send the event counter to the remote node for each entry, but not the ID"
+      }
+    },
+    {
+      "id": "EXAMPLE-VERSION-VARIANT-RECEIVE",
+      "kind": "example",
+      "operation": "version vector receive",
+      "source": "interval-tree-clocks",
+      "cite": "182#394-188#b60",
+      "input": {
+        "current_stamp": {
+          "id_tree": {
+            "left": 1,
+            "right": 0
+          },
+          "event_tree": 5
+        },
+        "received_stamp": {
+          "id_tree": {
+            "left": 0,
+            "right": 1
+          },
+          "event_tree": 7
+        }
+      },
+      "expect": {
+        "action": "if current >= received, do nothing; if current < received, store the new one with the new data"
+      }
+    },
+    {
+      "id": "EXAMPLE-VECTOR-VARIANT-PUSH",
+      "kind": "example",
+      "operation": "vector clock push",
+      "source": "interval-tree-clocks",
+      "cite": "210#803-211#e3b",
+      "input": {
+        "operation": "push"
+      },
+      "expect": {
+        "action": "increment event counter and store, then send only event counter (not ID)"
+      }
+    },
+    {
+      "id": "EXAMPLE-VECTOR-VARIANT-RECEIVE-GE",
+      "kind": "example",
+      "operation": "vector clock receive current >= received",
+      "source": "interval-tree-clocks",
+      "cite": "216#4da-217#e3b",
+      "input": {
+        "current_stamp": {
+          "id_tree": {
+            "left": 1,
+            "right": 0
+          },
+          "event_tree": 7
+        },
+        "received_stamp": {
+          "id_tree": {
+            "left": 0,
+            "right": 1
+          },
+          "event_tree": 5
+        }
+      },
+      "expect": {
+        "action": "merge both counters and increment with local id before storage"
+      }
+    },
+    {
+      "id": "EXAMPLE-VECTOR-VARIANT-RECEIVE-LT",
+      "kind": "example",
+      "operation": "vector clock receive current < received",
+      "source": "interval-tree-clocks",
+      "cite": "218#26e-219#e3b",
+      "input": {
+        "current_stamp": {
+          "id_tree": {
+            "left": 1,
+            "right": 0
+          },
+          "event_tree": 3
+        },
+        "received_stamp": {
+          "id_tree": {
+            "left": 0,
+            "right": 1
+          },
+          "event_tree": 7
+        }
+      },
+      "expect": {
+        "action": "store new data with merged counters incremented with local id before storage"
+      }
+    },
+    {
+      "id": "EXAMPLE-FORK-PRESERVES",
+      "kind": "example",
+      "operation": "fork preserves event",
+      "source": "itc2008",
+      "cite": "357#e22-363#6e5",
+      "input": {
+        "id_tree": {
+          "left": 1,
+          "right": {
+            "left": 1,
+            "right": 0
+          }
+        },
+        "event_tree": 7
+      },
+      "expect": {
+        "fork_result": [
+          {
+            "id_tree": {
+              "left": {
+                "left": 1,
+                "right": 0
+              },
+              "right": {
+                "left": 1,
+                "right": 0
+              }
+            },
+            "event_tree": 7
+          },
+          {
+            "id_tree": {
+              "left": {
+                "left": 0,
+                "right": 0
+              },
+              "right": {
+                "left": 0,
+                "right": {
+                  "left": 1,
+                  "right": 0
+                }
+              }
+            },
+            "event_tree": 7
+          }
+        ]
+      }
+    },
+    {
+      "id": "EXAMPLE-SEND-DETAILS",
+      "kind": "example",
+      "operation": "send details",
+      "source": "itc2008",
+      "cite": "119#6b9-120#193",
+      "input": {
+        "id_tree": {
+          "left": 1,
+          "right": 0
+        },
+        "event_tree": 3
+      },
+      "expect": {
+        "send_result": {
+          "local": {
+            "id_tree": {
+              "left": 1,
+              "right": 0
+            },
+            "event_tree": 4
+          },
+          "message": {
+            "id_tree": 0,
+            "event_tree": 4
+          }
+        }
+      }
+    },
+    {
+      "id": "EXAMPLE-RECEIVE-DETAILS",
+      "kind": "example",
+      "operation": "receive details",
+      "source": "itc2008",
+      "cite": "122#820-123#170",
+      "input": {
+        "local": {
+          "id_tree": {
+            "left": 1,
+            "right": 0
+          },
+          "event_tree": 3
+        },
+        "message": {
+          "id_tree": 0,
+          "event_tree": 5
+        }
+      },
+      "expect": {
+        "receive_result": {
+          "id_tree": {
+            "left": 1,
+            "right": 0
+          },
+          "event_tree": 4
+        },
+        "note": "join then event: merge with message (max=5), then increment local (5+1=6)"
+      }
+    },
+    {
+      "id": "EXAMPLE-COMPARISON",
+      "kind": "example",
+      "operation": "comparison",
+      "source": "itc2008",
+      "cite": "345#d07-355#17e",
+      "input": {
+        "stamp1": {
+          "id_tree": {
+            "left": 1,
+            "right": 0
+          },
+          "event_tree": 5
+        },
+        "stamp2": {
+          "id_tree": {
+            "left": 0,
+            "right": 1
+          },
+          "event_tree": 3
+        }
+      },
+      "expect": {
+        "comparison": {
+          "leq": true,
+          "equal": false,
+          "gt": true
+        }
+      }
+    },
+    {
+      "id": "EXAMPLE-COMPARISON-SAME",
+      "kind": "example",
+      "operation": "comparison same level",
+      "source": "itc2008",
+      "cite": "345#d07-355#17e",
+      "input": {
+        "stamp1": {
+          "id_tree": {
+            "left": 1,
+            "right": 0
+          },
+          "event_tree": 5
+        },
+        "stamp2": {
+          "id_tree": {
+            "left": 0,
+            "right": 1
+          },
+          "event_tree": 5
+        }
+      },
+      "expect": {
+        "comparison": {
+          "leq": true,
+          "equal": true,
+          "lt": false
+        }
+      }
+    },
+    {
+      "id": "EXAMPLE-JOIN-SEMILATTICE",
+      "kind": "example",
+      "operation": "join semilattice property",
+      "source": "itc2008",
+      "cite": "104#d47-108#69e",
+      "input": {
+        "stamp1": {
+          "id_tree": {
+            "left": 1,
+            "right": 0
+          },
+          "event_tree": 3
+        },
+        "stamp2": {
+          "id_tree": {
+            "left": 0,
+            "right": 1
+          },
+          "event_tree": 5
+        }
+      },
+      "expect": {
+        "join_result": {
+          "id_tree": {
+            "left": 1,
+            "right": 1
+          },
+          "event_tree": 5
+        },
+        "note": "join takes max of event trees: max(3, 5) = 5"
+      }
+    },
+    {
+      "id": "EXAMPLE-INITIAL-CONFIG",
+      "kind": "example",
+      "operation": "initial configuration",
+      "source": "itc2008",
+      "cite": "128#1c2-130#e3b",
+      "input": {},
+      "expect": {
+        "method": "fork seed stamp repeatedly until required number of participants reached"
+      }
+    },
+    {
+      "id": "EXAMPLE-FORK-OP",
+      "kind": "example",
+      "operation": "fork",
+      "source": "itc2008",
+      "cite": "361#fee-363#6e5",
+      "input": {
+        "id_tree": 1,
+        "event_tree": 0
+      },
+      "expect": {
+        "fork_result": {
+          "id_split": "split(1) = ((1, 0), (0, 1))",
+          "event_preserved": 0
+        }
+      }
+    },
+    {
+      "id": "EXAMPLE-SYNC-OP",
+      "kind": "example",
+      "operation": "sync",
+      "source": "itc2008",
+      "cite": "125#3f9-126#a1b",
+      "input": {
+        "left_id": 1,
+        "left_event": 5,
+        "right_id": 1,
+        "right_event": 3
+      },
+      "expect": {
+        "sync_result": "join+fork: merge events, split identity"
+      }
+    },
+    {
+      "id": "EXAMPLE-ID-TREE-STRUCT",
+      "kind": "example",
+      "operation": "id tree structure",
+      "source": "itc2008",
+      "cite": "228#524-230#4d8",
+      "input": {},
+      "expect": {
+        "grammar": "i ::= 0 | 1 | (i1, i2)",
+        "valid_ids": [
+          0,
+          1,
+          [
+            1,
+            0
+          ],
+          [
+            0,
+            1
+          ],
+          [
+            [
+              1,
+              0
+            ],
+            [
+              0,
+              1
+            ]
+          ]
+        ]
+      }
+    },
+    {
+      "id": "EXAMPLE-EVENT-TREE-STRUCT",
+      "kind": "example",
+      "operation": "event tree structure",
+      "source": "itc2008",
+      "cite": "247#6f2-250#98e",
+      "input": {},
+      "expect": {
+        "grammar": "e ::= n | (n, e1, e2)",
+        "valid_events": [
+          0,
+          1,
+          [
+            1,
+            0,
+            0
+          ],
+          [
+            2,
+            [
+              1,
+              0,
+              0
+            ],
+            0
+          ]
+        ]
+      }
+    },
+    {
+      "id": "EXAMPLE-EVENT-TREE-SEM",
+      "kind": "example",
+      "operation": "event tree semantics",
+      "source": "itc2008",
+      "cite": "252#7e5-255#dda",
+      "input": {
+        "event_tree": [
+          1,
+          0,
+          0
+        ]
+      },
+      "expect": {
+        "semantics": "J(1, 0, 0)K = 1 * 1 + lambda x. J0K(2x) + J0K(2x-1) = 1"
+      }
+    },
+    {
+      "id": "EXAMPLE-ID-NORM-OP",
+      "kind": "example",
+      "operation": "id tree normalization",
+      "source": "itc2008",
+      "cite": "298#b6e-300#2ed",
+      "input": {
+        "id_tree": [
+          1,
+          1
+        ]
+      },
+      "expect": {
+        "normalized": 1,
+        "rule": "norm((1, 1)) = 1"
+      }
+    },
+    {
+      "id": "EXAMPLE-EVENT-NORM-OP",
+      "kind": "example",
+      "operation": "event tree normalization",
+      "source": "itc2008",
+      "cite": "317#a05-319#4ca",
+      "input": {
+        "event_tree": [
+          2,
+          1,
+          1
+        ]
+      },
+      "expect": {
+        "normalized": 3,
+        "rule": "norm((2, 1, 1)) = 2 + 1 = 3"
+      }
+    },
+    {
+      "id": "EXAMPLE-SPLIT-OP",
+      "kind": "example",
+      "operation": "split function",
+      "source": "itc2008",
+      "cite": "366#f3c-370#48c",
+      "input": {
+        "id_tree": 1
+      },
+      "expect": {
+        "split_result": [
+          [
+            1,
+            0
+          ],
+          [
+            0,
+            1
+          ]
+        ],
+        "rule": "split(1) = ((1, 0), (0, 1))"
+      }
+    },
+    {
+      "id": "EXAMPLE-SUM-OP",
+      "kind": "example",
+      "operation": "sum function (id)",
+      "source": "itc2008",
+      "cite": "386#669-388#e7c",
+      "input": {
+        "left": [
+          1,
+          0
+        ],
+        "right": [
+          0,
+          1
+        ]
+      },
+      "expect": {
+        "sum_result": 1,
+        "rule": "sum((1,0), (0,1)) = norm((sum(1,0), sum(0,1))) = norm((1, 1)) = 1"
+      }
+    },
+    {
+      "id": "EXAMPLE-EVENT-JOIN-OP",
+      "kind": "example",
+      "operation": "event join function",
+      "source": "itc2008",
+      "cite": "392#792-396#4f9",
+      "input": {
+        "left": 3,
+        "right": 5
+      },
+      "expect": {
+        "join_result": 5,
+        "rule": "join(3, 5) = max(3, 5) = 5"
+      }
+    },
+    {
+      "id": "EXAMPLE-COMPARE-OP",
+      "kind": "example",
+      "operation": "comparison function",
+      "source": "itc2008",
+      "cite": "352#356-355#17e",
+      "input": {
+        "left_event": 3,
+        "right_event": 5
+      },
+      "expect": {
+        "leq_result": true,
+        "rule": "leq(3, 5) = 3 <= 5 = True"
+      }
+    },
+    {
+      "id": "EXAMPLE-FILL-OP",
+      "kind": "example",
+      "operation": "fill function (event)",
+      "source": "itc2008",
+      "cite": "426#7f5-434#5fe",
+      "input": {
+        "id_tree": 1,
+        "event_tree": 5
+      },
+      "expect": {
+        "fill_result": 5,
+        "rule": "fill(1, 5) = max(5) = 5"
+      }
+    },
+    {
+      "id": "EXAMPLE-GROW-OP",
+      "kind": "example",
+      "operation": "grow function (event)",
+      "source": "itc2008",
+      "cite": "453#7e0-462#955",
+      "input": {
+        "id_tree": 1,
+        "event_tree": 5
+      },
+      "expect": {
+        "grow_result": [
+          6,
+          0
+        ],
+        "rule": "grow(1, 5) = (5 + 1, 0) = (6, 0)"
+      }
+    },
+    {
+      "id": "EXAMPLE-EVENT-FULL-OP",
+      "kind": "example",
+      "operation": "event full definition",
+      "source": "itc2008",
+      "cite": "417#32e-420#02d",
+      "input": {
+        "id_tree": 1,
+        "event_tree": 0
+      },
+      "expect": {
+        "event_result": [
+          1,
+          1
+        ],
+        "rule": "event(1, 0) = (1, fill(1, 0)) = (1, 0) if fill=e, else (1, grow(1, 0))"
+      }
+    },
+    {
+      "id": "EXAMPLE-EXPLODE-OP",
+      "kind": "example",
+      "operation": "explode",
+      "source": "interval-tree-clocks",
+      "cite": "118#0cf-120#8fe",
+      "input": {
+        "id_tree": 1,
+        "event_tree": 5
+      },
+      "expect": {
+        "exploded": {
+          "id": 1,
+          "event_counter": 5
+        },
+        "note": "splits ID+event into independent components"
+      }
+    },
+    {
+      "id": "EXAMPLE-REBUILD-OP",
+      "kind": "example",
+      "operation": "rebuild",
+      "source": "interval-tree-clocks",
+      "cite": "118#0cf-120#8fe",
+      "input": {
+        "id": 1,
+        "event_counter": 5
+      },
+      "expect": {
+        "rebuilt": {
+          "id_tree": 1,
+          "event_tree": 5
+        },
+        "note": "reassembles ID and event counter into a stamp"
+      }
+    },
+    {
+      "id": "EXAMPLE-RECEIVE-ITC-OP",
+      "kind": "example",
+      "operation": "receive (ITC variant)",
+      "source": "interval-tree-clocks",
+      "cite": "190#bd4-198#c4b",
+      "input": {
+        "local_id": 1,
+        "local_event": 3,
+        "remote_event": 5
+      },
+      "expect": {
+        "steps": [
+          "explode to get event counter",
+          "event to increment",
+          "join to merge",
+          "peek remote stamp",
+          "rebuild complete stamp"
+        ],
+        "note": "sequence: explode -> event -> join -> peek -> rebuild"
+      }
+    },
+    {
+      "id": "EXAMPLE-RECEIVE-VC-OP",
+      "kind": "example",
+      "operation": "receive vector clock variant",
+      "source": "interval-tree-clocks",
+      "cite": "212#394-218#26e",
+      "input": {
+        "current_stamp": 5,
+        "received_stamp": 3
+      },
+      "expect": {
+        "action": "merge both counters and increment with local id",
+        "note": "when current >= received"
+      }
+    },
+    {
+      "id": "EXAMPLE-SYNC-ITC-OP",
+      "kind": "example",
+      "operation": "sync (ITC variant)",
+      "source": "interval-tree-clocks",
+      "cite": "58#7ed-59#e3b",
+      "input": {
+        "left_id": 1,
+        "left_event": 5,
+        "right_id": 1,
+        "right_event": 3
+      },
+      "expect": {
+        "result": "IDs stay as-is, event counters merge",
+        "note": "atomic composition of join + fork"
+      }
+    }
+  ],
+  "gaps": [
+    {
+      "id": "GAP-ENCODE",
+      "question": "Should the implementation include the binary encoding from Appendix A of the paper (itc2008 lines 631-666)?",
+      "answer": "The encoding is described but not required for the core ITC operations. It may be added later if serialization is needed."
+    },
+    {
+      "id": "GAP-CONFLICT-RESOLUTION",
+      "question": "How should conflict resolution be implemented? The paper mentions 'on resolving conflicts on the spot, or tracking conflicts'",
+      "answer": "The implementation should provide a conflict detection mechanism. Conflict resolution strategy (last-write-wins, application-specific, or tracking) is left as a configurable policy."
+    },
+    {
+      "id": "GAP-PARTIAL-ORDER",
+      "question": "Should the comparison return a total order or partial order?",
+      "answer": "The comparison should support before, before-or-same, after, and unknown (incomparable) as per the acceptance criteria. The partial order means two stamps may be incomparable."
+    },
+    {
+      "id": "GAP-EXPLODE-REBUILD",
+      "question": "Should explode and rebuild be exposed as public operations?",
+      "answer": "These are protocol-level operations from the ferd.ca blog. They can be implemented as helper functions that split/recombine ID and event counter, but the core ITC operations are fork, event, join, peek, send, receive, sync."
+    }
+  ]
+}

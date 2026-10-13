@@ -1,0 +1,277 @@
+{
+  "sources": {
+    "Consistent_Overhead_Byte_Stuffing": {
+      "path": "references/Consistent_Overhead_Byte_Stuffing.txt"
+    }
+  },
+  "entries": [
+    {
+      "id": "OP-DECODE",
+      "kind": "operation",
+      "operation": "decode",
+      "source": "Consistent_Overhead_Byte_Stuffing",
+      "cite": "47#012",
+      "statement": "COBS decode data from buffer — decodes COBS-encoded input bytes back to original data, stops decoding if delimiter byte (zero) is found."
+    },
+    {
+      "id": "OP-FRAME",
+      "kind": "operation",
+      "operation": "frame",
+      "source": "Consistent_Overhead_Byte_Stuffing",
+      "cite": "31#b70",
+      "statement": "Append a zero byte to COBS-encoded data to mark end-of-packet, forming a complete packet."
+    },
+    {
+      "id": "OP-ENCODE",
+      "kind": "operation",
+      "operation": "encode",
+      "source": "Consistent_Overhead_Byte_Stuffing",
+      "cite": "39#10e",
+      "statement": "COBS encode data to buffer — transforms input data bytes into COBS-encoded output, does not output delimiter byte."
+    },
+    {
+      "id": "LIM-MIN-OVERHEAD",
+      "kind": "limit",
+      "operation": "encode",
+      "source": "Consistent_Overhead_Byte_Stuffing",
+      "cite": "21#a24",
+      "input": "any input",
+      "expect": "minimum 1 byte overhead",
+      "statement": "COBS requires a minimum of 1 byte overhead."
+    },
+    {
+      "id": "LIM-MAX-OVERHEAD",
+      "kind": "limit",
+      "operation": "encode",
+      "source": "Consistent_Overhead_Byte_Stuffing",
+      "cite": "21#a24",
+      "input": "n data bytes",
+      "expect": "maximum of ceil(n/254) bytes overhead",
+      "statement": "COBS requires a maximum of ceil(n/254) bytes for n data bytes (one byte in 254, rounded up)."
+    },
+    {
+      "id": "LIM-LOOKAHEAD",
+      "kind": "limit",
+      "operation": "encode",
+      "source": "Consistent_Overhead_Byte_Stuffing",
+      "cite": "22#5ab",
+      "input": "any input",
+      "expect": "requires up to 254 bytes of lookahead",
+      "statement": "COBS does, however, require up to 254 bytes of lookahead. Before transmitting its first byte, it needs to know the position of the first zero byte (if any) in the following 254 bytes."
+    },
+    {
+      "id": "LIM-OFFSET-MAX",
+      "kind": "limit",
+      "operation": "encode",
+      "source": "Consistent_Overhead_Byte_Stuffing",
+      "cite": "51#79f",
+      "input": "any input",
+      "expect": "each offset is guaranteed to be at most 255",
+      "statement": "Second, replace each zero byte with the offset to the next zero byte, or the end of the packet. Because of the extra zeros added in the first step, each offset is guaranteed to be at most 255."
+    },
+    {
+      "id": "LIM-INPUT-RANGE",
+      "kind": "limit",
+      "operation": "encode",
+      "source": "Consistent_Overhead_Byte_Stuffing",
+      "cite": "31#b70",
+      "input": "any byte value 0-255",
+      "expect": "accepts bytes in range [0,255]",
+      "statement": "COBS transforms an arbitrary string of bytes in the range [0,255] into bytes in the range [1,255]."
+    },
+    {
+      "id": "LIM-OUTPUT-RANGE",
+      "kind": "limit",
+      "operation": "encode",
+      "source": "Consistent_Overhead_Byte_Stuffing",
+      "cite": "31#b70",
+      "input": "any valid input",
+      "expect": "output bytes in range [1,255] (no zero bytes in payload)",
+      "statement": "COBS transforms an arbitrary string of bytes in the range [0,255] into bytes in the range [1,255]. Having eliminated all zero bytes from the data, a zero byte can now be used to unambiguously mark the end of the transformed data."
+    },
+    {
+      "id": "LIM-GROUP-SIZE",
+      "kind": "limit",
+      "operation": "encode",
+      "source": "Consistent_Overhead_Byte_Stuffing",
+      "cite": "41#5d6",
+      "input": "any input",
+      "expect": "groups of at most 254 non-zero bytes",
+      "statement": "To encode some bytes, first append a zero byte, then break them into groups of either 254 non-zero bytes, or 0–253 non-zero bytes followed by a zero byte."
+    },
+    {
+      "id": "LIM-MAX-CODE",
+      "kind": "limit",
+      "operation": "encode",
+      "source": "Consistent_Overhead_Byte_Stuffing",
+      "cite": "43#1c7",
+      "input": "a group of 254 non-zero bytes",
+      "expect": "encoded as 255 prepended (byte of 255)",
+      "statement": "Encode each group by deleting the trailing zero byte (if any) and prepending the number of non-zero bytes, plus one. Thus, each encoded group is the same size as the original, except that 254 non-zero bytes are encoded into 255 bytes by prepending a byte of 255."
+    },
+    {
+      "id": "EX-1",
+      "kind": "example",
+      "operation": "encode",
+      "source": "Consistent_Overhead_Byte_Stuffing",
+      "cite": "69#457-70#3e2",
+      "input": "00",
+      "expect": "01 01 00",
+      "statement": "Single zero byte: 00 -> 01 01 00"
+    },
+    {
+      "id": "EX-2",
+      "kind": "example",
+      "operation": "encode",
+      "source": "Consistent_Overhead_Byte_Stuffing",
+      "cite": "72#cd3-73#dc6",
+      "input": "00 00",
+      "expect": "01 01 01 00",
+      "statement": "Two zero bytes: 00 00 -> 01 01 01 00"
+    },
+    {
+      "id": "EX-3",
+      "kind": "example",
+      "operation": "encode",
+      "source": "Consistent_Overhead_Byte_Stuffing",
+      "cite": "75#075-76#d10",
+      "input": "00 11 00",
+      "expect": "01 02 11 01 00",
+      "statement": "Zero, non-zero, zero: 00 11 00 -> 01 02 11 01 00"
+    },
+    {
+      "id": "EX-4",
+      "kind": "example",
+      "operation": "encode",
+      "source": "Consistent_Overhead_Byte_Stuffing",
+      "cite": "78#32f-79#d5c",
+      "input": "11 22 00 33",
+      "expect": "03 11 22 02 33 00",
+      "statement": "Non-zero, non-zero, zero, non-zero: 11 22 00 33 -> 03 11 22 02 33 00"
+    },
+    {
+      "id": "EX-5",
+      "kind": "example",
+      "operation": "encode",
+      "source": "Consistent_Overhead_Byte_Stuffing",
+      "cite": "81#cc0-82#ca8",
+      "input": "11 22 33 44",
+      "expect": "05 11 22 33 44 00",
+      "statement": "No zero bytes: 11 22 33 44 -> 05 11 22 33 44 00"
+    },
+    {
+      "id": "EX-6",
+      "kind": "example",
+      "operation": "encode",
+      "source": "Consistent_Overhead_Byte_Stuffing",
+      "cite": "84#344-85#a99",
+      "input": "11 00 00 00",
+      "expect": "02 11 01 01 01 00",
+      "statement": "Non-zero followed by three zeros: 11 00 00 00 -> 02 11 01 01 01 00"
+    },
+    {
+      "id": "EX-7",
+      "kind": "example",
+      "operation": "encode",
+      "source": "Consistent_Overhead_Byte_Stuffing",
+      "cite": "87#db8-88#9e2",
+      "input": "01 02 03 ... FD FE",
+      "expect": "FF 01 02 03 ... FD FE 00",
+      "statement": "254 non-zero bytes (0x01 to 0xFE): encoded with single overhead byte 0xFF, no internal zeros, trailing delimiter."
+    },
+    {
+      "id": "EX-8",
+      "kind": "example",
+      "operation": "encode",
+      "source": "Consistent_Overhead_Byte_Stuffing",
+      "cite": "90#f62-91#d30",
+      "input": "00 01 02 ... FC FD FE",
+      "expect": "01 FF 01 02 ... FC FD FE 00",
+      "statement": "255 bytes starting with zero: first byte becomes 01 (pointing to next zero at offset 1), then 0xFF for the 254-byte block, trailing delimiter."
+    },
+    {
+      "id": "EX-9",
+      "kind": "example",
+      "operation": "encode",
+      "source": "Consistent_Overhead_Byte_Stuffing",
+      "cite": "93#dfb-94#0f2",
+      "input": "01 02 03 ... FD FE FF",
+      "expect": "FF 01 02 03 ... FD FE 02 FF 00",
+      "statement": "255 non-zero bytes (0x01 to 0xFF): 0xFF header for first 254 bytes, then 02 FF for the last non-zero byte pointing to the implicit zero at end."
+    },
+    {
+      "id": "EX-10",
+      "kind": "example",
+      "operation": "encode",
+      "source": "Consistent_Overhead_Byte_Stuffing",
+      "cite": "96#b16-97#146",
+      "input": "02 03 04 ... FE FF 00",
+      "expect": "FF 02 03 04 ... FE FF 01 01 00",
+      "statement": "255 bytes ending with zero: 0xFF header for first 254 bytes, then 01 for the zero byte, then 01 for trailing delimiter."
+    },
+    {
+      "id": "EX-11",
+      "kind": "example",
+      "operation": "encode",
+      "source": "Consistent_Overhead_Byte_Stuffing",
+      "cite": "99#45b-100#dc6",
+      "input": "03 04 05 ... FF 00 01",
+      "expect": "FE 03 04 05 ... FF 02 01 00",
+      "statement": "255 bytes with zero in the middle near end: FE header (254 bytes to zero), then 02 for the zero, then 01 for the trailing data byte."
+    },
+    {
+      "id": "PROP-ROUNDTRIP",
+      "kind": "property",
+      "operation": "decode",
+      "source": "Consistent_Overhead_Byte_Stuffing",
+      "cite": "49#591",
+      "statement": "The linked list description says the encoding is obviously reversible. decode(encode(data)) == data for all valid inputs."
+    },
+    {
+      "id": "PROP-NO-ZEROS",
+      "kind": "property",
+      "operation": "encode",
+      "source": "Consistent_Overhead_Byte_Stuffing",
+      "cite": "31#b70",
+      "statement": "The encoded payload contains no zero bytes. All zero bytes in the input are replaced by offset markers."
+    },
+    {
+      "id": "PROP-DELIMITER",
+      "kind": "property",
+      "operation": "frame",
+      "source": "Consistent_Overhead_Byte_Stuffing",
+      "cite": "64#cf1",
+      "input": "11 22 33",
+      "expect": "04 11 22 33 00",
+      "statement": "A zero byte is appended at the end of every encoded packet to indicate end-of-packet. This packet delimiter byte is not part of COBS proper."
+    },
+    {
+      "id": "EXC-254-END",
+      "kind": "limit",
+      "operation": "encode",
+      "source": "Consistent_Overhead_Byte_Stuffing",
+      "cite": "45#efe",
+      "input": "input ending with exactly 254 non-zero bytes",
+      "expect": "no trailing zero byte needed after the last group",
+      "statement": "As a special exception, if a packet ends with a group of 254 non-zero bytes, it is not necessary to add the trailing zero byte. This saves one byte in some situations."
+    },
+    {
+      "id": "EXC-254-END-LIST",
+      "kind": "limit",
+      "operation": "encode",
+      "source": "Consistent_Overhead_Byte_Stuffing",
+      "cite": "49#591",
+      "input": "input ending with exactly 254 non-zero bytes",
+      "expect": "no zero byte inserted at end in linked list description",
+      "statement": "It is not necessary to insert a zero byte at the end of the packet if it happens to end with exactly 254 non-zero bytes."
+    },
+    {
+      "id": "PROP-DECODE-DELIMITER",
+      "kind": "property",
+      "operation": "decode",
+      "source": "Consistent_Overhead_Byte_Stuffing",
+      "cite": "163#5d7",
+      "statement": "The decoder stops when it encounters a delimiter byte (zero). The delimiter byte is not part of the decoded output."
+    }
+  ]
+}
