@@ -20,6 +20,7 @@ branch and sha. Grades come from `grade_<task>.py` over `runs/RNN/adapter.py`;
 | R86 | q35 | cobs | contract-first 6e25585 (T0516, T0518, T0519) | 42/44 | R84 39/44; B05 plain 41/44 in 48.8 min |
 | R87 | q35 | itc | contract-first 6e25585 (T0516, T0518, T0519) | 0/42 | R83 18/42; B04 plain 0/42 |
 | R88 | q35 | cobs | contract-first eccdcac (T0509, T0510, T0520, T0522) | — (OOM-killed at 23 min, in Contract) | R86 42/44; B05 plain 41/44 |
+| R89 | q35 | cobs | contract-first 676ffd1 (T0524) | 2/44 in 49.8 min (ended, not capped) | R86 42/44; B05 plain 41/44 in 48.8 min |
 
 ## B06 — the invented spec was not hard
 
@@ -352,4 +353,38 @@ T0002 Contract still open and no code written.
   before anything runs it.
 - Not answered by R88: whether accept.sh prints ok/FAIL lines at the seal, and
   whether milestones use `contract run --operation`. R89 repeats it on 676ffd1.
+
+## R89 — q35 cobs: 2/44, the encode milestone could not pass (T0525)
+
+The contract sealed at 13.8 min (R86: 14). Stages closed at:
+
+| Stage | Closed at |
+|---|---|
+| Contract (28 entries) | 9.2 min |
+| Second extraction | 11.9 min |
+| Reconcile (sealed) | 13.8 min |
+| T0005 Core encoding | open at the end, 49.8 min |
+
+- accept.sh prints one `ok <id>` / `FAIL <id>: why` line per entry (T0509/T0510
+  hold), and T0005's check was `beagle pursuit contract run --operation encode`
+  (T0520 holds).
+- 18 of the 28 entries could not be replayed: EX-7..EX-11 kept the source
+  table's elision (`01 02 03 ... FD FE`), and all 10 limits were descriptions
+  (`any input`, `n data bytes`). The acceptance FAILs them on parsing, so
+  `--operation encode` could not pass whatever the code did. R84, R85 and R86
+  sealed the same elided rows; before T0509 nothing judged a milestone by its
+  entries, so it cost nothing.
+- The T0005 worker spent its 900 s wall reasoning about a contract it read as
+  "intentionally contradictory", hit the output limit, and left a cobs.py whose
+  encode raises IndexError on `00`. The driver, refused the reference, worked
+  the algorithm in its head: three replies in a row ended at the 16k output
+  limit (5 min each), and tau ends a session on the third
+  (MAX_OUTPUT_LIMIT_CONTINUATIONS = 2). The run ended at 49.8 min, not capped.
+- T0525 (beagle 271a767): an example, limit or invalid whose input or expect
+  elides (`...`, `…`) or opens as a description (any/every/all/each/some/n …)
+  is a contract problem; a bound with no case of its own is pointed at kind
+  property. Over past contracts it flags R84–R89 cobs and one prose example
+  each in itc R77/R83, none in R73/R75/R79/R81/R87.
+- Open: the driver's output-limit spiral when a milestone stalls. R90 repeats
+  on 271a767.
 
