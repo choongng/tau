@@ -19,6 +19,7 @@ branch and sha. Grades come from `grade_<task>.py` over `runs/RNN/adapter.py`;
 | R85 | q35 | cobs | contract-first 6e25585 (independent second, T0516) | 0/44 | R84 39/44; B05 plain 41/44 |
 | R86 | q35 | cobs | contract-first 6e25585 (T0516, T0518, T0519) | 42/44 | R84 39/44; B05 plain 41/44 in 48.8 min |
 | R87 | q35 | itc | contract-first 6e25585 (T0516, T0518, T0519) | 0/42 | R83 18/42; B04 plain 0/42 |
+| R88 | q35 | cobs | contract-first eccdcac (T0509, T0510, T0520, T0522) | — (OOM-killed at 23 min, in Contract) | R86 42/44; B05 plain 41/44 |
 
 ## B06 — the invented spec was not hard
 
@@ -327,4 +328,28 @@ used.
 
 Even without it, itc's contract stage is long: Second extraction and Reconcile took 15 minutes
 after the Contract closed, against 14 minutes for cobs's whole stage in R86.
+
+## R88 — q35 cobs: killed at 23 min by an acceptance that ran itself (T0524)
+
+Not graded: the kernel's OOM killer took the run's scope at 23 min, with
+T0002 Contract still open and no code written.
+
+- T0522 held: the driver's first `pursuit_step` passed its own done_when, and
+  was told Contract keeps `contract check --draft`.
+- The first Contract worker spent 1.9–9.6 min reading the reference with no
+  writes, then wrote the contract as a JSON list (refused: an object is wanted)
+  and rebuilt it through `contract add` by 14.4 min. The 6 properties then
+  wanted an acceptance file naming each.
+- At 17.4 min the driver's notes said "accept.sh should use `beagle pursuit
+  contract run`". The next worker wrote accept.sh as
+  `exec beagle pursuit contract run`; the acceptance is
+  `sh contract/accept.sh`, so each started the other. Two worker runs hit their
+  4G cap on `bash contract/accept.sh`; then the driver itself ran
+  `beagle pursuit contract run` at 22.2 min, inside the whole run's scope.
+- T0524 (beagle 676ffd1): the acceptance beagle runs is marked
+  (BEAGLE_CONTRACT_ACCEPTANCE), and one run from inside it is refused, exit 2;
+  `contract check` names an acceptance file that runs beagle's contract
+  before anything runs it.
+- Not answered by R88: whether accept.sh prints ok/FAIL lines at the seal, and
+  whether milestones use `contract run --operation`. R89 repeats it on 676ffd1.
 
