@@ -23,6 +23,8 @@ branch and sha. Grades come from `grade_<task>.py` over `runs/RNN/adapter.py`;
 | R89 | q35 | cobs | contract-first 676ffd1 (T0524) | 2/44 in 49.8 min (ended, not capped) | R86 42/44; B05 plain 41/44 in 48.8 min |
 | R90 | q35 | cobs | contract-first 271a767 (T0524, T0525) | 39/44 at the 60 min cap (working tree; 31/44 committed) | R86 42/44; R89 2/44; B05 plain 41/44 in 48.8 min |
 | R91 | q35 | cobs | contract-first 6ff1dd0 (T0524–T0526) | 5/44 at the 60 min cap (encode never closed) | R90 39/44; R86 42/44; B05 plain 41/44 in 48.8 min |
+| R92 | q35 | cobs | contract-first 1684138 (T0529); tau 7cb40c5e (T0527, T0528) | void: another session switched ~/tautest/tau's branch at 18 min, removing the beagle extension | — |
+| R93 | q35 | cobs | the same, tau pinned in ~/tautest/tau-harness | 0/44 at the 60 min cap (contract not sealed) | R92 sealed at 30.6 min; R91 5/44; R90 39/44; B05 plain 41/44 in 48.8 min |
 
 ## B06 — the invented spec was not hard
 
@@ -456,3 +458,54 @@ At the cap ~/cobs/cobs/__init__.py was uncommitted, with no decode: 5/44.
 - Open: the worker wall against reasoning-length replies; the text-written
   tool calls (R37's class, unparsed by the server when the opening tag is
   missing).
+
+## R92 — void: the tau checkout under the run changed at 18 min
+
+The first run of T0527–T0529. At 08:29 another session checked
+`upstream/tui-stream-cpu` out in ~/tautest/tau, which the harness's `tau` and
+`~/.tau/extensions/beagle.py` both pointed into: every worker after that ran
+without the beagle extension. Stopped at 08:46. Before then the contract
+sealed at 30.6 min with 32 entries, and a contract worker wrote and ran code
+rather than hand-tracing (T0529), but built a COBS implementation inside
+`contract/accept.sh`. The two contract workers that ended on tool calls
+written as text had hit the 30-turn cap first: the markup was their reply to
+"no more tool calls", not the template failure R91 saw.
+
+Runs now use a tau pinned for them: launch.sh puts `~/tautest/tau-harness` (a
+detached worktree with its own venv) on PATH and sets
+`TAU_HOME=~/.tau-harness`, whose `extensions/beagle.py` points into it and
+whose other entries link to ~/.tau.
+
+## R93 — q35 cobs: 0/44 at the cap; the contract task took 51 min
+
+T0002 (Contract) ran from 0.2 to 52.5 min over four workers; T0003 (Second
+extraction) took 3 min; Reconcile was mid-way at the cap. No code.
+
+| Contract worker | Minutes | How it ended |
+|---|---|---|
+| 1d1b61b6 | 1.5–10.0 | 31-turn cap: 41 entries and accept.sh, 19 properties unnamed by it |
+| 392cdfc0 | 10.0–27.8 | the 837 s wall, not counting a 318 s reply cut at the output limit |
+| 33eca536 | 30.4–42.8 | 31-turn cap: wrote a JSON input/expect per property, then grepped beagle's binary for the rule |
+| fc87b9e2 | 42.8–52.6 | added `"property": "<id>"` to each JSON file; draft check passed |
+
+- What held the contract was one rule: `contract check` printed "no
+  acceptance file names property X: a property has no input to replay, so a
+  test must encode it, naming its id" once for each of 19 properties. Workers
+  read "encode it" as the COBS operation and gave each property an input and
+  expect, in the entry and then in `contract/prop-*.json` files named after
+  the ids (`files = ["contract/"]`, so the JSON files were read, and they did
+  not name the id in their text). Beagle 711abcb (branch
+  property-acceptance-message) prints one problem listing the unnamed ids and
+  the files it read, says the id goes in that file's text beside the test,
+  and that a file named after the id or an input on the entry does not count.
+- The check passed on a name, not a test: fc87b9e2 wrote each id into its
+  JSON file, and accept.sh names none of the 19. A data file holding the id
+  satisfied the rule; beagle e02f316 (same branch, T0530) counts an id only in
+  an acceptance file that is not a JSON document.
+- T0528 seen once: 392cdfc0's reply at the output limit (49.6k reasoning
+  chars) was replayed, and the next reply acted, writing a Python COBS to
+  compute expected outputs (T0529). Its wall left out the 318 s.
+- No tool calls written as text, no loop cuts.
+- The driver's own criterion `len(encode(b"a"*300)) <= 301` is wrong for COBS
+  (300 non-zero bytes need two code bytes); nothing graded it here.
+
