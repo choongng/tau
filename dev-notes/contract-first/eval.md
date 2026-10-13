@@ -17,6 +17,7 @@ branch and sha. Grades come from `grade_<task>.py` over `runs/RNN/adapter.py`;
 | R83 | q35 | itc | contract-first a80193c (add, listing, bare names) | 18/42 | R81 0/42; R57 lean cases-first 23/42 |
 | R84 | q35 | cobs | contract-first a80193c (add, listing, bare names) | 39/44 | R82 0/44; R60 42/44; B05 plain 41/44 |
 | R85 | q35 | cobs | contract-first 6e25585 (independent second, T0516) | 0/44 | R84 39/44; B05 plain 41/44 |
+| R86 | q35 | cobs | contract-first 6e25585 (T0516, T0518, T0519) | 42/44 | R84 39/44; B05 plain 41/44 in 48.8 min |
 
 ## B06 — the invented spec was not hard
 
@@ -262,3 +263,42 @@ then made a host symlink `~/.local/bin/python -> /usr/bin/python3` (removed afte
 R85, which ran with it). T0518 (24d24895) looks a check's first word up before
 running it, and refuses one that is not a program here. The refusal names
 `python3` or `.venv/bin/python` when they are there.
+
+## R86 — q35 cobs: 42/44, sealed at 14 min, capped in Tests
+
+Tau d1704881 (T0518, T0519), beagle 6e25585. Capped at 60 min. The code grades
+42/44 and fails only the two malformed-input cases. That is the best
+contract-first cobs grade, and above plain tau's 41/44 (B05). The code was
+committed with T0006 at about 44 min. The run did not finish: Tests was open at
+the cap, with Package and a gate fix pending, so it does not beat B05's 48.8 min.
+
+| Stage | Minutes | |
+|---|---|---|
+| Founding | 0–1.8 | |
+| Contract T0002 | 1.8–7.8 | 19 added, 2 refused |
+| Second extraction T0003 | 8.0–10.4 | 20 added, 2 refused; did not read the first |
+| Reconcile T0004 | 10.6–13.6 | 3 added; then sealed |
+| Core encoding T0006 | 14.0–44 | three workers, below |
+| Decoding T0007 | 44 | done by T0006, no worker |
+| Tests T0008 | 44–59 | worker killed at its 900 s budget; open at the cap |
+
+- The contract stage took 14 min (R84: 19). Reconcile had real work this time,
+  so it was a worker, not T0519's close at the seal.
+- T0518 refused the driver's first T0006 check (`python -c …`): "no `python` on
+  PATH; python3 is". The driver corrected it in one call.
+- T0006's first worker read the reference and the contract, then spent 10 min
+  writing the encoder in its reasoning. It was cut off at the 16K output limit
+  twice and ended with no file written.
+- T0006's check was the driver's own `python3 -c` assertions, and they
+  contradicted each other: `encode(b'') == b'\x01'` with no delimiter, but
+  `encode(b'\x00') == b'\x01\x01\x00'` with one. The second worker's code met
+  the contract and failed the check. The driver amended the check, and a third
+  worker ran (35.6–42.7 min). About 9 min went to a check the contract would not
+  have written.
+- The goal's criteria include a pytest suite and packaging, which the contract
+  does not cover. Tests took the rest of the hour.
+
+What it says: the contract stage is now about 14 min on cobs. After the seal,
+the time goes to checks the driver writes by hand, and to milestones the
+contract's acceptance could decide. The next step is to bind those milestones
+to `beagle pursuit contract run`, or a per-operation part of it.
