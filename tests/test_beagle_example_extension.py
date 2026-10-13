@@ -8327,6 +8327,34 @@ def test_the_memory_cap_wraps_a_command_in_a_systemd_scope(
 
 
 @pytest.mark.anyio
+async def test_a_check_whose_program_is_not_here_could_not_start(
+    tmp_path: Path, beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # R84: `python -m pytest` where only python3 was on PATH ran under systemd-run,
+    # which exited 1, read as failing until the work was done; 32 minutes went to it.
+    ext = _module()
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    (bin_dir / "python3").symlink_to(sys.executable)
+    (tmp_path / ".venv" / "bin").mkdir(parents=True)
+    (tmp_path / ".venv" / "bin" / "python").symlink_to(sys.executable)
+    monkeypatch.setenv("PATH", str(bin_dir))
+
+    rc, out = await ext._run_check("python -m pytest -q", tmp_path, timeout=60)
+    ok_rc, _ = await ext._run_check("python3 -c pass", tmp_path, timeout=60)
+    venv_rc, _ = await ext._run_check(".venv/bin/python -c pass", tmp_path, timeout=60)
+    gone_rc, gone = await ext._run_check("tools/run.sh", tmp_path, timeout=60)
+
+    assert rc == 127
+    assert out == (
+        "the check could not start: no `python` on PATH; python3 and .venv/bin/python are"
+    )
+    assert ext._check_broke(rc, out, [], tmp_path) == out
+    assert (ok_rc, venv_rc) == (0, 0)
+    assert (gone_rc, gone) == (127, "the check could not start: tools/run.sh is not a program here")
+
+
+@pytest.mark.anyio
 async def test_a_check_over_the_memory_cap_is_killed_and_says_why(
     tmp_path: Path, beagle: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -9786,6 +9786,27 @@ def _check_stopped(command: str, root: Path) -> tuple[str, float, float | None] 
     return killed[0], killed[1], _CHECK_SECONDS.get(key)
 
 
+def _missing_program(program: str, root: Path) -> str:
+    """Why a check's first word cannot be run in `root`, or "".
+
+    R84: bound to `python -m pytest -q --co -q` where only python3 was on PATH,
+    the check ran under systemd-run, which said "Failed to find executable
+    python" and exited 1. That read as failing until the work was done, and two
+    workers spent 32 minutes on a check no work could pass.
+    """
+    if "/" in program:
+        path = Path(program) if Path(program).is_absolute() else root / program
+        return "" if os.access(path, os.X_OK) else f"{program} is not a program here"
+    if shutil.which(program):
+        return ""
+    near = [f"{program}3"] if shutil.which(f"{program}3") else []
+    if os.access(root / ".venv" / "bin" / program, os.X_OK):
+        near.append(f".venv/bin/{program}")
+    if not near:
+        return f"no `{program}` on PATH"
+    return f"no `{program}` on PATH; {' and '.join(near)} {'are' if len(near) > 1 else 'is'}"
+
+
 async def _run_check(command: str, root: Path, timeout: float) -> tuple[int, str]:
     """Run a task's `done_when` the way its close will, before the close does.
 
@@ -9801,6 +9822,9 @@ async def _run_check(command: str, root: Path, timeout: float) -> tuple[int, str
         return 2, f"the check will not split into arguments ({exc})"
     if not argv:
         return 2, "the check is empty"
+    missing = _missing_program(argv[0], root)
+    if missing:
+        return 127, f"the check could not start: {missing}"
     limit = _memory_max()
     key = (str(root), command)
     timeout = _check_timeout(command, root, timeout)
