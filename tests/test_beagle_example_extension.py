@@ -14212,6 +14212,48 @@ async def test_contract_worker_reads_the_references_by_contract_refs(
 
 
 @pytest.mark.anyio
+async def test_contract_worker_adds_entries_by_contract_add(
+    tmp_path: Path, beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # R81: the contract worker wrote the contract whole, a 51 KB call cut off at
+    # the output limit, then spent 17 minutes fixing what a later check found.
+    # `contract add` checks each entry as it lands; the worker may run it, and it
+    # counts as writing, though the guard sees no path in it.
+    module = _module()
+    runtime, project = _reference_worker(tmp_path, monkeypatch, cap=10, scope="contract/")
+    goal = project / ".beagle" / "pursuit.toml"
+    goal.write_text(goal.read_text() + module.CONTRACT_TABLE, encoding="utf-8")
+    bash = _tool_with_hooks(runtime, "bash")
+    entry = '{"id": "ex-1", "kind": "example", "operation": "encode", "source": "paper"}'
+
+    idle = [await bash.execute(f"l{i}", {"command": "ls"}) for i in range(8)]
+    add = await bash.execute(
+        "a1",
+        {"command": f"cd {project} && beagle pursuit contract add <<'EOF'\n{entry}\nEOF\n"},
+    )
+    after = [await bash.execute(f"m{i}", {"command": "ls"}) for i in range(4)]
+    seal = await bash.execute("s1", {"command": "beagle pursuit contract seal"})
+
+    assert all(result.text == "ran" for result in idle[:7])
+    assert "refusing to run this command: 7 of 10 calls used" in idle[7].text
+    assert add.text == "ran"
+    assert all(result.text == "ran" for result in after)
+    assert "refusing to run `beagle pursuit contract seal`" in seal.text
+    assert module._contract_add(["beagle", "pursuit", "contract", "add"])
+    assert module._contract_add(["beagle", "pursuit", "contract", "refs", "add"]) is None
+    # The founding's milestone and the driver's note name it.
+    assert "`beagle pursuit contract add`" in module.CONTRACT_MILESTONES[0]
+    assert "`beagle pursuit contract add`" in module.CONTRACT_FIRST_NOTE
+    # A cut-off write of the whole contract is told to add it instead.
+    cut = module._truncated_call(
+        {"_raw_arguments": '{"path": "contract/contract.json", "content": "{\\"entries'}
+    )
+    assert cut is not None and "add its entries to contract/contract.json a few" in cut
+    other = module._truncated_call({"_raw_arguments": '{"path": "src/x.py", "content": "'})
+    assert other is not None and "contract add" not in other
+
+
+@pytest.mark.anyio
 async def test_nth_reread_of_a_reference_window_is_still_refused(
     tmp_path: Path, beagle: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

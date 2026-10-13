@@ -338,7 +338,8 @@ CONTRACT_CRITERION = (
 CONTRACT_MILESTONES = (
     "Contract::read the sources and list in "
     f"{CONTRACT_PATH} what they pin down, each entry citing its source by line "
-    f"anchor, with {CONTRACT_DIR}/accept.sh running every entry against the code",
+    "anchor and added with `beagle pursuit contract add` as it is read, with "
+    f"{CONTRACT_DIR}/accept.sh running every entry against the code",
     "Second extraction::list it again in "
     f"{CONTRACT_SECOND} without reading the first, then reconcile the two",
 )
@@ -16336,28 +16337,43 @@ def _pursuit_verb(argv: list[str]) -> str | None:
 #: and `contract refs` 34 times, and R75's cited bare line numbers for want of
 #: the anchors `refs` prints.
 _CONTRACT_READ_VERBS = frozenset({"status", "check", "refs", "diff", "run"})
+#: And `contract add`, which writes the contract an entry at a time, each checked
+#: against its source as it lands. R81's contract worker wrote the file whole, a
+#: 51 KB call cut off at the output limit, and fixed it for 17 minutes more.
+#: beagle refuses it on a sealed contract, and only contract work opens before.
+_CONTRACT_WORKER_VERBS = _CONTRACT_READ_VERBS | {"add"}
 
 
 def _pursuit_write_verb(argv: list[str]) -> str | None:
     """The verb of a `beagle pursuit <verb>` argv that changes the pursuit, or None.
 
     A `contract` verb is named with what follows it (`contract seal`), and its
-    reads pass.
+    reads pass, as does `contract add`, which is the contract task's own work.
     """
     verb = _pursuit_verb(argv)
     if verb == "contract":
         words = [arg for arg in argv[argv.index("contract") + 1 :] if not arg.startswith("-")]
         then = words[0] if words else None
-        return None if then is None or then in _CONTRACT_READ_VERBS else f"contract {then}"
+        return None if then is None or then in _CONTRACT_WORKER_VERBS else f"contract {then}"
     return None if verb in _PURSUIT_READ_VERBS else verb
 
 
 def _contract_read(argv: list[str]) -> str | None:
     """`argv` itself if it reads the contract or a source with its anchors
-    (`beagle pursuit contract refs`, `check`, `status`, `diff`, `run`), or None."""
+    (`beagle pursuit contract refs`, `check`, `status`, `diff`, `run`) or adds
+    to it (`contract add`), or None."""
     if _pursuit_verb(argv) == "contract" and _pursuit_write_verb(argv) is None:
         return " ".join(argv)
     return None
+
+
+def _contract_add(argv: list[str]) -> str | None:
+    """`argv` itself if it is `beagle pursuit contract add`, or None."""
+    if not _contract_read(argv):
+        return None
+    words = [arg for arg in argv if not arg.startswith("-")]
+    at = words.index("contract")
+    return " ".join(argv) if words[at + 1 : at + 2] == ["add"] else None
 
 
 def _contract_refs_call(command: str) -> bool:
@@ -16965,6 +16981,13 @@ def _truncated_call(arguments: Mapping[str, Any], earlier: int = 0) -> str | Non
         "shorter to generate with a short script run inline by bash (`python3 - <<'EOF'` "
         "... `EOF`) or saved to a scratch path outside the project, never saved in scope."
     )
+    if CONTRACT_PATH in text:
+        # R81: the contract worker's first draft, 51 KB in one write.
+        refusal += (
+            f" The contract is not written whole: add its entries to {CONTRACT_PATH} a "
+            "few at a time with `beagle pursuit contract add` (the JSON on stdin, "
+            "<<'EOF' ... EOF), which checks each against its source as it lands."
+        )
     if earlier:
         refusal += (
             f" This is the {_ordinal(earlier + 1)} call cut off at the output limit; "
@@ -17311,6 +17334,8 @@ def make_worker_scope_guard() -> Any:
             )
             if uncounted:
                 calls -= 1  # q35 R51: not counted toward the nothing-written refusals
+            # `contract add` writes the contract, where the guard sees no path.
+            wrote = wrote or (bool(command) and _bash_find(command, _contract_add) is not None)
             reread = (
                 None
                 if wrote or uncounted
@@ -19295,7 +19320,8 @@ CONTRACT_FIRST_NOTE = (
     "sub-agent reads the sources (the references, the repo's docs, tests and types, a "
     "named standard, experiments it runs) and lists in "
     f"{CONTRACT_PATH} every worked example, stated limit, invalid input and operation "
-    f"they define, each quoting its source, and writes {CONTRACT_DIR}/accept.sh, which "
+    "they define, each citing its source by line anchor and added a few at a time with "
+    f"`beagle pursuit contract add`, and writes {CONTRACT_DIR}/accept.sh, which "
     "runs every entry against the code. 'Second extraction': another sub-agent lists "
     f"them again in {CONTRACT_SECOND} without reading the first, then reconciles the "
     f"two. Give both the scope `{CONTRACT_DIR}/`; the Contract's check is `beagle "
