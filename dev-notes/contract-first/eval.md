@@ -26,6 +26,7 @@ branch and sha. Grades come from `grade_<task>.py` over `runs/RNN/adapter.py`;
 | R92 | q35 | cobs | contract-first 1684138 (T0529); tau 7cb40c5e (T0527, T0528) | void: another session switched ~/tautest/tau's branch at 18 min, removing the beagle extension | — |
 | R93 | q35 | cobs | the same, tau pinned in ~/tautest/tau-harness | 0/44 at the 60 min cap (contract not sealed) | R92 sealed at 30.6 min; R91 5/44; R90 39/44; B05 plain 41/44 in 48.8 min |
 | R94 | q35 | cobs | contract-first e02f316 (T0529, T0530); tau 7cb40c5e pinned | 13/44 at the 60 min cap (working tree; encode 11/11, decode 0/11) | R93 0/44; R90 39/44; B05 plain 41/44 in 48.8 min |
+| R95 | q35 | itc | contract-first e02f316 (T0529, T0530); tau 7cb40c5e pinned | 22/42 at the 60 min cap (working tree; uncommitted) | R87 0/42; B04 plain 0/42 |
 
 ## B06 — the invented spec was not hard
 
@@ -543,4 +544,26 @@ sealed; R91 20.6 min; R90 30.3). T0005 closed on T0004's commit. Then T0006
   did not catch it.
 - Turn cap: 3 of 7 workers ended at it (R93: 3 of 6), the next worker
   re-reading the tree for 5–8 turns each time.
+
+## R95 — q35 itc: 22/42 at the cap; the first itc stamps that pass
+
+The first contract-first itc run since R87 (0/42), and the first q35 itc run
+to pass any case. Contract closed at 13.6 min, Second extraction at 18.6,
+then Reconcile took 29 min: the contract sealed at 46.5 min, 201 entries.
+The code was written in the last 8 min (11:46–11:53) by two workers on the
+scaffolding and data-model tasks: ~/itc/src/itc/clock.py (529 lines),
+uncommitted. Graded through its tree functions (split, event,
+sum_id/join_event, leq, normalize_*): paper 7/7, norm 6/6, leq 5/5, join
+4/4, trace-canon 0/10, trace-causal 0/10. The traces fail on join: event
+trees come back with negative counters (`(3, 3, (-1, …))`), so `join_event`
+lifts and sinks wrong on unequal bases.
+
+- Reconcile (T0004): the first worker hit the 900 s wall mid-merge; the
+  second found the check already passing, changed nothing and gave no
+  witness, so prove could not refuse and the task stayed open; the driver
+  spawned T0010 with a delta, which closed at 46.5 min. Beagle has a route
+  for a check that passes before the work ("abandon: done by T000N"), but
+  not for one that the previous, killed attempt made pass.
+- The contract stage cost 46.5 of 60 min; coding got 13. 201 entries is
+  ~5x cobs's.
 
