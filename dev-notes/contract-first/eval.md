@@ -641,8 +641,10 @@ Time went to:
 
 1. **An acceptance that passes whatever the code does.** accept.sh prints
    `ok` for every `property` and `operation` entry unconditionally ("tested
-   by hand" is a comment), and checks examples only for not raising: every
-   example's expect is `valid`. Precedence, the spec's own example chain
+   by hand" is a comment), and checks examples only for not raising, passing each input
+   whole to `Version(...)`: 12 of 35 examples expect `valid`, and the other
+   23 are comparisons such as `1.0.0 < 2.0.0` → `less`, which no comparison
+   ever reached (T0549). Precedence, the spec's own example chain
    included, is a property, so nothing ever asked the code to compare two
    versions. Sealing let it through: without code every entry fails to
    import, one shared load reason, so T0541's outlier test sees no outlier
