@@ -27,6 +27,7 @@ branch and sha. Grades come from `grade_<task>.py` over `runs/RNN/adapter.py`;
 | R93 | q35 | cobs | the same, tau pinned in ~/tautest/tau-harness | 0/44 at the 60 min cap (contract not sealed) | R92 sealed at 30.6 min; R91 5/44; R90 39/44; B05 plain 41/44 in 48.8 min |
 | R94 | q35 | cobs | contract-first e02f316 (T0529, T0530); tau 7cb40c5e pinned | 13/44 at the 60 min cap (working tree; encode 11/11, decode 0/11) | R93 0/44; R90 39/44; B05 plain 41/44 in 48.8 min |
 | R95 | q35 | itc | contract-first e02f316 (T0529, T0530); tau 7cb40c5e pinned | 22/42 at the 60 min cap (working tree; uncommitted) | R87 0/42; R83 18/42; R57 lean cases-first 23/42; B04 plain 0/42 |
+| R96 | q35 | wrenfold | contract-first e02f316 (T0529, T0530); tau 7cb40c5e pinned | 50/54 at the 60 min cap (working tree; package ~/wrenfold/wrenfold, uncommitted) | R71 0/54; B06 plain 54/54 in 9.1 min |
 
 ## B06 — the invented spec was not hard
 
@@ -566,4 +567,44 @@ lifts and sinks wrong on unequal bases.
   not for one that the previous, killed attempt made pass.
 - The contract stage cost 46.5 of 60 min; coding got 13. 201 entries is
   ~5x cobs's.
+
+## R96 — q35 wrenfold: 50/54 at the cap; the acceptance, not the code, held it
+
+R71 was 0/54 on this prompt; plain B06 was 54/54 in 9.1 min. The contract
+sealed at 14.5 min (Contract 6 min, Second extraction 2, Reconcile 5; 44
+entries), the fastest seal yet. The encoder milestone (T0006) then had 45
+min and never closed, though by +29 min its worker had written
+~/wrenfold/wrenfold/encoder.py (191 lines, encode/decode/count) that grades
+50/54 through `from wrenfold import ...`. It misses: encode([63]) drops
+the end marker after `40 3f`; decode accepts input with no end marker
+(empty, `05`, `01 02`).
+
+Where the 45 min went, all on the sealed accept.sh:
+
+- It loads the code by path, `spec_from_file_location("wrenfold",
+  "wrenfold.py")`, while the founding criteria import `from wrenfold` and
+  the driver scoped T0006 to `wrenfold/`. Workers 1-2 (+15 to +36 min)
+  built the package and could not write the root `wrenfold.py` the
+  acceptance reads; every entry failed `module 'wrenfold' has no attribute`.
+  The driver then wrote the shim itself (+52 min); it was gone at the cap.
+- Its test for `prop-marker-inside` (a property: "inside a two-, three- or
+  five-byte form 0x3F is an ordinary byte") invents an input and a wrong
+  answer: `decode(81 3f 00) == [319]`. `0x81` opens the three-byte form, so
+  the spec gives 81664, which the code returns. Worker 3 spent its 900 s
+  wall (+37 to +52 min) concluding "there might be an error in the
+  contract. But the contract is sealed" — and there is no route for that.
+- Three `invalid` entries (invalid-negative, invalid-oversize,
+  inv-overflow) carry prose for input (`invalid syntax`, `name 'integer'
+  is not defined` when accept.sh evals them): they can never pass,
+  whatever the code does.
+
+Run against the final code through a shim, accept.sh prints 33 ok and 7
+FAIL: three prose inputs, prop-marker-inside twice (Reconcile left it in
+twice), and the one real miss twice, `decode(05)` not raising.
+
+- The fixes this calls for are beagle's, at seal: an acceptance that
+  imports the code by name, as the goal does; a codeless run in which an
+  entry that fails for any reason other than the missing code is named as
+  the acceptance's own defect; and a recorded route for a worker to
+  dispute a sealed entry's test against its cited source.
 
