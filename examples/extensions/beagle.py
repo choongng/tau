@@ -340,8 +340,11 @@ CONTRACT_MILESTONES = (
     f"{CONTRACT_PATH} what they pin down, each entry citing its source by line "
     "anchor and added with `beagle pursuit contract add` as it is read, with "
     f"{CONTRACT_DIR}/accept.sh running every entry against the code",
-    "Second extraction::list it again in "
-    f"{CONTRACT_SECOND} without reading the first, then reconcile the two",
+    # R81: written as a second whole contract it took 11 minutes and 39 KB, when
+    # it is compared only by the lines its entries cite and the operations.
+    "Second extraction::without reading the first, list in "
+    f"{CONTRACT_SECOND} where the sources pin something, each entry only an id, "
+    "kind, operation, source and line-anchor cite, then reconcile the two",
 )
 #: How long sealing may take: it runs the contract's full check first.
 CONTRACT_SEAL_TIMEOUT = 300.0
@@ -19322,9 +19325,10 @@ CONTRACT_FIRST_NOTE = (
     f"{CONTRACT_PATH} every worked example, stated limit, invalid input and operation "
     "they define, each citing its source by line anchor and added a few at a time with "
     f"`beagle pursuit contract add`, and writes {CONTRACT_DIR}/accept.sh, which "
-    "runs every entry against the code. 'Second extraction': another sub-agent lists "
-    f"them again in {CONTRACT_SECOND} without reading the first, then reconciles the "
-    f"two. Give both the scope `{CONTRACT_DIR}/`; the Contract's check is `beagle "
+    "runs every entry against the code. 'Second extraction': another sub-agent, "
+    f"without reading the first, lists in {CONTRACT_SECOND} where the sources pin "
+    "something, by line anchor and operation only (no inputs or results), then "
+    f"reconciles the two. Give both the scope `{CONTRACT_DIR}/`; the Contract's check is `beagle "
     "pursuit contract check --draft`, the second's `beagle pursuit contract check`. "
     "Nothing else opens until the contract is sealed; then plan each milestone from "
     "it with pursuit_plan. Done is every entry passing (`beagle pursuit contract "

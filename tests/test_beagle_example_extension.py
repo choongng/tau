@@ -1642,6 +1642,8 @@ async def test_founding_declares_the_contract_and_seeds_it_first(
         "--ordered",
     ]
     assert split[1].startswith("Contract::") and split[2].startswith("Second extraction::")
+    assert "each entry only an id, kind, operation, source and line-anchor cite" in split[2]
+    assert "by line anchor and operation only (no inputs or results)" in module.CONTRACT_FIRST_NOTE
     assert module.DRIVER_STEERS_NOTE in result.text
     assert module.CONTRACT_FIRST_NOTE in result.text and "Cases first" not in result.text
     assert "beagle pursuit contract check --draft" in module.CONTRACT_FIRST_NOTE
