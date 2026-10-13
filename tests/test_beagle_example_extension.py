@@ -8041,6 +8041,10 @@ async def test_history_guard_holds_every_session_in_a_pursuit(
         # R75's contract worker, refused the anchors it was asked to cite.
         ("beagle pursuit contract refs itc2008 --grep fork", None),
         ("beagle pursuit contract check --draft --json", None),
+        # T0520: the rest of what a worker may read, and the run T0510 checks with.
+        ("beagle pursuit contract status", None),
+        ("beagle pursuit contract diff contract/contract.second.json", None),
+        ("beagle pursuit contract run --operation encode 2>&1 | tail -40", None),
         ("beagle pursuit contract seal", "contract seal"),
         ("beagle doctor", None),
         ("echo 'beagle pursuit close T0003'", None),
@@ -12070,6 +12074,10 @@ async def test_worker_guard_refuses_beagle_commands_and_beagle_reads(
             },
         ),
         ("bash", {"command": "beagle pursuit contract refs itc2008 --grep fork"}),
+        # T0520: the milestone's own check, and the rest a worker may read.
+        ("bash", {"command": "beagle pursuit contract run --operation encode"}),
+        ("bash", {"command": "beagle pursuit contract status"}),
+        ("bash", {"command": "beagle pursuit contract diff contract/contract.second.json"}),
         ("read", {"path": "tests/x.py"}),
     ]
     for tool, arguments in allowed:
@@ -12090,6 +12098,7 @@ async def test_worker_guard_refuses_beagle_commands_and_beagle_reads(
     assert brief.text == "ran"
     assert _module().NO_BEAGLE_NOTE.startswith("Do not inspect .beagle/ or run beagle")
     assert "beagle pursuit contract refs" in _module().NO_BEAGLE_NOTE
+    assert "beagle pursuit contract run --operation" in _module().NO_BEAGLE_NOTE
 
 
 # run R15 class 7: workers read .beagle/ through git, uv init wrote unseen, retries re-read

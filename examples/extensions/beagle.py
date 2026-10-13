@@ -16792,7 +16792,8 @@ NO_BEAGLE_REASON = (
 #: What a worker is told in its brief, to the same end.
 NO_BEAGLE_NOTE = (
     "Do not inspect .beagle/ or run beagle, apart from reading the contract "
-    "(`beagle pursuit contract refs`, `check`, `status`)."
+    "(`beagle pursuit contract refs`, `check`, `status`, `diff`) and running it against "
+    "the code (`beagle pursuit contract run --operation <op>`)."
 )
 #: What a worker is told to do with a locked test no code can pass. q35 R51:
 #: W4 spent 15.7 min fitting code to test_cases.py, which made one call for
