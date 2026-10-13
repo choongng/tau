@@ -11378,14 +11378,16 @@ async def _prove(
                 continue
             return _Proof(proven=True, text=tail, by_absent_source=by_absent_source)
         if verdicts.get(task) == "NOT PROVEN" and "STILL PASSES" in out:
-            if (
-                how is mutated
-                and not _in_scope(how[1], scope, root)
-                and os.path.normpath(how[1]) not in changed
+            if how is mutated and (
+                (not _in_scope(how[1], scope, root) and os.path.normpath(how[1]) not in changed)
+                or os.path.normpath(how[1]) in {os.path.normpath(rel) for rel in sources}
             ):
                 # q35 R54: W5's witness in cobs/__init__.py, outside T0005's scope
                 # [pyproject.toml], still passed ruff, and that ended the attempts
                 # before the absence of pyproject.toml, which would have proven.
+                # R97: T0005's witness in src/semver/__init__.py, a file the task
+                # wrote, still passed a file-existence check, and a second worker
+                # was sent; taking that file away is tried next, and that proved.
                 still_passes = tail
                 continue
             # The check passed over the defect: a real answer, not one a

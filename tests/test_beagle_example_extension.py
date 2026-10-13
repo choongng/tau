@@ -13217,6 +13217,87 @@ async def test_prove_witness_outside_scope_does_not_preempt_absence_of_the_tasks
 
 
 @pytest.mark.anyio
+async def test_passed_check_is_proven_without_a_second_worker(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # R97 T0005: the first worker wrote the scaffold, the file-existence check
+    # passed, and its WITNESS in a file it wrote still passed; a second worker
+    # spent 9.5 min on a new WITNESS, and taking the new files away then proved.
+    project = _git_project(tmp_path, monkeypatch)
+    monkeypatch.chdir(project)
+    monkeypatch.setenv(
+        "FAKE_TAU_REPORT",
+        "wrote done.txt\n\nWITNESS: done.txt\nNEEDLE:\ndone\nREPLACEMENT:\nnone\nEND WITNESS",
+    )
+    check = "python3 -c \"import os; exit(0 if os.path.isfile('done.txt') else 1)\""
+    _ready_task(fake_beagle, check)
+    # beagle's prove answers by how the defect is put back.
+    wrapper = fake_beagle / "beagle-by-site"
+    wrapper.write_text(
+        f"#!{sys.executable}\nimport os, sys\nfrom pathlib import Path\n"
+        f"here = Path({str(fake_beagle)!r})\n"
+        "if sys.argv[1:3] == ['pursuit', 'prove']:\n"
+        "    still = '--mutate' in sys.argv\n"
+        "    (here / 'prove.out').write_text(\n"
+        "        'T0002: NOT PROVEN — the check STILL PASSES with the defect put back\\n'\n"
+        "        if still else 'T0002: PROVEN — refuses when done.txt is absent\\n'\n"
+        "    )\n"
+        "    (here / 'prove.rc').write_text('9' if still else '0')\n"
+        "os.execv(str(here / 'beagle'), [str(here / 'beagle'), *sys.argv[1:]])\n",
+        encoding="utf-8",
+    )
+    wrapper.chmod(0o755)
+    monkeypatch.setenv("BEAGLE_BIN", str(wrapper))
+    runtime, _ = _bound(tmp_path)
+    args = {"task": "T0002", "criteria": "c", "done_when": check, "scope": ["done.txt"]}
+
+    result = await _tool(runtime, "pursuit_step").execute("c1", args)
+
+    assert len(_runs(fake_tau)) == 1, result.text
+    proves = _pursuit_calls(fake_beagle, "prove")
+    assert [how[1:3] for how in proves] == [["--mutate", "done.txt"], ["--absent", "done.txt"]]
+    assert _pursuit_calls(fake_beagle, "close")[0][:3] == ["T0002", "--outcome", "done"]
+    assert "closed done" in result.text
+
+    # A check nothing showed can fail is still not proven: with the source taken
+    # away it failed only on importing it, so the still-passing witness stands.
+    module = _module()
+    real = module._run
+    proved: list[list[str]] = []
+
+    def run(cmd: list[str], *args: Any, **kwargs: Any) -> tuple[int, str]:
+        if "prove" not in cmd:
+            return real(cmd, *args, **kwargs)
+        proved.append(cmd[cmd.index("prove") + 2 :])
+        if "--mutate" in cmd:
+            return 9, "T0002: NOT PROVEN — the check STILL PASSES with the defect put back\n"
+        return 0, (
+            "ERROR tests/test_clock.py - ModuleNotFoundError: No module named 'clock'\n"
+            "T0002: PROVEN — refuses when src/clock.py is absent\n"
+        )
+
+    monkeypatch.setattr(module, "_run", run)
+    (project / "src").mkdir()
+    (project / "src" / "clock.py").write_text("def add(a, b):\n    return a + b\n")
+    report = (
+        "wrote clock\n\nWITNESS: src/clock.py\nNEEDLE:\n    return a + b\n"
+        "REPLACEMENT:\n    return a - b\nEND WITNESS"
+    )
+
+    proof = await module._prove("T0002", report, ["src/"], project, 60)
+
+    assert [how[:2] for how in proved][:2] == [
+        ["--mutate", "src/clock.py"],
+        ["--absent", "src/clock.py"],
+    ]
+    assert proof is not None and not proof.proven and proof.weak
+
+
+@pytest.mark.anyio
 async def test_not_proven_retry_does_not_ask_for_a_test_when_scope_has_none(
     tmp_path: Path,
     beagle: Path,
