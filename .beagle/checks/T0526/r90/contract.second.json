@@ -1,0 +1,163 @@
+{
+  "sources": {
+    "Consistent_Overhead_Byte_Stuffing": {
+      "path": "references/Consistent_Overhead_Byte_Stuffing.txt"
+    }
+  },
+  "entries": [
+    {
+      "id": "op-encode",
+      "kind": "operation",
+      "operation": "encode",
+      "source": "Consistent_Overhead_Byte_Stuffing",
+      "cite": "41#5d6-43#1c7"
+    },
+    {
+      "id": "op-decode",
+      "kind": "operation",
+      "operation": "decode",
+      "source": "Consistent_Overhead_Byte_Stuffing",
+      "cite": "49#591-51#79f"
+    },
+    {
+      "id": "limit-min-overhead",
+      "kind": "limit",
+      "operation": "encode",
+      "source": "Consistent_Overhead_Byte_Stuffing",
+      "cite": "21#a24"
+    },
+    {
+      "id": "limit-max-overhead",
+      "kind": "limit",
+      "operation": "encode",
+      "source": "Consistent_Overhead_Byte_Stuffing",
+      "cite": "21#a24"
+    },
+    {
+      "id": "limit-lookahead",
+      "kind": "limit",
+      "operation": "encode",
+      "source": "Consistent_Overhead_Byte_Stuffing",
+      "cite": "22#5ab"
+    },
+    {
+      "id": "limit-offset-max",
+      "kind": "limit",
+      "operation": "decode",
+      "source": "Consistent_Overhead_Byte_Stuffing",
+      "cite": "51#79f"
+    },
+    {
+      "id": "prop-no-zeros",
+      "kind": "property",
+      "operation": "encode",
+      "source": "Consistent_Overhead_Byte_Stuffing",
+      "cite": "31#b70"
+    },
+    {
+      "id": "prop-delimiter",
+      "kind": "property",
+      "operation": "encode",
+      "source": "Consistent_Overhead_Byte_Stuffing",
+      "cite": "31#b70"
+    },
+    {
+      "id": "prop-nonzero-unchanged",
+      "kind": "property",
+      "operation": "encode",
+      "source": "Consistent_Overhead_Byte_Stuffing",
+      "cite": "58#9c0"
+    },
+    {
+      "id": "prop-254-special",
+      "kind": "property",
+      "operation": "encode",
+      "source": "Consistent_Overhead_Byte_Stuffing",
+      "cite": "45#efe-49#591"
+    },
+    {
+      "id": "prop-decode-stops-delimiter",
+      "kind": "property",
+      "operation": "decode",
+      "source": "Consistent_Overhead_Byte_Stuffing",
+      "cite": "163#5d7"
+    },
+    {
+      "id": "ex-1",
+      "kind": "example",
+      "operation": "encode",
+      "source": "Consistent_Overhead_Byte_Stuffing",
+      "cite": "69#457-70#3e2"
+    },
+    {
+      "id": "ex-2",
+      "kind": "example",
+      "operation": "encode",
+      "source": "Consistent_Overhead_Byte_Stuffing",
+      "cite": "72#cd3-73#dc6"
+    },
+    {
+      "id": "ex-3",
+      "kind": "example",
+      "operation": "encode",
+      "source": "Consistent_Overhead_Byte_Stuffing",
+      "cite": "75#075-76#d10"
+    },
+    {
+      "id": "ex-4",
+      "kind": "example",
+      "operation": "encode",
+      "source": "Consistent_Overhead_Byte_Stuffing",
+      "cite": "78#32f-79#d5c"
+    },
+    {
+      "id": "ex-5",
+      "kind": "example",
+      "operation": "encode",
+      "source": "Consistent_Overhead_Byte_Stuffing",
+      "cite": "81#cc0-82#ca8"
+    },
+    {
+      "id": "ex-6",
+      "kind": "example",
+      "operation": "encode",
+      "source": "Consistent_Overhead_Byte_Stuffing",
+      "cite": "84#344-85#a99"
+    },
+    {
+      "id": "ex-7",
+      "kind": "example",
+      "operation": "encode",
+      "source": "Consistent_Overhead_Byte_Stuffing",
+      "cite": "87#db8-88#9e2"
+    },
+    {
+      "id": "ex-8",
+      "kind": "example",
+      "operation": "encode",
+      "source": "Consistent_Overhead_Byte_Stuffing",
+      "cite": "90#f62-91#d30"
+    },
+    {
+      "id": "ex-9",
+      "kind": "example",
+      "operation": "encode",
+      "source": "Consistent_Overhead_Byte_Stuffing",
+      "cite": "93#dfb-94#0f2"
+    },
+    {
+      "id": "ex-10",
+      "kind": "example",
+      "operation": "encode",
+      "source": "Consistent_Overhead_Byte_Stuffing",
+      "cite": "96#b16-97#146"
+    },
+    {
+      "id": "ex-11",
+      "kind": "example",
+      "operation": "encode",
+      "source": "Consistent_Overhead_Byte_Stuffing",
+      "cite": "99#45b-100#dc6"
+    }
+  ]
+}

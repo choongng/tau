@@ -1,0 +1,233 @@
+{
+  "sources": {
+    "Consistent_Overhead_Byte_Stuffing": {
+      "command": "curl -s https://en.wikipedia.org/wiki/Consistent_Overhead_Byte_Stuffing",
+      "output": "Wikipedia article on COBS, 256 lines"
+    },
+    "Consistent_Overhead_Byte_Stuffing.txt": {
+      "command": "cat references/Consistent_Overhead_Byte_Stuffing.txt",
+      "output": "Jump to content\n\nConsistent Overhead Byte Stuffing\n\n2 languages\n\nPolski\n\nРусский\n\nEdit links\n\nFrom Wikipedia, the free encyclopedia\n\nAlgorithm for encoding data bytes\n\nConsistent Overhead Byte Stuffing (COBS) is an algorithm for encoding data bytes that results in efficient, reliable, unambiguous packet framing regardless of packet content, thus making it easy for receiving applications to recover from malformed packets. It employs a particular byte value, typically zero, to serve as a packet delimiter (a special value that indicates the boundary between packets). When zero is used as a delimiter, the algorithm replaces each zero data byte with a non-zero value so that no zero data bytes will appear in the packet and thus be misinterpreted as packet boundaries.\n\nByte stuffing is a process that transforms a sequence of data bytes that may contain 'illegal' or 'reserved' values (such as packet delimiter) into a potentially longer sequence that contains no occurrences of those values. The extra length of the transformed sequence is typically referred to as the overhead of the algorithm. HDLC framing is a well-known example, used particularly in PPP (see RFC 1662 § 4.2). Although HDLC framing has an overhead of <1% in the average case, it suffers from a very poor worst-case overhead of 100%; for inputs that consist entirely of bytes that require escaping, HDLC byte stuffing will double the size of the input.\n\nThe COBS algorithm, on the other hand, tightly bounds the worst-case overhead. COBS requires a minimum of 1 byte overhead, and a maximum of ⌈n/254⌉ bytes for n data bytes (one byte in 254, rounded up). Consequently, the time to transmit the encoded byte sequence is highly predictable, which makes COBS useful for real-time applications in which jitter may be problematic. The algorithm is computationally inexpensive, and in addition to its desirable worst-case overhead, its average overhead is also low compared to other unambiguous framing algorithms like HDLC.[1][2]\nCOBS does, however, require up to 254 bytes of lookahead. Before transmitting its first byte, it needs to know the position of the first zero byte (if any) in the following 254 bytes.\n\nA 1999 Internet Draft proposed to standardize COBS as an alternative for HDLC framing in PPP, due to the aforementioned poor worst-case overhead of HDLC framing.[3]\n\nPacket framing and stuffing\n[edit]\n\nWhen packetized data is sent over any serial medium, some protocol is required to demarcate packet boundaries. This is done by using a framing marker, a special bit-sequence or character value that indicates where the boundaries between packets fall. Data stuffing is the process that transforms the packet data before transmission to eliminate all occurrences of the framing marker, so that when the receiver detects a marker, it can be certain that the marker indicates a boundary between packets.\n\nCOBS transforms an arbitrary string of bytes in the range [0,255] into bytes in the range [1,255]. Having eliminated all zero bytes from the data, a zero byte can now be used to unambiguously mark the end of the transformed data. This is done by appending a zero byte to the transformed data, thus forming a packet consisting of the COBS-encoded data (the payload) to unambiguously mark the end of the packet.\n\n(Any other byte value may be reserved as the packet delimiter, but using zero simplifies the description.)\n\nConsistent Overhead Byte Stuffing (COBS) encoding process\n\nThere are two equivalent ways to describe the COBS encoding process:\n\nPrefixed block description\n\nTo encode some bytes, first append a zero byte, then break them into groups of either 254 non-zero bytes, or 0–253 non-zero bytes followed by a zero byte. Because of the appended zero byte, this is always possible.\n\nEncode each group by deleting the trailing zero byte (if any) and prepending the number of non-zero bytes, plus one. Thus, each encoded group is the same size as the original, except that 254 non-zero bytes are encoded into 255 bytes by prepending a byte of 255.\n\nAs a special exception, if a packet ends with a group of 254 non-zero bytes, it is not necessary to add the trailing zero byte. This saves one byte in some situations.\n\nLinked list description\n\nFirst, insert a zero byte at the beginning of the packet, and after every run of 254 non-zero bytes. This encoding is obviously reversible. It is not necessary to insert a zero byte at the end of the packet if it happens to end with exactly 254 non-zero bytes.\n\nSecond, replace each zero byte with the offset to the next zero byte, or the end of the packet. Because of the extra zeros added in the first step, each offset is guaranteed to be at most 255.\n\nEncoding examples\n[edit]\n\nThese examples show how various data sequences would be encoded by the COBS algorithm. In the examples, all bytes are expressed as hexadecimal values, and encoded data is shown with text formatting to illustrate various features:\n\nBold indicates a data byte which has not been altered by encoding. All non-zero data bytes remain unaltered.\n\nGreen indicates a zero data byte that was altered by encoding. All zero data bytes are replaced during encoding by the offset to the following zero byte (i.e. one plus the number of non-zero bytes that follow). It is effectively a pointer to the next packet byte that requires interpretation: if the addressed byte is non-zero then it is the following group header byte zero data byte that points to the next byte requiring interpretation; if the addressed byte is zero then it is the end of packet.\n\nRed is an overhead byte which is also a group header byte containing an offset to a following group, but does not correspond to a data byte. These appear in two places: at the beginning of every encoded packet, and after every group of 254 non-zero bytes.\n\nA blue zero byte appears at the end of every packet to indicate end-of-packet to the data receiver. This packet delimiter byte is not part of COBS proper; it is an additional framing byte that is appended to the encoded output.\n\nExample | Unencoded data (hex)\n| Data bytes | Encoded with COBS (hex)\n\n1 | 00\n| 1 | 01 01 00\n\n2 | 00 00\n| 2 | 01 01 01 00\n\n3 | 00 11 00\n| 3 | 01 02 11 01 00\n\n4 | 11 22 00 33\n| 4 | 03 11 22 02 33 00\n\n5 | 11 22 33 44\n| 4 | 05 11 22 33 44 00\n\n6 | 11 00 00 00\n| 4 | 02 11 01 01 01 00\n\n7 | 01 02 03 ... FD FE\n| 254 | FF 01 02 03 ... FD FE 00\n\n8 | 00 01 02 ... FC FD FE\n| 255 | 01 FF 01 02 ... FC FD FE 00\n\n9 | 01 02 03 ... FD FE FF\n| 255 | FF 01 02 03 ... FD FE 02 FF 00\n\n10 | 02 03 04 ... FE FF 00\n| 255 | FF 02 03 04 ... FE FF 01 01 00\n\n11 | 03 04 05 ... FF 00 01\n| 255 | FE 03 04 05 ... FF 02 01 00\n\nBelow is a diagram using example 4 from above table, to illustrate how each modified data byte is located, and how it is identified as a data byte or an end of frame byte.\n\n[OHB] : Overhead byte (Start of frame)\n3+ -------------->| : Points to relative location of first zero symbol\n2+-------->| : Is a zero data byte, pointing to next zero symbol\n[EOP] : Location of end-of-packet zero symbol.\n0 1 2 3 4 5 : Byte Position\n03 11 22 02 33 00 : COBS Data Frame\n11 22 00 33 : Extracted Data\n\nOHB = Overhead Byte (Points to next zero symbol)\nEOP = End Of Packet\n\nExamples 7 through 10 show how the overhead varies depending on the data being encoded for packet lengths of 255 or more.\n\nImplementation\n[edit]\n\nThe following code implements a COBS encoder and decoder in the C programming language, processing data byte by byte.\n\n#include <stddef.h>\n#include <stdint.h>\n#include <assert.h>\n\n/** COBS encode data to buffer\n@param data Pointer to input data to encode\n@param length Number of bytes to encode\n@param buffer Pointer to encoded output buffer\n@return Encoded buffer length in bytes\n@note Does not output delimiter byte\n*/\nsize_t cobsEncode(const void *data, size_t length, uint8_t *buffer)\n{\nassert(data && buffer);\n\nuint8_t *encode = buffer; // Encoded byte pointer\nuint8_t *codep = encode++; // Output code pointer\nuint8_t code = 1; // Code value\n\nfor (const uint8_t *byte = (const uint8_t *)data; length--; ++byte)\n{\nif (*byte) // Byte not zero, write it\n*encode++ = *byte, ++code;\n\nif (!*byte || code == 0xff) // Input is zero or block completed, restart\n{\n*codep = code, code = 1, codep = encode;\nif (!*byte || length)\n++encode;\n}\n}\n*codep = code; // Write final code value\n\nreturn (size_t)(encode - buffer);\n}\n\n/** COBS decode data from buffer\n@param buffer Pointer to encoded input bytes\n@param length Number of bytes to decode\n@param data Pointer to decoded output data\n@return Number of bytes successfully decoded\n@note Stops decoding if delimiter byte is found\n*/\nsize_t cobsDecode(const uint8_t *buffer, size_t length, void *data)\n{\nassert(buffer && data);\n\nconst uint8_t *byte = buffer; // Encoded input byte pointer\nuint8_t *decode = (uint8_t *)data; // Decoded output byte pointer\n\nfor (uint8_t code = 0xff, block = 0; byte < buffer + length; --block)\n{\nif (block) // Decode block byte\n*decode++ = *byte++;\nelse\n{\nblock = *byte++; // Fetch the next block length\nif (block && (code != 0xff)) // Encoded zero, write it unless it's delimiter.\n*decode++ = 0;\ncode = block;\nif (!code) // Delimiter code found\nbreak;\n}\n}\n\nreturn (size_t)(decode - (uint8_t *)data);\n}\n\nSee also\n[edit]\n\nBit stuffing\n\nSerial Line Internet Protocol\n\nReferences\n[edit]\n\n↑\n\nCheshire, Stuart; Baker, Mary (April 1999). \"Consistent Overhead Byte Stuffing\" (PDF). IEEE/ACM Transactions on Networking. 7 (2): 159–172. CiteSeerX 10.1.1.108.3143. doi:10.1109/90.769765. S2CID 47267776. Retrieved November 30, 2015. {{cite journal}}: Cite uses deprecated parameter |citeseerx= (help)\n\n↑\nCheshire, Stuart; Baker, Mary (17 November 1997). Consistent Overhead Byte Stuffing (PDF). ACM SIGCOMM '97. Cannes. Retrieved November 23, 2010.\n\n↑ Carlson, James; Cheshire, Stuart; Baker, Mary (November 1997). PPP Consistent Overhead Byte Stuffing (COBS). IETF. I-D draft-ietf-pppext-cobs-00.txt.\n\nExternal links\n[edit]\n\nPython implementation\n\nAlternate C implementation\n\nAnother implementation in C\n\nConsistent Overhead Byte Stuffing—Reduced (COBS/R)\n\nA patent describing a scheme with a similar result but using a different method\n\nRetrieved from \"https://en.wikipedia.org/w/index.php?title=Consistent_Overhead_Byte_Stuffing&oldid=1344930661\"\n\nCategories:\n\nEncodings\n\nComputer network technology\n\nLink protocols\n\nLogical link control\n\nTelecommunications standards\n\nTelecommunication protocols\n\nNetworking standards\n\nHidden categories:\n\nArticles with short description\n\nShort description matches Wikidata\n\nCS1 errors: deprecated parameters\n\nSearch\n\nSearch\n\nConsistent Overhead Byte Stuffing\n\n2 languages\n\nAdd topic\n"
+    }
+  },
+  "entries": [
+    {
+      "id": "op-decode",
+      "kind": "operation",
+      "source": "Consistent_Overhead_Byte_Stuffing.txt",
+      "cite": "49#591-51#79f",
+      "statement": "COBS decodes by reading block length, outputting that many data bytes, and if block length is not zero, inserting a zero byte and repeating. Stop when delimiter code (zero) is found.",
+      "operation": "decode"
+    },
+    {
+      "id": "prop-no-zeros",
+      "kind": "property",
+      "source": "Consistent_Overhead_Byte_Stuffing.txt",
+      "cite": "31#b70",
+      "statement": "COBS transforms bytes in [0,255] into bytes in [1,255]. All zero bytes eliminated from encoded data except appended delimiter.",
+      "operation": "encode"
+    },
+    {
+      "id": "prop-delimiter",
+      "kind": "property",
+      "source": "Consistent_Overhead_Byte_Stuffing.txt",
+      "cite": "31#b70",
+      "statement": "A zero byte is appended to transformed data to mark end of packet. This delimiter is not part of COBS proper but used for framing.",
+      "operation": "encode"
+    },
+    {
+      "id": "prop-roundtrip",
+      "kind": "property",
+      "source": "Consistent_Overhead_Byte_Stuffing.txt",
+      "cite": "49#591-51#79f",
+      "statement": "Decode(Encode(data)) == data for all valid byte sequences. Encoding is reversible.",
+      "operation": "encode"
+    },
+    {
+      "id": "prop-nonzero-unchanged",
+      "kind": "property",
+      "source": "Consistent_Overhead_Byte_Stuffing.txt",
+      "cite": "58#9c0",
+      "statement": "All non-zero data bytes remain unaltered by encoding.",
+      "operation": "encode"
+    },
+    {
+      "id": "op-encode",
+      "kind": "operation",
+      "source": "Consistent_Overhead_Byte_Stuffing.txt",
+      "cite": "41#5d6-43#1c7",
+      "statement": "COBS encodes by appending a zero byte, breaking into groups of 254 non-zero bytes (or fewer followed by zero), then replacing each trailing zero with the count of preceding non-zero bytes plus one.",
+      "operation": "encode"
+    },
+    {
+      "id": "ex-1",
+      "kind": "example",
+      "source": "Consistent_Overhead_Byte_Stuffing.txt",
+      "cite": "69#457-70#3e2",
+      "input": "00",
+      "expect": "010100",
+      "operation": "encode"
+    },
+    {
+      "id": "ex-2",
+      "kind": "example",
+      "source": "Consistent_Overhead_Byte_Stuffing.txt",
+      "cite": "72#cd3-73#dc6",
+      "input": "0000",
+      "expect": "01010100",
+      "operation": "encode"
+    },
+    {
+      "id": "ex-3",
+      "kind": "example",
+      "source": "Consistent_Overhead_Byte_Stuffing.txt",
+      "cite": "75#075-76#d10",
+      "input": "001100",
+      "expect": "0102110100",
+      "operation": "encode"
+    },
+    {
+      "id": "ex-4",
+      "kind": "example",
+      "source": "Consistent_Overhead_Byte_Stuffing.txt",
+      "cite": "78#32f-79#d5c",
+      "input": "11220033",
+      "expect": "031122023300",
+      "operation": "encode"
+    },
+    {
+      "id": "ex-5",
+      "kind": "example",
+      "source": "Consistent_Overhead_Byte_Stuffing.txt",
+      "cite": "81#cc0-82#ca8",
+      "input": "11223344",
+      "expect": "051122334400",
+      "operation": "encode"
+    },
+    {
+      "id": "ex-6",
+      "kind": "example",
+      "source": "Consistent_Overhead_Byte_Stuffing.txt",
+      "cite": "84#344-85#a99",
+      "input": "11000000",
+      "expect": "021101010100",
+      "operation": "encode"
+    },
+    {
+      "id": "ex-7",
+      "kind": "example",
+      "source": "Consistent_Overhead_Byte_Stuffing.txt",
+      "cite": "87#db8-88#9e2",
+      "input": "0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4f5f6f7f8f9fafbfcfdfe",
+      "expect": "ff0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4f5f6f7f8f9fafbfcfdfe00",
+      "operation": "encode"
+    },
+    {
+      "id": "ex-8",
+      "kind": "example",
+      "source": "Consistent_Overhead_Byte_Stuffing.txt",
+      "cite": "90#f62-91#d30",
+      "input": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4f5f6f7f8f9fafbfcfdfe",
+      "expect": "01ff0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4f5f6f7f8f9fafbfcfdfe00",
+      "operation": "encode"
+    },
+    {
+      "id": "ex-9",
+      "kind": "example",
+      "source": "Consistent_Overhead_Byte_Stuffing.txt",
+      "cite": "93#dfb-94#0f2",
+      "input": "0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4f5f6f7f8f9fafbfcfdfeff",
+      "expect": "ff0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4f5f6f7f8f9fafbfcfdfe02ff00",
+      "operation": "encode"
+    },
+    {
+      "id": "ex-10",
+      "kind": "example",
+      "source": "Consistent_Overhead_Byte_Stuffing.txt",
+      "cite": "96#b16-97#146",
+      "input": "02030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4f5f6f7f8f9fafbfcfdfeff00",
+      "expect": "ff02030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4f5f6f7f8f9fafbfcfdfeff010100",
+      "operation": "encode"
+    },
+    {
+      "id": "ex-11",
+      "kind": "example",
+      "source": "Consistent_Overhead_Byte_Stuffing.txt",
+      "cite": "99#45b-100#dc6",
+      "input": "030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4f5f6f7f8f9fafbfcfdfeff0001",
+      "expect": "fe030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4f5f6f7f8f9fafbfcfdfeff020100",
+      "operation": "encode"
+    },
+    {
+      "id": "prop-decode-stops-delimiter",
+      "kind": "property",
+      "source": "Consistent_Overhead_Byte_Stuffing.txt",
+      "cite": "163#5d7",
+      "statement": "COBS decode stops when a delimiter code (zero) is found in the input stream.",
+      "operation": "decode"
+    },
+    {
+      "id": "prop-decode-inserts-zero",
+      "kind": "property",
+      "source": "Consistent_Overhead_Byte_Stuffing.txt",
+      "cite": "51#79f",
+      "statement": "During decode, when block length is not zero and not the first block, a zero byte is inserted in the output.",
+      "operation": "decode"
+    },
+    {
+      "id": "prop-delimiter-eliminated",
+      "kind": "property",
+      "source": "Consistent_Overhead_Byte_Stuffing.txt",
+      "cite": "31#b70",
+      "statement": "After encoding, all zero bytes are eliminated from the data except the appended delimiter byte. The encoded payload (before delimiter) contains only bytes in [1,255].",
+      "operation": "encode"
+    },
+    {
+      "id": "prop-min-overhead",
+      "kind": "property",
+      "source": "Consistent_Overhead_Byte_Stuffing.txt",
+      "cite": "21#a24",
+      "statement": "COBS requires a minimum of 1 byte overhead. Encoded length is always at least input length + 1.",
+      "operation": "encode"
+    },
+    {
+      "id": "prop-lookahead",
+      "kind": "property",
+      "source": "Consistent_Overhead_Byte_Stuffing.txt",
+      "cite": "22#5ab",
+      "statement": "COBS requires up to 254 bytes of lookahead before transmitting its first byte.",
+      "operation": "encode"
+    },
+    {
+      "id": "prop-offset-max-255",
+      "kind": "property",
+      "source": "Consistent_Overhead_Byte_Stuffing.txt",
+      "cite": "51#79f",
+      "statement": "Each offset in COBS is guaranteed to be at most 255. Encoded block headers are in range [1,255].",
+      "operation": "encode"
+    },
+    {
+      "id": "prop-254-special",
+      "kind": "property",
+      "source": "Consistent_Overhead_Byte_Stuffing.txt",
+      "cite": "45#efe-49#591",
+      "statement": "If a packet ends with exactly 254 non-zero bytes, the trailing zero byte is not added, saving one byte.",
+      "operation": "encode"
+    },
+    {
+      "id": "prop-max-overhead",
+      "kind": "property",
+      "source": "Consistent_Overhead_Byte_Stuffing.txt",
+      "cite": "21#a24",
+      "statement": "COBS has a maximum overhead of ⌈n/254⌉ bytes for n data bytes. Encoded length ≤ n + ⌈n/254⌉.",
+      "operation": "encode"
+    },
+    {
+      "id": "limit-min-overhead",
+      "kind": "property",
+      "operation": "encode",
+      "source": "Consistent_Overhead_Byte_Stuffing.txt",
+      "cite": "21#a24",
+      "statement": "COBS requires a minimum of 1 byte overhead. Encoded length is always at least input length + 1."
+    }
+  ]
+}
