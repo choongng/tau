@@ -12,6 +12,8 @@ branch and sha. Grades come from `grade_<task>.py` over `runs/RNN/adapter.py`;
 | R72 | q35 | cobs | contract-first c4bc1a5 | 0/44 | R60 42/44 (cases-first); B05 plain 41/44 |
 | R73 | q35 | itc | contract-first c4bc1a5 | 0/42 | B04 plain 0/42; R53–R61 cases-first: see below |
 | R74 | qwen 9B | cobs | contract-first 01db8e9 | 11/44 | qwen cobs best 7/44 (R22 3, R43 5); B01 0/44 |
+| R81 | q35 | itc | contract-first fce5dac (anchors) | 0/42 | R73 0/42; R57 lean cases-first 23/42 |
+| R82 | q35 | cobs | contract-first fce5dac (anchors) | 0/44 | R72 0/44; R60 42/44 (cases-first) |
 
 ## B06 — the invented spec was not hard
 
@@ -102,3 +104,68 @@ checks the hash and fills in the quote), then re-run q35 on cobs and itc.
 Open beyond that: a driver that does the work itself after abandoning, a
 seal task that is ready with no contract, and the per-worker turn cap on
 long contract tasks.
+
+## Line anchors: R75–R82 (T0504, T0506, T0508)
+
+Cites became `N#hhh` line anchors (beagle 809d194, fce5dac): `contract refs`
+prints each reference line with its anchor, and the check refuses an anchor
+whose hash is wrong or a bare line number, naming the right one. Three runs
+were stopped before grading, each by a tau guard that kept the workers from
+the anchors, and each guard was fixed before the next run:
+
+- **R75** (stopped): a worker sent with no task could not run `contract`
+  verbs (T0502, tau 0de5e0b7).
+- **R77** (stopped): a worker sent on a task met the "do not run beagle"
+  orientation guard, and invented anchors (T0505, tau 8633f50a).
+- **R79** (stopped): the brief offered 12 `read` calls at 60 lines, the worker
+  paged the references with `read`, and the call budget then refused
+  `contract refs`; 71 of 76 anchors were invented, copying the brief's example
+  (T0507, tau eab231f1: references are read by `contract refs`, uncounted).
+
+## R81 — q35 itc: the contract sealed; the code ignored it
+
+Capped at 3600 s, 5 of 9 tasks done. The first contract-first run to seal.
+The contract worker ran `contract refs` 38 times; its first draft had 34 bad
+cites of 76, and the check's refusals took that to 0. T0002 closed at 16:02
+(95 entries), the second extraction sealed it at 16:13, and Scaffolding, Core
+types, Split and Merge took the last 15 minutes.
+
+The contract states the paper's model (id and event trees, `split(1) =
+((1,0),(0,1))`), but `itc/clock.py` is a float interval per named node, so
+every grader case fails. Nothing held the code to the contract: `accept.sh`
+names `contract.json` only in a comment and runs 16 hand-written tests against
+a `src/itc/stamp.py` that was never built, none of the 58 example ids, and
+beagle's acceptance check reads the script's text only. Milestones closed on
+their own tests. Follow-ups: T0509 (the acceptance run must report every
+entry id before the contract seals), T0510 (a milestone is held to the
+contract entries for its operations).
+
+Where the hour went: contract 45 min (first draft 14, of which one 51 KB
+whole-file write was cut off and redone in parts; fixing cites and coverage
+17; second extraction 11), implementation 15. The contract workers wrote
+about 100k output tokens; the contract is 46 KB and was written about 2.5
+times.
+
+## R82 — q35 cobs: two problems the check would not explain
+
+Capped at 3600 s, never sealed, no code. By 17:12 the draft had 31 entries,
+0 bad cites and 3 problems: no second extraction yet, and `op-encode` and
+`op-decode` "defined and nothing exercises it". Those two are beagle's: the
+operation entries name `encode(data: bytes) -> bytes`, the 13 examples name
+`encode`, and the check matches the two strings exactly without saying so.
+The worker spent its last minutes adding property links to the operation
+entries; the retry worker (T0009) re-read every file and ran out of time.
+
+## What R81–R82 say
+
+- Anchors work once the workers can reach them: 0 bad cites in both runs,
+  fixed from the check's own refusals.
+- Sealing is not enough. R81 sealed a correct contract and built something
+  else, because acceptance was text and milestones were not held to it.
+- The contract stage is still most of the hour (45 min on itc), mostly in
+  writing JSON: whole-file writes, fixes, and a second full extraction.
+- A refusal has to say what would satisfy it (R82's exact name match).
+
+Next: T0509, T0510, the operation-name match, and a cheaper contract stage
+(entries added one at a time and checked as they go; a second extraction
+that lists anchors rather than rewriting entries).
