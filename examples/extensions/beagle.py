@@ -124,12 +124,9 @@ from __future__ import annotations
 
 import ast
 import asyncio
-import bisect
-import builtins
 import contextlib
 import fnmatch
 import functools
-import hashlib
 import importlib.util
 import itertools
 import json
@@ -145,7 +142,7 @@ import tempfile
 import time
 import tomllib
 import uuid
-from collections.abc import Awaitable, Callable, Collection, Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -394,17 +391,6 @@ def _contract_declared(root: Path) -> bool:
     except (OSError, tomllib.TOMLDecodeError):
         return False
     return isinstance(goal.get("contract"), dict)
-
-
-def _cases_off(root: Path) -> bool:
-    """Whether the known-answers machinery steps aside: under `LEAN_ENV`, or with a contract.
-
-    The locks, the cases-first refusals and the source judge held the known
-    answers a worker wrote. With `[contract]` beagle holds them instead: the
-    contract is checked against its sources and sealed before the code is
-    planned, and a sealed file changes only in a task on the contract.
-    """
-    return _lean() or _contract_declared(root)
 
 
 def _contract_work(scope: list[str], root: Path) -> bool:
@@ -4342,40 +4328,26 @@ def _uncommitted_note(task: str, paths: list[str]) -> str:
     named = ", ".join(paths[:8])
     if len(paths) > 8:
         named += f", {len(paths) - 8} more"
-    # T0462: lean locks nothing; set at launch, so the text holds for the session.
-    locks = "" if _lean() else ", with locks when it is data"
     return (
-        f"Uncommitted in {task}'s scope: {named}. Give each to the part that writes it"
-        f"{locks}; otherwise it goes out in a later part's commit."
+        f"Uncommitted in {task}'s scope: {named}. Give each to the part that writes it; "
+        "otherwise it goes out in a later part's commit."
     )
 
 
-def _commit_before_split(
-    root: Path, task: str, scope: list[str], paths: list[str], goal: Path | None = None
-) -> str:
+def _commit_before_split(root: Path, task: str, scope: list[str], paths: list[str]) -> str:
     """Commit a split task's uncommitted work when its check last passed; the note to give.
 
     R12: test_comprehensive.py passed under T0007 and was left to the last
     part, so the workspace-clean gate stayed red for every part before it.
     Work whose check failed, or was never run, stays a note for the parts.
-    R28: the commit kept a stripped locked test, so locked files are put back
-    first; the task being split no longer fixes them.
     """
-    if _lean():
+    if _lean() or _LAST_CHECK_EXIT.get((str(root), task)) != 0:
         return _uncommitted_note(task, paths)
-    put_back = _put_back_drift(goal, root, but=task) if goal is not None else ""
-    if put_back:
-        paths = [rel for rel in _changed_files(root) if _in_scope(rel, scope, root)]
-        if not paths:
-            return put_back
-        put_back += "\n\n"
-    if _LAST_CHECK_EXIT.get((str(root), task)) != 0:
-        return put_back + _uncommitted_note(task, paths)
     said = _commit(task, SPLIT_WIP_TITLE, scope, root)
     left = [rel for rel in _changed_files(root) if _in_scope(rel, scope, root)]
     if left:
-        return f"{put_back}{said}\n\n{_uncommitted_note(task, left)}"
-    return put_back + (
+        return f"{said}\n\n{_uncommitted_note(task, left)}"
+    return (
         f"{task}'s check passed at its last run, so its uncommitted work "
         f"({', '.join(paths[:8])}{', …' if len(paths) > 8 else ''}) was committed as "
         f"'{task}: {SPLIT_WIP_TITLE}' before the split: {said}"
@@ -4484,42 +4456,6 @@ def _is_leaf(task: str, nodes: list[dict[str, Any]]) -> bool:
     )
 
 
-def _part_paths(part: str) -> list[str]:
-    """The paths a plan part's text names: words with a directory or a file suffix."""
-    return [word.rstrip(".") for word in _SCRIPT_PATH_WORD.findall(part)]
-
-
-def _writes_known_answers(text: str) -> bool:
-    """Whether a part or task's text names the known answers or their cases data file."""
-    return _split_part(text)[0].lower().startswith("known answers") or any(
-        _is_cases_data(path) for path in _part_paths(text)
-    )
-
-
-def _plan_order_problem(parts: list[str], task: str, goal: Path) -> str | None:
-    """Why an ordered plan writes new source before the known answers that judge it, or None.
-
-    Run R16 planned T0006 (interval_tree_clocks.py) before T0007-T0009 (the
-    cases and their tests), each waiting on the one before; the code would
-    have been written with nothing from the reference to judge it.
-    """
-    answers = next((i for i, part in enumerate(parts) if _writes_known_answers(part)), None)
-    if answers is None:
-        return None
-    for index, part in enumerate(parts[:answers]):
-        title = _part_title(part)
-        if _cases_first_problem(_part_paths(part), task, title, goal) is None:
-            continue
-        first = _part_title(parts[answers])
-        return (
-            f"Cases first: part {index + 1} {title!r} writes new source before part "
-            f"{answers + 1} {first!r} writes the known answers that judge it, and in an "
-            f"ordered plan each part waits on the one before. Put part {answers + 1} "
-            f"{first!r} first and send the plan again."
-        )
-    return None
-
-
 def _ancestors(task: str, nodes: list[dict[str, Any]]) -> set[str]:
     """The ids above `task` in the tree."""
     parent = {str(n.get("id")): str(n.get("parent") or "") for n in nodes}
@@ -4540,17 +4476,6 @@ def _is_container(task: str, nodes: list[dict[str, Any]]) -> bool:
         n.get("parent") == task and n.get("status") not in ("abandoned", "superseded")
         for n in nodes
     )
-
-
-def _live_leaves(task: str, nodes: list[dict[str, Any]]) -> list[str]:
-    """The pending or open leaves under `task`, depth first in tree order."""
-    found: list[str] = []
-    for n in nodes:
-        nid = str(n.get("id"))
-        if n.get("parent") != task or n.get("status") not in ("pending", "open"):
-            continue
-        found += _live_leaves(nid, nodes) if _is_container(nid, nodes) else [nid]
-    return found
 
 
 def _steppable(ids: list[str], nodes: list[dict[str, Any]]) -> list[str]:
@@ -4706,9 +4631,6 @@ def make_plan_tool() -> Any:
         if rerun is not None:
             return _step_result(f"pursuit_plan: nothing added — {rerun}")
         ordered = arguments.get("ordered", True) is not False
-        backwards = _plan_order_problem(parts, task, goal) if ordered else None
-        if backwards is not None:
-            return _step_result(f"pursuit_plan: nothing added — {backwards}")
         # Run R25 sent 'T0007::…' to `split` raw, and beagle titled the task
         # 'T0007': every part goes on as the title `_split_part` repairs.
         unlabeled = [
@@ -4760,13 +4682,9 @@ def make_plan_tool() -> Any:
         # step. Run R15's beagle refused the part's title before it got there.
         if len(parts) == 1 and _is_leaf(task, _tree_nodes(root)):
             return _step_result(one_step)
-        drift = _put_back_drift(goal, root, but=task)
-        if drift:
-            split_notes.append(drift)
         # Read before the split, which leaves the task a container.
         scope, uncommitted = _uncommitted_in_scope(root, task)
         uncommitted_note = _uncommitted_note(task, uncommitted) if uncommitted else ""
-        moved_note = ""
         if len(parts) == 1:
             rc, out = _add_children(task, parts, root)
             # beagle says "a pending leaf" or, for one being worked, "a open
@@ -4775,12 +4693,10 @@ def make_plan_tool() -> Any:
                 return _step_result(one_step)
         else:
             if uncommitted:
-                uncommitted_note = _commit_before_split(root, task, scope, uncommitted, goal)
+                uncommitted_note = _commit_before_split(root, task, scope, uncommitted)
             rc, out = _pursuit(["split", task, *parts, *(["--ordered"] if ordered else [])], root)
             if rc != 0 and "already has children" in out:
                 rc, out = _add_children(task, parts, root)
-            elif rc == 0:
-                moved_note = _move_pending_locks(goal, task, parts, root)
         if rc != 0:
             refused = f"pursuit_plan: beagle refused (exit {rc}):\n{out}"
             if uncommitted_note:
@@ -4790,8 +4706,6 @@ def make_plan_tool() -> Any:
         notes = "".join(f"{note}\n\n" for note in split_notes)
         if uncommitted_note:
             notes += f"{uncommitted_note}\n\n"
-        if moved_note:
-            notes += f"{moved_note}\n\n"
         if repeated:
             notes += f"Not added again, {task} already has: {', '.join(repeated)}.\n\n"
         if "--outcome abandoned" in out:
@@ -5429,10 +5343,6 @@ def _scope_dir_files(root: Path, rel: str) -> list[str]:
     return found
 
 
-def _first_few(paths: list[str], few: int = 5) -> list[str]:
-    return paths if len(paths) <= few else [*paths[:few], f"{len(paths) - few} more"]
-
-
 def _module_names(rel: str) -> list[str]:
     """The dotted names `rel`, a .py file, may be imported as: each tail of its path."""
     parts = list(Path(rel).with_suffix("").parts)
@@ -5487,110 +5397,6 @@ def _scope_entries(scope: list[str], root: Path) -> list[str]:
     return entries
 
 
-def _oracle_with_code_parts(
-    scope: list[str], goal: Path, task: str = "", check: str = ""
-) -> tuple[list[str], list[str], list[str]]:
-    """(unlocked data, judged source, helpers) a scope holds."""
-    # Run R31: the driver passed locks= 59 times; they were filed as the task's
-    # pending locks, restored before each check as a manifest lock is.
-    locked = set(_locked(goal)) | set(_pending_locks(goal, task) if task else [])
-    root = goal.parent.parent
-    entries = _scope_entries(scope, root)
-    data = [
-        rel.rstrip("/")
-        for rel in entries
-        if _is_test_path(rel.rstrip("/"))
-        and Path(rel.rstrip("/")).suffix not in {"", ".py"}
-        and rel.rstrip("/") not in locked
-    ]
-    source, helpers = _judged_sources(entries, root, check)
-    return list(dict.fromkeys(data)), source, helpers
-
-
-def _helper_note(helpers: list[str]) -> str:
-    if not helpers:
-        return ""
-    return (
-        f" {', '.join(_first_few(helpers))}: a helper script no test imports and the check "
-        "does not name; delete it or leave it out of scope."
-    )
-
-
-def _oracle_with_code_problem(
-    scope: list[str], goal: Path, task: str = "", check: str = ""
-) -> str | None:
-    """Why a scope writes known answers beside the code they judge, or None.
-
-    Run R08: T0004's scope held itc/tests/cases.json, its test and the module,
-    so the worker wrote wrong expected values to fit its code, and every later
-    task was graded against them. A data file locked by an earlier task, or
-    filed as this task's pending lock, is restored before each check, so it is
-    no oracle the worker can bend.
-    """
-    if _contract_declared(goal.parent.parent):
-        return None
-    data, source, helpers = _oracle_with_code_parts(scope, goal, task, check)
-    if not data or not source:
-        return None
-    data, source = _first_few(data), _first_few(source)
-    # T0462: lean locks nothing; set at launch, so the text holds for the session.
-    passing = "" if _lean() else f", passing locks=[{', '.join(data)}]"
-    return (
-        f"scope holds known-answer data ({', '.join(data)}) and the code it judges "
-        f"({', '.join(source)}). Split it: first a task with only the data and its cases "
-        f"test in scope{passing}; then the code in a later task." + _helper_note(helpers)
-    )
-
-
-def _narrowed_scope(scope: list[str], goal: Path, task: str, check: str) -> list[str] | None:
-    """`scope` without its judged source, when that leaves a scope the guard passes."""
-    root = goal.parent.parent
-    _, source, helpers = _oracle_with_code_parts(scope, goal, task, check)
-    drop = set(source) | set(helpers)
-    narrowed: list[str] = []
-    for rel in scope:
-        bare = rel.rstrip("/")
-        if (root / bare).is_dir() and any(d.startswith(bare + "/") for d in drop):
-            narrowed.extend(f for f in _scope_dir_files(root, bare) if f not in drop)
-        elif bare not in drop:
-            narrowed.append(rel)
-    narrowed = list(dict.fromkeys(narrowed))
-    if not narrowed or _oracle_with_code_problem(narrowed, goal, task, check) is not None:
-        return None
-    return narrowed
-
-
-def _open_mixed_refusal(scope: list[str], goal: Path, task: str, check: str) -> str | None:
-    """The open-task refusal for a mixed scope, naming the narrowed call that runs."""
-    if _contract_declared(goal.parent.parent):
-        return None
-    data, source, helpers = _oracle_with_code_parts(scope, goal, task, check)
-    if not data or not source:
-        return None
-    narrowed = _narrowed_scope(scope, goal, task, check)
-    held = (
-        f"scope holds known-answer data ({', '.join(_first_few(data))}) and the code it "
-        f"judges ({', '.join(_first_few(source))})."
-    )
-    if narrowed is None:
-        # T0462: lean locks nothing; set at launch, so the text holds for the session.
-        passing = "" if _lean() else f", passing locks=[{', '.join(_first_few(data))}]"
-        return (
-            f"{held} Narrow the scope to the data and its cases test{passing}; the code "
-            "goes to a later task." + _helper_note(helpers)
-        )
-    removed = [*source, *helpers]
-    return (
-        f"{held} This call runs a worker: pursuit_step task={task} "
-        f'scope=[{", ".join(narrowed)}] notes="delete {", ".join(_first_few(removed))} if '
-        'this task wrote it; the code belongs to a later task".' + _helper_note(helpers)
-    )
-
-
-#: (root, task) -> (scope, text) of the last open-task mixed-scope refusal.
-_LAST_MIXED_REFUSAL: dict[tuple[str, str], tuple[tuple[str, ...], str]] = {}
-
-
 def _check_path_words(check: str) -> list[str]:
     """The relative paths a check's words name, inside one `sh -c` level, written or not."""
     try:
@@ -5611,10 +5417,10 @@ def _check_path_words(check: str) -> list[str]:
     return found
 
 
-def _scope_holds_code_or_cases(
+def _scope_holds_code_or_data(
     scope: list[str], root: Path, also: list[str] | None = None, tests_count: bool = True
 ) -> bool:
-    """Whether `scope` (its directories walked) or `also` holds a .py file or cases data.
+    """Whether `scope` (its directories walked) or `also` holds a .py file or test data.
 
     With `tests_count` false, a test .py is not code: only source counts.
     """
@@ -5623,7 +5429,7 @@ def _scope_holds_code_or_cases(
         if (root / rel).is_dir():
             entries.extend(_scope_dir_files(root, rel))
     return any(
-        _is_cases_data(rel) or (rel.endswith(".py") and (tests_count or not _is_test_path(rel)))
+        _is_test_data(rel) or (rel.endswith(".py") and (tests_count or not _is_test_path(rel)))
         for rel in entries
     )
 
@@ -5638,7 +5444,7 @@ def _doc_only_check_problem(check: str, scope: list[str], task: str, root: Path)
     reads = _check_path_words(check)
     if not reads or not all(_in_tests_dir(rel) and not rel.endswith(".py") for rel in reads):
         return None
-    if _scope_holds_code_or_cases(scope, root, reads, tests_count=False):
+    if _scope_holds_code_or_data(scope, root, reads, tests_count=False):
         return None
     return (
         f"{reads[0]} is under tests/, so nothing can witness it; fold reading the "
@@ -5647,7 +5453,7 @@ def _doc_only_check_problem(check: str, scope: list[str], task: str, root: Path)
     )
 
 
-def _no_scope_problem(scope: list[str], root: Path, locks: list[str], check: str) -> str | None:
+def _no_scope_problem(scope: list[str], root: Path) -> str | None:
     """Why a task may not open with no scope, or None.
 
     Run R17: T0002, T0008 and T0009 opened with scope [], so no worker on them
@@ -5656,27 +5462,17 @@ def _no_scope_problem(scope: list[str], root: Path, locks: list[str], check: str
     """
     if scope or not (root / "references").is_dir():
         return None
-    if not locks:
-        return (
-            "no scope given, so its sub-agent would write anywhere. Pass scope=[...] "
-            "naming the paths this task writes, and call pursuit_step again."
-        )
-    named = re.findall(r"\S*test_\w*(?:case|data)\w*\.py", check)
-    data_test = named[0] if named else "tests/test_case_data.py"
-    paths = list(dict.fromkeys([*locks, data_test]))
     return (
-        "no scope given, so its sub-agent would write anywhere, the code its known "
-        f"answers judge included. Pass scope=[{', '.join(paths)}] (the locks and the "
-        "data test), and call pursuit_step again."
+        "no scope given, so its sub-agent would write anywhere. Pass scope=[...] "
+        "naming the paths this task writes, and call pursuit_step again."
     )
 
 
-def _data_task(scope: list[str], goal: Path, check: str, locks: list[str]) -> bool:
+def _data_task(scope: list[str], goal: Path, check: str) -> bool:
     """Whether a task writes known-answer data and its cases test, not the code.
 
-    Judged as `_oracle_with_code_problem` judges a scope's entries, with a
-    directory judged by its files; a scope holding no data yet counts when its
-    check names a cases or data test.
+    A scope's entries are judged with a directory judged by its files; a scope
+    holding no data yet counts when its check names a cases or data test.
     """
     root = goal.parent.parent
     entries: list[str] = []
@@ -5686,8 +5482,6 @@ def _data_task(scope: list[str], goal: Path, check: str, locks: list[str]) -> bo
             entries.extend(_scope_dir_files(root, rel.rstrip("/")))
     if any(rel.endswith(".py") and not _is_test_path(rel) for rel in entries):
         return False
-    if locks:
-        return True
     data = any(
         _is_test_path(rel.rstrip("/")) and Path(rel.rstrip("/")).suffix not in {"", ".py"}
         for rel in entries
@@ -5695,27 +5489,8 @@ def _data_task(scope: list[str], goal: Path, check: str, locks: list[str]) -> bo
     return data or bool(re.search(r"test_\w*(case|data)", check))
 
 
-#: Root-level directories that hold no package of the project's own.
-_NOT_PACKAGES = frozenset(
-    {"docs", "doc", "references", "tests", "test", "data", "examples", "scripts", "notes"}
-)
 #: Imports in a test that name no module of the project's.
 _TEST_LIBRARIES = frozenset({"pytest", "_pytest", "hypothesis", "tests", "test", "conftest"})
-
-
-def _head_files(root: Path) -> set[str] | None:
-    """The files git holds at HEAD, or None when there is no HEAD to ask."""
-    try:
-        done = subprocess.run(
-            ["git", "ls-tree", "-r", "--name-only", "HEAD"],
-            cwd=root,
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-    except OSError:
-        return None
-    return set(done.stdout.splitlines()) if done.returncode == 0 else None
 
 
 def _module_of(rel: str) -> str:
@@ -5724,69 +5499,17 @@ def _module_of(rel: str) -> str:
     return path.replace("/", ".")
 
 
-def _new_modules(
-    scope: list[str], root: Path, *, whole_tree: bool = False
-) -> list[tuple[str, str]]:
-    """Each new (absent at HEAD) source module a scope names: (entry, dotted name).
-
-    A non-test .py file counts, and so does a package directory under src/ or
-    the root; a bare `src/` names a module not yet known, given as "". With
-    `whole_tree`, a whole-tree entry ("", ".", "./") names one the same way.
-
-    Run R36: the known-answers task's scope `["tests/", ".", "docs/"]` held no
-    new .py file when it opened, so nothing was named, and its worker wrote
-    itc/core.py beside the cases.
-    """
-    head = _head_files(root)
-
-    def absent(rel: str) -> bool:
-        if head is None:
-            return not (root / rel).exists()
-        return rel not in head and not any(f.startswith(f"{rel}/") for f in head)
-
-    found: list[tuple[str, str]] = []
-    for entry in scope:
-        rel = entry.strip().rstrip("/")
-        whole = whole_tree and os.path.normpath(rel or ".") == "."
-        if whole:
-            rel = "."
-        parts = Path(rel).parts
-        if not rel or _is_test_path(rel) or Path(rel).name in {"tests", "test"}:
-            continue
-        if rel.endswith(".py"):
-            if absent(rel):
-                found.append((rel, _module_of(rel)))
-            continue
-        if Path(rel).suffix:
-            continue
-        if (root / rel).is_dir():
-            files = [
-                f
-                for f in _scope_dir_files(root, rel)
-                if f.endswith(".py") and not _is_test_path(f) and absent(f)
-            ]
-            found += [(f, _module_of(f)) for f in files]
-            if files:
-                continue
-        package = (
-            parts == ("src",)
-            or (len(parts) == 2 and parts[0] == "src" and parts[1].isidentifier())
-            or (len(parts) == 1 and parts[0].isidentifier() and parts[0] not in _NOT_PACKAGES)
-        )
-        if whole or (package and absent(rel)):
-            found.append((entry, "" if whole or parts == ("src",) else parts[-1]))
-    return found
+#: Suffixes of a data file under tests/ that a test reads, whose absence proves its
+#: check (`prove --absent`).
+TEST_DATA_SUFFIXES = frozenset({".json", ".toml", ".yaml", ".yml", ".csv"})
 
 
-#: Suffixes of a known-answers data file a cases test must read.
-CASES_DATA_SUFFIXES = frozenset({".json", ".toml", ".yaml", ".yml", ".csv"})
+def _is_test_data(rel: str) -> bool:
+    """Whether `rel` is a data file under tests/, which a check can be proved by taking away."""
+    return Path(rel).suffix in TEST_DATA_SUFFIXES and _is_test_path(rel)
 
 
-def _is_cases_data(rel: str) -> bool:
-    return Path(rel).suffix in CASES_DATA_SUFFIXES and _is_test_path(rel)
-
-
-def _cases_test_reads(test_path: Path, data_basename: str) -> bool:
+def _test_reads_file(test_path: Path, data_basename: str) -> bool:
     """Whether the test's code, not a docstring or comment, opens the data file.
 
     Run R14: test_cases.py held hand-written asserts and never opened
@@ -5890,1695 +5613,6 @@ def _test_project_imports(test_path: Path) -> list[str]:
     return found
 
 
-def _unread_cases(
-    root: Path, entries: list[str], earlier: Collection[str] = ()
-) -> tuple[str, str] | None:
-    """(test, data file) when the locks hold a cases data file the code's tests never read.
-
-    Run R14 locked a data-shape test that loaded cases.json beside a test that
-    imported the code and never read it. When a locked test imports the code,
-    one such test must read each data file; a test importing nothing of the
-    project does not count.
-
-    Run R42: an analysis task's test, importing nothing of the project, was held
-    to the cases data an earlier task locked. `earlier` data is read only by a
-    test that imports the code; a task with none is not judged against it.
-    """
-    files = []
-    for entry in entries:
-        target = _project_file(root, entry)
-        if target is not None and target.is_file():
-            files.append(str(target.relative_to(root.resolve())))
-    tests = [rel for rel in files if rel.endswith(".py") and _is_test_path(rel)]
-    judges = [rel for rel in tests if _test_project_imports(root / rel)]
-    readers = judges or tests
-    for data in (rel for rel in files if _is_cases_data(rel)):
-        name = Path(data).name
-        held = judges if data in earlier else readers
-        if held and not any(_cases_test_reads(root / test, name) for test in held):
-            return held[0], data
-    return None
-
-
-#: Case keys that hold a case's label, inputs or provenance rather than its answer.
-_CASE_NON_ANSWER_KEYS = frozenset(
-    {
-        "name",
-        "id",
-        "title",
-        "case",
-        "source",
-        "sources",
-        "citation",
-        "description",
-        "desc",
-        "notes",
-        "note",
-        "comment",
-        "input",
-        "inputs",
-        "in",
-        "args",
-        "arguments",
-        "ops",
-        "operations",
-        "operation",
-        "setup",
-        "given",
-    }
-)
-
-
-def _case_labels(cases: list[object]) -> set[str]:
-    return {
-        str(case[key])
-        for case in cases
-        if isinstance(case, dict)
-        for key in ("name", "id")
-        if isinstance(case.get(key), str | int)
-    }
-
-
-def _answer_keys(cases: list[object]) -> set[str]:
-    keys = {key for case in cases if isinstance(case, dict) for key in case}
-    return {
-        key
-        for key in keys
-        if isinstance(key, str)
-        and key.lower() not in _CASE_NON_ANSWER_KEYS
-        and not any(part in key.lower() for part in SOURCE_KEY_PARTS)
-    }
-
-
-def _str_const(node: ast.AST) -> str | None:
-    if isinstance(node, ast.Constant) and isinstance(node.value, str):
-        return node.value
-    return None
-
-
-def _json_loaded_names(tree: ast.AST) -> set[str]:
-    """Names assigned straight from a `json.load` or `json.loads` call."""
-    names: set[str] = set()
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.Assign | ast.AnnAssign) or node.value is None:
-            continue
-        call = node.value
-        if not (
-            isinstance(call, ast.Call)
-            and isinstance(call.func, ast.Attribute)
-            and call.func.attr in {"load", "loads"}
-            and isinstance(call.func.value, ast.Name)
-            and call.func.value.id == "json"
-        ):
-            continue
-        targets = node.targets if isinstance(node, ast.Assign) else [node.target]
-        names.update(t.id for t in targets if isinstance(t, ast.Name))
-    return names
-
-
-def _absent_case_lookup(tree: ast.AST, labels: set[str], keys: Collection[str] = ()) -> str | None:
-    """The first case label the test looks up that the data does not hold, or None.
-
-    Run R22: `cases["cases"]` took the list from {"cases": [...]}. A subscript
-    by one of the data file's own top-level `keys`, or of a value straight
-    from `json.load`, reads the file's container, not a case.
-    """
-    loaded = _json_loaded_names(tree)
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Compare):
-            sides = [node.left, *node.comparators]
-            keyed = any(
-                isinstance(side, ast.Subscript) and _str_const(side.slice) in {"name", "id"}
-                for side in sides
-            )
-            if keyed:
-                for side in sides:
-                    named = _str_const(side)
-                    if named is not None and named not in labels:
-                        return named
-        elif (
-            isinstance(node, ast.Subscript)
-            and isinstance(node.value, ast.Name)
-            and "cases" in node.value.id.lower()
-            and node.value.id not in loaded
-        ):
-            named = _str_const(node.slice)
-            if named is not None and named not in labels and named not in keys:
-                return named
-    return None
-
-
-def _method_and_value(tree: ast.AST) -> str | None:
-    """An attribute the test both calls, `.x()`, and reads as a value it checks.
-
-    Run R20: `result.event == n` beside `clock.event()`. q35 R51: `clock.event()`
-    then `actual = {"event": clock.event}` and `assert _stamp_eq(actual, ...)`.
-    Besides a direct comparison or arithmetic operand, a read of the same object's
-    attribute counts when it is carried, through dict, list, tuple or set
-    literals, assignments to names and arguments to the module's own functions,
-    into an assert or comparison.
-    """
-    calls = [
-        node.func
-        for node in ast.walk(tree)
-        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
-    ]
-    called = {func.attr for func in calls}
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Compare):
-            operands = [node.left, *node.comparators]
-        elif isinstance(node, ast.BinOp):
-            operands = [node.left, node.right]
-        elif isinstance(node, ast.AugAssign):
-            operands = [node.target, node.value]
-        else:
-            continue
-        for operand in operands:
-            if isinstance(operand, ast.Attribute) and operand.attr in called:
-                return operand.attr
-    methods = {(ast.unparse(func.value), func.attr) for func in calls}
-    parents = {child: node for node in ast.walk(tree) for child in ast.iter_child_nodes(node)}
-    own = {
-        node.name
-        for node in ast.walk(tree)
-        if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef)
-    }
-    loads: dict[str, list[ast.Name]] = {}
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load):
-            loads.setdefault(node.id, []).append(node)
-
-    def checked(node: ast.AST, seen: set[str]) -> bool:
-        while True:
-            parent = parents.get(node)
-            carries = (
-                isinstance(parent, ast.List | ast.Tuple | ast.Set | ast.Starred | ast.keyword)
-                or (isinstance(parent, ast.Dict) and node in parent.values)
-                or (
-                    isinstance(parent, ast.Call)
-                    and node is not parent.func
-                    and isinstance(parent.func, ast.Name)
-                    and parent.func.id in own
-                )
-            )
-            if parent is None or not carries:
-                break
-            node = parent
-        if isinstance(parent, ast.Compare | ast.BinOp):
-            return True
-        if isinstance(parent, ast.Assert) and node is parent.test:
-            return True
-        if isinstance(parent, ast.Assign | ast.AnnAssign) and node is parent.value:
-            targets = parent.targets if isinstance(parent, ast.Assign) else [parent.target]
-            names = [t.id for t in targets if isinstance(t, ast.Name) and t.id not in seen]
-            return any(
-                checked(load, seen | {name}) for name in names for load in loads.get(name, [])
-            )
-        return False
-
-    for node in ast.walk(tree):
-        parent = parents.get(node)
-        if (
-            isinstance(node, ast.Attribute)
-            and isinstance(node.ctx, ast.Load)
-            and (ast.unparse(node.value), node.attr) in methods
-            and not (isinstance(parent, ast.Call) and parent.func is node)
-            and checked(node, set())
-        ):
-            return node.attr
-    return None
-
-
-#: Fixtures a parametrized cases test may take beside the case that carry nothing of it.
-_NEUTRAL_FIXTURES = frozenset(
-    {"self", "tmp_path", "tmp_path_factory", "monkeypatch", "capsys", "capfd", "caplog", "recwarn"}
-)
-#: Case keys that label or describe a case and reach no call.
-_CASE_LABEL_KEYS = frozenset(
-    {"name", "id", "title", "case", "description", "desc", "notes", "note", "comment"}
-)
-_MISSING = object()
-
-
-def _case_at(case: object, path: tuple[str, ...]) -> object:
-    for key in path:
-        if not isinstance(case, dict) or key not in case:
-            return _MISSING
-        case = case[key]
-    return case
-
-
-def _case_test_holds(test: ast.AST, case: object, name: str) -> bool:
-    """Whether `test`, a condition on the case `name` alone, holds for `case`.
-
-    Comparisons of constant-key reads of the case with constants, under
-    and/or/not, are evaluated; anything else raises ValueError.
-    """
-    if isinstance(test, ast.BoolOp):
-        held = [_case_test_holds(value, case, name) for value in test.values]
-        return all(held) if isinstance(test.op, ast.And) else any(held)
-    if isinstance(test, ast.UnaryOp) and isinstance(test.op, ast.Not):
-        return not _case_test_holds(test.operand, case, name)
-    if not (isinstance(test, ast.Compare) and len(test.ops) == 1):
-        raise ValueError(ast.unparse(test))
-
-    def value(node: ast.AST) -> object:
-        path: list[str] = []
-        while isinstance(node, ast.Subscript) and _str_const(node.slice) is not None:
-            path.insert(0, str(_str_const(node.slice)))
-            node = node.value
-        if isinstance(node, ast.Name) and node.id == name and path:
-            return _case_at(case, tuple(path))
-        try:
-            return ast.literal_eval(node)
-        except ValueError as error:
-            raise ValueError(ast.unparse(node)) from error
-
-    left, right, op = value(test.left), value(test.comparators[0]), test.ops[0]
-    if isinstance(op, ast.Eq | ast.Is):
-        return left == right
-    if isinstance(op, ast.NotEq | ast.IsNot):
-        return left != right
-    if isinstance(op, ast.In | ast.NotIn) and isinstance(right, tuple | list | set | str):
-        return (left in right) is isinstance(op, ast.In)
-    raise ValueError(ast.unparse(test))
-
-
-#: Calls whose arguments are a message, not something a case's call is made from.
-_MESSAGE_CALLS = frozenset({"skip", "fail", "xfail", "print"})
-
-
-def _case_reads(function: ast.AST, name: str) -> list[tuple[tuple[str, ...], bool]] | None:
-    """Each constant-key path the function reads under the case `name`, and whether
-    the read sits only in a message (f-string, assert message, skip/fail text).
-
-    None when the case is used other than by constant keys, as a whole or by a
-    computed key, so which of its keys reach a call cannot be told.
-    """
-    parents = {child: node for node in ast.walk(function) for child in ast.iter_child_nodes(node)}
-
-    def step(node: ast.AST) -> tuple[ast.AST, str | None] | None:
-        parent = parents.get(node)
-        if isinstance(parent, ast.Subscript) and parent.value is node:
-            return parent, _str_const(parent.slice)
-        call = parents.get(parent) if isinstance(parent, ast.Attribute) else None
-        if (
-            isinstance(parent, ast.Attribute)
-            and parent.attr == "get"
-            and isinstance(call, ast.Call)
-            and call.func is parent
-            and call.args
-        ):
-            return call, _str_const(call.args[0])
-        return None
-
-    def in_message(node: ast.AST) -> bool:
-        while node in parents:
-            parent = parents[node]
-            if isinstance(parent, ast.JoinedStr) or (
-                isinstance(parent, ast.Assert) and node is parent.msg
-            ):
-                return True
-            if (
-                isinstance(parent, ast.Call)
-                and ast.unparse(parent.func).split(".")[-1] in _MESSAGE_CALLS
-            ):
-                return True
-            node = parent
-        return False
-
-    reads: list[tuple[tuple[str, ...], bool]] = []
-    for node in ast.walk(function):
-        if not (isinstance(node, ast.Name) and node.id == name):
-            continue
-        path: tuple[str, ...] = ()
-        top: ast.AST = node
-        while (taken := step(top)) is not None and taken[1] is not None:
-            top, path = taken[0], (*path, taken[1])
-        if not path or taken is not None:
-            return None
-        reads.append((path, in_message(top)))
-    return reads
-
-
-def _reaching_cases(
-    function: ast.FunctionDef | ast.AsyncFunctionDef, name: str, cases: list[object]
-) -> list[dict[str, object]] | None:
-    """The cases that get past the function's skip or return guards, or None.
-
-    A guard is a top-level `if` on the case alone whose body skips, fails or
-    returns (`if case["operation"] != "event": pytest.skip(...)`). None when an
-    exit sits anywhere else or a guard cannot be evaluated on a case.
-    """
-    exits = [
-        node
-        for node in ast.walk(function)
-        if isinstance(node, ast.Return | ast.Raise)
-        or (
-            isinstance(node, ast.Call)
-            and ast.unparse(node.func).split(".")[-1] in _MESSAGE_CALLS - {"print"}
-        )
-    ]
-    guards = {
-        stmt.test: {node for sub in stmt.body for node in ast.walk(sub)}
-        for stmt in function.body
-        if isinstance(stmt, ast.If) and not stmt.orelse
-    }
-    if any(not any(node in body for body in guards.values()) for node in exits):
-        return None
-    tests = [test for test, body in guards.items() if any(node in body for node in exits)]
-    try:
-        return [
-            case
-            for case in cases
-            if isinstance(case, dict)
-            and not any(_case_test_holds(test, case, name) for test in tests)
-        ]
-    except ValueError:
-        return None
-
-
-def _unread_input_keys(
-    first: dict[str, object],
-    second: dict[str, object],
-    routing: set[tuple[str, ...]],
-    answers: Collection[str],
-) -> list[str]:
-    """The input keys on which the two cases differ that the test never reads."""
-    read_under: dict[str, set[str]] = {}
-    for path in routing:
-        read_under.setdefault(path[0], set()).update(path[1:2])
-    unread: list[str] = []
-    for key in dict.fromkeys([*first, *second]):
-        if key in answers or key in _CASE_LABEL_KEYS or (key,) in routing:
-            continue
-        if any(part in key.lower() for part in SOURCE_KEY_PARTS):
-            continue
-        left, right = first.get(key, _MISSING), second.get(key, _MISSING)
-        if key in read_under and isinstance(left, dict) and isinstance(right, dict):
-            unread += [
-                sub
-                for sub in dict.fromkeys([*left, *right])
-                if sub not in read_under[key]
-                and left.get(sub, _MISSING) != right.get(sub, _MISSING)
-            ]
-        elif key not in read_under and left != right:
-            unread.append(key)
-    return unread
-
-
-def _indistinguishable_cases(tree: ast.Module, cases: list[object]) -> str | None:
-    """Two cases a parametrized test makes the same call for that expect different answers.
-
-    q35 R51: test_case_event read only case["operation"] and case["input"]["node"],
-    and a later step added "initial_id"/"initial_event" to double_event, so it
-    and event_on_full made one call and expected events 2 and 1. A test is
-    judged only when it is parametrized over one case, from an unfiltered list,
-    and reads the case only by constant keys; the keys it reads outside
-    messages, operation names included, are what tell two cases' calls apart.
-    Cases its skip guards drop never reach the call.
-    """
-    answers = _answer_keys(cases)
-    values = {
-        value
-        for case in cases
-        if isinstance(case, dict)
-        for value in case.values()
-        if isinstance(value, str)
-    }
-    module_values = {
-        target.id: node.value
-        for node in tree.body
-        if isinstance(node, ast.Assign)
-        for target in node.targets
-        if isinstance(target, ast.Name)
-    }
-    functions = [
-        node
-        for top in tree.body
-        for node in (top.body if isinstance(top, ast.ClassDef) else [top])
-        if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef) and node.name.startswith("test")
-    ]
-    for function in functions:
-        params = [*function.args.posonlyargs, *function.args.args, *function.args.kwonlyargs]
-        carried = [a.arg for a in params if a.arg not in _NEUTRAL_FIXTURES]
-        if len(carried) != 1 or function.args.vararg or function.args.kwarg:
-            continue
-        name = carried[0]
-        source = None
-        for decorator in function.decorator_list:
-            if (
-                isinstance(decorator, ast.Call)
-                and ast.unparse(decorator.func).endswith("parametrize")
-                and len(decorator.args) >= 2
-                and _str_const(decorator.args[0]) == name
-            ):
-                source = decorator.args[1]
-        if isinstance(source, ast.Name):
-            source = module_values.get(source.id)
-        if not isinstance(source, ast.Call | ast.Subscript) or any(
-            (isinstance(sub, ast.comprehension) and sub.ifs)
-            or isinstance(sub, ast.Lambda)
-            or (isinstance(sub, ast.Name) and sub.id == "filter")
-            or _str_const(sub) in values
-            for sub in ast.walk(source)
-        ):
-            continue
-        if any(isinstance(sub, ast.Global | ast.Nonlocal) for sub in ast.walk(function)):
-            continue
-        reads = _case_reads(function, name)
-        held = _reaching_cases(function, name, cases) if reads else None
-        if not reads or held is None:
-            continue
-        routing = {path for path, message in reads if path[0] not in answers and not message}
-        judged = {path for path, _ in reads if path[0] in answers}
-        if not judged:
-            continue
-        for index, first in enumerate(held):
-            for second in held[index + 1 :]:
-                if any(_case_at(first, p) != _case_at(second, p) for p in routing):
-                    continue
-                if all(_case_at(first, p) == _case_at(second, p) for p in judged):
-                    continue
-                unread = _unread_input_keys(first, second, routing, answers)
-                pair = sorted(_case_label(case, cases.index(case)) for case in (first, second))
-                why = (
-                    f"it never reads their input keys {', '.join(unread)}"
-                    if unread
-                    else "they agree on every input key it reads"
-                )
-                return (
-                    f"makes the same call in {function.name} for cases {pair[0]} and "
-                    f"{pair[1]}, which expect different answers ({why})"
-                )
-    return None
-
-
-def _answers_compared(
-    tree: ast.AST, answers: Collection[str], against: Collection[str] = ()
-) -> bool:
-    """Whether a value read under one of the `answers` keys reaches an assert or comparison.
-
-    Run R30: the locked test loaded each case's answer and asserted only a
-    roundtrip. A read is a subscript, `.get()` or attribute by an answer key; a
-    name assigned or looped from one, or a function returning one, carries it.
-    With `against`, only an assert or comparison that also takes the result of a
-    call to one of those functions counts; a call given an answer yields none.
-    """
-
-    def reads(node: ast.AST) -> bool:
-        for sub in ast.walk(node):
-            if isinstance(sub, ast.Subscript) and _str_const(sub.slice) in answers:
-                return True
-            if isinstance(sub, ast.Attribute) and sub.attr in answers:
-                return True
-            if (
-                isinstance(sub, ast.Call)
-                and isinstance(sub.func, ast.Attribute)
-                and sub.func.attr == "get"
-                and sub.args
-                and _str_const(sub.args[0]) in answers
-            ):
-                return True
-            if isinstance(sub, ast.Name) and sub.id in carriers:
-                return True
-        return False
-
-    def names(target: ast.AST) -> set[str]:
-        return {sub.id for sub in ast.walk(target) if isinstance(sub, ast.Name)}
-
-    carriers: set[str] = set()
-    grew = True
-    while grew:
-        before = len(carriers)
-        for node in ast.walk(tree):
-            if isinstance(node, ast.Assign) and reads(node.value):
-                carriers.update(n for target in node.targets for n in names(target))
-            elif (
-                isinstance(node, ast.AnnAssign | ast.AugAssign | ast.NamedExpr)
-                and node.value is not None
-                and reads(node.value)
-            ) or (
-                isinstance(node, ast.For | ast.AsyncFor | ast.comprehension) and reads(node.iter)
-            ):
-                carriers.update(names(node.target))
-            elif isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef) and any(
-                isinstance(sub, ast.Return) and sub.value is not None and reads(sub.value)
-                for sub in ast.walk(node)
-            ):
-                carriers.add(node.name)
-        grew = len(carriers) > before
-
-    def result(node: ast.AST) -> bool:
-        if not against:
-            return True
-        for sub in ast.walk(node):
-            if (
-                isinstance(sub, ast.Call)
-                and isinstance(sub.func, ast.Name)
-                and sub.func.id in against
-                and sub.func.id not in carriers
-                and not any(reads(arg) for arg in [*sub.args, *(k.value for k in sub.keywords)])
-            ):
-                return True
-            if isinstance(sub, ast.Name) and sub.id in results:
-                return True
-        return False
-
-    results: set[str] = set()
-    grew = bool(against)
-    while grew:
-        before = len(results)
-        for node in ast.walk(tree):
-            if isinstance(node, ast.Assign) and result(node.value):
-                results.update(n for target in node.targets for n in names(target))
-            elif (
-                isinstance(node, ast.AnnAssign | ast.AugAssign | ast.NamedExpr)
-                and node.value is not None
-                and result(node.value)
-            ) or (
-                isinstance(node, ast.For | ast.AsyncFor | ast.comprehension) and result(node.iter)
-            ):
-                results.update(names(node.target))
-        grew = len(results) > before
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Assert | ast.Compare) and reads(node) and result(node):
-            return True
-        if (
-            isinstance(node, ast.Call)
-            and isinstance(node.func, ast.Attribute)
-            and node.func.attr.startswith("assert")
-            and reads(node)
-            and result(node)
-        ):
-            return True
-    return False
-
-
-def _called_module_functions(tree: ast.Module) -> list[str]:
-    """The module-level functions, other than test* ones, that the module calls by name."""
-    called = {
-        node.func.id
-        for node in ast.walk(tree)
-        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
-    }
-    return [
-        node.name
-        for node in tree.body
-        if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef)
-        and not node.name.startswith("test")
-        and node.name in called
-    ]
-
-
-def _called_on_case_inputs(
-    tree: ast.Module, functions: Collection[str], keys: Collection[str], answers: Collection[str]
-) -> list[str]:
-    """The `functions` some call gives a case's input, so their results are computed.
-
-    An input is a value read under one of the cases' `keys` other than the
-    `answers`, a name assigned or looped from one, or a whole case (a name read
-    under a case key). q35 10-11: test_case_data.py's `_load_cases()` was given
-    nothing, and `for case in _load_cases(): assert "result" in case` was judged
-    its own copy of the algorithm; a loader computes no case's result.
-    """
-    inputs = set(keys) - set(answers)
-
-    def read(node: ast.AST, under: Collection[str]) -> ast.AST | None:
-        if isinstance(node, ast.Subscript) and _str_const(node.slice) in under:
-            return node.value
-        if (
-            isinstance(node, ast.Call)
-            and isinstance(node.func, ast.Attribute)
-            and node.func.attr == "get"
-            and node.args
-            and _str_const(node.args[0]) in under
-        ):
-            return node.func.value
-        return None
-
-    whole = {base.id for node in ast.walk(tree) if isinstance(base := read(node, keys), ast.Name)}
-
-    def given(node: ast.AST) -> bool:
-        if isinstance(node, ast.Name) and node.id in whole:
-            return True
-        return any(
-            read(sub, inputs) is not None or (isinstance(sub, ast.Name) and sub.id in held)
-            for sub in ast.walk(node)
-        )
-
-    held: set[str] = set()
-    grew = True
-    while grew:
-        before = len(held)
-        for node in ast.walk(tree):
-            if isinstance(node, ast.Assign) and given(node.value):
-                held.update(
-                    sub.id for t in node.targets for sub in ast.walk(t) if isinstance(sub, ast.Name)
-                )
-            elif isinstance(node, ast.For | ast.AsyncFor | ast.comprehension) and given(node.iter):
-                held.update(sub.id for sub in ast.walk(node.target) if isinstance(sub, ast.Name))
-        grew = len(held) > before
-    return [
-        name
-        for name in functions
-        if any(
-            isinstance(node, ast.Call)
-            and isinstance(node.func, ast.Name)
-            and node.func.id == name
-            and any(given(arg) for arg in [*node.args, *(k.value for k in node.keywords)])
-            for node in ast.walk(tree)
-        )
-    ]
-
-
-#: Names a module has bound without an import or assignment in its own source.
-_MODULE_IMPLICIT_NAMES = frozenset(
-    {*dir(builtins), "__file__", "__name__", "__doc__", "__spec__", "__loader__"}
-)
-
-
-NO_TEST_FUNCTION = "defines no test function pytest collects (no test* function or Test* class)"
-
-
-def _cases_problem_fix(root: Path, test: str, problem: str) -> str:
-    """What to change in `test` for the `_cases_test_problem` verdict `problem`.
-
-    Run R35: "defines no test function" got the advice on how cases are used,
-    and W8 rewrote the data test; renaming `def main` in the cases test fixed it.
-    Only a verdict on how the cases are used gets that advice.
-    """
-    if problem == NO_TEST_FUNCTION:
-        try:
-            tree = ast.parse((root / test).read_text(encoding="utf-8"))
-        except (OSError, SyntaxError, ValueError):
-            tree = ast.Module(body=[], type_ignores=[])
-        names = [
-            node.name
-            for node in tree.body
-            if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef)
-            and not node.name.startswith("test")
-        ]
-        fix = (
-            f"rename one of its top-level functions ({', '.join(f'`{n}`' for n in names)}) "
-            "to test_… or add a test_ function"
-            if names
-            else "add a test_ function that runs the cases"
-        )
-    elif problem.startswith("is a copy of "):
-        fix = (
-            "make it import the code under test and compare each case's answer with "
-            "the code's result"
-        )
-    elif problem.startswith("checks its own copy "):
-        fix = (
-            "delete the functions it defines, import the code under test, and compare each "
-            "case's answer with the code's result"
-        )
-    elif problem.startswith("makes the same call "):
-        fix = (
-            "make it pass the code every input key that tells the two cases apart, or "
-            "drop the case whose answer the reference does not give"
-        )
-    elif problem.startswith("uses ") and " without importing " in problem:
-        fix = f"import {problem.rpartition(' without importing ')[2]} in it"
-    else:
-        fix = (
-            "make it look up only cases the data holds, compare the code's results with "
-            "each case's expected value, and use each attribute one way"
-        )
-    return f"{fix}; change only {test}, and the bound check stays as it is"
-
-
-def _test_structure_problem(tree: ast.Module) -> str | None:
-    """What keeps a test module from judging anything, read from its AST alone.
-
-    Run R33: a cases test defined only helpers, so pytest collected nothing,
-    and called `name.attr(...)` on a module it never imported, so it could not
-    run. Collected: a module-level `test*` function, or a `test*` method of a
-    module-level `Test*` class.
-    """
-
-    def is_test(node: ast.AST) -> bool:
-        return isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef) and node.name.startswith(
-            "test"
-        )
-
-    imported: set[str] = set()
-    star = False
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Import | ast.ImportFrom):
-            for alias in node.names:
-                star = star or alias.name == "*"
-                imported.add(alias.asname or alias.name.split(".")[0])
-    collectable = any(
-        is_test(node)
-        or (
-            isinstance(node, ast.ClassDef)
-            and node.name.startswith("Test")
-            and any(is_test(sub) for sub in node.body)
-        )
-        for node in tree.body
-    ) or any(name.startswith("test") for name in imported)
-    if not collectable:
-        return NO_TEST_FUNCTION
-    if star:
-        return None
-    bound = set(imported) | _MODULE_IMPLICIT_NAMES
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store | ast.Del):
-            bound.add(node.id)
-        elif isinstance(node, ast.arg):
-            bound.add(node.arg)
-        elif isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef) or (
-            isinstance(node, ast.ExceptHandler | ast.MatchAs | ast.MatchStar) and node.name
-        ):
-            bound.add(node.name)
-        elif isinstance(node, ast.MatchMapping) and node.rest:
-            bound.add(node.rest)
-        elif isinstance(node, ast.Global | ast.Nonlocal):
-            bound.update(node.names)
-    for node in ast.walk(tree):
-        if (
-            isinstance(node, ast.Call)
-            and isinstance(node.func, ast.Attribute)
-            and isinstance(node.func.value, ast.Name)
-            and node.func.value.id not in bound
-        ):
-            name = node.func.value.id
-            return f"uses {name}.{node.func.attr}() without importing {name}"
-    return None
-
-
-#: Token Jaccard at or above which two test files count as copies of each other.
-TEST_COPY_JACCARD = 0.9
-
-
-def _test_copy_score(left: Path, right: Path) -> float:
-    """How alike two Python test files are, 0.0 to 1.0, comments and layout aside.
-
-    Each file is parsed and unparsed, with docstrings dropped, so formatting,
-    quoting and comments do not count; the score is the Jaccard index of the
-    two token multisets (each token paired with its occurrence count).
-    """
-    bags: list[set[tuple[str, int]]] = []
-    for path in (left, right):
-        try:
-            tree = ast.parse(path.read_text(encoding="utf-8"))
-        except (OSError, SyntaxError, ValueError):
-            return 0.0
-        for node in ast.walk(tree):
-            body = getattr(node, "body", None)
-            if isinstance(body, list):
-                node.body = [  # type: ignore[attr-defined]
-                    stmt
-                    for stmt in body
-                    if not (
-                        isinstance(stmt, ast.Expr)
-                        and isinstance(stmt.value, ast.Constant)
-                        and isinstance(stmt.value.value, str)
-                    )
-                ] or [ast.Pass()]
-        seen: dict[str, int] = {}
-        bag: set[tuple[str, int]] = set()
-        for token in re.findall(r"\w+|[^\w\s]", ast.unparse(tree)):
-            seen[token] = seen.get(token, 0) + 1
-            bag.add((token, seen[token]))
-        bags.append(bag)
-    union = bags[0] | bags[1]
-    return len(bags[0] & bags[1]) / len(union) if union else 1.0
-
-
-def _copied_cases_test(root: Path, tests: list[str], data: str) -> tuple[str, str] | None:
-    """(copy, original) when no test reading `data` imports the project and two of
-    them are near-copies, so the would-be cases test only repeats the data test.
-
-    Run R39 locked tests/test_cases.py identical to tests/test_case_data.py:
-    both read cases.json and checked its shape, neither imported the code. Of
-    the pair, the one whose name does not say "data" is named as the copy.
-    """
-    readers = [rel for rel in tests if _cases_test_reads(root / rel, Path(data).name)]
-    if any(_test_project_imports(root / rel) for rel in readers):
-        return None
-    for index, first in enumerate(readers):
-        for second in readers[index + 1 :]:
-            if _test_copy_score(root / first, root / second) < TEST_COPY_JACCARD:
-                continue
-            if "data" in Path(second).stem and "data" not in Path(first).stem:
-                return first, second
-            return second, first
-    return None
-
-
-def _cases_test_problem(root: Path, entries: list[str]) -> tuple[str, str] | None:
-    """(test, what is wrong) when a locked test reading cases data could never judge it.
-
-    Run R20 locked a test_cases.py that looked up three case names cases.json
-    did not hold, never read a case's "expected", and used `.event` both as a
-    method and as a number. Read from each test's AST; nothing is run. The
-    unread-answers check applies only to tests importing the project, as the
-    data's own shape test reads no answers. Run R39: a cases test copying the
-    data test, with no test importing the project, is refused too. Run R40: a
-    test importing no project module that compared the answers with the results
-    of functions it defined itself checked its own copy, not the code. q35
-    10-11: only functions given a case's input count; a data loader does not.
-    q35 R51: two cases the test cannot tell apart that expect different answers
-    are refused (`_indistinguishable_cases`).
-    """
-    files = []
-    for entry in entries:
-        target = _project_file(root, entry)
-        if target is not None and target.is_file():
-            files.append(str(target.relative_to(root.resolve())))
-    tests = [rel for rel in files if rel.endswith(".py") and _is_test_path(rel)]
-    for data in (rel for rel in files if _is_cases_data(rel) and rel.endswith(".json")):
-        try:
-            raw = json.loads((root / data).read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            continue
-        cases = _cases_list(raw)
-        keys = {str(key) for key in raw} if isinstance(raw, dict) else set()
-        labels = _case_labels(cases)
-        answers = _answer_keys(cases)
-        copied = _copied_cases_test(root, tests, data)
-        if copied is not None:
-            return copied[0], f"is a copy of {copied[1]} and imports none of the code"
-        for test in tests:
-            if not _cases_test_reads(root / test, Path(data).name):
-                continue
-            try:
-                tree = ast.parse((root / test).read_text(encoding="utf-8"))
-            except (OSError, SyntaxError, ValueError):
-                continue
-            broken = _test_structure_problem(tree)
-            if broken is not None:
-                return test, broken
-            if not _cases_off(root):
-                own = _called_module_functions(tree)
-                computed = _called_on_case_inputs(
-                    tree, own, {k for c in cases if isinstance(c, dict) for k in c}, answers
-                )
-                if (
-                    computed
-                    and answers
-                    and not _test_project_imports(root / test)
-                    and _answers_compared(tree, answers, against=computed)
-                ):
-                    # The functions given a case's input, not every one it
-                    # calls: a loader such as _load_cases copies nothing.
-                    named = ", ".join(computed[:4]) + (", …" if len(computed) > 4 else "")
-                    return test, (
-                        f"checks its own copy of the algorithm, not the code: it defines {named} "
-                        "and imports no module of the project"
-                    )
-            absent = _absent_case_lookup(tree, labels, keys) if labels else None
-            if absent is not None:
-                return test, f'looks up case "{absent}", which {data} does not hold'
-            mentioned = {
-                text
-                for node in ast.walk(tree)
-                for text in (_str_const(node), getattr(node, "attr", None))
-                if isinstance(text, str)
-            }
-            if answers and _test_project_imports(root / test) and not answers & mentioned:
-                keys = ", ".join(f'"{key}"' for key in sorted(answers))
-                return test, f"never reads the cases' answers ({keys} in {data})"
-            if (
-                answers
-                and _test_project_imports(root / test)
-                and not _answers_compared(tree, answers)
-            ):
-                keys = ", ".join(f'"{key}"' for key in sorted(answers))
-                return test, (
-                    f"reads the cases' answers ({keys} in {data}) but never compares them: no "
-                    "assert or comparison uses them, so a wrong result the test never checks "
-                    "against an answer passes"
-                )
-            same = _indistinguishable_cases(tree, cases)
-            if same is not None and _test_project_imports(root / test):
-                return test, same
-            both = _method_and_value(tree)
-            if both is not None:
-                return test, (
-                    f"uses .{both} both as a method, .{both}(), and as a value it "
-                    "compares or computes with, so it cannot pass against any one code"
-                )
-    return None
-
-
-#: Words a case's source must quote from references/*.txt to count as found.
-SOURCE_QUOTE_MIN_WORDS = 4
-#: Key fragments that mark where a case keeps its source text.
-SOURCE_KEY_PARTS = ("source", "cite", "quote", "ref")
-#: Pairs of marks a quote may sit between inside a longer source string. Run
-#: R36: sources were a file:line label then the quote in parentheses; a bracket
-#: or parenthesis span needs 12 or more chars, so an index like `[0]` is no quote.
-_QUOTE_MARKS = re.compile(
-    r'"([^"]+)"|“([^”]+)”|`([^`]+)`|\'([^\']{12,})\'|\(([^()]{12,})\)|\[([^\[\]]{12,})\]'
-)
-#: A leading `<file>:<line>` (or line range) label on a source string.
-_SOURCE_LABEL = re.compile(r"^\s*[\w./-]+:\d+(?:\s*[-–]\s*\d+)?\s*[:,;—-]?\s*")
-
-
-def _quote_candidates(text: str) -> list[str]:
-    """`text` whole, without a leading file:line label, and each span in `_QUOTE_MARKS`."""
-    candidates = [text]
-    unlabelled = _SOURCE_LABEL.sub("", text, count=1)
-    if unlabelled != text:
-        candidates.append(unlabelled)
-    candidates += [next(g for g in m.groups() if g) for m in _QUOTE_MARKS.finditer(text)]
-    return candidates
-
-
-def _normalised(text: str) -> str:
-    return " ".join(text.split()).lower()
-
-
-def _strings_in(value: object) -> list[str]:
-    if isinstance(value, str):
-        return [value]
-    if isinstance(value, dict):
-        return [s for item in value.values() for s in _strings_in(item)]
-    if isinstance(value, list):
-        return [s for item in value for s in _strings_in(item)]
-    return []
-
-
-def _source_strings(case: object) -> list[str]:
-    """The strings under a case's source-like keys, at any depth; else all its strings."""
-    found: list[str] = []
-    keyed = False
-
-    def walk(value: object) -> None:
-        nonlocal keyed
-        if isinstance(value, dict):
-            for key, item in value.items():
-                if any(part in str(key).lower() for part in SOURCE_KEY_PARTS):
-                    keyed = True
-                    found.extend(_strings_in(item))
-                else:
-                    walk(item)
-        elif isinstance(value, list):
-            for item in value:
-                walk(item)
-
-    walk(case)
-    return found if keyed else _strings_in(case)
-
-
-def _has_source_key(case: object) -> bool:
-    """Whether a case has a source-like key at any depth (`_source_strings` reads it)."""
-    if isinstance(case, dict):
-        return any(
-            any(part in str(key).lower() for part in SOURCE_KEY_PARTS) or _has_source_key(item)
-            for key, item in case.items()
-        )
-    return isinstance(case, list) and any(_has_source_key(item) for item in case)
-
-
-def _flagged_source(case: object) -> str:
-    """A flagged case's source strings for its verdict, or "" when it has no source key."""
-    return " | ".join(_source_strings(case)) if _has_source_key(case) else ""
-
-
-def _quotes_reference(text: str, reference: str) -> bool:
-    """Whether `text`, whole, unlabelled, quoted in it, or split at an ellipsis or colon,
-    is in `reference`.
-
-    Run R15: a leading label ('send: This operation is ...' against the
-    reference's 'send This operation ...') and a formula after a colon that
-    the reference's PDF extraction spaced differently hid verbatim quotes.
-    """
-    candidates = _quote_candidates(text)
-    candidates += [part for c in list(candidates) for part in re.split(r"\.\.\.|…|:\s", c)]
-    for candidate in candidates:
-        quote = _normalised(candidate).strip(" \"'`“”.,;:")
-        if len(quote.split()) >= SOURCE_QUOTE_MIN_WORDS and quote in reference:
-            return True
-    return False
-
-
-def _cases_list(data: object) -> list[object]:
-    if isinstance(data, list):
-        return data
-    if isinstance(data, dict):
-        lists = [v for v in data.values() if isinstance(v, list) and v]
-        if lists:
-            return max(lists, key=len)
-        if data and all(isinstance(v, dict) for v in data.values()):
-            return [{"name": k, **v} for k, v in data.items()]
-    return []
-
-
-def _case_label(case: object, index: int) -> str:
-    if isinstance(case, dict):
-        for key in ("name", "id", "title", "case"):
-            if isinstance(case.get(key), str | int) and str(case[key]).strip():
-                return str(case[key])
-    return f"#{index + 1}"
-
-
-#: Key fragments that mark a case's expected result. q35 R56: `encoded_hex` and
-#: `decoded_hex` held every result, and the judge judged none of them.
-RESULT_KEY_PARTS = ("expect", "result", "output", "want", "answer", "encoded", "decoded")
-#: A scalar or string result shorter than this is searched for only in the
-#: reference lines its source quotes: "1", "ok" or "00" occurs in, or is
-#: absent from, a whole source by chance.
-RESULT_MIN_CHARS = 4
-#: A number-like token in a source: decimal, hex with 0x or \x, or bare hex digits.
-_VALUE_TOKEN = re.compile(r"(0x|\\x)?([0-9a-fA-F]+)(?![0-9a-zA-Z])", re.IGNORECASE)
-#: What may sit between two tokens of one rendered sequence.
-_VALUE_SEPARATOR = re.compile(r"[\s,;\[\]()\-]*")
-_ELLIPSIS = re.compile(r"\s*(?:\.\.\.|…)\s*[,;]?\s*")
-_GAP = "…"
-
-
-def _value_runs(text: str, base: int) -> list[list[int | str]]:
-    """The runs of values `text` renders in `base` (10, or 16 as bytes), split where
-    anything but a separator or an ellipsis (kept as _GAP) sits between tokens."""
-    runs: list[list[int | str]] = []
-    run: list[int | str] = []
-    end = 0
-    for match in _VALUE_TOKEN.finditer(text):
-        between = text[end : match.start()]
-        if _ELLIPSIS.fullmatch(between) and run:
-            run.append(_GAP)
-        elif not _VALUE_SEPARATOR.fullmatch(between):
-            if run:
-                runs.append(run)
-            run = []
-        end = match.end()
-        prefix, digits = match.group(1), match.group(2)
-        values: list[int | str] | None
-        if match.start() > 0 and text[match.start() - 1].isalnum() and not prefix:
-            values = None  # the tail of a word, not a token
-        elif base == 10:
-            values = [int(digits)] if not prefix and digits.isdigit() else None
-        elif prefix:
-            values = [int(digits, 16)]
-        else:
-            values = (
-                [int(digits[i : i + 2], 16) for i in range(0, len(digits), 2)]
-                if len(digits) % 2 == 0
-                else None
-            )
-        if values is None:
-            if run:
-                runs.append(run)
-            run = []
-        else:
-            run.extend(values)
-    if run:
-        runs.append(run)
-    return runs
-
-
-def _holds_sequence(run: list[int | str], want: list[int]) -> bool:
-    """Whether `run` is `want` exactly, or its head and tail around an ellipsis.
-
-    Whole runs, not a slice of one: run R34's wrong [1, 0] sits inside the
-    reference's `01 01 00`.
-    """
-    pieces: list[list[int]] = [[]]
-    for value in run:
-        if value == _GAP:
-            pieces.append([])
-        else:
-            pieces[-1].append(int(value))
-    if len(pieces) == 1:
-        return pieces[0] == want
-    head, *middle, tail = pieces
-    if not head or not tail or len(head) + len(tail) >= len(want):
-        return False
-    if want[: len(head)] != head or want[len(want) - len(tail) :] != tail:
-        return False
-    at, stop = len(head), len(want) - len(tail)
-    for part in middle:
-        found = next(
-            (i for i in range(at + 1, stop - len(part)) if want[i : i + len(part)] == part), -1
-        )
-        if not part or found < 0:
-            return False
-        at = found + len(part)
-    return True
-
-
-#: A bracketed group of several values, such as `{0,2}` or `(1, 2)`.
-_VALUE_GROUP = re.compile(r"[\[{(]\s*[^\s,;\[\]{}()]+(?:\s*[,;]\s*[^\s,;\[\]{}()]+)+\s*[\]})]")
-
-
-def _bounded(text: str, value: str) -> bool:
-    """Whether `value` occurs in `text`, whitespace aside, with no letter or digit
-    either side of it."""
-    words = value.split()
-    if not words:
-        return False
-    body = r"\s*".join(re.escape(word) for word in words)
-    found = re.search(rf"(?<![0-9A-Za-z]){body}(?![0-9A-Za-z])", text, re.IGNORECASE)
-    return found is not None
-
-
-#: One decimal number, a fraction kept, in a nested list result's rendering.
-_DECIMAL = re.compile(r"(?<![0-9A-Za-z.])\d+(?:\.\d+)?(?![0-9A-Za-z]|\.\d)")
-
-
-def _result_numbers(value: object) -> list[int | float] | None:
-    """A list result's numbers in order, nested lists flattened, or None when an
-    item at any depth is not a number or a list."""
-    if not isinstance(value, list):
-        return None
-    numbers: list[int | float] = []
-    for item in value:
-        if isinstance(item, list):
-            inner = _result_numbers(item)
-            if inner is None:
-                return None
-            numbers += inner
-        elif isinstance(item, int | float) and not isinstance(item, bool):
-            numbers.append(item)
-        else:
-            return None
-    return numbers
-
-
-def _renders_decimals(text: str, want: list[int | float]) -> bool:
-    """Whether a whole run of decimal numbers in `text` is `want`, value for value."""
-    run: list[float] = []
-    end = 0
-    for match in _DECIMAL.finditer(text):
-        if run and not _VALUE_SEPARATOR.fullmatch(text[end : match.start()]):
-            if run == want:
-                return True
-            run = []
-        run.append(float(match.group()))
-        end = match.end()
-    return run == want
-
-
-def _renders_result(text: str, result: object, whole: bool = False) -> bool:
-    """Whether `text` holds `result` as the reference would print it.
-
-    A list of ints as decimal tokens or two-digit hex bytes (with or without 0x
-    or \\x, with or without separators), a long one by its head and tail around
-    an ellipsis; a nested list by all its numbers in order, a fraction as
-    decimals; a number by str() or hex; a string by itself, whitespace aside,
-    or as the bytes it spells in hex.
-
-    With `whole`, a number or string must be a whole value: bounded by no
-    letter or digit, and not one of a bracketed group of several values.
-    """
-    if isinstance(result, list):
-        flat = _result_numbers(result) or []
-        if not all(isinstance(v, int) for v in flat):
-            return _renders_decimals(text, [float(v) for v in flat])
-        want = [int(v) for v in flat]
-        bases = (10, 16) if all(0 <= v <= 255 for v in want) else (10,)
-        return any(_holds_sequence(run, want) for base in bases for run in _value_runs(text, base))
-    if whole:
-        text = _VALUE_GROUP.sub(" ", text)
-    if isinstance(result, int | float):
-        tokens = {str(v) for run in _value_runs(text, 10) for v in run}
-        tokens |= {str(int(m.group(2), 16)) for m in _VALUE_TOKEN.finditer(text) if m.group(1)}
-        if str(result) in tokens:
-            return True
-        return _bounded(text, str(result)) if whole else str(result) in text
-    if whole:
-        if _bounded(text, str(result)):
-            return True
-    elif "".join(str(result).split()).lower() in "".join(text.split()).lower():
-        return True
-    spelled = str(result).strip().lower()
-    if not re.fullmatch(r"(?:(?:0x|\\x)?[0-9a-f]{2}[\s,:\-]*)+", spelled):
-        return False
-    digits = re.sub(r"0x|\\x", "", spelled)
-    return _renders_result(text, [int(b, 16) for b in re.findall(r"[0-9a-f]{2}", digits)])
-
-
-def _searchable_result(value: object) -> bool:
-    """Whether a case's result has a rendering worth searching a source for."""
-    if isinstance(value, bool) or value is None:
-        return False
-    if isinstance(value, list):
-        return bool(_result_numbers(value))
-    if isinstance(value, int | float | str):
-        return bool(str(value).strip())
-    return False
-
-
-def _input_values(value: object) -> list[object]:
-    """`value` and every value in a dict nested in it, booleans and None aside.
-
-    A list's own scalars are not taken one by one: a count equal to one byte
-    of an input is still an answer.
-    """
-    found = [] if isinstance(value, bool) or value is None else [value]
-    if isinstance(value, dict):
-        items = list(value.values())
-    elif isinstance(value, list):
-        items = [item for item in value if isinstance(item, dict | list)]
-    else:
-        items = []
-    for item in items:
-        found += _input_values(item)
-    return found
-
-
-def _case_results(case: object) -> list[tuple[object, bool]]:
-    """(result, narrow) for each searchable result under a case's result-like keys.
-
-    A result is narrow when it is shorter than RESULT_MIN_CHARS or equal to one
-    of the case's inputs: found anywhere in a source it shows nothing, so only
-    the reference lines the source quotes may hold it. Run R34: expected_decoded
-    equalled the input a source quoted. Run R35: empty_input's "00" equalled its
-    input and was under RESULT_MIN_CHARS, and was wrong.
-
-    Run R36: an expected dict echoed its input's nested id "A" beside the event
-    it changed. Inputs are compared at any depth, and when some result differs
-    from every input the ones equal to an input are dropped: an echoed field
-    is not an answer.
-    """
-    if not isinstance(case, dict):
-        return []
-    # q35 R56: decoded_hex equalled input_hex, an echo once `decoded` is a result key.
-    inputs = [
-        item
-        for key, value in case.items()
-        if (str(key).lower() in _CASE_NON_ANSWER_KEYS or str(key).lower().startswith("input_"))
-        and not any(part in str(key).lower() for part in SOURCE_KEY_PARTS)
-        for item in _input_values(value)
-    ]
-    results: list[tuple[object, bool, bool]] = []
-
-    def walk(value: object) -> None:
-        if isinstance(value, dict):
-            for item in value.values():
-                walk(item)
-        elif _searchable_result(value):
-            short = not isinstance(value, list) and len(str(value).strip()) < RESULT_MIN_CHARS
-            echoed = any(type(item) is type(value) and item == value for item in inputs)
-            results.append((value, short, echoed))
-
-    for key, value in case.items():
-        name = str(key).lower()
-        if name == "out" or any(part in name for part in RESULT_KEY_PARTS):
-            walk(value)
-    if not all(echoed for _, _, echoed in results):
-        results = [result for result in results if not result[2]]
-    return [(value, short or echoed) for value, short, echoed in results]
-
-
-def _quoted_spans(source: str, lines: list[str]) -> list[tuple[int, int]]:
-    """(first, last) index of the reference lines each quote in `source` spans."""
-    spans: list[tuple[int, int]] = []
-    joined = " ".join(lines)
-    starts = list(itertools.accumulate((len(line) + 1 for line in lines), initial=0))
-    for candidate in _quote_candidates(source):
-        quote = _normalised(candidate).strip(" \"'`“”.,;:")
-        if not quote:
-            continue
-        at = joined.find(quote)
-        while at >= 0:
-            first = bisect.bisect_right(starts, at) - 1
-            last = bisect.bisect_right(starts, at + len(quote) - 1) - 1
-            spans.append((first, last))
-            at = joined.find(quote, at + 1)
-    return spans
-
-
-def _lines_after(source: str, lines: list[str]) -> list[str]:
-    """The next non-blank reference line after each line a quote in `source` ends on."""
-    return [lines[last + 1] for _, last in _quoted_spans(source, lines) if last + 1 < len(lines)]
-
-
-def _quoted_context(source: str, lines: list[str]) -> list[str]:
-    """The reference lines a quote in `source` spans, and the next non-blank one."""
-    return [
-        line for first, last in _quoted_spans(source, lines) for line in lines[first : last + 2]
-    ]
-
-
-#: A split table row's first line: its example index, then its input (`1 | 00`).
-_INDEXED_ROW = re.compile(r"\d+\s*\|")
-
-
-def _input_half(lines: list[str], at: int, inputs: list[object]) -> bool:
-    """Whether reference line `at` is a table row's example index and input, its
-    output on the next line, in a row that does not hold every one of `inputs`.
-
-    q35 R52: Wikipedia's example table puts each row on two lines, "1 | 00" then
-    "| 1 | 01 01 00". Case empty_input quoted "1 | 00", the row's input, as the
-    source of its expected [0], and the judge accepted it. A decode case's
-    expected bytes are on that line and its input on the next, so the line still
-    holds a result when the row holds the case's inputs.
-    """
-    if at + 1 >= len(lines) or not _INDEXED_ROW.match(lines[at]):
-        return False
-    if not lines[at + 1].startswith("|"):
-        return False
-    row = lines[at : at + 2]
-    return not inputs or not all(
-        any(_renders_result(line, value, whole=True) for line in row) for value in inputs
-    )
-
-
-def _result_unquoted(case: object, references: list[list[str]]) -> bool:
-    """Whether `case` has a checkable result that is not where it must be."""
-    return _result_found(case, references) is False
-
-
-def _result_found(case: object, references: list[list[str]]) -> bool | None:
-    """Whether each of `case`'s checkable results is where it must be, or None
-    when it has none to check.
-
-    A wide result must be in the case's source or the reference line after the
-    quoted one; a narrow one (`_case_results`) in the quoted reference line or,
-    as a whole value, the one after it. A narrow result is not checked when the
-    source quotes no reference line. Each checked result must be found, not any
-    one: run R36's echoed id "A" was in every quoted line.
-
-    Audit 11: R36 case #2 quoted "The counter remains 1" for an event of 2, and
-    passed on the 2 in "{0,2}" on the next line.
-
-    Run R44: a bare `true` has nothing to search, so it is not judged.
-
-    q35 R52: a quote of only a table row's index and input (`_input_half`) does
-    not hold the result itself; the row's output line after it still may.
-    """
-    results = _case_results(case)
-    if not results:
-        return None
-    sources = _source_strings(case)
-    inputs = _case_inputs(case)
-    quoted: list[str] = []
-    after: list[str] = []
-    halves: list[str] = []
-    spanned = False
-    for lines in references:
-        for source in sources:
-            after += _lines_after(source, lines)
-            spans = _quoted_spans(source, lines)
-            for first, last in spans:
-                spanned = True
-                if first < last or not _input_half(lines, first, inputs):
-                    quoted += lines[first : last + 1]
-            if spans and all(
-                first == last and _input_half(lines, first, inputs) for first, last in spans
-            ):
-                halves.append(source)
-    wide = [*(source for source in sources if source not in halves), *after]
-
-    def found(result: object, is_narrow: bool) -> bool:
-        if not is_narrow:
-            return any(_renders_result(text, result) for text in wide)
-        return any(_renders_result(text, result) for text in quoted) or any(
-            _renders_result(text, result, whole=True) for text in after
-        )
-
-    checked = [(result, is_narrow) for result, is_narrow in results if spanned or not is_narrow]
-    if not checked:
-        return None
-    return all(found(result, is_narrow) for result, is_narrow in checked)
-
-
-def _unquoted_cases(
-    root: Path, entries: list[str]
-) -> tuple[str, int, int, list[str], bool, list[tuple[str, str]], list[str]] | None:
-    """(data file, unfound, total, up to 3 names, whether by result, each named one's
-    source, the cases already sourced) for cases whose source does not tie them to
-    references/*.txt.
-
-    Runs R12 and R14: cases cited bare URLs, nothing, or `itc2008.txt:221`,
-    a line that held a page number. A source counts as found when at least
-    SOURCE_QUOTE_MIN_WORDS words of it occur, whitespace-normalised, in one
-    reference text; most must be found.
-
-    Run R34: every source was verbatim, but 11 of 13 quoted the case's input
-    line or prose, and 8 expected values were wrong. Any case with a searchable
-    result (`_case_results`) must have it in its source or the reference line
-    after the one quoted; run R35, a short or input-equal one in the quoted
-    reference line or the one after it. The fifth element is then True.
-
-    Run R36: the verdict named the cases, not what was searched in them, so a
-    driver could not see that the check missed quotes in parentheses. The last
-    element is the first flagged case's source strings, joined, or "".
-
-    Run R43: the hold named only the failing cases, and later workers changed
-    sources an earlier close had accepted. The last element names the cases
-    that pass both rules, for the hold to say to keep. Run R44: a case whose
-    result was not judged (`_result_found` None) is not named there.
-    """
-    refs = root / REFERENCES_DIR
-    texts = []
-    references: list[list[str]] = []
-    for path in sorted(refs.glob("*.txt")) if refs.is_dir() else []:
-        try:
-            raw = path.read_text(encoding="utf-8", errors="replace")
-        except OSError:
-            continue
-        texts.append(_normalised(raw))
-        references.append([_normalised(line) for line in raw.splitlines() if line.strip()])
-    if not texts:
-        return None
-    for entry in entries:
-        target = _project_file(root, entry)
-        if target is None or not target.is_file() or target.suffix != ".json":
-            continue
-        rel = str(target.relative_to(root.resolve()))
-        if not _is_cases_data(rel):
-            continue
-        try:
-            cases = _cases_list(json.loads(target.read_text(encoding="utf-8")))
-        except (OSError, ValueError):
-            continue
-        unfound = [
-            (i, case)
-            for i, case in enumerate(cases)
-            if not any(_quotes_reference(s, text) for s in _source_strings(case) for text in texts)
-        ]
-        verdicts = [_result_found(case, references) for case in cases]
-        wrong = [(i, case) for i, case in enumerate(cases) if verdicts[i] is False]
-        held = {i for i, _ in unfound}
-        sourced = [
-            _case_label(case, i)
-            for i, case in enumerate(cases)
-            if i not in held and verdicts[i] is True
-        ]
-        if cases and 2 * len(unfound) > len(cases):
-            names = [_case_label(case, i) for i, case in unfound[:3]]
-            sources = [
-                (name, _flagged_source(case))
-                for name, (_, case) in zip(names, unfound, strict=False)
-            ]
-            return rel, len(unfound), len(cases), names, False, sources, sourced
-        if wrong:
-            names = [_case_label(case, i) for i, case in wrong[:3]]
-            sources = [
-                (name, _flagged_source(case)) for name, (_, case) in zip(names, wrong, strict=False)
-            ]
-            return rel, len(wrong), len(cases), names, True, sources, sourced
-    return None
-
-
-#: Names of already-sourced cases a source hold lists, at most.
-SOURCED_NAMES_MAX = 8
-
-
-def _keep_sourced(sourced: list[str]) -> str:
-    """The hold's sentence naming the cases that already pass, for the next worker to keep."""
-    if not sourced:
-        return ""
-    shown = ", ".join(sourced[:SOURCED_NAMES_MAX])
-    more = len(sourced) - SOURCED_NAMES_MAX
-    shown += f" and {more} more" if more > 0 else ""
-    return f"Already sourced, keep unchanged: {shown}."
-
-
-#: Chars of a flagged case's source a verdict quotes.
-SEARCHED_SOURCE_CHARS = 240
-
-
-def _searched_source(name: str, source: str) -> str:
-    """What the source-quote check searched in case `name`, for its verdict."""
-    if not source.strip():
-        return f"Case {name} has no source string to search."
-    shown = source if len(source) <= SEARCHED_SOURCE_CHARS else source[:SEARCHED_SOURCE_CHARS] + "…"
-    return (
-        f'Case {name}\'s source, "{shown}", was searched: no run of '
-        f"{SOURCE_QUOTE_MIN_WORDS} or more of its words (whole, after a file:line label, or "
-        "inside quote marks, parentheses or brackets) was found in "
-        f"{REFERENCES_DIR}/*.txt."
-    )
-
-
-def _searched_sources(flagged: list[tuple[str, str]]) -> str:
-    """What the source-quote check searched in each named case, for its verdict.
-
-    Audit 11: the verdict showed only the first case's source; a worker fixing
-    the others had to guess what was wrong with theirs.
-    """
-    if not flagged:
-        return ""
-    lines = [_searched_source(*flagged[0])]
-    for name, source in flagged[1:]:
-        if not source.strip():
-            lines.append(f"Case {name} has no source string to search.")
-            continue
-        shown = (
-            source if len(source) <= SEARCHED_SOURCE_CHARS else source[:SEARCHED_SOURCE_CHARS] + "…"
-        )
-        lines.append(f'Case {name}\'s source, "{shown}", was not found either.')
-    return " ".join(lines)
-
-
-#: Keys whose values a case feeds the code, which a reference example line shows.
-_CASE_INPUT_KEYS = frozenset(
-    {
-        "input",
-        "inputs",
-        "in",
-        "args",
-        "arguments",
-        "ops",
-        "operations",
-        "operation",
-        "setup",
-        "given",
-    }
-)
-#: Value tokens one input must render for a line holding it alone to be shown.
-VALUE_RUN_MIN_TOKENS = 3
-#: Chars of a reference line a value-location sentence quotes.
-VALUE_LINE_CHARS = 120
-
-
-def _case_inputs(case: object) -> list[object]:
-    """The searchable values under a case's input keys, at any depth."""
-    if not isinstance(case, dict):
-        return []
-    return [
-        item
-        for key, value in case.items()
-        if str(key).lower() in _CASE_INPUT_KEYS
-        for item in _input_values(value)
-        if _searchable_result(item)
-    ]
-
-
-def _value_tokens(value: object) -> int:
-    if isinstance(value, list):
-        return len(_result_numbers(value) or value)
-    return len(re.findall(r"[0-9A-Za-z]+", str(value)))
-
-
-def _value_line(
-    label: str, case: object, references: list[tuple[str, list[tuple[int, str]]]]
-) -> str:
-    """Where in `references` a flagged case's input values are, for its verdict.
-
-    Run R37: workers paraphrased sources ("Example 1 shows unencoded data 00
-    encodes to 01 01 00") while the reference held the example as a two-line
-    table row, `1 | 00` then `| 1 | 01 01 00`. A line holds the inputs when
-    each renders on it as `_renders_result` reads a whole value.
-
-    An input such as `00` is on many lines, so the line shown is the first
-    that holds the inputs with every result on it or the next line. Without
-    such a line, the first holding the inputs alone is shown only when one
-    input is a run of VALUE_RUN_MIN_TOKENS or more tokens, which a line holds
-    by chance rarely; else nothing is said, rather than point at a random
-    line, unless no line holds the inputs at all.
-
-    A line is offered to copy only when it passes `_quotes_reference` on its
-    own; else the two lines are offered joined when that passes, else none.
-    """
-    inputs = _case_inputs(case)
-    if not inputs:
-        return ""
-    results = _case_results(case)
-
-    def holds_inputs(text: str) -> bool:
-        return all(_renders_result(text, value, whole=True) for value in inputs)
-
-    paired: tuple[str, int, int] | None = None
-    alone: tuple[str, int, int] | None = None
-    for name, lines in references:
-        for at, (_, text) in enumerate(lines):
-            if not holds_inputs(text):
-                continue
-            after = at + 1 if at + 1 < len(lines) else at
-            pair = (name, at, after)
-            alone = alone or pair
-            near = [text, lines[after][1]]
-            if results and all(
-                any(_renders_result(line, result, whole=narrow) for line in near)
-                for result, narrow in results
-            ):
-                paired = pair
-                break
-        if paired:
-            break
-    distinct = max(_value_tokens(value) for value in inputs) >= VALUE_RUN_MIN_TOKENS
-    found = paired or (alone if distinct else None)
-    if found is None:
-        if alone:
-            return ""
-        return (
-            f"No line of {REFERENCES_DIR}/*.txt holds case {label}'s inputs; "
-            "check it comes from the reference."
-        )
-    name, at, after = found
-    lines = dict(references)[name]
-
-    def quoted(index: int) -> str:
-        text = lines[index][1].strip()
-        if len(text) > VALUE_LINE_CHARS:
-            text = text[:VALUE_LINE_CHARS] + "…"
-        return f'"{text}"'
-
-    reference = _normalised(" ".join(text for _, text in lines))
-
-    def quotable(text: str) -> bool:
-        return _quotes_reference(text.strip('"'), reference)
-
-    first, last = lines[at][0], lines[after][0]
-    if after == at:
-        if not quotable(quoted(at)):
-            return f"Case {label}'s values are on {name}:{first}: {quoted(at)}."
-        return f"Case {label}'s values are on {name}:{first}: {quoted(at)}; copy it as its source."
-    span = f"{first}-{last}" if last == first + 1 else f"{first},{last}"
-    where = f"Case {label}'s values are on {name}:{span}: {quoted(at)} / {quoted(after)}"
-    if quotable(quoted(at)) and quotable(quoted(after)):
-        return f"{where}; copy one of those lines as its source."
-    # Run R43: "1 | 00" was offered alone, three words, and the rule refused it.
-    joined = lines[at][1].strip() + " " + lines[after][1].strip()
-    if quotable(joined):
-        return f'{where}; copy the two joined, "{joined}", as its source.'
-    return f"{where}."
-
-
-def _value_lines(root: Path, data: str, named: list[str]) -> str:
-    """Where in references/*.txt each case `named` in `data` has its input values."""
-    references: list[tuple[str, list[tuple[int, str]]]] = []
-    refs = root / REFERENCES_DIR
-    for path in sorted(refs.glob("*.txt")) if refs.is_dir() else []:
-        try:
-            raw = path.read_text(encoding="utf-8", errors="replace")
-        except OSError:
-            continue
-        numbered = [(n, line) for n, line in enumerate(raw.splitlines(), 1) if line.strip()]
-        references.append((path.name, numbered))
-    try:
-        cases = _cases_list(json.loads((root / data).read_text(encoding="utf-8")))
-    except (OSError, ValueError):
-        return ""
-    labelled: dict[str, object] = {}
-    for i, case in enumerate(cases):
-        labelled.setdefault(_case_label(case, i), case)
-    sentences = [
-        _value_line(name, labelled[name], references) for name in named if name in labelled
-    ]
-    return " ".join(sentence for sentence in sentences if sentence)
-
-
 def _unanswered_case_note(root: Path) -> str:
     """The known-answers verdict's sentence for a case no reference line answers.
 
@@ -7592,63 +5626,6 @@ def _unanswered_case_note(root: Path) -> str:
         "rather than quote a rule or prose line again."
     )
     return f"{note} To find lines that give a result, search with bash: `{_reference_search()}`."
-
-
-def _reads_locked_data(root: Path, test: str, data: list[str]) -> bool:
-    """Whether `test` reads one of the `data` files and imports a project module.
-
-    The same AST reads as `_unread_cases`: the test opens the file by name, and
-    imports a module that is neither stdlib, a test library nor a test.
-    """
-    names = {Path(rel).name for rel in data}
-    path = root / test
-    return (
-        test.endswith(".py")
-        and _is_test_path(test)
-        and any(_cases_test_reads(path, name) for name in names)
-        and bool(_test_project_imports(path))
-    )
-
-
-def _cases_tests_beside_locks(
-    root: Path, goal: Path, changed: list[str], locks: list[str]
-) -> list[str]:
-    """The changed tests, not in `locks`, that read locked data and import the code.
-
-    Run R22: T0002 locked tests/cases.json alone, and its committed
-    tests/test_cases.py, which read it and imported cobs, stayed unlocked, so
-    Cases first refused every code task after it.
-    """
-    named = set()
-    for entry in locks:
-        target = _project_file(root, entry)
-        if target is not None:
-            named.add(str(target.relative_to(root.resolve())))
-    data = [rel for rel in [*named, *_locked(goal)] if _is_cases_data(rel)]
-    if not data:
-        return []
-    held = named | set(_locked(goal))
-    return [rel for rel in changed if rel not in held and _reads_locked_data(root, rel, data)]
-
-
-def _locked_test_imports(goal: Path) -> dict[str, str]:
-    """Each project module a locked test file imports, with the first test importing it.
-
-    With a cases data file locked, a test that reads none of them is skipped:
-    its own asserts, not the known answers, would judge the code.
-    """
-    store = goal.parent / LOCKED_DIR
-    imported: dict[str, str] = {}
-    locked = _locked(goal)
-    data = [Path(rel).name for rel in locked if _is_cases_data(rel)]
-    for rel in locked:
-        if not rel.endswith(".py") or not _is_test_path(rel):
-            continue
-        if data and not any(_cases_test_reads(store / rel, name) for name in data):
-            continue
-        for name in _test_project_imports(store / rel):
-            imported.setdefault(name, rel)
-    return imported
 
 
 def _runs_test_file(command: str, rel: str) -> bool:
@@ -7705,558 +5682,6 @@ def _python_script(args: list[str]) -> str | None:
             continue
         return token.rstrip(";").removeprefix("./")
     return None
-
-
-def _locked_test_unrun(command: str, scope: list[str], goal: Path) -> tuple[str, str] | None:
-    """The module in `scope` a locked test judges, and that test, when `command`
-    runs no locked test; else None.
-
-    Run R14 closed T0007 and T0008, both scoped on interval_tree_clocks, on
-    construct-and-call checks; the locked cases test that imports it never ran.
-    """
-    imported = _locked_test_imports(goal)
-    if not imported or not scope:
-        return None
-    judged = [(module, test) for module, test in imported.items() if _holds_module(scope, module)]
-    if not judged or any(_runs_test_file(command, test) for _, test in judged):
-        return None
-    return judged[0]
-
-
-def _holds_module(scope: list[str], module: str) -> bool:
-    """Whether an entry of `scope` holds `module`'s file, at the root or under src/."""
-    entries = [e.rstrip("/") for e in scope]
-    rel = module.replace(".", "/")
-    for base in ("", "src/"):
-        for path in (f"{base}{rel}.py", f"{base}{rel}/__init__.py"):
-            if any(e in {"", "."} or path == e or path.startswith(f"{e}/") for e in entries):
-                return True
-        if any(e == f"{base}{rel}" or e.startswith(f"{base}{rel}/") for e in entries):
-            return True
-    return False
-
-
-def _runs_no_test(command: str) -> bool:
-    """Whether `command` runs neither pytest nor python: a linter, say."""
-    return not any(
-        Path(word).name in {"pytest", "py.test"} or _PYTHON_NAME.fullmatch(Path(word).name)
-        for word in re.split(r"[\s'\"]+", command)
-    )
-
-
-def _locked_test_unrun_said(module: str, test: str) -> str:
-    """The lead of a refusal of a check that runs none of the locked tests."""
-    return (
-        f"the scope holds {module}, which the locked {test} judges, but done_when runs "
-        f"none of the locked tests, so the reference's answers would not judge this part"
-    )
-
-
-def _locked_test_problem(command: str, scope: list[str], goal: Path) -> str | None:
-    """Why a part on a module a locked test judges is bound to a check that runs no
-    locked test, or None; the call it offers binds that test."""
-    unrun = _locked_test_unrun(command, scope, goal)
-    if unrun is None:
-        return None
-    module, test = unrun
-    return (
-        f"{_locked_test_unrun_said(module, test)}. Bind `python3 -m pytest -q {test}`. "
-        "A selection of that file counts as running it, so a small part can bind just "
-        "the cases it makes pass: a node id "
-        f"(`python3 -m pytest -q {test}::<test name>`) or `python3 -m pytest -q {test} "
-        "-k <name>`. Call pursuit_step again with that."
-    )
-
-
-async def _locked_test_refusal(
-    command: str,
-    scope: list[str],
-    goal: Path,
-    passing_refused: Callable[[str], Awaitable[str | None]],
-) -> str | None:
-    """`_locked_test_problem`, its offer first met with the refusal that meets it.
-
-    `passing_refused` runs a check and gives the refusal of it as passing before
-    any work, or None. Runs R22 and R43 bound the locked test this offered and
-    were refused as already passing, many times: where the locked test passes
-    now, that refusal, with its own way on, is said in place of the offer.
-    """
-    if _cases_off(goal.parent.parent):
-        return None
-    unrun = _locked_test_unrun(command, scope, goal)
-    if unrun is None:
-        return None
-    module, test = unrun
-    refused = await passing_refused(f"python3 -m pytest -q {test}")
-    if refused is None:
-        return _locked_test_problem(command, scope, goal)
-    said = (
-        f"{_locked_test_unrun_said(module, test)}, and binding the locked test is no "
-        f"way on either: {refused}"
-    )
-    if _runs_no_test(command):
-        # q35 R54 L53-L59: T0005's ruff check failed now and its scope named the
-        # files, so "bind a check that fails now" named the refused call; only
-        # cobs/ in scope was wrong, and the driver found that after 3.6 min.
-        rest = [entry for entry in scope if not _holds_module([entry], module)]
-        keep = f": scope={json.dumps(rest)}" if rest else ", naming only the files it changes"
-        said += (
-            f" `{command}` runs no test, so the locked test need not judge this task: "
-            f"call again with the same done_when and {module} out of scope{keep}."
-        )
-    return said
-
-
-#: The known-answers task's scope and locks, as the cases-first hint gives them.
-_CASES_FIRST_SCOPE = ("tests/cases.json", "tests/test_cases.py", "tests/test_case_data.py")
-
-#: The known-answers task's scope, check and locks, as the cases-first hint gives them.
-_CASES_FIRST_WORK = (
-    f"with scope {', '.join(_CASES_FIRST_SCOPE)}; "
-    'done_when="python3 -m pytest -q tests/test_case_data.py"; and '
-    f"locks=[{', '.join(_CASES_FIRST_SCOPE)}]"
-)
-
-
-def _known_answers_siblings(task: str, nodes: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """The unfinished tasks beside `task`, under its parent, that write the known answers."""
-    node = next((n for n in nodes if str(n.get("id")) == task), None)
-    parent = node.get("parent") if node else None
-    if not parent:
-        return []
-    return [
-        n
-        for n in nodes
-        if n.get("parent") == parent
-        and str(n.get("id")) != task
-        and n.get("status") in ("pending", "open")
-        and _writes_known_answers(f"{n.get('title') or ''}::{n.get('intent') or ''}")
-    ]
-
-
-_KNOWN_ANSWERS_FILE = re.compile(r"case|known_answer")
-
-
-def _known_answers_on_disk(root: Path) -> list[str]:
-    """The known-answers files under tests/ that git holds uncommitted."""
-    return [
-        rel
-        for rel in _changed_files(root)
-        if rel.startswith("tests/") and _KNOWN_ANSWERS_FILE.search(Path(rel).name)
-    ]
-
-
-def _cases_on_disk_route(
-    task: str,
-    title: str,
-    named: str,
-    unjudged_text: str,
-    on_disk: list[str],
-    existing: str,
-    unwait: str,
-    nodes: list[dict[str, Any]] | None = None,
-    root: Path | None = None,
-) -> str:
-    """The Cases first refusal when the known answers are on disk, uncommitted.
-
-    Run R18 #51: the hint ordered a fresh known-answers split whose data test
-    had passed since t3.7 on W1's uncommitted files, and that open was then
-    refused as "already passes". The route named here opens on those files.
-    Run R26 E196: it told the driver to open T0011, already open and unprovable;
-    an open holder gets the call that settles it instead.
-    """
-    holder = next((n for n in nodes or [] if str(n.get("id")) == existing), None)
-    if existing and holder is not None and holder.get("status") == "open":
-        check = str(holder.get("done_when") or "").strip()
-        own = _strings(holder.get("scope"))
-        stuck = root is not None and (
-            (str(root), existing) in _UNPROVEN or _at_spawn_limit(existing, nodes)
-        )
-        settle = (
-            _unproven_call(
-                existing,
-                check,
-                own,
-                root,
-                _missing_data(check, own, root) if check else [],
-                nodes,
-            )
-            if stuck and root is not None
-            else f'pursuit_step task="{existing}"'
-        )
-        sealing = _seal_warning(existing, str(holder.get("parent") or ""))
-        if "abandon=" in settle and sealing:
-            settle += ". " + sealing.rstrip(".")
-        return (
-            f"Cases first: {unjudged_text} The known answers are on disk already, "
-            f"uncommitted, and {existing}, open already, holds them: do not split {task}. "
-            f"{unwait}Settle {existing} first: {settle}. {task} opens once its cases are "
-            f"locked, its test importing {named} by name."
-        )
-    data = next((rel for rel in on_disk if re.search(r"test_\w*data\w*\.py$", rel)), "")
-    check = f"python3 -m pytest -q {data or 'tests/test_case_data.py'}"
-    scope = sorted({*on_disk, data or "tests/test_case_data.py"})
-    listed = ", ".join(on_disk[:8]) + (f", {len(on_disk) - 8} more" if len(on_disk) > 8 else "")
-    work = f'with scope {", ".join(scope)}; done_when="{check}"; and locks=[{", ".join(scope)}]'
-    opens = (
-        f"`{check}` may pass already: it passes only on these uncommitted files, so the "
-        "open accepts it, and the close judges them (its witness takes them away). Do "
-        "not write the cases again."
-    )
-    head = (
-        f"Cases first: {unjudged_text} The known answers are on disk already, "
-        f"uncommitted: {listed}."
-    )
-    if existing and holder is not None and _at_spawn_limit(existing, nodes):
-        # Run R26: "Open T0011 first" for a holder whose retry chain was at the
-        # limit; the driver sent it with new_route=true, and beagle refused it.
-        status = str(holder.get("status") or "")
-        held = _strings(holder.get("scope")) or scope
-        if status == "pending":
-            settle = (
-                f'Open {existing} first, with no new route: pursuit_step task="{existing}". '
-                f"If its check then cannot be proven: "
-                + _spawn_limit_offer(existing, str(holder.get("done_when") or ""), held, nodes)
-            )
-        else:
-            settle = _spawn_limit_offer(existing, "", held, nodes or [])
-        return (
-            f"{head} {existing} holds them: do not split {task}. {unwait}{settle} {task} "
-            f"opens once its cases are locked, its test importing {named} by name."
-        )
-    if existing:
-        return (
-            f"{head} {existing} holds them: do not split {task}. {unwait}Open {existing} first, "
-            f'{work}: pursuit_step task="{existing}". {opens} {task} opens once its cases '
-            f"are locked, its test importing {named} by name."
-        )
-    parts = [
-        f"Known answers::the cases on disk ({listed}), locked",
-        f"{_judged_label(title, task)}::the code, judged by the locked cases",
-    ]
-    clash = _live_title_clash(task, parts, nodes or [])
-    if clash is not None:
-        return f"{head} No task holds them yet, and a plan cannot add one: {clash}"
-    return (
-        f"{head} No task holds them yet. Add it before this one in one call: "
-        f'pursuit_plan task="{task}" parts={json.dumps(parts, ensure_ascii=False)}. '
-        f"Then open the known-answers task, {work}. {opens}"
-    )
-
-
-def _judged_label(title: str, task: str) -> str:
-    """The code part's title in a cases-first plan: never `task`'s own title.
-
-    Run R29: the plan's second part took the task's title, and the plan tool
-    refused it as the title of the task being split.
-    """
-    base = title.replace("::", ":").replace('"', "'").strip() or task
-    return f"{base}, judged by the cases"
-
-
-def _locked_data_route(
-    task: str,
-    scope: list[str],
-    named: str,
-    unjudged_text: str,
-    data: list[str],
-    committed: list[tuple[str, str]],
-    module: str,
-    root: Path,
-    locked: list[str] | tuple[str, ...] = (),
-) -> str:
-    """The Cases first refusal when the known answers are locked but no test of them is.
-
-    Run R22: the hint planned a known-answers part over the locked
-    tests/cases.json, and that part's work was refused as locked. With a done
-    task's cases test committed, the route locks it on this step; else this
-    task writes the test and its close locks it.
-
-    Run R39: a candidate test on disk was skipped for the next fresh name, so
-    each refusal named a new file. A candidate on disk, neither committed nor
-    in `locked`, that reads the data is offered for this task to finish.
-    """
-    listed = ", ".join(data)
-    head = (
-        f"Cases first: {unjudged_text} The known answers ({listed}) are locked already: "
-        "do not plan them again."
-    )
-    if committed:
-        test, owner = committed[0]
-        check = f"python3 -m pytest -q {test}"
-        scoped = ", ".join(f'"{e}"' for e in scope)
-        return (
-            f"{head} {test} is {owner}'s committed work: it reads them and imports the "
-            f"code, but it was never locked. Lock it on this step, scope kept: "
-            f'pursuit_step task="{task}" scope=[{scoped}] done_when="{check}" '
-            f'locks=["{test}"]. {test} is locked at once, as {owner} committed it, and '
-            "then judges this task's code."
-        )
-    stem = module.split(".")[-1] if module else "cases"
-    candidates = [
-        "tests/test_cases.py",
-        f"tests/test_{stem}_cases.py",
-        f"tests/test_{stem}_known_answers.py",
-    ]
-    on_disk = [rel for rel in candidates if (root / rel).is_file()]
-    held = (_head_files(root) or set()) | set(locked) if on_disk else set()
-    names = {Path(rel).name for rel in data}
-    started = next(
-        (
-            rel
-            for rel in on_disk
-            if rel not in held and any(_cases_test_reads(root / rel, name) for name in names)
-        ),
-        None,
-    )
-    test = started or next((rel for rel in candidates if not (root / rel).exists()), candidates[-1])
-    # q35 R59 L91: a scope that held the test listed it twice.
-    scoped = ", ".join(f'"{e}"' for e in dict.fromkeys([*scope, test]))
-    write = (
-        f"{test} is on disk, uncommitted and unlocked, and reads {listed}: put {test} in "
-        f"scope and make it import the code, {named}, in this task, then lock it at its "
-        "close"
-        if started
-        else "Write that test in this task and lock it at its close"
-    )
-    return (
-        f"{head} No test that reads them imports {named} yet. {write}: "
-        f'pursuit_step task="{task}" scope=[{scoped}] '
-        f'done_when="python3 -m pytest -q {test}" locks=["{test}"]. The test must load '
-        f"{listed} and run every case against {named}, with no asserts of its own."
-    )
-
-
-def _committed_cases_tests(
-    root: Path, goal: Path, task: str, nodes: list[dict[str, Any]]
-) -> list[tuple[str, str]]:
-    """(test, done task) for each unlocked test a done task committed that reads
-    locked data and imports the code, unchanged since HEAD.
-
-    Run R22: T0002 committed tests/test_cases.py beside the locked
-    tests/cases.json but never locked it.
-    """
-    locked = _locked(goal)
-    data = [rel for rel in locked if _is_cases_data(rel)]
-    head = _head_files(root) if data else None
-    found: list[tuple[str, str]] = []
-    for rel in sorted(head or ()):
-        if rel in locked or not _reads_locked_data(root, rel, data):
-            continue
-        try:
-            unchanged = (root / rel).read_bytes() == _committed_bytes(root, "HEAD", rel)
-        except OSError:
-            continue
-        owner = _done_task_in_log([rel], task, nodes, root) if unchanged else ""
-        if owner:
-            found.append((rel, owner))
-    return found
-
-
-def _live_data_holder(task: str, nodes: list[dict[str, Any]], data: list[str], goal: Path) -> str:
-    """The live leaf to work for `data`: the first open or pending task whose scope
-    or pending locks name a `data` file, or the first live leaf under it when it is
-    a container; "" when no live task holds the data.
-
-    Run R24: the lookup skipped containers, so each new_route split off a fresh
-    known-answers task (T0002, T0013, T0019) over files T0002 already held.
-    """
-    live = ("open", "pending")
-    wanted = {os.path.normpath(rel) for rel in data}
-    root = goal.parent.parent
-
-    def holds(node: dict[str, Any]) -> bool:
-        held = _strings(_shown(str(node.get("id")), root).get("scope"))
-        held += _pending_locks(goal, str(node.get("id")))
-        return any(os.path.normpath(entry.strip()) in wanted for entry in held)
-
-    containers = {str(n.get("id")) for n in nodes if n.get("container")}
-
-    def leaf(node_id: str, seen: set[str]) -> str:
-        parts = [
-            n for n in nodes if str(n.get("parent") or "") == node_id and n.get("status") in live
-        ]
-        if not parts:
-            return "" if node_id in containers else node_id
-        for part in parts:
-            part_id = str(part.get("id"))
-            if part_id in seen:
-                continue
-            found = leaf(part_id, seen | {part_id})
-            if found and found != task:
-                return found
-        return ""
-
-    holders = [n for n in nodes if str(n.get("id")) != task and n.get("status") in live]
-    # A leaf that names the data outranks a container whose scope is wider.
-    holders.sort(key=lambda n: bool(n.get("container")))
-    for node in holders:
-        if holds(node):
-            node_id = str(node.get("id"))
-            found = leaf(node_id, {node_id})
-            if found and found != task:
-                return found
-    return ""
-
-
-def _cases_first_problem(
-    scope: list[str],
-    task: str,
-    title: str,
-    goal: Path,
-    nodes: list[dict[str, Any]] | None = None,
-    locks: list[str] | None = None,
-) -> str | None:
-    """Why a task would write new source before known answers judge it, or None.
-
-    Run R12: CASES_FIRST_NOTE was advice, the driver opened the implementation
-    before any cases, and a plain-int event clock was built that nothing from
-    the paper bound. With references/ there, a new source module waits for a
-    locked test that imports it by name.
-
-    Run R16's hint split T0006 under a new known-answers task although its
-    siblings T0007-T0009 already held the cases: given the tree, a sibling
-    that writes the known answers is named instead.
-    """
-    if _cases_off(goal.parent.parent):
-        return None
-    root = goal.parent.parent
-    if not (root / REFERENCES_DIR).is_dir():
-        return None
-    asked = set(_lock_paths(locks or [], root))
-    known_answers = _names_known_answers(title) or bool(asked & set(_CASES_FIRST_SCOPE))
-    new = _new_modules(scope, root, whole_tree=known_answers)
-    if not new:
-        return None
-    locked_data = [rel for rel in _locked(goal) if _is_cases_data(rel)]
-    committed = _committed_cases_tests(root, goal, task, nodes or []) if locked_data else []
-    for rel, owner in committed:
-        if rel in asked:
-            # The route below asks for this: a done task's committed test,
-            # locked as that task left it.
-            _lock(goal, root, [rel], owner)
-    named_scope = set(_lock_paths(scope, root))
-    carried = [
-        rel
-        for rel in asked & named_scope
-        if rel.endswith(".py") and _is_test_path(rel) and rel not in _locked(goal)
-    ]
-    if locked_data and carried:
-        # Its close locks the cases test beside the locked data, or stays open.
-        return None
-    imported = _locked_test_imports(goal)
-
-    def judged(module: str) -> bool:
-        if not module:
-            return bool(imported)
-        return any(
-            name == module or name.startswith(f"{module}.") or module.startswith(f"{name}.")
-            for name in imported
-        )
-
-    unjudged = [(entry, module) for entry, module in new if not judged(module)]
-    if not unjudged:
-        return None
-    entry, module = unjudged[0]
-    if known_answers:
-        # Run R29: the known-answers task itself was told to split off known answers.
-        rest = [e for e in scope if not _new_modules([e], root, whole_tree=True)] or list(
-            _CASES_FIRST_SCOPE
-        )
-        shown = entry if entry.strip() else json.dumps(entry)
-        return (
-            f"Cases first: {task} is the known-answers task: drop {shown} from scope (the "
-            f"code is a later task) and call pursuit_step again with scope "
-            f"{json.dumps(rest)}."
-        )
-    if imported:
-        name, test = next(iter(imported.items()))
-        path = name.replace(".", "/")
-        base = "src/" if (root / "src").is_dir() else ""
-        return (
-            f"Cases first: scope names new source {entry}, which no locked test imports, "
-            f"so nothing from the reference judges it. The locked cases test {test} imports "
-            f"`{name}`: put that module ({base}{path}.py or {base}{path}/) in this task's "
-            f"scope instead of {entry}, and call pursuit_step again."
-        )
-    named = f"`{module}`" if module else "the module this task writes"
-    unjudged_text = (
-        f"Scope names new source {entry}, and no locked test imports it yet, so nothing "
-        "from the reference would judge the code."
-    )
-    if locked_data:
-        return _locked_data_route(
-            task, scope, named, unjudged_text, locked_data, committed, module, root, _locked(goal)
-        )
-    on_disk = _known_answers_on_disk(root)
-    siblings = _known_answers_siblings(task, nodes or [])
-    if siblings:
-        first = str(siblings[0].get("id"))
-        listed = ", ".join(f"{n.get('id')} {str(n.get('title') or '')!r}" for n in siblings)
-        drops = [
-            f'    beagle pursuit depend {n.get("id")} {task} --drop --reason "known answers '
-            'go before the code"'
-            for n in siblings
-            if task in [str(w) for w in n.get("waiting_on") or []]
-        ]
-        unwait = (
-            f"They wait on {task}, so drop each wait first. Run in bash, exactly:\n\n"
-            + "\n".join(drops)
-            + "\n\n"
-            if drops
-            else ""
-        )
-        if on_disk:
-            return _cases_on_disk_route(
-                task, title, named, unjudged_text, on_disk, first, unwait, nodes, root
-            )
-        return (
-            f"Cases first: {unjudged_text} The known answers are already planned beside "
-            f"{task}: {listed}. Do not split {task}. {unwait}Then work {first} first, "
-            f'{_CASES_FIRST_WORK}: pursuit_step task="{first}". {task} opens once its '
-            f"cases are locked, its test importing {named} by name."
-        )
-    if on_disk:
-        data = [rel for rel in on_disk if _is_cases_data(rel)] or on_disk
-        existing = _live_data_holder(task, nodes or [], data, goal) or next(
-            (
-                str(n.get("id"))
-                for n in nodes or []
-                if str(n.get("id")) != task
-                and n.get("status") in ("pending", "open")
-                and not n.get("container")
-                and _names_known_answers(str(n.get("title") or ""))
-            ),
-            "",
-        )
-        return _cases_on_disk_route(
-            task, title, named, unjudged_text, on_disk, existing, "", nodes, root
-        )
-    # Not on disk: the data file is the one the known-answers work below writes.
-    data = [rel for rel in _CASES_FIRST_SCOPE if _is_cases_data(rel)]
-    holder = _live_data_holder(task, nodes or [], data, goal)
-    if holder:
-        return (
-            f"Cases first: {unjudged_text} {holder} holds {', '.join(data)} already: do not "
-            f"split {task}. Work {holder} first, {_CASES_FIRST_WORK}: "
-            f'pursuit_step task="{holder}". {task} opens once its cases are locked, its '
-            f"test importing {named} by name."
-        )
-    parts = [
-        "Known answers::cases from references/ in tests/cases.json, and "
-        f"tests/test_cases.py importing {named} by name",
-        f"{_judged_label(title, task)}::the code, judged by the locked cases",
-    ]
-    clash = _live_title_clash(task, parts, nodes or [])
-    if clash is not None:
-        return f"Cases first: {unjudged_text} A known-answers milestone cannot be planned: {clash}"
-    return (
-        "Cases first: open the known-answers milestone before the code; its test imports "
-        f"this module by name. {unjudged_text} Add the milestone "
-        f'before this one in one call: pursuit_plan task="{task}" '
-        f"parts={json.dumps(parts, ensure_ascii=False)}. Then work the known-answers "
-        f"task first, {_CASES_FIRST_WORK}."
-    )
 
 
 def _python_c_code(argv: list[str]) -> str | None:
@@ -8700,8 +6125,6 @@ def _pytest_node_missing_problem(command: str, scope: list[str], root: Path) -> 
         if " " in word:
             with contextlib.suppress(ValueError):
                 parts += shlex.split(word)
-    locked = set(_locked(root / ".beagle" / GOAL_BASENAME))
-    named = {os.path.normpath(e.strip()) for e in scope}
     for part in parts:
         rel, _, node_id = part.partition("::")
         rel = rel.rstrip("/")
@@ -8715,7 +6138,7 @@ def _pytest_node_missing_problem(command: str, scope: list[str], root: Path) -> 
         ):
             continue
         rel = os.path.normpath(rel)
-        if _in_scope(rel, scope, root) and (rel not in locked or rel in named):
+        if _in_scope(rel, scope, root):
             continue
         try:
             tree = ast.parse((root / rel).read_text(encoding="utf-8"))
@@ -8740,12 +6163,11 @@ def _pytest_node_missing_problem(command: str, scope: list[str], root: Path) -> 
             )
             or (isinstance(n, ast.ClassDef) and n.name.startswith("Test"))
         ]
-        why = "it is locked" if rel in locked else "it is outside the task's scope"
         held = f"its tests are: {', '.join(tests[:5])}" if tests else "it holds no tests"
         return (
             f"done_when `{command}` names `{node_id}`, which is not in {rel}; {held}. "
-            f"No worker can add it, since {why}. Name a test that exists, or a test file "
-            "in the task's scope, and call pursuit_step again with that."
+            "No worker can add it, since it is outside the task's scope. Name a test that "
+            "exists, or a test file in the task's scope, and call pursuit_step again with that."
         )
     return None
 
@@ -9003,90 +6425,6 @@ def _data_test_import_said(
     )
 
 
-def _import_guard(test_path: Path, name: str) -> str:
-    """The guard around `test_path`'s import of module `name`: the first handler of the
-    try that holds it (`except ImportError`) or the with that does (`with
-    contextlib.suppress(ImportError)`); "" when neither holds it."""
-    try:
-        tree = ast.parse(test_path.read_text(encoding="utf-8"))
-    except (OSError, SyntaxError, ValueError):
-        return ""
-
-    def imports(stmts: list[ast.stmt]) -> bool:
-        for stmt in stmts:
-            for node in ast.walk(stmt):
-                if isinstance(node, ast.Import):
-                    names = [alias.name for alias in node.names]
-                elif isinstance(node, ast.ImportFrom) and node.module and not node.level:
-                    names = [node.module]
-                else:
-                    continue
-                if any(n == name or n.startswith(f"{name}.") for n in names):
-                    return True
-        return False
-
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Try | ast.TryStar) and node.handlers and imports(node.body):
-            caught = node.handlers[0].type
-            return f"except {ast.unparse(caught)}" if caught is not None else "except"
-        if isinstance(node, ast.With) and imports(node.body):
-            return f"with {', '.join(ast.unparse(item.context_expr) for item in node.items)}"
-    return ""
-
-
-def _guarded_import_said(test: str, module: str, imported: str, root: Path) -> str:
-    """That `test` imports `module`, which the tree does not provide, and passes anyway."""
-    line = _import_line(root / test, imported)
-    guard = _import_guard(root / test, imported)
-    at = f" (`{line}`{f', under `{guard}`' if guard else ''})" if line else ""
-    return (
-        f"{test} imports {module}{at}, which the project tree does not provide, and still "
-        f"passes: its import is guarded, so its cases judge nothing until {module} exists."
-    )
-
-
-async def _cases_test_passing_without_code(
-    root: Path, entries: list[str]
-) -> tuple[str, str, str] | None:
-    """(test, module, imported) for a cases test in `entries`, one that reads a cases
-    data file there, which imports, itself or through a sibling test, a module the tree
-    and the installed packages do not provide, and passes when run; or None.
-
-    Run R43: the locked tests/test_case_data.py imported the code under try/except
-    ImportError: return, so it passed with no code, and the next task's open was
-    told both to bind it and that it already passes.
-    """
-    data = [Path(rel).name for rel in entries if _is_cases_data(rel)]
-    for rel in entries:
-        test = root / rel
-        if not (rel.endswith(".py") and _is_test_path(rel) and test.is_file()):
-            continue
-        if not any(_cases_test_reads(test, name) for name in data):
-            continue
-        found = _unwritten_import(test, [], root, set())
-        if found is None:
-            continue
-        run = f"python3 -m pytest -q {shlex.quote(rel)}"
-        if (await _run_check(run, root, DEFAULT_CHECK_TIMEOUT))[0] == 0:
-            module, via = found
-            return rel, module, Path(via[0]).stem if via else module
-    return None
-
-
-def _locked_test_without_its_module(command: str, goal: Path, root: Path) -> tuple[str, str] | None:
-    """(locked test, module) when `command` runs a locked test that imports a module
-    the tree and the installed packages do not provide, ignoring the scope that would
-    write it; or None. With the check passing, that test passes without the module."""
-    if _cases_off(root):
-        return None
-    for module, test in _locked_test_imports(goal).items():
-        if _runs_test_file(command, test) and not _module_written(
-            module, root, (root / test).parent, []
-        ):
-            return test, module
-    return None
-
-
 def _self_import(
     command: str, scope: list[str], root: Path | None
 ) -> tuple[str, str, tuple[str, ...]] | None:
@@ -9164,49 +6502,6 @@ def _check_imports_code(command: str, root: Path) -> bool:
     return any(_project_imports(root / rel, root) for rel in _check_test_files(command, root))
 
 
-def _cases_test_close_note(test: str, data: str, scope: list[str], root: Path) -> str:
-    """What the close requires of the cases test: `test` when it reads `data` and is
-    not the data test, else the scope's other test; empty when there is none.
-
-    Run R40: the check's tests/test_case_data.py, which imports no project module,
-    was named the cases test. A `test` reading `data` that imports none is the data
-    test whatever the scope, and is never named the cases test: the scope's other
-    test is named, one importing the code first, or, with no other test in scope and
-    no directory, the cases test is said to be still to be written. A test that
-    imports the code and reads `data` is still named.
-    """
-    name = Path(data).name
-    entries = [e.rstrip("/") for e in scope]
-    others = [e for e in entries if e.endswith(".py") and _is_test_path(e)] + [
-        p.relative_to(root).as_posix()
-        for e in entries
-        if (root / e).is_dir()
-        for p in sorted((root / e).rglob("*.py"))
-        if _is_test_path(p.relative_to(root).as_posix()) and _cases_test_reads(p, name)
-    ]
-    others = sorted(
-        (o for o in dict.fromkeys(others) if o != test),
-        key=lambda o: (root / o).is_file() and not _test_project_imports(root / o),
-    )
-    reads = (root / test).is_file() and _cases_test_reads(root / test, name)
-    data_test = reads and not _test_project_imports(root / test)
-    cases = test if reads and not data_test else next(iter(others), "")
-    if not cases and data_test:
-        return (
-            f"{test} is not the cases test: it imports none of the code. The cases test "
-            "is still to be written: whether or not this check runs it, the close requires "
-            f"a test that imports the code, loads {data} and runs every case in it against "
-            "the code, with no hand-written asserts of its own. "
-        )
-    if not cases:
-        return ""
-    return (
-        f"{cases} is the cases test, whether or not this check runs it: the close "
-        f"requires it to load {data} and run every case in it against the code, with no "
-        "hand-written asserts of its own. "
-    )
-
-
 def _known_answers_note(command: str, scope: list[str], root: Path) -> str:
     """The brief's proof note for a scope of data and tests: what the data test imports.
 
@@ -9229,12 +6524,10 @@ def _known_answers_note(command: str, scope: list[str], root: Path) -> str:
         and _runs_test_file(command, rel)
     ]
     test = next(
-        (t for t in runs if _cases_test_reads(root / t, Path(data).name)),
+        (t for t in runs if _test_reads_file(root / t, Path(data).name)),
         next((t for t in runs if _in_scope(t, scope, root)), runs[0] if runs else ""),
     ) or _data_test("", scope, root)
-    proof = _cases_test_close_note(test, data, scope, root) + _tests_only_proof_note(
-        command, scope, root
-    )
+    proof = _tests_only_proof_note(command, scope, root)
     imports = _project_imports(root / test, root)
     present = [module for module, here in imports if here]
     if present:
@@ -9368,7 +6661,7 @@ def _check_data_reads(command: str, root: Path) -> list[str]:
     Run R21: T0005's check ran tests/test_case_data.py, which read tests/cases.json
     and imported nothing; the scope held only the test, so the data file's absence,
     the one proof such a test has, was out of reach. Found from the test's code (the
-    file it opens, by `_cases_test_reads`) and `CASES_DATA_SUFFIXES`; a bare name
+    file it opens, by `_test_reads_file`) and `TEST_DATA_SUFFIXES`; a bare name
     resolves beside the test.
     """
     found: list[str] = []
@@ -9384,9 +6677,9 @@ def _check_data_reads(command: str, root: Path) -> list[str]:
             if not (isinstance(node, ast.Constant) and isinstance(node.value, str)):
                 continue
             named = Path(node.value.strip())
-            if named.suffix not in CASES_DATA_SUFFIXES or named.is_absolute():
+            if named.suffix not in TEST_DATA_SUFFIXES or named.is_absolute():
                 continue
-            if not _cases_test_reads(test, named.name):
+            if not _test_reads_file(test, named.name):
                 continue
             beside = (test.parent / named.name).relative_to(root).as_posix()
             data = named.as_posix() if len(named.parts) > 1 and (root / named).is_file() else beside
@@ -9398,32 +6691,6 @@ def _check_data_reads(command: str, root: Path) -> list[str]:
 def _missing_data(command: str, scope: list[str], root: Path) -> list[str]:
     """The data files the check's tests read that `scope` does not hold."""
     return [rel for rel in _check_data_reads(command, root) if not _in_scope(rel, scope, root)]
-
-
-def _changed_locked_only(scope: list[str], goal: Path, root: Path) -> list[str]:
-    """The locked, tracked files in `scope` the work changed, when it changed nothing else
-    there: a known-answers fix, whose data file's absence proves nothing."""
-    changed = [rel for rel in _changed_files(root) if _in_scope(rel, scope, root)]
-    locked = set(_locked(goal))
-    if not changed or any(
-        rel not in locked or not _in_commit("HEAD", rel, root) for rel in changed
-    ):
-        return []
-    return changed
-
-
-def _locked_data_proof_note(held: list[str]) -> str:
-    """Said instead of TESTS_ONLY_PROOF_NOTE for a fix to tracked locked data.
-
-    Run R34 E66-E68: the note asked for a check failing with tests/cases.json
-    removed; that check already passed, and the open refused it.
-    """
-    rels = ", ".join(held)
-    return (
-        f"The check must fail on the locked version of {rels}: assert the cases that "
-        f"change. {rels} is tracked, so taking it away proves nothing; the close puts "
-        "its locked version back as the defect, and the check must refuse it."
-    )
 
 
 def _tests_only_proof_note(command: str, scope: list[str], root: Path | None) -> str:
@@ -9452,8 +6719,7 @@ def _joint_cases_route(command: str, scope: list[str], root: Path) -> str:
 
     q35 R59 L47-L53: T0003's scope held only tests/test_cases.py, which imports the
     unwritten itc. Told to mutate the module the test imports, or to name a new data
-    test, it met prove's refusal of a WITNESS in a test file either way. The route is
-    `_locked_data_route`'s; under lean nothing is locked.
+    test, it met prove's refusal of a WITNESS in a test file either way.
     """
     if not _only_data_and_tests(scope) or _scope_has_data(scope, root):
         return ""
@@ -9465,9 +6731,7 @@ def _joint_cases_route(command: str, scope: list[str], root: Path) -> str:
     scoped = json.dumps([test, f"{base}{module.split('.')[0]}/"])
     check = f'done_when="python3 -m pytest -q {test}"'
     write = f"Write {test} and the code it imports, `{module}`, in one task"
-    if _cases_off(root):
-        return f"{write}: scope={scoped}, {check}."
-    return f'{write}, and lock {test} at its close: scope={scoped}, {check}, locks=["{test}"].'
+    return f"{write}: scope={scoped}, {check}."
 
 
 def _data_test_imports_unwritten(data_check: str, scope: list[str], root: Path) -> str:
@@ -10600,61 +7864,10 @@ def _pytest_collected_none(rc: int, check: str, output: str = "") -> str | None:
     )
 
 
-def _missing_locked_file(output: str, locks: list[str], root: Path) -> str | None:
-    """A locked path the check failed on for want of it, not on disk: the work not yet
-    done, not a wrong check. Run R17 E26 failed on FileNotFoundError for
-    tests/cases.json, locked for the task, and was told to pass a corrected done_when."""
-    if _cases_off(root):
-        return None
-    missing = [lock.rstrip("/") for lock in locks if not (root / lock).exists()]
-    if not missing:
-        return None
-    named = re.findall(r"No such file or directory: '([^']+)'", output)
-    named += [m.split("::")[0] for m in re.findall(r"file or directory not found:\s*(\S+)", output)]
-    for path in named:
-        path = path.rstrip("/")
-        for lock in missing:
-            if path == lock or path.endswith(f"/{lock}"):
-                return lock
-    return None
-
-
-def _absent_locks(locks: list[str], root: Path) -> list[str]:
-    """The lock entries that are not a file on disk: the task's work not yet done.
-
-    Under `LEAN_ENV` nothing is locked, so a close is not held for them."""
-    if _cases_off(root):
-        return []
-    return [lock for lock in locks if not (root / lock.rstrip("/")).is_file()]
-
-
 _COLLECT_ONLY = re.compile(r"(?<![\w-])--(?:collect-only|co)(?![\w-])")
 
 
-def _reads_a_lock(check: str, locks: list[str], root: Path) -> bool:
-    """Whether `check` names a locked file, or a test (or a directory of them) that
-    reads one, as `_cases_test_reads` judges it.
-
-    Run R29: a test lock the check names counts though it is not on disk yet;
-    it is the test the task will write.
-    """
-    locks = _lock_paths(locks, root)
-    if any(lock.rstrip("/") in check for lock in locks):
-        return True
-    named = {os.path.normpath(word.split("::")[0]) for word in _check_words(check)}
-    if any(_is_test_path(lock) and os.path.normpath(lock) in named for lock in locks):
-        return True
-    names = {Path(lock.rstrip("/")).name for lock in locks}
-    for rel in _check_targets(check, root):
-        path = root / rel
-        tests = sorted(path.rglob("test_*.py")) if path.is_dir() else [path]
-        for test in tests:
-            if test.suffix == ".py" and any(_cases_test_reads(test, n) for n in names):
-                return True
-    return False
-
-
-def _amend_problem(check: str, bound: str, locks: list[str], root: Path) -> str | None:
+def _amend_problem(check: str, bound: str) -> str | None:
     """Why `check` may not replace a task's bound check, judged before it runs.
 
     Run R17 #26 swapped T0008's check, which loaded tests/cases.json, for
@@ -10669,13 +7882,6 @@ def _amend_problem(check: str, bound: str, locks: list[str], root: Path) -> str 
         return (
             f"`{check}` runs pytest --collect-only, which only imports the tests and runs "
             f"none, so it passes whatever the work does.{keep}"
-        )
-    locks = _lock_paths(locks, root)
-    if locks and not _reads_a_lock(check, locks, root):
-        return (
-            f"this task has locked known answers ({', '.join(locks)}), and `{check}` "
-            "names none of them and runs no test that reads one, so it passes whatever "
-            f"the known answers say.{keep}"
         )
     return None
 
@@ -10765,41 +7971,19 @@ def _root_relative(entry: str, root: Path) -> str | None:
     return None
 
 
-def _root_relative_scope(
-    scope: list[str], root: Path, kind: str = "scope"
-) -> tuple[list[str], str | None]:
-    """`scope` with absolute entries under `root` made root-relative, or why one is refused.
-
-    `kind` names the argument in the refusal: "scope", or "locks" for the locks.
-    """
+def _root_relative_scope(scope: list[str], root: Path) -> tuple[list[str], str | None]:
+    """`scope` with absolute entries under `root` made root-relative, or why one is refused."""
     entries: list[str] = []
     for entry in scope:
         rel = _root_relative(entry, root)
         if rel is None:
             return scope, (
-                f"pursuit_step: {kind} entry {entry} is outside the project root {root}. "
-                f"{kind.capitalize()} names paths in the project, relative to {root} "
+                f"pursuit_step: scope entry {entry} is outside the project root {root}. "
+                f"Scope names paths in the project, relative to {root} "
                 '(e.g. "src/module.py"); call pursuit_step again with those.'
             )
         entries.append(rel)
     return entries, None
-
-
-def _lock_path(entry: str, root: Path) -> str:
-    """Lock `entry` root-relative and normalized; an entry outside `root` is kept as given."""
-    rel = _root_relative(entry.strip(), root)
-    if rel is None:
-        return entry.strip()
-    return os.path.normpath(rel) + ("/" if rel.endswith("/") and rel != "/" else "")
-
-
-def _lock_paths(locks: list[str], root: Path) -> list[str]:
-    """`locks` root-relative and normalized, each once, in order.
-
-    Run R29: absolute locks never matched a relative check, and
-    reference_digest.md was listed twice.
-    """
-    return list(dict.fromkeys(_lock_path(e, root) for e in locks if e.strip()))
 
 
 def _in_scope(rel: str, scope: list[str], root: Path | None = None) -> bool:
@@ -10826,7 +8010,7 @@ def _scope_data(scope: list[str], root: Path | None = None) -> list[str]:
             for path in sorted((root / rel).rglob("*")):
                 with contextlib.suppress(ValueError):
                     under = path.relative_to(root).as_posix()
-                    if path.is_file() and _is_cases_data(under) and under not in found:
+                    if path.is_file() and _is_test_data(under) and under not in found:
                         found.append(under)
     return found
 
@@ -11036,7 +8220,7 @@ def _unproven_call(
     elif tests_only and _scope_has_data(scope, root):
         data = _scope_data(scope, root)[0]
         test = next(
-            (t for t in tests if _cases_test_reads(root / t, Path(data).name)),
+            (t for t in tests if _test_reads_file(root / t, Path(data).name)),
             _data_test("", scope, root),
         )
         done_when, added = f"python3 -m pytest -q {test}", [test]
@@ -11190,7 +8374,7 @@ def _check_reads(check: str, rel: str, root: Path) -> bool:
     rel = os.path.normpath(rel)
     reach = [os.path.normpath(found) for found in _check_reach(check, root)]
     return rel in reach or any(
-        found.endswith(".py") and _cases_test_reads(root / found, Path(rel).name) for found in reach
+        found.endswith(".py") and _test_reads_file(root / found, Path(rel).name) for found in reach
     )
 
 
@@ -11223,7 +8407,6 @@ async def _prove(
     scope: list[str],
     root: Path,
     timeout: float,
-    locks: list[str] | None = None,
 ) -> _Proof | None:
     """Ask `beagle pursuit prove` whether the passing check can refuse at all.
 
@@ -11231,10 +8414,9 @@ async def _prove(
     work: run 11d closed two tasks on import-only checks. The worker names the
     defect (`WITNESS_NOTE`); a missing or misshapen one falls back to taking
     away the source files the task changed that were not in the tree when it
-    opened, or with none, its data files; a task with locks it wrote takes those
-    away. Last, each source file in scope that changed since the task opened is
-    put back as the open held it, so a change an earlier, stopped attempt made
-    is judged too. None
+    opened, or with none, its data files. Last, each source file in scope that
+    changed since the task opened is put back as the open held it, so a change
+    an earlier, stopped attempt made is judged too. None
     when neither can be tried — no witness and no changed file — and the close
     decides.
 
@@ -11255,7 +8437,7 @@ async def _prove(
     check = str(record.get("done_when") or "").strip()
     scripts = _check_scripts(check, root)
     data_witness = (
-        witness is not None and _is_cases_data(witness[0]) and _check_reads(check, witness[0], root)
+        witness is not None and _is_test_data(witness[0]) and _check_reads(check, witness[0], root)
     )
     in_test = witness is not None and _is_test_path(witness[0]) and not data_witness
     modules = _imported_modules(root, scope) if _only_data_and_tests(scope) else []
@@ -11289,29 +8471,16 @@ async def _prove(
         path, needle, replacement = witness
         attempts.append(["--mutate", path, "--needle", needle, "--replacement", replacement])
     mutated = attempts[-1] if witness is not None and attempts else None
-    # Run R17: T0008's locked cases.json was never written, and the fallback
-    # took away itc.py instead; for a known-answers task the data is the work.
     opened = _opened_commit(task, root, record or None)
     changed = _changed_files(root)
-    reverted = _locked_fix_reversion(task, scope, root, changed)
-    if reverted:
-        attempts.insert(0, reverted)
     # q35 10-11: what the parent's split committed is this part's work.
     carried = _split_carried(task, root)
     changed = list(dict.fromkeys([*changed, *carried.files]))
     sources = [
         rel
-        for rel in (lock.rstrip("/") for lock in locks or [])
-        if rel in changed
-        and (root / rel).is_file()
-        and not _in_commit(carried.base(rel, opened), rel, root)
+        for rel in changed
+        if _in_scope(rel, scope, root) and not _is_test_path(rel) and (root / rel).is_file()
     ]
-    if not sources:
-        sources = [
-            rel
-            for rel in changed
-            if _in_scope(rel, scope, root) and not _is_test_path(rel) and (root / rel).is_file()
-        ]
     if not sources:
         # A known-answers task changes only data and tests: taking its data
         # file away is the defect (beagle proves it when the task wrote it).
@@ -11481,44 +8650,6 @@ def _reversion_edit(current: str, locked: str) -> tuple[str, str] | None:
     return needle, replacement
 
 
-def _locked_fix_reversion(
-    task: str, scope: list[str], root: Path, changed: list[str]
-) -> list[str] | None:
-    """`prove` arguments putting each locked file a known-answers fix changed back to
-    its locked version: the defect the fix's check must refuse.
-
-    Run R34 E66: T0011 fixed the locked tests/cases.json, which was tracked, so no
-    file new since it opened could be taken away and the fix could not be proved.
-    """
-    goal = root / ".beagle" / GOAL_BASENAME
-    manifest = _lock_manifest(goal)
-    held = [
-        rel
-        for rel in _locked_in_scope(scope, goal)
-        if rel in changed and (root / rel).is_file() and rel in manifest
-    ]
-    if not held:
-        return None
-    rc, out = _pursuit(["show", task], root)
-    record = _json_reply(out) if rc == 0 else None
-    title = str(record.get("title") or "") if isinstance(record, dict) else ""
-    if not _fixes_known_answers_in(title, scope, goal):
-        return None
-    argv: list[str] = []
-    for rel in held:
-        locked = _locked_bytes(root, goal.parent / LOCKED_DIR, rel, manifest[rel])
-        if locked is None:
-            continue
-        try:
-            current = (root / rel).read_text(encoding="utf-8")
-            edit = _reversion_edit(current, locked.decode("utf-8"))
-        except (OSError, UnicodeDecodeError):
-            continue
-        if edit is not None:
-            argv += ["--mutate", rel, "--needle", edit[0], "--replacement", edit[1]]
-    return argv or None
-
-
 def _requires_witness(root: Path) -> bool:
     """Whether the pursuit's `[close] require` holds a done close to a witnessed check."""
     try:
@@ -11572,113 +8703,6 @@ def _ids(entries: Any) -> list[str]:
     return ids
 
 
-#: Under `.beagle/`: the known copy of each locked file, and the locks a task
-#: asked for, held until it closes done.
-LOCKED_DIR = "locked"
-PENDING_LOCKS = "locks-pending.json"
-#: Under `.beagle/`: for each locked path, its sha256 and the commit that holds
-#: it. Run R14: a worker's `ruff format .` rewrote a locked test and its copy in
-#: the store alike, so comparing the two restored nothing.
-LOCK_MANIFEST = "locks.json"
-
-
-def _locked(goal: Path) -> list[str]:
-    """The project paths locked so far: in the lock manifest, with a known copy.
-
-    Run R22: a copy put into the store by hand locked a file nothing had locked;
-    only beagle writes the manifest, so a copy it does not name is not a lock.
-    """
-    if _cases_off(goal.parent.parent):
-        return []
-    store = goal.parent / LOCKED_DIR
-    try:
-        return sorted(rel for rel in _lock_manifest(goal) if (store / rel).is_file())
-    except (OSError, ValueError):
-        return []
-
-
-def _project_file(root: Path, entry: str) -> Path | None:
-    """`entry` as a file under the project and outside `.beagle/`, else None."""
-    try:
-        target = (root / entry).resolve()
-        base = root.resolve()
-    except (OSError, ValueError):
-        return None
-    if base not in target.parents or (base / ".beagle") in (target, *target.parents):
-        return None
-    return target
-
-
-def _lock(
-    goal: Path, root: Path, entries: list[str], task: str = "", relock: Collection[str] = ()
-) -> tuple[list[str], list[str]]:
-    """Copy each named file to the locked store; (locked, why the rest were not).
-
-    A path in `relock` is locked again from its new content: a known-answers
-    fix task's close.
-    """
-    if _cases_off(goal.parent.parent):
-        return [], []
-    store = goal.parent / LOCKED_DIR
-    held = set(_locked(goal)) - set(relock)
-    locked: list[str] = []
-    skipped: list[str] = []
-    for entry in entries:
-        target = _project_file(root, entry)
-        if target is None or not target.is_file():
-            skipped.append(f"{entry}: not a file in the project")
-            continue
-        rel = str(target.relative_to(root.resolve()))
-        if rel in held:
-            skipped.append(f"{rel}: already locked")
-            continue
-        copy = store / rel
-        try:
-            copy.parent.mkdir(parents=True, exist_ok=True)
-            copy.write_bytes(target.read_bytes())
-        except OSError as exc:
-            skipped.append(f"{rel}: {exc}")
-            continue
-        locked.append(rel)
-    if locked:
-        manifest = _lock_manifest(goal)
-        for rel in locked:
-            data = (store / rel).read_bytes()
-            manifest[rel] = {"sha256": _sha256(data), "commit": _head_holding(root, rel, data)}
-            if task:
-                manifest[rel]["task"] = task
-        _write_lock_manifest(goal, manifest)
-    return locked, skipped
-
-
-def _sha256(data: bytes) -> str:
-    return hashlib.sha256(data).hexdigest()
-
-
-def _lock_manifest(goal: Path) -> dict[str, dict[str, Any]]:
-    """The lock manifest: each locked path's sha256 and the commit holding it."""
-    if _cases_off(goal.parent.parent):
-        return {}
-    try:
-        raw = json.loads((goal.parent / LOCK_MANIFEST).read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return {}
-    if not isinstance(raw, dict):
-        return {}
-    return {
-        rel: entry
-        for rel, entry in raw.items()
-        if isinstance(entry, dict) and isinstance(entry.get("sha256"), str)
-    }
-
-
-def _write_lock_manifest(goal: Path, manifest: dict[str, dict[str, Any]]) -> None:
-    with contextlib.suppress(OSError):
-        (goal.parent / LOCK_MANIFEST).write_text(
-            json.dumps(manifest, indent=1, sort_keys=True), encoding="utf-8"
-        )
-
-
 def _committed_bytes(root: Path, commit: str, rel: str) -> bytes | None:
     """`rel` as `commit` holds it, or None."""
     try:
@@ -11694,204 +8718,6 @@ def _committed_bytes(root: Path, commit: str, rel: str) -> bytes | None:
     return shown.stdout if shown.returncode == 0 else None
 
 
-def _head_holding(root: Path, rel: str, data: bytes) -> str | None:
-    """The HEAD commit's id when it holds `rel` as `data`, else None."""
-    if _committed_bytes(root, "HEAD", rel) != data:
-        return None
-    rc, out = _run(["git", "rev-parse", "HEAD"], root, timeout=10.0)
-    commit = out.strip()
-    return commit if rc == 0 and re.fullmatch(r"[0-9a-f]{40,64}", commit) else None
-
-
-def _locked_bytes(root: Path, store: Path, rel: str, entry: dict[str, Any]) -> bytes | None:
-    """The bytes `rel` was locked as, from its lock commit or the store; None if lost."""
-    want = entry["sha256"]
-    commit = entry.get("commit")
-    if isinstance(commit, str) and commit:
-        data = _committed_bytes(root, commit, rel)
-        if data is not None and _sha256(data) == want:
-            return data
-    with contextlib.suppress(OSError):
-        data = (store / rel).read_bytes()
-        if _sha256(data) == want:
-            return data
-    data = _committed_bytes(root, "HEAD", rel)
-    if data is not None and _sha256(data) == want:
-        return data
-    return None
-
-
-def _restore_locked(goal: Path, root: Path, spare: Collection[str] = ()) -> list[str]:
-    """Put back every locked file a worker changed or removed; the ones it did.
-
-    A path in `spare` is left as the worker wrote it: a known-answers fix
-    task's own scope.
-
-    A path in the lock manifest is held to its recorded sha256 and restored
-    from its lock commit, the store copy rewritten with it: a tool run over
-    the whole tree changes the store too.
-    """
-    if _cases_off(goal.parent.parent):
-        return []
-    store = goal.parent / LOCKED_DIR
-    manifest = _lock_manifest(goal)
-    changed_manifest = False
-    restored = []
-    for rel in _locked(goal):
-        if rel in spare:
-            continue
-        target = root / rel
-        entry = manifest[rel]
-        try:
-            current = target.read_bytes() if target.is_file() else None
-            known = _locked_bytes(root, store, rel, entry)
-            if known is None:
-                continue  # neither the commit nor the store holds it any more
-            if not entry.get("commit"):
-                commit = _head_holding(root, rel, known)
-                if commit is not None:
-                    entry["commit"] = commit
-                    changed_manifest = True
-            copy = store / rel
-            if not copy.is_file() or copy.read_bytes() != known:
-                copy.write_bytes(known)
-            if current == known:
-                continue
-            target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_bytes(known)
-        except OSError:
-            continue
-        restored.append(rel)
-    if changed_manifest:
-        _write_lock_manifest(goal, manifest)
-    return restored
-
-
-def _put_back_drift(
-    goal: Path, root: Path, nodes: list[dict[str, Any]] | None = None, but: str = ""
-) -> str:
-    """Put back each locked file that differs from its lock; one line saying so, or "".
-
-    Run R28: W3 stripped the locked tests/test_cases.py after the last put-back, the
-    split's WIP commit kept it, and T0026 closed done on a check that passed only on
-    the stripped file. An open known-answers fix task other than `but` keeps the
-    locked files in its scope as it wrote them; its close locks them again.
-    """
-    if not _locked(goal):
-        return ""
-    spare: list[str] = []
-    for node in _tree_nodes(root) if nodes is None else nodes:
-        task = str(node.get("id") or "")
-        if task == but or node.get("status") != "open":
-            continue
-        title = str(node.get("title") or "")
-        rc, out = _pursuit(["show", task], root)
-        shown = _json_reply(out) if rc == 0 else None
-        scope = _strings(shown.get("scope")) if isinstance(shown, dict) else []
-        if not _fixes_known_answers_in(title, scope, goal):
-            continue
-        if not scope:
-            return ""  # a fix whose scope is unknown may hold any of them
-        spare += _locked_in_scope(scope, goal)
-    restored = _restore_locked(goal, root, spare)
-    if not restored:
-        return ""
-    return (
-        f"{len(restored)} locked file(s) were put back, since they differed from their "
-        f"lock: {', '.join(restored)}."
-    )
-
-
-def _pending_locks(goal: Path, task: str, add: list[str] | None = None) -> list[str]:
-    """The locks `task` asked for, adding `add`; kept until the task closes done."""
-    path = goal.parent / PENDING_LOCKS
-    root = goal.parent.parent
-    try:
-        pending = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        pending = {}
-    if not isinstance(pending, dict):
-        pending = {}
-    # Run R29 filed absolute paths; they are read, and stored, root-relative.
-    entries = _lock_paths([e for e in pending.get(task) or [] if isinstance(e, str)], root)
-    if add:
-        entries = _lock_paths(entries + add, root)
-        pending[task] = entries
-        with contextlib.suppress(OSError):
-            path.write_text(json.dumps(pending, indent=1), encoding="utf-8")
-    return entries
-
-
-def _lockable(rel: str) -> bool:
-    """Whether `rel` may be filed as a pending lock: a test or a data file.
-
-    Run R24 #14 filed tests/interval_tree_clocks.py, the module, as a lock, and
-    the workers after it were refused the file their task was to write.
-    """
-    return _is_test_path(rel) or Path(rel).suffix.lower() in CASES_DATA_SUFFIXES
-
-
-def _drop_pending_locks(goal: Path, task: str) -> None:
-    path = goal.parent / PENDING_LOCKS
-    with contextlib.suppress(OSError, ValueError, AttributeError):
-        pending = json.loads(path.read_text(encoding="utf-8"))
-        if pending.pop(task, None) is not None:
-            path.write_text(json.dumps(pending, indent=1), encoding="utf-8")
-
-
-def _names_file(text: str, rel: str) -> bool:
-    """Whether `text` names the file `rel`: by its path, or by its file name as a word."""
-    return any(
-        re.search(rf"(?<![\w.-]){re.escape(name)}(?![\w-])", text)
-        for name in dict.fromkeys([rel, Path(rel).name])
-    )
-
-
-def _move_pending_locks(goal: Path, task: str, parts: list[str], root: Path) -> str:
-    """Move `task`'s pending locks to the tasks split from `parts`; a note, or "".
-
-    Run R17 split T0002 and its three pending locks stayed behind: only a
-    done close drops them, and a container is never closed that way. q38fn
-    10-11: all three went to the first part, T0007, whose closes were then held
-    open for tests/test_cases.py, T0009's to write. Each lock goes to the first
-    part whose scope, title or intent names that file; one no part names goes
-    to the first part.
-    """
-    if _cases_off(goal.parent.parent):
-        return ""
-    locks = _pending_locks(goal, task)
-    if not locks or not parts:
-        return ""
-    children = _children(task, root)
-    first = children.get(_part_title(parts[0]).lower())
-    if first is None:
-        return ""
-    nodes = {str(n.get("id")): n for n in _tree_nodes(root)}
-    texts: list[tuple[str, str]] = []
-    for part in parts:
-        heir = children.get(_part_title(part).lower())
-        if heir is not None:
-            node = nodes.get(heir, {})
-            said = [part, str(node.get("intent") or ""), *_strings(node.get("scope"))]
-            texts.append((heir, "\n".join(said)))
-    named = {
-        lock: next((heir for heir, text in texts if _names_file(text, lock)), "") for lock in locks
-    }
-    given: dict[str, list[str]] = {}
-    for lock in locks:
-        given.setdefault(named[lock] or first, []).append(lock)
-    for heir, held in given.items():
-        _pending_locks(goal, heir, held)
-    _drop_pending_locks(goal, task)
-    rest = [lock for lock in locks if not named[lock]]
-    if len(rest) == len(locks):
-        return f"{task}'s pending locks ({', '.join(locks)}) moved to its first part, {first}."
-    moved = ", ".join(f"{lock} to {named[lock]}" for lock in locks if named[lock])
-    if rest:
-        moved += f"; {', '.join(rest)} to its first part, {first}, as no part names them"
-    return f"{task}'s pending locks moved to the part that names each: {moved}."
-
-
 def _fixes_known_answers(title: str) -> bool:
     """Whether a task titled `title` fixes the known answers, and so may hold them.
 
@@ -11903,111 +8729,6 @@ def _fixes_known_answers(title: str) -> bool:
         return True
     head = text.split("::", 1)[0]
     return bool(re.search(r"\bfix", head)) and "known answer" in head
-
-
-def _fixes_known_answers_in(title: str, scope: list[str], goal: Path) -> bool:
-    """Whether a task titled `title` on `scope` fixes the known answers.
-
-    Run R34 #27: T0007, made as the fix and scoped to the locked file alone, was
-    refused as locked for lacking the title's words. A scope of nothing but
-    locked files has no other work to do, whatever the title says.
-    """
-    if _fixes_known_answers(title):
-        return True
-    named = {os.path.normpath(entry.strip()) for entry in scope if entry.strip()}
-    return bool(named) and named <= set(_locked(goal))
-
-
-def _locked_in_scope(scope: list[str], goal: Path) -> list[str]:
-    """The locked files `scope` names, itself or by a directory holding them."""
-    held = []
-    for rel in _locked(goal):
-        for entry in scope:
-            path = os.path.normpath(entry.strip())
-            if path == "." or rel == path or rel.startswith(path.rstrip("/") + "/"):
-                held.append(rel)
-                break
-    return held
-
-
-def _known_answers_fix_route(
-    rel: str,
-    goal: Path,
-    task: str,
-    title: str,
-    nodes: list[dict[str, Any]] | None = None,
-    rest: list[str] | None = None,
-    done_when: str = "",
-) -> str:
-    """Who locked `rel`, that its changes are put back, and how a wrong one is fixed.
-
-    Run R28 offered a fix part titled as pending container T0010, which the
-    plan refused as a clash; a live fix leaf is offered instead, and a title
-    already in the tree is made distinct. Run R34: with only that route offered,
-    seven steps were refused on a scope whose one file to write was not locked;
-    `rest`, the scope without its locked files, is offered first as the same call.
-    """
-    owner = _lock_manifest(goal).get(rel, {}).get("task")
-    head = (
-        f"{rel} is locked as the known answers{f' ({owner})' if owner else ''}: a "
-        "worker's change to it is put back before every check. "
-    )
-    if rest:
-        call = f'pursuit_step task="{task}", scope={json.dumps(rest)}'
-        if done_when:
-            call += f", done_when={json.dumps(_suggested_check(done_when, goal.parent.parent))}"
-        head += (
-            f"Send the same call without the locked files: {call}, the rest as it was. "
-            "The locked files stay readable to the worker and judge its work. "
-        )
-    if nodes is None:
-        nodes = _tree_nodes(goal.parent.parent)
-    fix = f"Known answers: fix {rel}"
-    same = [n for n in nodes if _fold(str(n.get("title") or "")) == _fold(fix)]
-    titled = {str(m.get("id")): str(m.get("title") or "") for m in nodes}
-    for n in same:
-        nid = str(n.get("id"))
-        if n.get("status") not in ("pending", "open"):
-            continue
-        leaves = _live_leaves(nid, nodes) if _is_container(nid, nodes) else [nid]
-        leaf = next((t for t in leaves if _fixes_known_answers(titled.get(t, ""))), None)
-        if leaf is not None:
-            return (
-                f'{head}If the locked test is wrong, fix it in {leaf}: pursuit_step task="'
-                f'{leaf}", scope={json.dumps([rel])}. Its close re-locks the file.'
-            )
-    if same:
-        fix = f"{fix} for {task}"
-    # The second part may not take {task}'s own title: the plan refuses that (T0240).
-    return (
-        f"{head}If the locked test is wrong, split {task} with a fix first: "
-        f'pursuit_plan task="{task}" parts=["{fix}::<what is wrong in it>", "{title}, on '
-        f'the fixed answers::<what {task} is for>"]; then run the fix step with pursuit_step, '
-        f"{rel} in its scope. Its close re-locks the file."
-    )
-
-
-def _locked_scope_problem(
-    scope: list[str], root: Path, task_title: str, task: str, done_when: str = ""
-) -> str | None:
-    """Why `scope` may not name a locked file, or None.
-
-    Run R20: T0010 and T0011 scoped the locked tests/test_cases.py, and every
-    edit the worker made to it was put back before the check. A directory
-    holding a locked file is allowed: put-back still guards the file, and later
-    tasks add their own tests beside it.
-    """
-    if _cases_off(root):
-        return None
-    goal = root / ".beagle" / GOAL_BASENAME
-    if _fixes_known_answers_in(task_title, scope, goal):
-        return None
-    named = {os.path.normpath(entry.strip()) for entry in scope}
-    held = [rel for rel in _locked(goal) if rel in named]
-    if not held:
-        return None
-    rest = [entry for entry in scope if os.path.normpath(entry.strip()) not in held]
-    return _known_answers_fix_route(held[0], goal, task, task_title, rest=rest, done_when=done_when)
 
 
 #: Retries beagle allows a task its own check blocked.
@@ -12541,7 +9262,6 @@ def _abandon(task: str, why: str, root: Path, goal: Path) -> str:
             f"pursuit_step: `beagle pursuit close {task} --outcome abandoned` refused "
             f"(exit {rc}):\n{out}"
         )
-    _drop_pending_locks(goal, task)
     _forget_task(root, task)
     released = _release_waiters(task, why, root)
     freed = f"\nNo longer waiting on it: {', '.join(released)}." if released else ""
@@ -12624,7 +9344,6 @@ def _close_infeasible(
             f"pursuit_step: `beagle pursuit close {task} --outcome infeasible` refused "
             f"(exit {rc}):\n{out}"
         )
-    _drop_pending_locks(goal, task)
     _forget_task(root, task)
     parent = str(node.get("parent") or "")
     # q35 10-11: this said to re-plan T0002 once T0011 closed, and the parts
@@ -13041,27 +9760,6 @@ def _on_disk_note(check: str, task: str, carried: _SplitCarry | None = None) -> 
     )
 
 
-def _cases_close_problem(root: Path, entries: list[str]) -> tuple[str, str] | None:
-    """(what keeps the task open, the notes that fix it) when the close's cases
-    judgements, `_unread_cases` then `_cases_test_problem`, refuse the files on disk."""
-    unread = _unread_cases(root, entries)
-    if unread is not None:
-        test, data = unread
-        return (
-            f"{test} does not read {data}, so the known answers judge nothing",
-            f"{test} must load {data} and run every case in it against the code, with no "
-            "hand-written asserts of its own.",
-        )
-    flawed = _cases_test_problem(root, entries)
-    if flawed is not None:
-        test, problem = flawed
-        return (
-            f"{test} {problem}, so the known answers could never judge the code",
-            f"{test} {problem}: {_cases_problem_fix(root, test, problem)}.",
-        )
-    return None
-
-
 def _bound_is_data_check(bound: str, data_check: str, root: Path) -> bool:
     """Whether the bound check already is `data_check`, the data test it would propose."""
     if not bound:
@@ -13079,15 +9777,13 @@ async def _data_route_on_disk(
     extra: list[str] | None = None,
     *,
     bound: str = "",
-    locks: list[str] | None = None,
     is_open: bool = False,
 ) -> str | None:
     """What to say in place of "bind the data test" when that test already passes; or None.
 
     Run R18: told to bind `pytest tests/test_case_data.py`, which W1's uncommitted
     files made pass, the driver was refused as "already passes" for 14 minutes.
-    Run R32: told an open task "closes on that work" that the close's cases
-    judgements still refused, and to bind the check it was already bound to.
+    Run R32: an open task was told to bind the check it was already bound to.
     """
     test, module, data_check, needs = route
     if (await _run_check(data_check, root, DEFAULT_CHECK_TIMEOUT))[0] != 0:
@@ -13103,14 +9799,6 @@ async def _data_route_on_disk(
             f"data test `{data_check}`. That already passes, on the known-answers work on "
             "disk, uncommitted in this scope"
         )
-        kept = _cases_close_problem(root, list(dict.fromkeys([*needs, *(locks or [])])))
-        if kept is not None:
-            problem, notes = kept
-            return (
-                f"Send pursuit_step task={json.dumps(task)}{rebind}, notes={json.dumps(notes)}: "
-                f"the close keeps {task} open while {problem}. {why}, but the close also "
-                f"judges the cases test.{leave}"
-            )
         opens = "its check is amended" if is_open and not same else "it opens"
         if is_open and same:
             opens = "it runs"
@@ -13226,16 +9914,13 @@ async def _unwritten_check_problem(
     extra: list[str] | None = None,
     *,
     bound: str = "",
-    locks: list[str] | None = None,
     is_open: bool = False,
 ) -> str | None:
     """`_imports_unwritten_problem`, unless the data test it prescribes already passes."""
     route = _data_test_route(command, scope, root)
     if route is None:
         return None
-    on_disk = await _data_route_on_disk(
-        task, route, root, extra, bound=bound, locks=locks, is_open=is_open
-    )
+    on_disk = await _data_route_on_disk(task, route, root, extra, bound=bound, is_open=is_open)
     return on_disk or _imports_unwritten_problem(command, scope, root)
 
 
@@ -13504,13 +10189,10 @@ async def _done_by(
             f"{refused}{done}'s commit ({shas[0][:12]}) touches none of "
             f"{', '.join(paths)}, so it did not do this task's work."
         )
-    # Run R28: T0026 closed done on a check that passed only on a stripped locked test.
-    put_back = _put_back_drift(root / ".beagle" / GOAL_BASENAME, root, nodes)
     check_rc, check_out = await _run_check(check, root, DEFAULT_CHECK_TIMEOUT)
     if check_rc != 0:
         return (
-            (f"{put_back}\n\n" if put_back else "")
-            + f"{refused}its check `{check}` does not pass now (exit {check_rc}), so the "
+            f"{refused}its check `{check}` does not pass now (exit {check_rc}), so the "
             f"work is not there yet: work it with pursuit_step.\n"
             f"{check_out[-CHECK_TAIL_CHARS:]}"
         )
@@ -14730,29 +11412,6 @@ def _check_runs_own_file(
     return ""
 
 
-def _locked_fix_leaf(task: str, nodes: list[dict[str, Any]], root: Path | None) -> str:
-    """The step for the first live fix leaf under container `task` while files are locked.
-
-    Run R28: T0010's parts needed the locked test, and its container answer
-    named only T0012, itself a container, so no worker ran.
-    """
-    if root is None:
-        return ""
-    locked = _locked(root / ".beagle" / GOAL_BASENAME)
-    if not locked:
-        return ""
-    titled = {str(n.get("id")): str(n.get("title") or "") for n in nodes}
-    leaf = next(
-        (t for t in _live_leaves(task, nodes) if _fixes_known_answers(titled.get(t, ""))), None
-    )
-    if leaf is None:
-        return ""
-    return (
-        f" If its parts are held back by the locked {', '.join(locked)}, fix that first "
-        f'in {leaf}: pursuit_step task="{leaf}", scope={json.dumps(locked)}.'
-    )
-
-
 def _not_workable(
     task: str, nodes: list[dict[str, Any]], workable: list[str], root: Path | None = None
 ) -> str:
@@ -14794,7 +11453,7 @@ def _not_workable_text(
         return (
             f"{task} is not a task to work now: it is a container of {', '.join(parts)}, "
             f"done when its parts are. Workable now: {listed}. Call pursuit_step with no "
-            "arguments." + _locked_fix_leaf(task, nodes, root)
+            "arguments."
         )
     return (
         f"{task} is not a task to work now. Workable now: {listed}. Call pursuit_step "
@@ -14842,15 +11501,8 @@ def make_step_tool() -> Any:
             if outside is not None:
                 return _step_result(outside)
             arguments = {**arguments, "scope": scope}
-        if _strings(arguments.get("locks")) and _contract_declared(root):
-            kept_lead.append(CONTRACT_LOCKS_NOTE)
-            arguments = {**arguments, "locks": []}
         if _strings(arguments.get("locks")):
-            # Run R29: absolute locks never matched the relative check.
-            locks, outside = _root_relative_scope(_strings(arguments.get("locks")), root, "locks")
-            if outside is not None:
-                return _step_result(outside)
-            arguments = {**arguments, "locks": _lock_paths(locks, root)}
+            kept_lead.append(CONTRACT_LOCKS_NOTE)
         rc, ready, raw = _next_ready(root)
         if rc == 4 or rc not in (0, 3) or not isinstance(ready, dict):
             return _step_result(
@@ -14861,9 +11513,6 @@ def make_step_tool() -> Any:
         ready_ids = _ids(ready.get("ready"))
         blocked = _blocked_tasks(root)
         nodes = _tree_nodes(root)
-        drift = _put_back_drift(goal, root, nodes)
-        if drift:
-            kept_lead.append(f"{drift}\n\n")
         open_ids = _steppable(open_ids, nodes)
         ready_ids = _steppable(ready_ids, nodes)
         left = _unfinished(nodes)
@@ -15130,15 +11779,10 @@ def make_step_tool() -> Any:
 
                 scoped = (
                     _scope_problem(route_scope, task, nodes, root)
-                    or _locked_scope_problem(route_scope, root, title, task, done_when or old_check)
                     or _sibling_owned_check_problem(
                         done_when or old_check, route_scope, task, nodes, root
                     )
-                    or _oracle_with_code_problem(route_scope, goal, task, done_when or old_check)
                     or _copied_answers_problem(done_when, title, root)
-                    or await _locked_test_refusal(
-                        done_when or old_check, route_scope, goal, route_passing
-                    )
                     or _import_scope_problem(done_when or old_check, route_scope, root)
                     or _inverted_exit_problem(done_when or old_check)
                     or _absent_check_file_problem(done_when or old_check, route_scope, root)
@@ -15151,7 +11795,6 @@ def make_step_tool() -> Any:
                     root,
                     _strings(record.get("scope")),
                     bound=old_check,
-                    locks=_pending_locks(goal, task) + _strings(arguments.get("locks")),
                     is_open=status == "open",
                 )
                 if scoped is not None:
@@ -15323,18 +11966,6 @@ def make_step_tool() -> Any:
                 rewritten_from: tuple[str, str] | None = None,
             ) -> str:
                 """The pre-run's refusal of `command`, which passes before any work."""
-                unjudged = _locked_test_without_its_module(command, goal, root)
-                if unjudged:
-                    # Run R43: binding the locked test was refused as already passing,
-                    # and a new test file as not running the locked test, for 22 calls.
-                    test, module = unjudged
-                    return (
-                        f"`{command}` already passes, before any work: "
-                        f"{_guarded_import_said(test, module, module, root)} No check that "
-                        "runs it can fail now, and one that does not run it is refused, so "
-                        "the locked test is what is wrong. "
-                        + _known_answers_fix_route(test, goal, task, title, _tree_nodes(root))
-                    )
                 now = _tree_nodes(root)
                 # The paths `_done_by` takes for the offered call, which names `scope`.
                 chosen = scope or _strings(record.get("scope"))
@@ -15372,24 +12003,11 @@ def make_step_tool() -> Any:
 
             async def scope_refusal(scope: list[str]) -> str | None:
                 return (
-                    _no_scope_problem(
-                        scope,
-                        root,
-                        _pending_locks(goal, task) + _strings(arguments.get("locks")),
-                        done_when,
-                    )
+                    _no_scope_problem(scope, root)
                     or _scope_problem(scope, task, nodes, root)
-                    or _locked_scope_problem(scope, root, title, task, done_when)
                     or _sibling_owned_check_problem(done_when, scope, task, nodes, root)
-                    or _oracle_with_code_problem(scope, goal, task, done_when)
                     or _copied_answers_problem(done_when, title, root)
                     or _doc_only_check_problem(done_when, scope, task, root)
-                    or _cases_first_problem(
-                        scope, task, title, goal, nodes, _strings(arguments.get("locks"))
-                    )
-                    or await _locked_test_refusal(
-                        done_when, scope, goal, lambda command: open_passing(command, scope)
-                    )
                     or _import_scope_problem(done_when, scope, root)
                     or _inverted_exit_problem(done_when)
                     or _absent_check_file_problem(done_when, scope, root)
@@ -15401,7 +12019,6 @@ def make_step_tool() -> Any:
                     task,
                     root,
                     _predecessor_scope(record, root),
-                    locks=_pending_locks(goal, task) + _strings(arguments.get("locks")),
                 )
 
             rehomed = _rehomed_scope(scope, root)
@@ -15502,8 +12119,6 @@ def make_step_tool() -> Any:
                 )
             )
             is not None
-            and _locked_scope_problem(scope or _strings(record.get("scope")), root, title, task)
-            is None
         ):
             # Run R32 #12: an open task's notes were refused with a done_when whose
             # data test was the bound check already; the bound check stays and the
@@ -15532,14 +12147,8 @@ def make_step_tool() -> Any:
                 route += _bound_note(done_when, chained)
                 done_when = chained
                 problem = (
-                    _amend_problem(
-                        done_when,
-                        bound_check,
-                        _pending_locks(goal, task) + _strings(arguments.get("locks")),
-                        root,
-                    )
+                    _amend_problem(done_when, bound_check)
                     or _inverted_exit_problem(done_when)
-                    or _locked_scope_problem(own_scope, root, title, task, done_when)
                     or _sibling_owned_check_problem(done_when, own_scope, task, nodes, root)
                     or _absent_check_file_problem(done_when, own_scope, root)
                     or _pytest_node_missing_problem(done_when, own_scope, root)
@@ -15551,7 +12160,6 @@ def make_step_tool() -> Any:
                         root,
                         _predecessor_scope(record, root),
                         bound=bound_check,
-                        locks=_pending_locks(goal, task) + _strings(arguments.get("locks")),
                         is_open=True,
                     )
                 )
@@ -15666,7 +12274,6 @@ def make_step_tool() -> Any:
                     root,
                     _predecessor_scope(record, root),
                     bound=bound_check,
-                    locks=_pending_locks(goal, task) + _strings(arguments.get("locks")),
                     is_open=True,
                 )
                 if on_disk is not None:
@@ -15707,12 +12314,6 @@ def make_step_tool() -> Any:
                 + ".",
                 ran=False,
             )
-        if status == "open" and not new_route and not amends_open and scope:
-            # Run R34 #22: an open task's call scope held the locked files, passed
-            # unchecked, and W6 and W7 spent 11 min on edits that were put back.
-            locked_scope = _locked_scope_problem(scope, root, title, task)
-            if locked_scope is not None:
-                return _step_result(f"pursuit_step: {task} not run — {locked_scope}")
 
         if retrying:
             # beagle briefs only an open task; a blocked one is briefed from its record.
@@ -15733,12 +12334,7 @@ def make_step_tool() -> Any:
             brief = _brief_in_scope(brief, scope)
         references = _references_brief(
             root,
-            _data_task(
-                scope or _strings(record.get("scope")),
-                goal,
-                check,
-                _pending_locks(goal, task) + _strings(arguments.get("locks")),
-            ),
+            _data_task(scope or _strings(record.get("scope")), goal, check),
             contract=_contract_work(scope or _strings(record.get("scope")), root),
         )
         if references:
@@ -15755,32 +12351,6 @@ def make_step_tool() -> Any:
         if hang:
             brief = f"{brief}\n\n{hang.rstrip()}"
         brief += "\n\n" + NO_BEAGLE_NOTE + "\n\n" + _turn_cap_note()
-        held = set(_locked(goal))
-        asked = [e for e in _strings(arguments.get("locks")) if os.path.normpath(e) not in held]
-        locks = _pending_locks(goal, task, [e for e in asked if _lockable(e)])
-        unlocked = [e for e in asked if not _lockable(e)]
-        if unlocked:
-            kept_lead.append(
-                f"Not filed as locks: {', '.join(unlocked)} (only tests and data files "
-                "are locked; code stays open to the task that writes it).\n\n"
-            )
-        # A known-answers fix may change the locked files in its scope; its
-        # close locks them again from what it wrote.
-        fixing = (
-            _locked_in_scope(scope or _strings(record.get("scope")), goal)
-            if _fixes_known_answers_in(title, scope or _strings(record.get("scope")), goal)
-            else []
-        )
-        locked = [rel for rel in _locked(goal) if rel not in fixing]
-        if locked:
-            brief += (
-                "\n\nLocked files: known-answer cases an earlier task wrote from the "
-                "reference. Read them; do not edit them. Any change is undone before the "
-                "check runs, so make the code pass them as they are:\n"
-                + "\n".join(f"- {rel}" for rel in locked)
-                + "\n"
-                + LOCKED_UNPASSABLE_NOTE
-            )
         try:
             attempts = max(1, int(arguments.get("attempts") or DEFAULT_STEP_ATTEMPTS))
         except (TypeError, ValueError):
@@ -15802,7 +12372,6 @@ def make_step_tool() -> Any:
         retry_note = _last_failure_note((str(root), task), check) if status == "open" else ""
         progress_key = (str(_resolved(root)), task)
         retry_note = _KILLED_PROGRESS.get(progress_key, "") + retry_note
-        restored: set[str] = set()
         attempt = 0
         proof: _Proof | None = None
         cannot_pass: tuple[str, str, str, list[str]] | None = None
@@ -15813,20 +12382,6 @@ def make_step_tool() -> Any:
         self_import = _self_import_note(check, scope, root) if check else ""
         retry_note = self_import + retry_note
         missing_data = _missing_data(check, scope, root) if check else []
-        mixed = _open_mixed_refusal(scope, goal, task, check)
-        if mixed is not None:
-            # Opened before this guard, or by hand: still no worker on it.
-            # Run R31: the same refusal came back 49 times while only locks grew.
-            refusal_key = (str(root), task)
-            if _LAST_MIXED_REFUSAL.get(refusal_key) == (tuple(scope), mixed):
-                mixed += (
-                    " This is the same answer as last time for this scope: locks do not "
-                    "change it; the scope, or deleting the flagged file, does."
-                )
-            else:
-                _LAST_MIXED_REFUSAL[refusal_key] = (tuple(scope), mixed)
-            return _step_result(f"pursuit_step: {task} not run — {mixed}")
-        _LAST_MIXED_REFUSAL.pop((str(root), task), None)
         if unproven_key in _UNPROVEN:
             # Run R23: the breaker quotes only a result's first line; the call goes there.
             call = _unproven_call(task, check, scope, root, missing_data, nodes)
@@ -15891,10 +12446,7 @@ def make_step_tool() -> Any:
             brief += "\n\n" + CONTRACT_WITNESS_NOTE
         elif not (tests_only and _scope_has_data(scope, root)):
             brief += "\n\n" + WITNESS_NOTE
-        elif not (
-            _fixes_known_answers_in(title, scope or _strings(record.get("scope")), goal)
-            and _check_imports_code(check, root)
-        ):
+        elif not (_fixes_known_answers(title) and _check_imports_code(check, root)):
             # Run R28: a fix task's check ran a test importing code, and the note
             # told W3 it imported none.
             brief += "\n\n" + _known_answers_note(check, scope, root)
@@ -15923,7 +12475,7 @@ def make_step_tool() -> Any:
             verdict = await _run_check(check, root, check_timeout)
             _note_check_run(unproven_key, check, verdict)
             if verdict[0] == 0:
-                proof = await _prove(task, "", scope, root, check_timeout, locks)
+                proof = await _prove(task, "", scope, root, check_timeout)
         elif passed_on_disk is not None and check == done_when and not _judge_kept_open(task, root):
             # Run R20: T0007's check passed at open on T0003's leftovers, and W11
             # passed at turn 2 and spent 29 more: the work was done; prove and close.
@@ -15931,7 +12483,7 @@ def make_step_tool() -> Any:
             # again with no worker, and its notes reached no one.
             verdict = passed_on_disk
             _note_check_run(unproven_key, check, verdict)
-            proof = await _prove(task, "", scope, root, check_timeout, locks)
+            proof = await _prove(task, "", scope, root, check_timeout)
             if proof is not None and (not proof.proven or proof.by_absent_source):
                 if proof.proven:
                     proof = _Proof(proven=False, text=proof.text)
@@ -15945,11 +12497,7 @@ def make_step_tool() -> Any:
         step_budget = timeout * STEP_BUDGET_FACTOR
         budget_spent = ""
         for attempt in range(1, attempts + 1):
-            if (
-                verdict[0] == 0
-                and (proof is None or proof.proven)
-                and not _absent_locks(locks, root)
-            ):
+            if verdict[0] == 0 and (proof is None or proof.proven):
                 break
             attempt_timeout = timeout
             if attempt > 1:
@@ -15979,8 +12527,6 @@ def make_step_tool() -> Any:
                 thinking=thinking,
             )
             worker_ran = True
-            undone = _restore_locked(goal, root, fixing)
-            restored.update(undone)
             if run.spent is not None:
                 spent = (spent or 0) + run.spent
             if run.problem is not None:
@@ -16027,9 +12573,7 @@ def make_step_tool() -> Any:
                 else "reported back"
             )
             if verdict[0] == 0:
-                if _absent_locks(locks, root):
-                    break
-                proof = await _prove(task, report, scope, root, check_timeout, locks)
+                proof = await _prove(task, report, scope, root, check_timeout)
                 if proof is None or proof.proven:
                     break
                 if not proof.weak and not proof.ask_module:
@@ -16088,16 +12632,6 @@ def make_step_tool() -> Any:
             if no_tests is not None:
                 retry_note = f"\n\n{no_tests}" + retry_note
             retry_note += _fix_the_work(verdict[0], verdict[1], check)
-            if undone:
-                retry_note += (
-                    f" It also changed locked files ({', '.join(undone)}); they were put "
-                    "back. Make the code pass them as they are."
-                )
-                if any(rel in verdict[1] for rel in undone):
-                    retry_note += (
-                        " If a locked test is itself wrong, say which and why in your "
-                        "report: the driver can open a known-answers fix for it."
-                    )
             if missing:
                 retry_note += "\n\n" + missing.rstrip()
             # q35 R58: W2's cut-off kill note was briefed as its notes. A cut-off
@@ -16117,34 +12651,6 @@ def make_step_tool() -> Any:
                 )
         if budget_spent:
             attempt -= 1
-        undid = (
-            f"The sub-agent changed locked files ({', '.join(sorted(restored))}); they "
-            "were put back before the check.\n\n"
-            if restored
-            else ""
-        )
-        failing_locked = [rel for rel in sorted(restored) if verdict[0] and rel in verdict[1]]
-        if failing_locked:
-            # Run R20: T0010 and T0011 had the locked test put back every check
-            # and no route out when it was the test that was wrong.
-            undid += _known_answers_fix_route(failing_locked[0], goal, task, title) + "\n\n"
-
-        absent = _absent_locks(locks, root)
-        if verdict[0] == 0 and absent:
-            # Run R17: T0008 closed done and its lock became "Not locked:
-            # tests/cases.json: not a file in the project".
-            state = "stays blocked" if retrying else "stays open"
-            named = ", ".join(lock.rstrip("/") for lock in absent)
-            return _not_done(
-                root,
-                task,
-                scope,
-                f"{route}{undid}{task} — {title}: the check passes, but {named}: it is "
-                f"locked for this task and not written, so that is the work; the task "
-                f"{state}, since a done close needs its locked files on disk.\n\n"
-                f"Last report:\n{shown}\n\n"
-                f'Next: pursuit_step with task="{task}" and notes saying to write {named}.',
-            )
         disputed = (
             _disputed_entry(report, verdict[1])
             if worker_ran and check and verdict[0] != 0 and (root / CONTRACT_SEAL).is_file()
@@ -16156,7 +12662,7 @@ def make_step_tool() -> Any:
                 task, disputed, record, root, signal, on_update
             )
             if upheld:
-                return _step_result(f"{route}{undid}{task} — {title}: {dispute_note}")
+                return _step_result(f"{route}{task} — {title}: {dispute_note}")
         if check and verdict[0] != 0:
             state = "stays blocked" if retrying else "stays open"
             fix_check = (
@@ -16177,12 +12683,6 @@ def make_step_tool() -> Any:
                     "that is the work, not a wrong check."
                 )
             if_line = f"If {if_wrong} "
-            missing_lock = _missing_locked_file(verdict[1], locks, root)
-            if missing_lock is not None:
-                if_line = (
-                    f"The check names {missing_lock}: it is locked for this task and not "
-                    "written, so that is the work, not a wrong check. "
-                )
             no_tests = _pytest_collected_none(verdict[0], check, verdict[1])
             if no_tests is not None:
                 if_line = ""
@@ -16204,7 +12704,6 @@ def make_step_tool() -> Any:
                     cannot_pass,
                     root,
                     bound=check,
-                    locks=_pending_locks(goal, task) + _strings(arguments.get("locks")),
                     is_open=True,
                 )
                 if cannot_pass is not None
@@ -16247,7 +12746,7 @@ def make_step_tool() -> Any:
                 + unpassable
                 + _cwd_relative_data_lead(verdict[1], scope, root)
                 + collection
-                + f"{route}{undid}{task} — {title}: the check still fails after {attempt} "
+                + f"{route}{task} — {title}: the check still fails after {attempt} "
                 f"sub-agent run(s), so the task {state}.\n\n`{check}` exit {verdict[0]}:\n"
                 f"{verdict[1][-CHECK_TAIL_CHARS:]}\n\n"
                 + ("" if collection else _implementation_in_tests_lead(root, scope, check))
@@ -16258,10 +12757,7 @@ def make_step_tool() -> Any:
             )
         if proof is not None and not proof.proven:
             state = "stays blocked" if retrying else "stays open"
-            held = _changed_locked_only(scope, goal, root)
-            if held:
-                proof_note = _locked_data_proof_note(held)
-            elif proof_note == TESTS_ONLY_MUTATE_NOTE:
+            if proof_note == TESTS_ONLY_MUTATE_NOTE:
                 # q35 R59 L47: no module the test imports is on disk to mutate.
                 proof_note = _joint_cases_route(check, scope, root) or proof_note
             # The new route the Next offers keeps this check only where the route's
@@ -16290,7 +12786,7 @@ def make_step_tool() -> Any:
                 root,
                 task,
                 scope,
-                f"{budget_spent}{route}{undid}{task} — {title}: the check passes, but "
+                f"{budget_spent}{route}{task} — {title}: the check passes, but "
                 f"{why}; the task "
                 f"{state}, since a done close needs a check shown to refuse.\n\n"
                 f"`prove` said:\n{proof.text}\n\n"
@@ -16304,7 +12800,7 @@ def make_step_tool() -> Any:
                     'abandon="folded into <that task>".'
                     if tests_only
                     and all(Path(rel.rstrip("/")).suffix not in {"", ".py"} for rel in scope)
-                    and not _scope_holds_code_or_cases(scope, root)
+                    and not _scope_holds_code_or_data(scope, root)
                     else f'Next: pursuit_step with task="{task}" and notes saying what to '
                     f"fix. {proof_note}"
                     if tests_only and proof.weak
@@ -16324,7 +12820,7 @@ def make_step_tool() -> Any:
                         f"its done_when, `{check}`, which passes, kept. {proof_note}"
                         if keeps
                         else fresh_check + proof_note
-                        if tests_only and (held or missing_data)
+                        if tests_only and missing_data
                         else f"a done_when that runs that file's test. {proof_note}"
                         if tests_only
                         else "a done_when that runs a test of the behaviour itself, e.g. "
@@ -16370,7 +12866,7 @@ def make_step_tool() -> Any:
                 root,
                 task,
                 scope,
-                f"{route}{undid}{task} — {title}: the check passes, but the task {state}: "
+                f"{route}{task} — {title}: the check passes, but the task {state}: "
                 "implementation belongs in the module the test imports, not the test "
                 "file. A test file holds `test_` functions, `_` helpers and pytest "
                 "fixtures; it defines:\n"
@@ -16380,125 +12876,6 @@ def make_step_tool() -> Any:
                 "out of the test file (into the module the test imports, under a task "
                 "whose scope holds it) or delete them.",
                 ran=worker_ran,
-            )
-        if (
-            not locks
-            and not _cases_off(root)
-            and _only_data_and_tests(changed)
-            and any(map(_is_cases_data, changed))
-        ):
-            # Run R04: the driver passed no locks for its known-answers task.
-            # Run R42: a task that wrote no cases data is no known-answers task.
-            locks = changed
-        if locks:
-            locks = [*locks, *_cases_tests_beside_locks(root, goal, changed, locks)]
-        # The data locked earlier counts: a cases test locked now must read it.
-        earlier = [rel for rel in _locked(goal) if _is_cases_data(rel) and rel not in locks]
-        judged = list(dict.fromkeys([*locks, *earlier]))
-        unread = _unread_cases(root, judged, earlier) if locks else None
-        if unread:
-            state = "stays blocked" if retrying else "stays open"
-            test, data = unread
-            return _not_done(
-                root,
-                task,
-                scope,
-                f"{route}{undid}{task} — {title}: the check passes, but the task {state} "
-                f"and nothing is locked: {test} does not read {data}, so the known answers "
-                f"judge nothing: the sub-agent must make {test} load {data} and run every "
-                "case in it against the code, with no hand-written asserts of its own."
-                f"\n\nLast report:\n{shown}\n\n"
-                f'Next: pursuit_step with task="{task}" and notes saying {test} must load '
-                f"{data} and run every case against the code.",
-            )
-        guarded = await _cases_test_passing_without_code(root, judged) if locks else None
-        if guarded:
-            state = "stays blocked" if retrying else "stays open"
-            test, module, imported = guarded
-            return _not_done(
-                root,
-                task,
-                scope,
-                f"{route}{undid}{task} — {title}: the check passes, but the task {state} "
-                f"and nothing is locked: {_guarded_import_said(test, module, imported, root)} "
-                f"Let the import fail the test: import {imported} unguarded, in a cases test "
-                f"this task's check does not run (the task that writes {module} runs it); "
-                "the test this check runs loads the data only."
-                f"\n\nLast report:\n{shown}\n\n"
-                f'Next: pursuit_step with task="{task}" and notes saying {test} must not '
-                f"guard its import of {imported}: the cases test imports it unguarded, and "
-                "this task's check runs only the data's own test.",
-            )
-        flawed = _cases_test_problem(root, judged) if locks else None
-        if flawed:
-            state = "stays blocked" if retrying else "stays open"
-            test, problem = flawed
-            fix = _cases_problem_fix(root, test, problem)
-            return _not_done(
-                root,
-                task,
-                scope,
-                f"{route}{undid}{task} — {title}: the check passes, but the task {state} "
-                f"and nothing is locked: {test} {problem}, so the known answers could "
-                f"never judge the code: the sub-agent must {fix}."
-                f"\n\nLast report:\n{shown}\n\n"
-                f'Next: pursuit_step with task="{task}" and notes saying {test} {problem}: '
-                f"{fix}.",
-            )
-        unquoted = _unquoted_cases(root, locks) if locks else None
-        if unquoted and unquoted[4]:
-            state = "stays blocked" if retrying else "stays open"
-            data, missing, total, named, _, _, sourced = unquoted
-            unanswered = _unanswered_case_note(root)
-            keep = _keep_sourced(sourced)
-            return _not_done(
-                root,
-                task,
-                scope,
-                f"{route}{undid}{task} — {title}: the check passes, but the task {state} "
-                f"and nothing is locked: {missing} of {total} cases in {data} have a source "
-                "that does not give the case's expected result, so a wrong answer would "
-                f"{'pass' if _lean() else 'be locked'} as known: case {named[0]}'s source "
-                "quotes its input or prose, not its expected result: quote the line that "
-                "gives the result, where the reference has one"
-                + (f" (also {', '.join(named[1:])})" if named[1:] else "")
-                + f". {unanswered} A source holds the result when it, or the line of "
-                f"{REFERENCES_DIR}/*.txt after the one it quotes, gives every value of it, "
-                "as decimal, hex bytes or the string; a long sequence may be elided with "
-                "`...` between its head and tail. Where the reference gives a different "
-                "result, the case's expected value is wrong: change it to the reference's."
-                + (f" {keep}" if keep else "")
-                + f"\n\nLast report:\n{shown}\n\n"
-                f'Next: pursuit_step with task="{task}" and notes saying case {named[0]}\'s '
-                f"source in {data} quotes its input, not its expected result: quote the line "
-                "that gives the result and make the expected value match it, or, where no "
-                "line of the references gives it, replace the case with one whose input and "
-                "result the reference both gives." + (f" {keep}" if keep else ""),
-                cases=(data, named),
-            )
-        if unquoted:
-            state = "stays blocked" if retrying else "stays open"
-            data, missing, total, named, _, sources, sourced = unquoted
-            located = _value_lines(root, data, named)
-            located = f"{located} " if located else ""
-            keep = _keep_sourced(sourced)
-            return _not_done(
-                root,
-                task,
-                scope,
-                f"{route}{undid}{task} — {title}: the check passes, but the task {state} "
-                f"and nothing is locked: {missing} of {total} cases in {data} have no source "
-                f"quoting {REFERENCES_DIR}/*.txt (e.g. {', '.join(named)}), so nothing ties "
-                f"them to the reference. {_searched_sources(sources)} "
-                f"{located}"
-                "The sub-agent must give each case a `source` that "
-                f"copies, verbatim, at least {SOURCE_QUOTE_MIN_WORDS} words of a line of "
-                f"{REFERENCES_DIR}/*.txt it comes from. A bare file:line, page number or URL "
-                "is not a source." + (f" {keep}" if keep else "") + f"\n\nLast report:\n{shown}\n\n"
-                f'Next: pursuit_step with task="{task}" and notes saying each case in {data} '
-                f"must quote, verbatim, the line of {REFERENCES_DIR}/*.txt it comes from, "
-                f"starting with {named[0]}." + (f" {keep}" if keep else ""),
-                cases=(data, named),
             )
         # Committed while the task is still open, as beagle has a worker do:
         # the close's sweep then finds the work in history, not in the tree.
@@ -16531,26 +12908,13 @@ def make_step_tool() -> Any:
         state = "closed done" if rc == 0 else f"{verb} exited {rc}"
         if rc == 0:
             _forget_task(root, task)
-        lock_note = ""
-        if rc == 0 and (locks or fixing):
-            now, skipped = _lock(
-                goal, root, [*locks, *(rel for rel in fixing if rel not in locks)], task, fixing
-            )
-            _drop_pending_locks(goal, task)
-            if now:
-                lock_note += (
-                    f"Locked: {', '.join(now)}. No later sub-agent can change them; make "
-                    "the later tasks' done_when run them.\n\n"
-                )
-            if skipped:
-                lock_note += f"Not locked: {'; '.join(skipped)}.\n\n"
         superseded = _SUPERSEDED_REPORT_NOTE if rc == 0 and _report_claims_failure(shown) else ""
         seal_note = _seal_when_ready(root, title) if rc == 0 else ""
         if seal_note.startswith("Sealed"):
             seal_note += await _settle_after_seal(task, root)
         return _step_result(
             f"{route}{task} — {title}: {state}.\n\n{committed}\n\n{closed}\n\n"
-            f"{undid}{lock_note}{seal_note}{unrun_note}"
+            f"{seal_note}{unrun_note}"
             f"{superseded}Sub-agent report:\n{shown}\n\n"
             "Next: call pursuit_step with no arguments for the next task."
         )
@@ -17138,12 +13502,12 @@ def _ruff_rewrite_paths(argv: list[str]) -> tuple[str, list[str]] | None:
     return what, paths
 
 
-def _ruff_over_locked(command: str, cwd: Path, root: Path, locked: list[str]) -> str | None:
-    """The `ruff` rewrite in `command` that reaches past named files to locked ones, or None.
+def _ruff_over_tree(command: str, cwd: Path, root: Path) -> str | None:
+    """The `ruff` rewrite in `command` over the whole tree, not named files, or None.
 
     Run R14: W5 ran `uv run ruff format .` and `ruff check --fix .`, which
-    rewrote the locked tests. Refused: no path, `.`, or a directory that holds
-    a locked file. Named files pass; the scope guard holds those.
+    rewrote the locked tests. Refused: no path, or the project root.
+    Named files pass; the scope guard holds those.
     """
 
     def match(argv: list[str]) -> str | None:
@@ -17156,8 +13520,6 @@ def _ruff_over_locked(command: str, cwd: Path, root: Path, locked: list[str]) ->
         for raw in paths:
             target = _resolved(cwd / raw)
             if target == root:
-                return f"`{what} {raw}`"
-            if target.is_dir() and any(target in (root / rel).parents for rel in locked):
                 return f"`{what} {raw}`"
         return None
 
@@ -17174,15 +13536,6 @@ NO_BEAGLE_NOTE = (
     "Do not inspect .beagle/ or run beagle, apart from reading the contract "
     "(`beagle pursuit contract refs`, `check`, `status`, `diff`) and running it against "
     "the code (`beagle pursuit contract run --operation <op>`)."
-)
-#: What a worker is told to do with a locked test no code can pass. q35 R51:
-#: W4 spent 15.7 min fitting code to test_cases.py, which made one call for
-#: double_event and event_on_full; W5 saw why and circled until it was killed.
-LOCKED_UNPASSABLE_NOTE = (
-    "If a locked test can pass against no code (it makes the same call for two cases "
-    "that expect different answers, or uses one attribute both as a method and as a "
-    "value), do not work around it: report that it cannot be passed, naming the two "
-    "cases or the attribute, and end the step there."
 )
 #: Programs that only show what a path holds: a worker reading `.beagle/` with one
 #: is orienting, not working. A check script under it (`bash .beagle/checks/...`)
@@ -17491,38 +13844,6 @@ def _task_record(goal: Path, task: str) -> dict[str, Any]:
 def _task_check(goal: Path, task: str) -> str:
     """The task's bound `done_when`, read from its record in the pursuit's tree; or ""."""
     return str(_task_record(goal, task).get("done_when") or "")
-
-
-def _known_answers_source_refusal(
-    target: Path, root: Path, goal: Path, task: str, head: list[set[str] | None]
-) -> str | None:
-    """Why a known-answers worker may not write `target`, or None.
-
-    With references/ there, the task whose title names the known answers
-    (`_names_known_answers`, as `_cases_first_problem` judges it) writes no new
-    non-test .py outside a tests directory; a conftest or helper under tests/
-    is its own. Run R36: scope `["tests/", ".", "docs/"]` let W1 write
-    itc/core.py and a cases test that passes against it. `head` caches the
-    files at HEAD across a call's targets.
-    """
-    rel = target.relative_to(root).as_posix()
-    if not rel.endswith(".py") or _is_test_path(rel) or _in_tests_dir(rel):
-        return None
-    if _cases_off(root) or not (root / REFERENCES_DIR).is_dir():
-        return None
-    if not _names_known_answers(str(_task_record(goal, task).get("title") or "")):
-        return None
-    if not head:
-        head.append(_head_files(root))
-    at_head = head[0]
-    if (rel in at_head) if at_head is not None else target.exists():
-        return None
-    return (
-        f"refusing to write {rel}: {task} is the known-answers task, and new source is "
-        "the code its cases will judge. The code is a later task, and its cases are "
-        "written from the references, not from code: name the module they import in "
-        "your report."
-    )
 
 
 def _check_imports(check: str, root: Path, rel: Path) -> bool:
@@ -17930,22 +14251,11 @@ def make_worker_scope_guard() -> Any:
             goal = _find_goal(cwd) if command and sent_on_task else None
             if goal is not None:
                 root = _resolved(goal.parent.parent)
-                ruff = _ruff_over_locked(command, cwd, root, _locked(goal))
+                ruff = _ruff_over_tree(command, cwd, root)
                 if ruff is not None:
                     files = ", ".join(sent[1]) if sent is not None else "the files you changed"
                     return ToolCallHookResult(
-                        block=True,
-                        # q35 R57: under lean nothing is locked; fixed at launch.
-                        reason=(
-                            f"refusing {ruff}"
-                            + (
-                                ""
-                                if _lean()
-                                else ": it reaches the pursuit's locked tests, which "
-                                "no sub-agent may change"
-                            )
-                            + f". Name the files instead: {files}."
-                        ),
+                        block=True, reason=f"refusing {ruff}. Name the files instead: {files}."
                     )
             if sent is None:
                 return None
@@ -17992,7 +14302,6 @@ def make_worker_scope_guard() -> Any:
             log = _task_log(root, os.environ.get(WORKER_TASK_ENV, "").strip())
             in_store = False
             hits = 0
-            head: list[set[str] | None] = []
             for target in targets:
                 target = _own_path(target, root)
                 if target != root and root not in target.parents:
@@ -18006,9 +14315,6 @@ def make_worker_scope_guard() -> Any:
                     continue
                 if _CACHE_DIRS & set(target.parts):
                     continue
-                known = _known_answers_source_refusal(target, root, goal, task, head)
-                if known is not None:
-                    return ToolCallHookResult(block=True, reason=known)
                 if _scope_hit(target, root, scope) is None:
                     break
                 hits += 1
@@ -18479,9 +14785,9 @@ def make_driver_reference_guard() -> Any:
     return guard
 
 
-#: What beagle keeps under `.beagle/` as its record of the pursuit, and the
-#: cases this extension locks. Only beagle and this extension write them;
-#: the `*.toml` beside them is configuration, and editable.
+#: What beagle keeps under `.beagle/` as its record of the pursuit. Only beagle
+#: and this extension write them; the `*.toml` beside them is configuration, and
+#: editable.
 _STORE_RECORDS = frozenset(
     {
         "tree",
@@ -18494,9 +14800,6 @@ _STORE_RECORDS = frozenset(
         "hook-trace.json",
         ".lock",
         ".gate.lock",
-        LOCKED_DIR,
-        PENDING_LOCKS,
-        LOCK_MANIFEST,
     }
 )
 
@@ -19911,34 +16214,6 @@ TESTS_ONLY_MUTATE_NOTE = (
     "in that module, a NEEDLE there that the test must catch."
 )
 
-CASES_FIRST_NOTE = (
-    "Cases first. Make the first milestone after the reference the known answers: a "
-    "sub-agent reads the reference and writes, without any implementation, (a) a data "
-    "file of small inputs and the exact results the reference gives for them, each "
-    "with a `source` quoting the reference's own words verbatim, at least four of them "
-    "copied from a line of references/*.txt where the references are fetched there; a "
-    "bare file:line or URL is not a source (e.g. `tests/cases.json`), and (b) "
-    "a test that runs every case against the code (e.g. `tests/test_cases.py`). That "
-    "test imports the module later tasks will write, by name (e.g. `from <package> "
-    "import …`), and defines no class or helper of its own; it cannot pass until the "
-    "code exists, so it is not this task's check. Both tests load the data file beside "
-    "them: load it as `Path(__file__).with_name('cases.json')`, since the check runs "
-    "from the project "
-    "root. Its done_when checks only the data, with a small "
-    "test of the file itself (e.g. `python3 -m pytest -q tests/test_case_data.py`: "
-    "every case has its inputs, its result and its citation, and there are enough "
-    "of them); not `python3 -m json.tool`, which passes once the file parses and is "
-    "refused as a check. That data test imports no code and no other test, and must "
-    "pass now: an ImportError from it is a defect to fix, not the pre-implementation "
-    "state."
-    # R55: lean locks nothing; fixed at load, so no prefix changes mid-session.
-    + (
-        ""
-        if _lean()
-        else " It passes `locks` with the data file and both tests. Once it "
-        "closes they are locked, and every later task's done_when runs the cases test."
-    )
-)
 
 #: R0003: founding seeds the contract ahead of the milestones (CONTRACT_MILESTONES).
 #: The driver writes each step's check and scope, so it is told what they are.
