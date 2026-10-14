@@ -1675,6 +1675,17 @@ async def test_founding_seeds_examples_slice_only(
         assert retired not in note and all(retired not in part for part in split)
 
 
+def test_contract_slice_names_the_oracle_standin() -> None:
+    # T0581: beagle's seal refuses a draft with examples and no oracle/ (T0572),
+    # so the slice that writes the first ones is told to write it.
+    module = _module()
+    [seeded] = module.CONTRACT_MILESTONES
+    assert "contract/draft/standin/, the code with every answer wrong" in seeded
+    assert "contract/draft/oracle/, laid out the same: a literal table" in seeded
+    assert "with its expect and rejecting each invalid input" in seeded
+    assert "an oracle/, a table of the right answers" in module.CONTRACT_FIRST_NOTE
+
+
 @pytest.mark.anyio
 async def test_founding_drops_a_known_answers_milestone_for_the_contract(
     tmp_path: Path, beagle: Path, fake_beagle: Path, monkeypatch: pytest.MonkeyPatch
