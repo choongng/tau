@@ -1,1 +1,6 @@
-{}
+{
+ "T0600": {
+  "at": "2026-10-14T20:17:54+00:00",
+  "kind": "this check script has `! echo \"$last\" | grep -qE 'failed|error|skipped'` on line # under `set -e`, where bash does not exit when a command negated with `!` fail"
+ }
+}
