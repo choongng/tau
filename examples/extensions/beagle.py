@@ -2863,6 +2863,86 @@ _UNSEALED_OPERATION = re.compile(
 )
 
 
+#: beagle's last line of `contract run --operation X` while no sealed slice
+#: bounds X with a limit or invalid entry, or a gap where the sources are
+#: silent (T0582): X's entries ran, and X is not judged done until its limits
+#: slice seals. R98 closed `Encoder: validation` on the examples slice alone.
+_LIMITS_UNJUDGED = re.compile(
+    r"contract run --operation ([^\n]+?): NOT JUDGED: [^\n]*?"
+    r"`Slice: ([^`\s]+) limits and invalid inputs`"
+)
+
+
+def _limits_slice_part(op: str) -> str:
+    """The `pursuit_plan` part of the slice that bounds `op`."""
+    return (
+        f"{SLICE_PREFIX} {op} limits and invalid inputs::add {op}'s stated limits and "
+        f"invalid inputs, and its worked examples if no sealed slice holds them, each "
+        f"citing its source by line anchor; where the sources say nothing of {op}'s "
+        f'malformed input, a gap with "operation": "{op}", the question, and the '
+        "assumption the work makes"
+    )
+
+
+def _plan_slice_call(op: str, record: Mapping[str, Any], root: Path | None = None) -> str:
+    """How the driver gets `Slice: <op> limits and invalid inputs` stepped: the
+    task planned already, or the pursuit_plan call that plans it."""
+    title = f"{SLICE_PREFIX} {op} limits and invalid inputs"
+    for node in _tree_nodes(root) if root is not None else []:
+        if str(node.get("title") or "").strip() == title and str(node.get("status") or "") not in (
+            "done",
+            "abandoned",
+            "infeasible",
+        ):
+            planned = node.get("id")
+            return f'it is planned as {planned}: step it with pursuit_step task="{planned}"'
+    parent = str(record.get("parent") or "").strip()
+    under = f'task="{parent}"' if parent else "task=<the root task>"
+    return (
+        f"plan it with pursuit_plan {under} parts={json.dumps([_limits_slice_part(op)])}, "
+        "step it (pursuit_step gives it its scope and check, and its close seals it)"
+    )
+
+
+def _limits_unjudged(output: str) -> tuple[str, bool] | None:
+    """The operation `contract run --operation` left unjudged for want of its
+    limits slice, and whether every entry of it passed; None if none was."""
+    matches = list(_LIMITS_UNJUDGED.finditer(output))
+    if not matches:
+        return None
+    found = matches[-1]
+    passed = re.search(
+        rf"contract run --operation {re.escape(found.group(1))}: all \d+ of its entries pass",
+        output,
+    )
+    return found.group(2), passed is not None
+
+
+def _held_for_limits(key: tuple[str, str], check: str) -> bool:
+    """Whether the task at `key` last failed `check` only for want of its
+    operation's limits slice: every entry passed, and beagle did not judge it."""
+    last = _LAST_CHECK_FAILURE.get(key)
+    unjudged = _limits_unjudged(last[2]) if last is not None and last[0] == check else None
+    return unjudged is not None and unjudged[1]
+
+
+def _limits_due(task: str, record: Mapping[str, Any], output: str, root: Path) -> str:
+    """What pursuit_step says when `task`'s check ran and beagle did not judge
+    its operation done for want of its limits slice; "" otherwise."""
+    unjudged = _limits_unjudged(output)
+    if unjudged is None:
+        return ""
+    op, _passed = unjudged
+    return (
+        f"`beagle pursuit contract run --operation {op}` ends NOT JUDGED: no sealed slice "
+        f"holds a limit or invalid entry of {op}, nor a gap for its malformed input, so "
+        f"{task} cannot close done whatever its code does. That is the contract's work, "
+        f"not another worker's on {task}: `{SLICE_PREFIX} {op} limits and invalid inputs` "
+        f"is due now; {_plan_slice_call(op, record, root)}, then step {task} again: its "
+        "check runs first, and a worker goes only if the sealed limits fail."
+    )
+
+
 def _slice_due(task: str, record: Mapping[str, Any], refusal: str) -> str | None:
     """What pursuit_step says when beagle refused `task`'s open for want of a
     sealed entry of the operation its check runs, or None for another refusal."""
@@ -2870,20 +2950,11 @@ def _slice_due(task: str, record: Mapping[str, Any], refusal: str) -> str | None
     if found is None:
         return None
     op = found.group(2)
-    title = f"{SLICE_PREFIX} {op} limits and invalid inputs"
-    parent = str(record.get("parent") or "").strip()
-    under = f'task="{parent}"' if parent else "task=<the root task>"
-    part = (
-        f"{title}::add {op}'s stated limits and invalid inputs, and its worked examples "
-        "if no sealed slice holds them, each citing its source by line anchor"
-    )
     return (
         f"pursuit_step: {task} not opened — no sealed slice of the contract holds an entry "
         f"of {found.group(1)}, so its check `beagle pursuit contract run --operation {op}` "
         f"could not pass whatever the code does. The slice for it is due now, just ahead of "
-        f"this work: plan it with pursuit_plan {under} parts={json.dumps([part])}, step it "
-        f"(pursuit_step gives it its scope and check, and its close seals it), then step "
-        f"{task} again."
+        f"this work: {_plan_slice_call(op, record)}, then step {task} again."
     )
 
 
@@ -4982,9 +5053,11 @@ def _contract_run_note(root: Path) -> str:
     named = f" (its operations: {', '.join(ops)})" if ops else ""
     return (
         "Check each milestone against the part of the contract it builds: done_when "
-        f"`beagle pursuit contract run --operation <op>`, once per operation{named}; an "
-        f"operation no sealed slice holds yet first gets its `{SLICE_PREFIX} <op> limits "
-        "and invalid inputs`. Work the contract does not cover, such as tests or "
+        f"`beagle pursuit contract run --operation <op>`, once per operation{named}. A "
+        "milestone starts on its operation's examples; it closes done only once a sealed "
+        f"`{SLICE_PREFIX} <op> limits and invalid inputs` bounds that operation, so plan "
+        "that slice beside the milestone, not ahead of it, when the step result says it "
+        "is due. Work the contract does not cover, such as tests or "
         "packaging, takes a scope with no code outside tests/ and docs/, and the goal's "
         "own command. Do not copy entries into a check: "
         "the contract holds them, and a copy can be wrong."
@@ -12661,6 +12734,23 @@ def make_step_tool() -> Any:
                     proof = _Proof(proven=False, text=proof.text)
                 attempts = 1
                 retry_note = "\n\n" + ON_DISK_WITNESS_NOTE
+        elif status == "open" and _held_for_limits(unproven_key, check):
+            # T0582: left open for its limits slice; the slice may have sealed
+            # since, and the check says whether any work is left.
+            verdict = await _run_check(check, root, check_timeout)
+            _note_check_run(unproven_key, check, verdict)
+            if verdict[0] == 0:
+                proof = await _prove(task, "", scope, root, check_timeout)
+            elif _held_for_limits(unproven_key, check):
+                return _step_result(
+                    f"{route}{task} — {title}: not sent again, and it stays open. "
+                    + _limits_due(task, record, verdict[1], root)
+                )
+            else:
+                retry_note = (
+                    f"\n\nThe check fails now that more of the contract is sealed (exit "
+                    f"{verdict[0]}). Its output ends:\n{verdict[1][-CHECK_TAIL_CHARS:]}\n"
+                )
         worker_ran = False
         _KILLED_PROGRESS.pop(progress_key, None)
         unreported: list[tuple[int, _WorkerRun, list[str]]] = []
@@ -12785,6 +12875,10 @@ def make_step_tool() -> Any:
             if _disputed_entry(report, verdict[1]):
                 # T0547: a disputed sealed test goes to a judge, not to another worker.
                 break
+            if (unjudged := _limits_unjudged(verdict[1])) is not None and unjudged[1]:
+                # T0582: every entry passes, and what is left is the contract's
+                # limits slice, which no worker on this task may write.
+                break
             retry_note = (
                 f"\n\nAn earlier attempt {ended}, but the check still fails (exit "
                 f"{verdict[0]}). Its output ends:\n{verdict[1][-CHECK_TAIL_CHARS:]}\n"
@@ -12835,6 +12929,16 @@ def make_step_tool() -> Any:
             )
             if upheld:
                 return _step_result(f"{route}{task} — {title}: {dispute_note}")
+        limits = _limits_due(task, record, verdict[1], root) if check and verdict[0] != 0 else ""
+        if limits and _held_for_limits(unproven_key, check):
+            return _not_done(
+                root,
+                task,
+                scope,
+                f"{route}{task} — {title}: every contract entry its check runs passes, "
+                f"and it stays open. {limits}\n\nLast report:\n{shown}\n\n",
+                ran=worker_ran,
+            )
         if check and verdict[0] != 0:
             state = "stays blocked" if retrying else "stays open"
             fix_check = (
@@ -12925,6 +13029,7 @@ def make_step_tool() -> Any:
                 + _unreported_runs(unreported, attempt)
                 + f"Last report:\n{shown}\n\n"
                 + dispute_note
+                + (f"{limits}\n\n" if limits else "")
                 + next_step,
             )
         if proof is not None and not proof.proven:

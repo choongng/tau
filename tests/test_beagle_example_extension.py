@@ -11924,6 +11924,85 @@ async def test_operation_refusal_offers_slice(
     assert module._contract_step("Slice: encode limits and invalid inputs", project) is not None
 
 
+#: beagle's `contract run --operation encode` on R98's tree (T0582): only the
+#: examples slice sealed, every example passing, encode not yet bounded.
+LIMITS_UNJUDGED_RUN = (
+    "ok ex-001\nok ex-002\n"
+    "contract run --operation encode: all 2 of its entries pass\n"
+    "contract run --operation encode: NOT JUDGED: no sealed slice holds a limit or "
+    "invalid entry of encode, nor a gap saying the sources are silent on its malformed "
+    "input, so encode is not judged done whatever the code does. Not the code's to fix: "
+    "plan `Slice: encode limits and invalid inputs` (contract/ and references/ only) "
+    "beside this work and seal it; then run this again.\n"
+)
+
+
+@pytest.mark.anyio
+async def test_limits_slice_gate_holds_the_milestone_for_its_slice(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # R98: `Encoder: validation` closed done with only 01-examples sealed. beagle
+    # now ends `contract run --operation encode` NOT JUDGED until encode's limits
+    # slice seals: the milestone opens and its worker runs at once, no second
+    # worker is sent after it, and the driver is told to plan the slice.
+    module = _module()
+    project = _git_project(tmp_path, monkeypatch)
+    goal = project / ".beagle" / "pursuit.toml"
+    goal.write_text(goal.read_text() + module.CONTRACT_TABLE, encoding="utf-8")
+    monkeypatch.chdir(project)
+    monkeypatch.setenv("PATH", f"{fake_beagle}{os.pathsep}{os.environ['PATH']}")
+    monkeypatch.setenv("FAKE_TAU_SUCCEEDS_ON", "99")
+    monkeypatch.setenv("FAKE_TAU_WRITES", json.dumps({"encode.py": "def encode(x): ...\n"}))
+    monkeypatch.setenv("FAKE_TAU_REPORT", "encode written; both examples pass")
+    check = "beagle pursuit contract run --operation encode"
+    _ready_task(fake_beagle, check)
+    show = fake_beagle / "show.out"
+    record = {**json.loads(show.read_text()), "title": "Encoder: validation", "parent": "T0001"}
+    show.write_text(json.dumps(record))
+    (fake_beagle / "contract.rc").write_text("1")
+    (fake_beagle / "contract-run.out").write_text(LIMITS_UNJUDGED_RUN)
+    step = {"task": "T0002", "criteria": "c", "done_when": check, "scope": ["encode.py"]}
+
+    runtime, _ = _bound(tmp_path)
+    text = (await _tool(runtime, "pursuit_step").execute("c1", step)).text
+
+    assert len(_pursuit_calls(fake_beagle, "open")) == 1, text
+    assert len(_runs(fake_tau)) == 1, text
+    assert _pursuit_calls(fake_beagle, "close") == [], text
+    assert "every contract entry its check runs passes, and it stays open" in text
+    assert "ends NOT JUDGED" in text and "That is the contract's work" in text
+    assert 'plan it with pursuit_plan task="T0001" parts=["Slice: encode limits and ' in text
+    assert 'a gap with \\"operation\\": \\"encode\\"' in text
+    assert "then step T0002 again" in text
+    # Stepped again before the slice seals: the check runs, no worker is sent,
+    # and a slice already planned is named rather than planned twice.
+    show.write_text(
+        json.dumps({**record, "status": "open", "done_when": check, "scope": ["encode.py"]})
+    )
+    planned = {"id": "T0009", "title": "Slice: encode limits and invalid inputs"}
+    (fake_beagle / "tree.out").write_text(json.dumps({"nodes": [{**planned, "status": "ready"}]}))
+    again = await _tool(runtime, "pursuit_step").execute("c2", {"task": "T0002"})
+    assert len(_runs(fake_tau)) == 1, again.text
+    assert "not sent again, and it stays open" in again.text
+    assert 'it is planned as T0009: step it with pursuit_step task="T0009"' in again.text
+    # Sealed, its invalid entry fails on the code: now a worker is sent, told why.
+    (fake_beagle / "contract-run.out").write_text(
+        "ok ex-001\nok ex-002\nFAIL inv-001: wrote bytes for 2^38\n"
+        "contract run --operation encode: 2 of 3 of its entries pass; FAIL inv-001\n"
+    )
+    third = await _tool(runtime, "pursuit_step").execute("c3", {"task": "T0002"})
+    assert len(_runs(fake_tau)) >= 2, third.text
+    assert "more of the contract is sealed" in json.dumps(_runs(fake_tau)[1])
+    assert "NOT JUDGED" not in third.text
+    # Another check's failure is not this gate's.
+    assert module._limits_unjudged("FAIL x\n") is None
+    assert module._limits_unjudged(LIMITS_UNJUDGED_RUN) == ("encode", True)
+
+
 @pytest.mark.anyio
 async def test_pursuit_step_keeps_an_open_contract_milestone_on_its_check(
     tmp_path: Path,
