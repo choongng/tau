@@ -9420,7 +9420,6 @@ async def test_worker_guard_refuses_beagle_commands_and_beagle_reads(
     runtime = _scoped_worker(tmp_path, monkeypatch, scope="tests/")
     calls = [
         ("bash", {"command": "beagle pursuit tree"}),
-        ("bash", {"command": "beagle doctor"}),
         ("bash", {"command": "cd . && cat .beagle/tree/T0003.md"}),
         ("read", {"path": ".beagle/pursuit.toml"}),
     ]
@@ -9473,6 +9472,72 @@ async def test_worker_guard_refuses_beagle_commands_and_beagle_reads(
     assert _module().NO_BEAGLE_NOTE.startswith("Do not inspect .beagle/ or run beagle")
     assert "beagle pursuit contract refs" in _module().NO_BEAGLE_NOTE
     assert "beagle pursuit contract run --operation" in _module().NO_BEAGLE_NOTE
+
+
+@pytest.mark.anyio
+async def test_worker_runs_help_and_read_only_verbs(
+    tmp_path: Path, beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # S01: the examples slice's worker was refused `contract --help`, `contract
+    # reread --help` and `beagle doctor` while `contract status` ran.
+    runtime = _scoped_worker(tmp_path, monkeypatch, scope="tests/")
+    allowed = [
+        "beagle pursuit contract --help",
+        "beagle pursuit contract reread --help",
+        "beagle pursuit close -h",
+        "beagle --help 2>&1 | head -40",
+        "beagle doctor",
+        "beagle doctor --only pursuit",
+        "beagle pursuit contract show",
+        "beagle pursuit contract coverage --json",
+        "beagle pursuit contract status && beagle pursuit contract refs itc2008",
+        # What ran before still runs.
+        "beagle pursuit contract add --entry @e.json",
+        "beagle pursuit contract check --draft",
+        "beagle pursuit contract run --operation encode | tail -5",
+    ]
+    for command in allowed:
+        result = await _tool_with_hooks(runtime, "bash").execute("c1", {"command": command})
+
+        assert result.text == "ran", command
+    note = _module().NO_BEAGLE_NOTE
+    assert "`--help`" in note and "`beagle doctor`" in note and "`coverage`" in note
+
+
+@pytest.mark.anyio
+async def test_worker_mutating_beagle_refused(
+    tmp_path: Path, beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # S01: widening to --help and the read-only verbs keeps the writes the driver's,
+    # an allowed call carrying none in a compound command or a substitution.
+    runtime = _scoped_worker(tmp_path, monkeypatch, scope="tests/")
+    refused = [
+        "beagle pursuit open T0003",
+        "beagle pursuit close T0003 --status done",
+        "beagle pursuit amend T0003 --criteria x",
+        "beagle pursuit prove T0003 --mutate",
+        "beagle pursuit add T0003 x",
+        "beagle pursuit depend T0003 T0004",
+        "beagle pursuit contract seal --slice examples",
+        "beagle pursuit contract reread listing.json --source s --lines 1-9",
+        "beagle loop start",
+        "beagle gate run",
+        "beagle pursuit commit T0003 a.py -- -h",
+        "beagle pursuit contract status; beagle pursuit close T0003",
+        "beagle doctor && beagle pursuit amend T0003 --criteria x",
+        "beagle pursuit contract --help | beagle pursuit open T0003",
+        "beagle pursuit contract status $(beagle pursuit close T0003)",
+        'beagle pursuit contract status "$(beagle pursuit close T0003)"',
+        "beagle pursuit contract status `beagle pursuit close T0003`",
+        'echo "$(beagle pursuit open T0003 --help; beagle pursuit close T0003)"',
+        "eval 'beagle pursuit close T0003'",
+        "echo T0003 | xargs -n1 beagle pursuit close",
+    ]
+    for command in refused:
+        result = await _tool_with_hooks(runtime, "bash").execute("c1", {"command": command})
+
+        # Whichever guard says so first: orientation's note or the sub-agent's.
+        assert "Tool call blocked: refusing to run `beagle" in result.text, command
 
 
 # run R15 class 7: workers read .beagle/ through git, uv init wrote unseen, retries re-read

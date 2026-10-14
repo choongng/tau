@@ -13374,7 +13374,9 @@ def _pursuit_verb(argv: list[str]) -> str | None:
 #: own guard reads them. R71-R75's contract workers were refused `contract check`
 #: and `contract refs` 34 times, and R75's cited bare line numbers for want of
 #: the anchors `refs` prints.
-_CONTRACT_READ_VERBS = frozenset({"status", "check", "refs", "diff", "run"})
+#: S01 adds `show` (beagle's alias of `status`) and `coverage` ("Writes nothing"),
+#: as `beagle pursuit contract --help` lists them.
+_CONTRACT_READ_VERBS = frozenset({"status", "show", "check", "refs", "diff", "run", "coverage"})
 #: And `contract add`, which writes the contract an entry at a time, each checked
 #: against its source as it lands. R81's contract worker wrote the file whole, a
 #: 51 KB call cut off at the output limit, and fixed it for 17 minutes more.
@@ -13585,9 +13587,10 @@ NO_BEAGLE_REASON = (
 #: What a worker is told in its brief, to the same end.
 NO_BEAGLE_NOTE = (
     "Do not inspect .beagle/ or run beagle, apart from reading the contract "
-    "(`beagle pursuit contract refs`, `check`, `status`, `diff`) and running it against "
-    "the code (`beagle pursuit contract run --operation <op>`), and, with references/ "
-    "in your scope, saving a source (`beagle refs fetch <URL>`)."
+    "(`beagle pursuit contract refs`, `check`, `status`, `diff`, `coverage`) and running "
+    "it against the code (`beagle pursuit contract run --operation <op>`), `beagle doctor`, "
+    "any beagle command's `--help`, and, with references/ in your scope, saving a source "
+    "(`beagle refs fetch <URL>`)."
 )
 #: Programs that only show what a path holds: a worker reading `.beagle/` with one
 #: is orienting, not working. A check script under it (`bash .beagle/checks/...`)
@@ -13648,6 +13651,43 @@ def _slice_refs_fetch(argv: list[str]) -> bool:
     )
 
 
+def _beagle_help_or_doctor(argv: list[str]) -> bool:
+    """Whether `argv` is a beagle command that only prints: `-h`/`--help` anywhere
+    before a `--` (argparse prints the help and exits before any verb acts), or
+    `beagle doctor`. S01: a slice worker was refused `contract --help`, `contract
+    reread --help` and `beagle doctor` while `contract status` ran."""
+    words = argv[1 : argv.index("--")] if "--" in argv else argv[1:]
+    if "-h" in words or "--help" in words:
+        return True
+    verbs = [arg for arg in words if not arg.startswith("-")]
+    return verbs[:1] == ["doctor"]
+
+
+def _substituted(command: str) -> list[str]:
+    """The commands `$(...)` and backticks run inside `command`, quoted or not.
+
+    shlex keeps `"$(beagle pursuit close T1)"` one word, and a backtick in the
+    word it touches, so an allowed `beagle` call could carry another unseen.
+    """
+    found: list[str] = []
+    at = 0
+    while at < len(command):
+        if command.startswith("$(", at):
+            depth, end = 1, at + 2
+            while end < len(command) and depth:
+                depth += {"(": 1, ")": -1}.get(command[end], 0)
+                end += 1
+            found.append(command[at + 2 : end - 1 if not depth else end])
+            at += 2
+        elif command[at] == "`":
+            end = command.find("`", at + 1)
+            found.append(command[at + 1 : end if end != -1 else len(command)])
+            at = end + 1 if end != -1 else len(command)
+        else:
+            at += 1
+    return found
+
+
 def _worker_orientation(tool: str, args: Mapping[str, Any], cwd: Path) -> str | None:
     """What a worker's call does to orient itself on beagle, or None.
 
@@ -13666,10 +13706,15 @@ def _worker_orientation(tool: str, args: Mapping[str, Any], cwd: Path) -> str | 
     command = str(args.get("command", ""))
 
     def match(argv: list[str]) -> str | None:
+        if argv[0] in ("eval", "xargs"):  # the command they run is in their words
+            named = [at for at, arg in enumerate(argv) if Path(arg).name == "beagle"]
+            if argv[0] == "eval":
+                return _bash_find(" ".join(argv[1:]), match)
+            return match(argv[named[0] :]) if named else None
         if _named(argv, "beagle"):
             # R77: the contract worker, told to cite by `contract refs`, was
             # refused it and made anchors up. The contract's reads pass.
-            if _contract_read(argv) or _slice_refs_fetch(argv):
+            if _contract_read(argv) or _slice_refs_fetch(argv) or _beagle_help_or_doctor(argv):
                 return None
             return f"run `{' '.join(argv[:3])}`"
         if Path(argv[0]).name in _READERS and any(_in_store(a) for a in argv[1:]):
@@ -13683,6 +13728,10 @@ def _worker_orientation(tool: str, args: Mapping[str, Any], cwd: Path) -> str | 
     found = _bash_find(command, match)
     if found is not None:
         return found
+    for inner in _substituted(command):
+        found = _bash_find(inner, match)
+        if found is not None:
+            return found
     # Run R31: W1, refused `cat .beagle/...` four times, printed both task
     # records with `python3 - <<'EOF'`; a heredoc body is not in the shell words.
     for opener, body in _split_heredocs(command)[1]:
@@ -14529,7 +14578,19 @@ def make_worker_pursuit_guard() -> Any:
                 what = "spawn a sub-agent with the agent tool"
             elif event.tool_name == "bash":
                 command = str((event.arguments or {}).get("command", ""))
-                verb = _bash_find(command, _pursuit_write_verb)
+
+                # S01: `--help` prints and exits, whatever verb it follows.
+                def write(argv: list[str]) -> str | None:
+                    return None if _beagle_help_or_doctor(argv) else _pursuit_write_verb(argv)
+
+                verb = next(
+                    (
+                        found
+                        for each in (command, *_substituted(command))
+                        if (found := _bash_find(each, write)) is not None
+                    ),
+                    None,
+                )
                 git = _bash_find(command, _worker_git_commit)
                 if verb is not None:
                     what = f"run `beagle pursuit {verb}`"
