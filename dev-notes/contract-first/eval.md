@@ -31,6 +31,7 @@ branch and sha. Grades come from `grade_<task>.py` over `runs/RNN/adapter.py`;
 | B07 | q35 | semver (bare goal) | none (plain tau, no extensions) | 75/76 in 8.1 min, ended on its own | — (baseline for the bare-goal pursuit runs) |
 | R97 | q35 | semver (bare goal) | contract-first 24bd167 (T0536, T0537, T0541); tau e66018d7 pinned | 58/76 at the 60 min cap (working tree; T0006 Core Version class open, uncommitted) | B07 plain 75/76 in 8.1 min |
 | S01 | q35 | semver (smoke, 25 min cap) | contract-first cde3fbd (incremental contract, T0554-T0560, T0566); tau 2ea8cd1b | not graded: capped at 1500 s mid-milestone; first code at 14.0 min (R97 31.6) | B07 plain 75/76 in 8.1 min |
+| R98 | q35 | wrenfold | contract-first 395d806 (incremental contract + S01 fixes T0567-T0581, oracle stand-in T0572); tau df13db3e | 54/54 in 49.9 min, ended on its own (codec.py committed) | R96 50/54 capped; B06 plain 54/54 in 9.1 min |
 
 ## B06 — the invented spec was not hard
 
@@ -702,3 +703,41 @@ tau-harness's venv.
 Fixes filed as T0567-T0575 (source saving, read-only verbs, status vs
 check, acceptance root, committed seal, a crashing test under the stand-in,
 milestones on `contract run`, the venv on PATH, `run --operation` noise).
+
+## R98 — q35 wrenfold on the incremental contract: 54/54 in 49.9 min
+
+The first full run of the incremental contract after the S01 fixes, and
+the first full score on wrenfold under beagle (R96 50/54 capped, R71
+0/54). It ended by itself, every file committed. Plain tau (B06) also
+scores 54/54, in 9.1 min, so on this task the contract bought
+reliability plain tau already had, at 5.5 times the time.
+
+Timeline (worker sessions, minutes from launch):
+
+| From | To | What |
+|---|---|---|
+| 0.0 | 1.9 | founding |
+| 1.9 | 4.7 | `Slice: examples`: 8 encode examples, accept.sh, standin/, oracle/; sealed at 4.8 |
+| 4.7 | 10.5 | driver planning (5.8 min, no worker) |
+| 10.5 | 17.2 | codec.py (first code commit 22:09, 17.6 min) |
+| 17.6 | 28.2 | tests, encoder validation, decoder rejection |
+| 28.2 | 34.4 | driver (6.2 min; a duplicate coverage slice T0013 filed and abandoned) |
+| 34.4 | 49.0 | `Slice: coverage`: 12 entries, 29/29 normative lines cited or excluded |
+
+What went right: the slice worker saved the spec and sealed in under 3
+minutes, with the right-answer stand-in written first time (T0572,
+T0581); the acceptance root, committed seal and source saving held
+(T0567-T0571).
+
+What it shows:
+- The examples slice is no longer the cost. Coverage is (14.6 min, 29%
+  of the run), then driver time between workers (12 min, 24%).
+- No limits-and-invalid slice was planned. The validation and rejection
+  milestones closed on `contract run --operation encode` and the
+  worker's own pytest, with nothing sealed for decode until coverage
+  (T0517's read: the gate checks "any sealed entry", not "a sealed limit
+  or invalid entry"). The code was right anyway; the contract only caught
+  up at the end. -> T0582, T0583.
+- First code at 10.5 min (worker start) / 17.6 min (commit), against
+  S01's 14.0 and R97's 31.6.
+
