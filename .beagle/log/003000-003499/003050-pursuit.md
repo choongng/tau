@@ -1,0 +1,14 @@
++++
+id = "003050-pursuit"
+ordinal = 3050
+kind = "pursuit"
+timestamp = "2026-10-14T06:01:54+00:00"
+summary = "pursuit open T0585: recon: where R98's 49.9 min went beyond the code (driver 12 min between workers, coverage slice 14.6 min)"
+metric_command = ""
+drains = []
+hooks = []
++++
+
+criteria: dev-notes/contract-first/r98-time-recon.md accounts, from R98's tau session traces (~/.tau-harness/sessions/home-wrenfold-5b007e, sessions created after 21:51 PDT 10-13) and ~/wrenfold's git log, for the driver's 4.7-10.5 and 28.2-34.4 min gaps (turns, model latency, tool calls, refusals, the T0013 duplicate) and the coverage slice's 14.6 min (what it read, how many contract add calls, refusals, re-runs); separates model time from beagle/tau overhead; ranks cuts by minutes saved that would hold for any pursuit (not only contract mode), and ends 'Decision: ' naming the tasks to file.
+decided by: sh -c 'echo "fe9c8c781edfe8af4e9d96e26f0b2587eb04a2ecc44b2b0e5dc51fd5ff0ad77e  .beagle/checks/T0585/T0585.sh" | sha256sum -c --quiet && bash .beagle/checks/T0585/T0585.sh'
+budget: 60000 tokens
