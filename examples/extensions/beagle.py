@@ -1262,9 +1262,48 @@ def _lease_live(record: Mapping[str, Any]) -> bool:
     return isinstance(minutes, int | float) and 0 <= elapsed <= minutes * 60
 
 
+#: Where the extension logs what it read past in beagle's output, one JSON line each.
+BEAGLE_LOG_NAME = "beagle-extension.jsonl"
+#: Where a JSON reply may start: `{` or `[` opening a line, as json.dumps prints one.
+_JSON_LINE_START = re.compile(r"^[{\[]", re.MULTILINE)
+
+
+def _log_beagle_remainder(argv: list[str], remainder: str) -> None:
+    """Append what `beagle <argv>` printed besides its JSON to Tau's diagnostic log."""
+    entry = {"at": datetime.now(UTC).isoformat(), "argv": argv, "remainder": remainder}
+    with contextlib.suppress(OSError, ValueError):
+        logs = TauPaths().logs_dir
+        logs.mkdir(parents=True, exist_ok=True)
+        with (logs / BEAGLE_LOG_NAME).open("a", encoding="utf-8") as log:
+            log.write(json.dumps(entry) + "\n")
+
+
 def _json_out(argv: list[str], root: Path) -> Any:
+    """The JSON `beagle <argv>` prints, or None when it fails or prints none.
+
+    The output holds stderr too, and beagle 0.48 adds lines around its JSON: a
+    `next: <move>` last (on stderr after a refusal), notes and warnings. The JSON
+    is read from the first line opening with `{` or `[` that parses, as
+    `_json_reply` reads a reply, and whatever else was printed is logged
+    (`BEAGLE_LOG_NAME`), not taken as a failed read: a strict parse here read
+    every such reply as None, and an awaited worker's scope as empty.
+    """
     rc, out = _run([BEAGLE_BIN, *argv, "--root", str(root)], root, HOOK_TIMEOUT)
-    return json.loads(out) if rc == 0 else None
+    if rc != 0:
+        return None
+    for opened in _JSON_LINE_START.finditer(out):
+        start = opened.start()
+        try:
+            value, end = json.JSONDecoder().raw_decode(out[start:])
+        except ValueError:
+            continue  # a note's `[T0003]`, not the reply
+        remainder = (out[:start] + out[start + end :]).strip()
+        if remainder:
+            _log_beagle_remainder(argv, remainder)
+        return value
+    if out.strip():
+        _log_beagle_remainder(argv, out.strip())
+    return None
 
 
 def _live_wait(root: Path, session_id: str) -> str | None:
@@ -3114,6 +3153,53 @@ def _json_reply(out: str) -> Any:
         return json.JSONDecoder().raw_decode(out[start:])[0]
     except ValueError:
         return None
+
+
+#: beagle 0.48's `next: <command>` line: the one move its output implies,
+#: printed last (`_say_next`), on stderr after a refusal that names one.
+_NEXT_LINE = re.compile(r"^next: (.+)$", re.MULTILINE)
+
+
+def _beagle_next(out: str) -> str:
+    """The move the last `next:` line in a beagle reply names, or ""."""
+    moves = _NEXT_LINE.findall(out)
+    return moves[-1].strip() if moves else ""
+
+
+def _tau_next(move: str) -> str:
+    """beagle's `next:` move as the tau tool call that makes it, as a "Next: …" line.
+
+    The driver drives with tau's tools, not beagle's verbs: a verb pursuit_step
+    runs is named as that call. A move no tool makes is passed on as beagle said it.
+    """
+    words = move.split()
+    verb = words[2] if words[:2] == ["beagle", "pursuit"] and len(words) > 2 else ""
+    task = words[3] if len(words) > 3 and _TASK_ID.fullmatch(words[3]) else ""
+    if verb == "next" and len(words) == 3:
+        return "Next: call pursuit_step with no arguments for the next task."
+    if verb == "audit" and len(words) == 3:
+        return "Next: call pursuit_step with no arguments; it runs the audit that is due."
+    if verb == "open" and task:
+        return f'Next: pursuit_step with task="{task}", which opens it.'
+    if verb == "retry" and task:
+        return f'Next: pursuit_step with task="{task}", which reworks it on its own check.'
+    if verb == "spawn" and task:
+        return (
+            f'Next: pursuit_step with task="{task}", new_route=true and notes saying how '
+            "the new route differs."
+        )
+    return f"Next, as beagle says: `{move}`."
+
+
+def _relay_next(out: str, fallback: str) -> tuple[str, str]:
+    """A beagle reply without its `next:` line, and the move it named as a tau call.
+
+    `fallback`, the caller's own Next line, where the reply names no move.
+    """
+    move = _beagle_next(out)
+    if not move:
+        return out, fallback
+    return _NEXT_LINE.sub("", out).strip(), _tau_next(move)
 
 
 def _strings(value: Any) -> list[str]:
@@ -8000,6 +8086,24 @@ def _import_error_only(output: str) -> bool:
     )
 
 
+async def _run_prove(argv: list[str], root: Path, timeout: float) -> tuple[int, str]:
+    """Run a `beagle pursuit prove` argv, in a scratch copy when beagle says so.
+
+    beagle 0.48 refuses a prove in this checkout while another worker is live in
+    the loop (a background dispatch's wait, `beagle loop tick --awaiting`): the
+    defect put back would be read by that worker as its own failure. Its refusal
+    ends `next: beagle pursuit prove <task> --isolated …`, and the prove is run
+    again so, with `--isolated` added to `argv` for any later run of it.
+    """
+    rc, out = await asyncio.to_thread(_run, _capped(argv, _memory_max()), root, 2 * timeout + 120)
+    if rc != 0 and "--isolated" not in argv and "--isolated" in _beagle_next(out).split():
+        argv.append("--isolated")
+        rc, out = await asyncio.to_thread(
+            _run, _capped(argv, _memory_max()), root, 2 * timeout + 120
+        )
+    return rc, out
+
+
 async def _prove(
     task: str,
     report: str,
@@ -8111,9 +8215,7 @@ async def _prove(
     still_passes = ""
     for how in attempts:
         argv = [BEAGLE_BIN, "pursuit", "prove", task, *how, "--check-timeout", f"{timeout:.0f}"]
-        rc, out = await asyncio.to_thread(
-            _run, _capped(argv, _memory_max()), root, 2 * timeout + 120
-        )
+        rc, out = await _run_prove(argv, root, timeout)
         sites = [
             os.path.normpath(how[at + 1]) for at, arg in enumerate(how[:-1]) if arg in SITE_FLAGS
         ]
@@ -8130,9 +8232,7 @@ async def _prove(
                 else PREDATES_BECAUSE
             )
             argv += ["--predates-because", because]
-            rc, out = await asyncio.to_thread(
-                _run, _capped(argv, _memory_max()), root, 2 * timeout + 120
-            )
+            rc, out = await _run_prove(argv, root, timeout)
         tail = out[-PROVE_TAIL_CHARS:]
         verdicts = {m.group(1): m.group(2) for m in _PROVE_VERDICT.finditer(out)}
         if rc == 0 and verdicts.get(task) == "PROVEN":
@@ -8623,9 +8723,9 @@ def _abandon(task: str, why: str, root: Path, goal: Path) -> str:
     _forget_task(root, task)
     released = _release_waiters(task, why, root)
     freed = f"\nNo longer waiting on it: {', '.join(released)}." if released else ""
+    _, then = _relay_next(out, "Next: call pursuit_step with no arguments for the next task.")
     return (
-        f"{out.splitlines()[0] if out else task + ' abandoned'}{freed}\n\n"
-        f"{_tree(root)}\n\nNext: call pursuit_step with no arguments for the next task."
+        f"{out.splitlines()[0] if out else task + ' abandoned'}{freed}\n\n{_tree(root)}\n\n{then}"
     )
 
 
@@ -8710,7 +8810,7 @@ def _close_infeasible(
     next_move = (
         _sealed_text(parent, [task], closed, now=True)
         if task in _sealed(closed).get(parent, [])
-        else "Next: call pursuit_step with no arguments for the next task."
+        else _relay_next(out, "Next: call pursuit_step with no arguments for the next task.")[1]
     )
     return (
         f"{out.splitlines()[0] if out else task + ' closed infeasible'}\n\n"
@@ -9577,11 +9677,14 @@ async def _done_by(
         argv += ["--confirms", done]
     rc, opened = _pursuit(argv, root, timeout=DEFAULT_CHECK_TIMEOUT + 60)
     if rc != 0:
-        return f"pursuit_step: `beagle pursuit open` refused (exit {rc}):\n{opened}"
+        refused, then = _relay_next(opened, "")
+        return f"pursuit_step: `beagle pursuit open` refused (exit {rc}):\n{refused}" + (
+            f"\n\n{then}" if then else ""
+        )
     if witness:
         argv = ["prove", task, *(a for rel in witness for a in ("--absent", rel))]
         argv += ["--check-timeout", f"{DEFAULT_CHECK_TIMEOUT:.0f}"]
-        rc, proved = _pursuit(argv, root, timeout=2 * DEFAULT_CHECK_TIMEOUT + 120)
+        rc, proved = await _run_prove([BEAGLE_BIN, "pursuit", *argv], root, DEFAULT_CHECK_TIMEOUT)
         verdicts = {m.group(1): m.group(2) for m in _PROVE_VERDICT.finditer(proved)}
         if rc != 0 or verdicts.get(task) != "PROVEN":
             why = (
@@ -9603,10 +9706,10 @@ async def _done_by(
         why = f"`beagle pursuit close` refused the done close (exit {rc})"
         return _done_by_released(task, why, closed, root)
     _forget_task(root, task)
-    return (
-        f"{task} — {title}: closed done, {because}.\n\n{closed}\n\n{_tree(root)}\n\n"
-        "Next: call pursuit_step with no arguments for the next task."
+    closed, then = _relay_next(
+        closed, "Next: call pursuit_step with no arguments for the next task."
     )
+    return f"{task} — {title}: closed done, {because}.\n\n{closed}\n\n{_tree(root)}\n\n{then}"
 
 
 def _changes_done_work(
@@ -11442,8 +11545,10 @@ def make_step_tool() -> Any:
                     f'Send {first.group()} first, with pursuit_step task="{first.group()}".'
                 )
             if rc != 0:
+                refused, then = _relay_next(opened, "")
                 return _step_result(
-                    f"pursuit_step: `beagle pursuit open` refused (exit {rc}):\n{opened}"
+                    f"pursuit_step: `beagle pursuit open` refused (exit {rc}):\n{refused}"
+                    + (f"\n\n{then}" if then else "")
                 )
             if _KILLED_NOT_OPENED.get(str(_resolved(root)), ("",))[0] == task:
                 del _KILLED_NOT_OPENED[str(_resolved(root))]
@@ -12229,11 +12334,14 @@ def make_step_tool() -> Any:
         if rc == 0:
             _forget_task(root, task)
         superseded = _SUPERSEDED_REPORT_NOTE if rc == 0 and _report_claims_failure(shown) else ""
+        # T0602: beagle's `next:` names the move after this close, as a tau call.
+        closed, then = _relay_next(
+            closed, "Next: call pursuit_step with no arguments for the next task."
+        )
         return _step_result(
             f"{route}{task} — {title}: {state}.\n\n{committed}\n\n{closed}\n\n"
             f"{unrun_note}"
-            f"{superseded}Sub-agent report:\n{shown}\n\n"
-            "Next: call pursuit_step with no arguments for the next task."
+            f"{superseded}Sub-agent report:\n{shown}\n\n{then}"
         )
 
     async def execute(
@@ -12531,8 +12639,48 @@ def _past_runner(argv: list[str]) -> list[str]:
 #: The `beagle pursuit` verbs that only read the pursuit. A worker sent with no
 #: task may run these; every other verb changes the tree or the log.
 _PURSUIT_READ_VERBS = frozenset(
-    {"next", "brief", "show", "status", "view", "tree", "findings", "rules", "review-check"}
-)
+    {
+        "next", "brief", "show", "status", "view", "tree", "findings", "rules",
+        "review-check", "coverage",
+    }
+)  # fmt: skip
+
+
+def _worker_beagle_read(argv: list[str]) -> str | None:
+    """`argv` itself if it is a beagle read a worker sent on a task may run, or None.
+
+    beagle 0.48 gives a spec-tied task's worker its reads: `refs find` and `refs
+    show` print the numbered reference lines a cite copies, `pursuit rules
+    [section]` the step's rules, and `pursuit coverage <ref>` the reference's
+    lines no done task cites. None of them writes.
+    """
+    if not _named(argv, "beagle"):
+        return None
+    words = [arg for arg in argv[1:] if not arg.startswith("-")]
+    if words[:2] in (["refs", "find"], ["refs", "show"]):
+        return " ".join(argv)
+    if words[:2] in (["pursuit", "rules"], ["pursuit", "coverage"]):
+        return " ".join(argv)
+    return None
+
+
+def _refs_read_call(command: str) -> bool:
+    """Whether a bash command only prints reference lines with `beagle refs find`
+    or `beagle refs show`, after at most a `cd`, piped at most into filters
+    such as head: the anchored read of a reference, as a search of it counts.
+    """
+
+    def refs(argv: list[str]) -> str | None:
+        words = [arg for arg in argv[1:] if not arg.startswith("-")]
+        return _worker_beagle_read(argv) if words[:1] == ["refs"] else None
+
+    def other(argv: list[str]) -> str | None:
+        if refs(argv) or _named(argv, "cd") or Path(argv[0]).name in _SEARCH_FILTERS:
+            return None
+        return argv[0]
+
+    command = _QUIET_REDIRECT.sub(" ", command)
+    return _bash_find(command, refs) is not None and _bash_find(command, other) is None
 
 
 def _pursuit_verb(argv: list[str]) -> str | None:
@@ -12692,12 +12840,15 @@ def _ruff_over_tree(command: str, cwd: Path, root: Path) -> str | None:
 #: Why a worker is kept from beagle and its store.
 NO_BEAGLE_REASON = (
     "the brief already holds what the task needs; do the task. A worker does not "
-    "inspect .beagle/ or run beagle: the session that sent you does that."
+    "inspect .beagle/ or run beagle, beyond the reads `beagle refs find|show`, `beagle "
+    "pursuit rules [section]` and `beagle pursuit coverage <ref>`: the session that "
+    "sent you does that."
 )
 #: What a worker is told in its brief, to the same end.
 NO_BEAGLE_NOTE = (
-    "Do not inspect .beagle/ or run beagle, apart from `beagle doctor` and any beagle "
-    "command's `--help`."
+    "Do not inspect .beagle/ or run beagle, apart from `beagle doctor`, any beagle "
+    "command's `--help`, and the reads `beagle refs find|show`, `beagle pursuit rules "
+    "[section]` and `beagle pursuit coverage <ref>`."
 )
 #: Programs that only show what a path holds: a worker reading `.beagle/` with one
 #: is orienting, not working. A check script under it (`bash .beagle/checks/...`)
@@ -12806,7 +12957,7 @@ def _worker_orientation(tool: str, args: Mapping[str, Any], cwd: Path) -> str | 
                 return _bash_find(" ".join(argv[1:]), match)
             return match(argv[named[0] :]) if named else None
         if _named(argv, "beagle"):
-            if _beagle_help_or_doctor(argv):
+            if _beagle_help_or_doctor(argv) or _worker_beagle_read(argv):
                 return None
             return f"run `{' '.join(argv[:3])}`"
         if Path(argv[0]).name in _READERS and any(_in_store(a) for a in argv[1:]):
@@ -13263,7 +13414,7 @@ def _free_reference_call(
         return None
     root = _resolved(goal.parent.parent)
     if tool == "bash":
-        if command and _reference_search_call(command, cwd, root):
+        if command and (_reference_search_call(command, cwd, root) or _refs_read_call(command)):
             return "search"
         return None
     window = _reference_window(arguments, cwd, root)

@@ -184,6 +184,9 @@ if sys.argv[1:3] == ["pursuit", "open"] and "--over" not in sys.argv and ranked.
     sys.exit(2)
 if len(sys.argv) > 2 and reply.exists():
     sys.stdout.write(reply.read_text())
+said = here / (sys.argv[2] + ".err")  # what beagle says on stderr: notes, `next:`
+if len(sys.argv) > 2 and said.exists():
+    sys.stderr.write(said.read_text())
 status = here / (sys.argv[2] + ".rc")
 if len(sys.argv) > 2 and status.exists():
     sys.exit(int(status.read_text()))
@@ -193,7 +196,8 @@ if len(sys.argv) > 2 and status.exists():
 @pytest.fixture
 def fake_beagle(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     """A `beagle` that logs each call, prints `<argv[2]>-<argv[3]>.out` or else
-    `<argv[2]>.out` when it exists, and exits with `<argv[2]>.rc`'s status (else 0)."""
+    `<argv[2]>.out` when it exists, `<argv[2]>.err` on stderr, and exits with
+    `<argv[2]>.rc`'s status (else 0)."""
     here = tmp_path / "fake-beagle"
     here.mkdir()
     script = here / "beagle"
@@ -19359,3 +19363,239 @@ async def test_retry_note_omits_fix_the_work_when_the_output_names_no_failure(
         assert said(1, output, check) == fix, output
     assert said(124, "", check) == fix
     assert said(5, "no tests ran in 0.01s\n", "python3 -m pytest -q tests/test_x.py") == fix
+
+
+# T0602: beagle 0.48's outputs taken as 0.48 gives them
+
+
+def test_json_out_reads_past_next_and_stderr_notes(
+    tmp_path: Path, beagle: Path, fake_beagle: Path
+) -> None:
+    # 0.48 prints `next: <move>` last (_say_next), on stderr after a refusal, and
+    # notes beside its JSON; a strict json.loads read each such reply as None,
+    # which emptied an awaited worker's scope.
+    project = _pursuit_project(tmp_path)
+    rows = [{"id": "T0003", "status": "open"}]
+    (fake_beagle / "tree.out").write_text(
+        "[T0001] note: 1 container has no check of its own\n"
+        + json.dumps(rows, indent=2)
+        + "\nnext: beagle pursuit next\n"
+    )
+    (fake_beagle / "tree.err").write_text("warning: the loop record is stale\n")
+    module = _module()
+
+    got = module._json_out(["pursuit", "tree", "--json", "--status", "open"], project)
+
+    assert got == rows
+    log = Path.home() / ".tau" / "logs" / module.BEAGLE_LOG_NAME
+    [entry] = [json.loads(line) for line in log.read_text().splitlines()]
+    assert entry["argv"] == ["pursuit", "tree", "--json", "--status", "open"]
+    for said in ("[T0001] note", "next: beagle pursuit next", "warning: the loop record"):
+        assert said in entry["remainder"], entry
+    # An object, and a reply with no JSON at all: None, and what it said is logged.
+    (fake_beagle / "show.out").write_text('{"id": "T0003", "scope": ["a.py"]}\n')
+    (fake_beagle / "show.err").write_text("next: beagle pursuit audit\n")
+    assert module._json_out(["pursuit", "show", "T0003"], project) == {
+        "id": "T0003",
+        "scope": ["a.py"],
+    }
+    (fake_beagle / "read.out").write_text("no run in flight\n")
+    assert module._json_out(["loop", "read", "--json"], project) is None
+    logged = [json.loads(line)["remainder"] for line in log.read_text().splitlines()]
+    assert logged[1:] == ["next: beagle pursuit audit", "no run in flight"]
+    # A failed call is None, as before, and logs nothing.
+    (fake_beagle / "read.rc").write_text("3")
+    assert module._json_out(["loop", "read", "--json"], project) is None
+    assert len(log.read_text().splitlines()) == 3
+
+
+@pytest.mark.anyio
+async def test_prove_runs_isolated_beside_a_live_worker(
+    tmp_path: Path, fake_beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # 0.48 refuses a prove in this checkout while the loop holds another worker's
+    # live wait, and its refusal names the move: the same prove with --isolated.
+    project = _git_project(tmp_path, monkeypatch)
+    (project / "README.md").write_text("start\n")
+    _git(project, "add", "README.md")
+    _git(project, "commit", "-q", "-m", "start")
+    opened = _git(project, "rev-parse", "HEAD").strip()
+    record = {"id": "T0010", "status": "open", "opened_commit": opened, "done_when": "true"}
+    (fake_beagle / "show.out").write_text(json.dumps(record))
+    (project / "clock.py").write_text("def tick(n):\n    return n + 1\n")
+    module = _module()
+    real = module._run
+    proved: list[list[str]] = []
+    live = {"worker": True, "predates": False}
+
+    def run(cmd: list[str], *args: Any, **kwargs: Any) -> tuple[int, str]:
+        if "prove" not in cmd:
+            return real(cmd, *args, **kwargs)
+        how = cmd[cmd.index("prove") + 2 :]
+        proved.append(how)
+        if live["predates"] and "--predates-because" not in how:
+            return 2, "beagle: clock.py is not in T0010 since abc; say why with --predates-because"
+        if live["worker"] and "--isolated" not in how:
+            return 2, (
+                "beagle: NOT RUN: a worker is live in the loop here: [W2] W2 on T0011. "
+                "Run it in a scratch copy of this tree with --isolated.\n"
+                "next: beagle pursuit prove T0010 --isolated <the same witness>"
+            )
+        return 0, "T0010: PROVEN — refuses with clock.py gone\n"
+
+    monkeypatch.setattr(module, "_run", run)
+
+    proof = await module._prove("T0010", "done, no witness", ["clock.py"], project, 60)
+
+    assert proof is not None and proof.proven, proof
+    assert [how[:2] for how in proved] == [["--absent", "clock.py"]] * 2
+    assert "--isolated" not in proved[0] and proved[1][-1] == "--isolated"
+
+    # A refusal that wants a reason first: the reason, then --isolated, kept together.
+    # clock.py was there at the open, so its edit since is put back (--mutate).
+    _git(project, "add", "clock.py")
+    _git(project, "commit", "-q", "-m", "T0009: clock")
+    record["opened_commit"] = _git(project, "rev-parse", "HEAD").strip()
+    (fake_beagle / "show.out").write_text(json.dumps(record))
+    (project / "clock.py").write_text("def tick(n):\n    return n + 2\n")
+    proved.clear()
+    live["predates"] = True
+    proof = await module._prove("T0010", "done, no witness", ["clock.py"], project, 60)
+
+    assert proof is not None and proof.proven, proof
+    assert [how[:2] for how in proved] == [["--mutate", "clock.py"]] * 3
+    assert "--predates-because" in proved[2] and "--isolated" in proved[2]
+
+    # No worker live: one prove, in this checkout.
+    proved.clear()
+    live.update(worker=False, predates=False)
+    proof = await module._prove("T0010", "done, no witness", ["clock.py"], project, 60)
+
+    assert proof is not None and proof.proven, proof
+    assert len(proved) == 1 and "--isolated" not in proved[0]
+
+
+def test_relay_next_maps_beagles_move_to_the_tau_call() -> None:
+    module = _module()
+    tau_next = module._tau_next
+    assert tau_next("beagle pursuit next") == (
+        "Next: call pursuit_step with no arguments for the next task."
+    )
+    assert "pursuit_step with no arguments" in tau_next("beagle pursuit audit")
+    assert 'pursuit_step with task="T0007", which opens it' in tau_next(
+        'beagle pursuit open T0007 --criteria "<…>" --done-when "<…>"'
+    )
+    assert 'pursuit_step with task="T0007", which reworks it' in tau_next(
+        'beagle pursuit retry T0007 --because "<what changed>"'
+    )
+    assert 'task="T0007", new_route=true' in tau_next(
+        'beagle pursuit spawn T0007 --approach-delta "<…>" --reason "<…>"'
+    )
+    # No tau call makes it: passed on as beagle said it.
+    move = 'beagle pursuit prove T0007 --mutate <file> --needle "<…>"'
+    assert tau_next(move) == f"Next, as beagle says: `{move}`."
+    out = "T0007 closed done\n  spend 1000\nnext: beagle pursuit next"
+    assert module._relay_next(out, "Next: fallback.") == (
+        "T0007 closed done\n  spend 1000",
+        "Next: call pursuit_step with no arguments for the next task.",
+    )
+    assert module._relay_next("T0007 closed done", "Next: fallback.") == (
+        "T0007 closed done",
+        "Next: fallback.",
+    )
+
+
+@pytest.mark.anyio
+async def test_pursuit_step_close_relays_beagles_next(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # T0600: a real close ends `next: beagle pursuit next`, which the result showed
+    # verbatim above its own "Next: call pursuit_step"; the driver gets one move.
+    project = _git_project(tmp_path, monkeypatch)
+    monkeypatch.chdir(project)
+    monkeypatch.setenv("FAKE_TAU_REPORT", WITNESSED_REPORT)
+    _ready_task(fake_beagle)
+    (fake_beagle / "prove.out").write_text("T0002: PROVEN — refuses when `a + b` is `a - b`\n")
+    (fake_beagle / "commit.out").write_text("T0002: committed abc123, 1 file(s): T0002: Parser\n")
+    (fake_beagle / "close.out").write_text("closed T0002 done\nnext: beagle pursuit next\n")
+    runtime, _ = _bound(tmp_path)
+
+    result = await _tool(runtime, "pursuit_step").execute(
+        "c1",
+        {
+            "task": "T0002",
+            "criteria": "c",
+            "done_when": "grep -q done done.txt",
+            "scope": ["done.txt"],
+        },
+    )
+
+    assert "closed T0002 done" in result.text
+    assert "next: beagle pursuit next" not in result.text
+    assert result.text.endswith("Next: call pursuit_step with no arguments for the next task.")
+
+
+@pytest.mark.anyio
+async def test_worker_runs_beagle_refs_and_rules_reads(
+    tmp_path: Path, beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # 0.48 gives a spec-tied task's worker reads of its own: the anchored
+    # reference lines a cite copies, the step's rules, a reference's coverage.
+    runtime = _scoped_worker(tmp_path, monkeypatch, scope="tests/")
+    allowed = [
+        'beagle refs find "seed stamp" fork',
+        "beagle refs show itc --from 80 --to 120",
+        "beagle refs show itc | head -40",
+        "beagle pursuit rules",
+        "beagle pursuit rules 2b",
+        "beagle pursuit coverage itc --max 10",
+    ]
+    for command in allowed:
+        result = await _tool_with_hooks(runtime, "bash").execute("c1", {"command": command})
+
+        assert result.text == "ran", (command, result.text)
+    refused = [
+        "beagle refs fetch https://example.com/itc.pdf",
+        "beagle refs show itc; beagle pursuit close T0003",
+        "beagle pursuit rules $(beagle pursuit open T0003)",
+        "beagle pursuit coverage itc && beagle pursuit prove T0003 --absent a.py",
+        "beagle pursuit open T0003 --criteria c",
+        "beagle loop tick",
+    ]
+    for command in refused:
+        result = await _tool_with_hooks(runtime, "bash").execute("c1", {"command": command})
+
+        assert "Tool call blocked: refusing to run `beagle" in result.text, command
+    note = _module().NO_BEAGLE_NOTE
+    assert "`beagle refs find|show`" in note and "`beagle pursuit rules [section]`" in note
+    # A `refs` read is a search of the references, as the re-read counter counts one.
+    module = _module()
+    assert module._refs_read_call("beagle refs show itc --from 1 --to 40 | head -5")
+    assert module._refs_read_call("cd /x && beagle refs find fork")
+    assert not module._refs_read_call("beagle refs show itc && python3 make.py")
+    assert not module._refs_read_call("beagle pursuit rules")
+
+
+@pytest.mark.anyio
+async def test_known_answers_worker_refs_reads_are_not_counted(
+    tmp_path: Path, beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # As a ranged read or a search of references/ (q35 R51), `beagle refs show`
+    # and `refs find` are not counted toward the nothing-written refusals.
+    runtime, _ = _reference_worker(tmp_path, monkeypatch, cap=10)
+    read = _tool_with_hooks(runtime, "read")
+    bash = _tool_with_hooks(runtime, "bash")
+
+    refs = [
+        await bash.execute(f"s{i}", {"command": f"beagle refs show paper --from {1 + 30 * i}"})
+        for i in range(5)
+    ] + [await bash.execute("f1", {"command": "beagle refs find value"})]
+    others = [await read.execute(f"n{i}", {"path": "notes.txt"}) for i in range(5)]
+    late = await read.execute("n5", {"path": "notes.txt"})
+
+    assert all(result.text == "ran" for result in refs + others)
+    assert "refusing to read notes.txt: 5 of 10 calls used and nothing written" in late.text

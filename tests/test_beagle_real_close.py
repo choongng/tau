@@ -15,7 +15,7 @@ from beagle_real_cli import (
     show,
     step_hello,
 )
-from test_beagle_example_extension import _tool
+from test_beagle_example_extension import _module, _tool
 
 pytestmark = [pytest.mark.real_beagle, pytest.mark.anyio]
 
@@ -61,3 +61,29 @@ async def test_real_close_is_refused_when_the_worker_does_nothing(
     refused = beagle_cli(real_beagle, "pursuit", "close", hello, "--outcome", "done", ok=False)
     assert refused.returncode != 0, refused.stdout
     assert show(real_beagle, hello)["status"] != "done"
+
+
+async def test_real_prove_runs_isolated_beside_a_live_worker_and_relays_next(
+    tmp_path: Path, real_beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # T0602: 0.48 refuses a prove in this checkout while another worker's wait is
+    # live in the loop; the step proves in a scratch copy (--isolated) instead.
+    beagle_cli(real_beagle, "loop", "start", "--by", "test")
+    beagle_cli(
+        real_beagle, "loop", "tick", "--awaiting", "W9 on T0999", "--wait-id", "W9", "--for", "30"
+    )
+    hello, _, result = await step_hello(tmp_path, monkeypatch, {"hello.txt": "hi\n"})
+
+    assert "closed done" in result.text, result.text
+    assert show(real_beagle, hello)["status"] == "done"
+    # The close's `next: beagle pursuit next` comes as the tau call that makes it.
+    assert "next: beagle pursuit next" not in result.text
+    assert result.text.endswith("Next: call pursuit_step with no arguments for the next task.")
+    # Proven, in a scratch copy: in this checkout beagle refuses, naming --isolated.
+    assert "in a scratch copy" in show(real_beagle, hello)["refutes"]
+    here = beagle_cli(real_beagle, "pursuit", "prove", hello, "--absent", "hello.txt", ok=False)
+    assert here.returncode != 0 and "NOT RUN" in here.stderr, here.stderr
+    assert f"next: beagle pursuit prove {hello} --isolated" in here.stderr
+    # The wait the refusal counted, as the extension reads the loop record.
+    record = _module()._json_out(["loop", "read", "--json"], real_beagle)
+    assert [wait["id"] for wait in record["waits"]] == ["W9"], record
