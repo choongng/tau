@@ -1618,11 +1618,13 @@ def test_found_criteria_leave_values_to_the_contract(tmp_path: Path) -> None:
 
 
 @pytest.mark.anyio
-async def test_founding_declares_the_contract_and_seeds_it_first(
+async def test_founding_seeds_examples_slice_only(
     tmp_path: Path, beagle: Path, fake_beagle: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # R0003: in every low q35 run founding planned from memory, and done meant
-    # the checks it wrote. The contract is read from the sources first.
+    # the checks it wrote. The contract is read from the sources first. T0551:
+    # R97 paid 31.6 min of contract before code (Contract, Second extraction,
+    # Reconcile); now one slice of worked examples goes first, the rest later.
     module = _module()
     project = tmp_path / "project"
     project.mkdir()
@@ -1643,12 +1645,7 @@ async def test_founding_declares_the_contract_and_seeds_it_first(
     result = await found.execute("c2", {**args, "user_confirmed": True})
 
     written = tomllib.loads((project / ".beagle" / "pursuit.toml").read_text())
-    assert written["contract"] == {
-        "path": "contract/contract.json",
-        "second": "contract/contract.second.json",
-        "acceptance": "sh contract/accept.sh",
-        "files": ["contract/"],
-    }
+    assert written["contract"] == {"slices": "contract/slices", "draft": "contract/draft"}
     assert written["goal"]["criteria"] == ["hello.txt says hi", module.CONTRACT_CRITERION]
     assert written["close"] == {"require": "witness"}
     [split] = _pursuit_calls(fake_beagle, "split")
@@ -1659,15 +1656,23 @@ async def test_founding_declares_the_contract_and_seeds_it_first(
         "Docs::say how",
         "--ordered",
     ]
-    assert split[1].startswith("Contract::") and split[2].startswith("Second extraction::")
-    assert split[3].startswith("Reconcile::")
-    assert "each entry only an id, kind, operation, source and line-anchor cite" in split[2]
-    assert "reconcile" not in split[2]
-    assert "by line anchor and operation only (no inputs or results)" in module.CONTRACT_FIRST_NOTE
+    # One task ahead of the milestones: the examples slice, citing by line anchor.
+    [seeded] = module.CONTRACT_MILESTONES
+    assert seeded.startswith("Slice: examples::") and split[1] == seeded
+    assert "citing its source by line anchor" in seeded and "contract/draft/standin/" in seeded
+    assert "Examples only: limits, invalid inputs and properties are later slices" in seeded
+    # A bare goal: with no source to read, the slice holds experiments and gaps.
+    assert "With no source to read, the slice holds the experiments run and the gaps" in seeded
+    assert module._contract_step("Slice: examples", project) == module.CONTRACT_STEPS
+    assert "and the contract covers its sources" in module.CONTRACT_CRITERION
+    note = module.CONTRACT_FIRST_NOTE
     assert module.DRIVER_STEERS_NOTE in result.text
-    assert module.CONTRACT_FIRST_NOTE in result.text and "Cases first" not in result.text
-    assert "gives these three their scope and check itself" in module.CONTRACT_FIRST_NOTE
-    assert [m.partition("::")[0] for m in module.CONTRACT_MILESTONES] == list(module.CONTRACT_STEPS)
+    assert note in result.text and "Cases first" not in result.text
+    assert "each citing its source by line anchor" in note
+    assert "`Slice: <op> limits and invalid inputs`" in note and "`Slice: coverage`" in note
+    assert "pursuit_step gives every slice task its scope and check itself" in note
+    for retired in ("Second extraction", "Reconcile", "contract.second.json"):
+        assert retired not in note and all(retired not in part for part in split)
 
 
 @pytest.mark.anyio
@@ -11606,174 +11611,119 @@ async def test_contract_worker_adds_entries_by_contract_add(
     assert "`beagle pursuit contract add`" in module.CONTRACT_FIRST_NOTE
     # A cut-off write of the whole contract is told to add it instead.
     cut = module._truncated_call(
-        {"_raw_arguments": '{"path": "contract/contract.json", "content": "{\\"entries'}
+        {"_raw_arguments": '{"path": "contract/draft/contract.json", "content": "{\\"entries'}
     )
-    assert cut is not None and "add its entries to contract/contract.json a few" in cut
+    assert cut is not None and "add its entries to contract/draft/contract.json a few" in cut
     other = module._truncated_call({"_raw_arguments": '{"path": "src/x.py", "content": "'})
     assert other is not None and "contract add" not in other
 
 
 @pytest.mark.anyio
-async def test_the_second_extraction_reads_nothing_of_the_first(
-    tmp_path: Path, beagle: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    # R84: both second-extraction workers began with `cat contract/contract.json`,
-    # and the listing copied the first's ids and cites.
-    module = _module()
-    runtime, project = _reference_worker(
-        tmp_path, monkeypatch, cap=30, scope=module.CONTRACT_SECOND
-    )
-    goal = project / ".beagle" / "pursuit.toml"
-    goal.write_text(goal.read_text() + module.CONTRACT_TABLE, encoding="utf-8")
-    (project / "contract").mkdir()
-    (project / "contract" / "contract.json").write_text('{"entries": []}\n')
-    bash = _tool_with_hooks(runtime, "bash")
-    read = _tool_with_hooks(runtime, "read")
-    second, first = module.CONTRACT_SECOND, module.CONTRACT_PATH
-    add = "beagle pursuit contract add"
-
-    refused = [
-        await read.execute("r1", {"path": "contract/contract.json"}),
-        await bash.execute("b1", {"command": "cat contract/contract.json"}),
-        await bash.execute("b2", {"command": f"python3 -c 'open(\"{project}/{first}\").read()'"}),
-        await bash.execute("b3", {"command": f"beagle pursuit contract diff a {second}"}),
-        await bash.execute("b4", {"command": "beagle pursuit contract add <<'EOF'\n{}\nEOF"}),
-        await bash.execute("b5", {"command": "beagle pursuit contract check --draft"}),
-    ]
-    taken = [
-        await bash.execute("t1", {"command": f"{add} --file {second} <<'EOF'\n{{}}\nEOF"}),
-        await bash.execute("t2", {"command": f"beagle pursuit contract check --file={second}"}),
-        await bash.execute("t3", {"command": "beagle pursuit contract refs paper --grep value"}),
-    ]
-
-    assert all("second, independent extraction" in r.text for r in refused), [
-        r.text for r in refused
-    ]
-    assert "without `--file contract/contract.second.json`" in refused[4].text
-    assert all(r.text == "ran" for r in taken), [r.text for r in taken]
-
-
-@pytest.mark.anyio
-async def test_only_the_second_extraction_writes_it(
-    tmp_path: Path, beagle: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    # R83: the Contract worker read the full check's "second extraction does not
-    # exist yet" and wrote it itself, 20 KB of full entries, after the first.
-    module = _module()
-    runtime, project = _reference_worker(tmp_path, monkeypatch, cap=30, scope="contract/")
-    goal = project / ".beagle" / "pursuit.toml"
-    goal.write_text(goal.read_text() + module.CONTRACT_TABLE, encoding="utf-8")
-    bash = _tool_with_hooks(runtime, "bash")
-    write = _tool_with_hooks(runtime, "write")
-    second = module.CONTRACT_SECOND
-    add = "beagle pursuit contract add"
-
-    refused = [
-        await write.execute("w1", {"path": second, "content": "{}"}),
-        await bash.execute("b1", {"command": f"cat > {second} <<'EOF'\n{{}}\nEOF"}),
-        await bash.execute("b2", {"command": f"{add} --file {second} <<'EOF'\n{{}}\nEOF"}),
-    ]
-    taken = [
-        await bash.execute("t1", {"command": "beagle pursuit contract add <<'EOF'\n{}\nEOF"}),
-        await bash.execute("t2", {"command": f"cat {second}"}),
-        await write.execute("t3", {"path": "contract/accept.sh", "content": "true\n"}),
-    ]
-
-    assert all("refusing to" in r.text and "another reader's" in r.text for r in refused), [
-        r.text for r in refused
-    ]
-    assert [r.text for r in taken] == ["ran", "ran", "ran"]
-
-
-@pytest.mark.anyio
-async def test_pursuit_step_scopes_the_contract_milestones_itself(
+async def test_slice_step_scope_and_check_fixed(
     tmp_path: Path,
     beagle: Path,
     fake_beagle: Path,
     fake_tau: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # R83, R84: the driver gave the second extraction the scope contract/, so
-    # beagle briefed it as contract work, and nothing kept it from the first.
+    # R83, R84: a driver-chosen scope let a contract task's worker write another's
+    # file. Any `Slice:` task gets contract/ and `contract check --draft` at open,
+    # whatever scope and check the driver passes.
     module = _module()
     project = _pursuit_project(tmp_path)
     goal = project / ".beagle" / "pursuit.toml"
     goal.write_text(goal.read_text() + module.CONTRACT_TABLE, encoding="utf-8")
     monkeypatch.chdir(project)
-    _ready_task(fake_beagle)
-    record = json.loads((fake_beagle / "show.out").read_text())
-    (fake_beagle / "show.out").write_text(json.dumps({**record, "title": "Second extraction"}))
-    # The check is probed before the open: it runs the fake, and fails.
     monkeypatch.setenv("PATH", f"{fake_beagle}{os.pathsep}{os.environ['PATH']}")
     (fake_beagle / "contract.rc").write_text("1")
-    runtime, _ = _bound(tmp_path)
+    given = [
+        ("Slice: examples", "beagle pursuit contract check"),
+        ("Slice: encode limits and invalid inputs", "python3 -m pytest -q"),
+        ("slice:  properties", "beagle pursuit contract run --operation encode"),
+    ]
 
-    result = await _tool(runtime, "pursuit_step").execute(
-        "c1",
-        {
-            "task": "T0002",
-            "criteria": "the listing is written",
-            "done_when": "beagle pursuit contract check",
-            "scope": ["contract/"],
-        },
-    )
+    for title, check in given:
+        (fake_beagle / "calls.jsonl").unlink(missing_ok=True)
+        _ready_task(fake_beagle)
+        record = json.loads((fake_beagle / "show.out").read_text())
+        (fake_beagle / "show.out").write_text(json.dumps({**record, "title": title}))
+        result = await _tool(_bound(tmp_path)[0], "pursuit_step").execute(
+            "c1",
+            {
+                "task": "T0002",
+                "criteria": "the slice is drafted",
+                "done_when": check,
+                "scope": ["src/encode.py"],
+            },
+        )
 
-    opens = _pursuit_calls(fake_beagle, "open")
-    assert len(opens) == 1, result.text
-    [opened] = opens
-    assert opened[opened.index("--scope") + 1] == module.CONTRACT_SECOND
-    assert opened[opened.index("--done-when") + 1] == (
-        f"beagle pursuit contract check --file {module.CONTRACT_SECOND}"
-    )
+        opens = _pursuit_calls(fake_beagle, "open")
+        assert len(opens) == 1, (title, result.text)
+        [opened] = opens
+        assert opened[opened.index("--scope") + 1 :] == ["contract/"], title
+        assert opened[opened.index("--done-when") + 1] == module.CONTRACT_STEPS[1], title
+    assert module.CONTRACT_STEPS == (["contract/"], "beagle pursuit contract check --draft")
+    # Only a `Slice:` title, and only under a declared contract.
+    assert module._contract_step("Encode", project) is None
+    assert module._contract_step("Contract", project) is None
+    assert module._contract_step("Slice: examples", tmp_path) is None
 
 
-@pytest.mark.anyio
-@pytest.mark.parametrize(
-    ("title", "given", "check"),
-    [
-        ("Contract", "beagle pursuit contract check", "beagle pursuit contract check --draft"),
-        ("Reconcile", "beagle pursuit contract check --draft", "beagle pursuit contract check"),
-    ],
+#: beagle's refusal to open a check of `contract run --operation encode` while
+#: no sealed slice holds an entry of encode (contract.operation_refusal).
+UNSEALED_OPERATION_REFUSAL = (
+    "beagle: no sealed slice holds an entry of encode, so `contract run --operation encode` "
+    "cannot pass whatever the code does. Plan the slice that adds them (`Slice: encode "
+    "limits and invalid inputs`, or its examples) to seal before this task.\n"
 )
-async def test_pursuit_step_scopes_the_contract_and_reconcile_itself(
+
+
+@pytest.mark.anyio
+async def test_operation_refusal_offers_slice(
     tmp_path: Path,
     beagle: Path,
     fake_beagle: Path,
     fake_tau: Path,
     monkeypatch: pytest.MonkeyPatch,
-    title: str,
-    given: str,
-    check: str,
 ) -> None:
-    # The Contract and Reconcile tasks get the whole contract/ and their own
-    # check at open, whatever scope and check the driver passes.
+    # T0551: a milestone is checked by its operation's sealed entries, and beagle
+    # refuses the open while none is sealed; the driver is told the slice to plan.
     module = _module()
-    project = _pursuit_project(tmp_path)
-    goal = project / ".beagle" / "pursuit.toml"
-    goal.write_text(goal.read_text() + module.CONTRACT_TABLE, encoding="utf-8")
+    project = _contract_project(tmp_path)
     monkeypatch.chdir(project)
     _ready_task(fake_beagle)
     record = json.loads((fake_beagle / "show.out").read_text())
-    (fake_beagle / "show.out").write_text(json.dumps({**record, "title": title}))
+    (fake_beagle / "show.out").write_text(json.dumps({**record, "parent": "T0001"}))
     monkeypatch.setenv("PATH", f"{fake_beagle}{os.pathsep}{os.environ['PATH']}")
     (fake_beagle / "contract.rc").write_text("1")
+    (fake_beagle / "open.rc").write_text("4")
+    (fake_beagle / "open.out").write_text(UNSEALED_OPERATION_REFUSAL)
     runtime, _ = _bound(tmp_path)
 
     result = await _tool(runtime, "pursuit_step").execute(
         "c1",
         {
             "task": "T0002",
-            "criteria": "the contract is written",
-            "done_when": given,
-            "scope": [module.CONTRACT_SECOND],
+            "criteria": "encode meets its entries",
+            "done_when": "beagle pursuit contract run --operation encode",
+            "scope": ["src/encode.py"],
         },
     )
 
-    opens = _pursuit_calls(fake_beagle, "open")
-    assert len(opens) == 1, result.text
-    [opened] = opens
-    assert opened[opened.index("--scope") + 1] == "contract/"
-    assert opened[opened.index("--done-when") + 1] == check
+    assert len(_pursuit_calls(fake_beagle, "open")) == 1, result.text
+    assert result.text.startswith("pursuit_step: T0002 not opened — no sealed slice"), result.text
+    assert "`beagle pursuit contract run --operation encode` could not pass" in result.text
+    assert 'plan it with pursuit_plan task="T0001" parts=["Slice: encode limits and invalid' in (
+        result.text
+    )
+    assert "then step T0002 again" in result.text and _runs(fake_tau) == []
+    # Another refusal is passed on as beagle said it.
+    assert module._slice_due("T0002", record, "beagle: T0002 is open already") is None
+    # The slice it names is one pursuit_step scopes and checks itself, sealed by its title.
+    assert module._slice_name("Slice: encode limits and invalid inputs") == (
+        "encode-limits-and-invalid-inputs"
+    )
+    assert module._contract_step("Slice: encode limits and invalid inputs", project) is not None
 
 
 @pytest.mark.anyio
@@ -11798,9 +11748,9 @@ async def test_pursuit_step_keeps_an_open_contract_milestone_on_its_check(
     (fake_beagle / "next.out").write_text(
         json.dumps({"open": ["T0002"], "ready": [], "ready_total": 0})
     )
-    forced = module.CONTRACT_STEPS["Contract"][1]
-    weak = "test -f contract/contract.json"
-    record = {"id": "T0002", "title": "Contract", "status": "open", "scope": ["contract/"]}
+    forced = module.CONTRACT_STEPS[1]
+    weak = "test -f contract/draft/contract.json"
+    record = {"id": "T0002", "title": "Slice: examples", "status": "open", "scope": ["contract/"]}
     show = fake_beagle / "show.out"
     step = {"task": "T0002", "done_when": weak, "scope": ["contract/", "references/"]}
 
@@ -11809,7 +11759,7 @@ async def test_pursuit_step_keeps_an_open_contract_milestone_on_its_check(
         "c1", {**step, "notes": "add the properties' tests"}
     )
     assert _pursuit_calls(fake_beagle, "amend") == [], kept.text
-    assert f"Contract keeps its check `{forced}`" in kept.text
+    assert f"Slice: examples keeps its check `{forced}`" in kept.text
     assert "is worked on this call's scope" not in kept.text
     # A check the driver already put in its place is put back.
     show.write_text(json.dumps({**record, "done_when": weak}))
@@ -19689,127 +19639,63 @@ def test_a_check_may_run_the_contract_and_nothing_else_of_beagle() -> None:
 
 
 @pytest.mark.anyio
-@pytest.mark.parametrize("state", ["ready", "draft"])
-async def test_a_close_seals_the_contract_once_beagle_reads_it_ready(
+async def test_close_seals_draft_as_slice(
     tmp_path: Path,
     beagle: Path,
     fake_beagle: Path,
     fake_tau: Path,
     monkeypatch: pytest.MonkeyPatch,
-    state: str,
 ) -> None:
-    monkeypatch.chdir(_contract_project(tmp_path))
-    monkeypatch.setenv("FAKE_TAU_REPORT", "wrote done.txt")
-    _ready_task(fake_beagle)
-    (fake_beagle / "contract-status.out").write_text(json.dumps({"state": state}))
-    (fake_beagle / "contract-seal.out").write_text("sealed 3 file(s)\n")
-    # A Reconcile left pending: the seal tries it as done by the task that closed.
-    reconcile = {"id": "T0004", "parent": "T0001", "title": "Reconcile", "status": "pending"}
-    (fake_beagle / "tree.out").write_text(json.dumps({"goal": "Ship it", "nodes": [reconcile]}))
-    runtime, _ = _bound(tmp_path)
-
-    result = await _tool(runtime, "pursuit_step").execute(
-        "c1",
-        {
-            "task": "T0002",
-            "criteria": "c",
-            "done_when": "grep -q done done.txt",
-            "scope": ["done.txt"],
-            "locks": ["done.txt"],
-        },
-    )
-
-    assert "closed done" in result.text
-    assert _module().CONTRACT_LOCKS_NOTE in result.text and "Locked:" not in result.text
-    sealed = "Sealed the contract (contract/contract.json)" in result.text
-    calls = _pursuit_calls(fake_beagle, "contract")
-    if state == "ready":
-        assert sealed and calls == [["status", "--json"], ["seal"]]
-        assert "pursuit_step: T0004 not closed done by T0002" in result.text
-        assert "done_when `beagle pursuit contract run --operation <op>`" in result.text
-    else:
-        assert not sealed and calls == [["status", "--json"]]
-        assert "T0004" not in result.text
-
-
-def _reconcile_project(tmp_path: Path, fake: Path, monkeypatch: pytest.MonkeyPatch) -> str:
-    """A contract project whose T0003, Second extraction, committed the second and is
-    done, with T0004, Reconcile, pending; beagle's checks pass. Returns the commit."""
+    # T0551: a slice task's done close seals the draft as the slice its title
+    # names, so the driver never needs the verb; any other close seals nothing.
     module = _module()
-    project, _ = _done_by_project(tmp_path, fake, monkeypatch, "T0001: setup")
-    goal = project / ".beagle" / "pursuit.toml"
-    close = '\n[close]\nrequire = "witness"\n'
-    goal.write_text(goal.read_text() + close + module.CONTRACT_TABLE, encoding="utf-8")
-    (project / module.CONTRACT_SECOND).parent.mkdir(exist_ok=True)
-    (project / module.CONTRACT_SECOND).write_text("[]\n")
-    _git(project, "add", module.CONTRACT_SECOND)
-    _git(project, "commit", "-q", "-m", "T0003: Second extraction")
-    nodes = [
-        {"id": "T0001", "parent": "", "title": "Goal", "status": "open", "container": True},
-        {"id": "T0002", "parent": "T0001", "title": "Contract", "status": "done"},
-        {"id": "T0003", "parent": "T0001", "title": "Second extraction", "status": "done"},
-        {"id": "T0004", "parent": "T0001", "title": "Reconcile", "status": "pending"},
-        {"id": "T0005", "parent": "T0001", "title": "Encode", "status": "pending"},
-    ]
-    (fake / "tree.out").write_text(json.dumps({"goal": "Ship it", "nodes": nodes}))
-    record = {"id": "T0004", "title": "Reconcile", "status": "pending", "done_when": ""}
-    (fake / "show-T0004.out").write_text(json.dumps(record))
-    (fake / "prove.out").write_text("T0004: PROVEN — refuses with the second gone\n")
-    monkeypatch.setenv("PATH", f"{fake}{os.pathsep}{os.environ['PATH']}")
-    return _git(project, "rev-parse", "HEAD").strip()
-
-
-@pytest.mark.anyio
-async def test_reconcile_closes_done_by_on_its_own_check(
-    tmp_path: Path,
-    beagle: Path,
-    fake_beagle: Path,
-    fake_tau: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    # R85: offered `contract check`, the driver bound --draft to Reconcile's
-    # done-by close, which could not refuse with the second taken away.
-    _reconcile_project(tmp_path, fake_beagle, monkeypatch)
+    project = _contract_project(tmp_path)
+    monkeypatch.chdir(project)
+    title = "Slice: encode limits and invalid inputs"
+    _ready_task(fake_beagle)
+    record = json.loads((fake_beagle / "show.out").read_text())
+    check = module.CONTRACT_STEPS[1]
+    (fake_beagle / "show.out").write_text(
+        json.dumps({**record, "title": title, "done_when": check})
+    )
+    (project / "contract" / "draft").mkdir(parents=True)
+    (project / "contract" / "draft" / "contract.json").write_text('{"entries": []}\n')
+    # The slice's own check, `contract check --draft`, passes once the worker
+    # has written the draft's accept.sh.
+    monkeypatch.setenv("FAKE_TAU_SUCCEEDS_ON", "99")
+    monkeypatch.setenv("FAKE_TAU_WRITES", json.dumps({"contract/draft/accept.sh": "true"}))
+    checker = tmp_path / "checker"
+    checker.mkdir()
+    (checker / "beagle").write_text("#!/bin/sh\nexec test -f contract/draft/accept.sh\n")
+    (checker / "beagle").chmod(0o755)
+    monkeypatch.setenv("PATH", f"{checker}{os.pathsep}{os.environ['PATH']}")
+    (fake_beagle / "contract-seal.out").write_text("contract sealed: slice 02-x\n")
     runtime, _ = _bound(tmp_path)
 
     result = await _tool(runtime, "pursuit_step").execute(
-        "c1",
-        {
-            "task": "T0004",
-            "abandon": "done by T0003",
-            "done_when": "beagle pursuit contract check --draft",
-            "scope": ["contract/contract.json"],
-        },
+        "c1", {"task": "T0002", "criteria": "c", "done_when": "grep -q done done.txt"}
     )
 
-    [opened] = _pursuit_calls(fake_beagle, "open")
-    assert opened[opened.index("--done-when") + 1] == "beagle pursuit contract check", result.text
-    assert opened[opened.index("--scope") + 1] == "contract/"
-    [proved] = _pursuit_calls(fake_beagle, "prove")
-    assert proved[proved.index("--absent") + 1] == _module().CONTRACT_SECOND
-    assert "T0004 — Reconcile: closed done" in result.text
-
-
-@pytest.mark.anyio
-async def test_the_seal_closes_reconcile_done_by_the_task_that_sealed(
-    tmp_path: Path,
-    beagle: Path,
-    fake_beagle: Path,
-    fake_tau: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    # R85: the extractions agreed, the contract sealed when T0003 closed, and
-    # Reconcile could be neither opened nor dropped; the run stopped with no code.
-    sha = _reconcile_project(tmp_path, fake_beagle, monkeypatch)
-
-    said = await _module()._settle_after_seal("T0003", Path.cwd())
-
-    assert [c[0] for c in _pursuit_calls(fake_beagle, "open")] == ["T0004"]
-    assert [c[0] for c in _pursuit_calls(fake_beagle, "close")] == ["T0004"]
-    assert said == (
-        f"T0004 — Reconcile: closed done, satisfied by T0003's commit {sha[:12]}; "
-        "no sub-agent ran.\n\n"
+    assert "closed done" in result.text, result.text
+    seals = [c for c in _pursuit_calls(fake_beagle, "contract") if c[0] == "seal"]
+    assert seals == [["seal", "--slice", "encode-limits-and-invalid-inputs"]], result.text
+    assert "Sealed the draft as the contract's slice encode-limits-and-invalid-inputs" in (
+        result.text
     )
+    assert "done_when `beagle pursuit contract run --operation <op>`" in result.text
+    # Any other title seals nothing; nor does a slice with no draft.
+    assert module._seal_when_ready(project, "Encode") == ""
+    assert module._seal_when_ready(tmp_path / "elsewhere", "Slice: examples") == ""
+    assert [c for c in _pursuit_calls(fake_beagle, "contract") if c[0] == "seal"] == seals
+    assert module._slice_name("Slice: examples") == "examples"
+    # A refused seal is said, with the slice to plan again.
+    (fake_beagle / "contract.rc").write_text("1")
+    refusal = "not sealed: examples pass under every stand-in\n"
+    (fake_beagle / "contract-seal.out").write_text(refusal)
+    refused = module._seal_when_ready(project, "Slice: properties")
+    assert "did not seal as slice properties (exit 1)" in refused
+    assert "examples pass under every stand-in" in refused
+    assert "Plan another `Slice: properties` task with pursuit_plan" in refused
 
 
 @pytest.mark.anyio
@@ -19836,6 +19722,26 @@ async def test_nothing_ready_says_what_the_contracts_acceptance_found(
     assert "Every entry of the contract passes (`sh contract/accept.sh`)" in met
     assert "- a block ends at 254 bytes" in met and "NOT done" not in met
 
+    # T0551: what a sealed contract still lacks names the slice that adds it.
+    spans = [f"spec.md {n}-{n + 1}" for n in range(10, 80, 10)]
+    uncovered = await step(gate | {"current": False, "uncovered": spans})
+    assert "does not cover its sources. 7 span(s)" in uncovered
+    assert "(spec.md 10-11, " in uncovered and ", and 1 more)" in uncovered
+    assert "Plan `Slice: coverage`" in uncovered and "spec.md 70-71" not in uncovered
+    pending = await step(gate | {"pending": 3})
+    assert "3 entries are drafted in contract/draft/ and not sealed" in pending
+    retired = await step(gate | {"met": True, "excused": ["C4"]})
+    assert "passes (`sh contract/accept.sh`), but for C4, which a dispute retired" in retired
+    assert "NOT done" not in retired
+    rereads = [{"source": "spec.md", "first": 40, "last": 52, "triggers": ["dispute C4"]}]
+    (fake_beagle / "contract-status.out").write_text(json.dumps({"rereads": rereads}))
+    reread = await step(gate | {"met": True})
+    assert "A re-read is due, each a slice of its own: `Slice: reread spec.md 40-52`" in reread
+    assert "(dispute C4)" in reread
+    unsealed = await step({"state": "draft", "met": False})
+    assert "no slice of the contract is sealed yet (it is draft)" in unsealed
+    assert "The first is `Slice: examples`" in unsealed
+
 
 @pytest.mark.anyio
 async def test_a_task_on_the_contract_witnesses_a_quote_not_code(
@@ -19848,8 +19754,8 @@ async def test_a_task_on_the_contract_witnesses_a_quote_not_code(
     monkeypatch.chdir(_contract_project(tmp_path))
     monkeypatch.setenv("FAKE_TAU_SUCCEEDS_ON", "99")
     # Its check is the contract's own, which pursuit_step keeps (T0522).
-    record = {"id": "T0002", "title": "Contract", "status": "open", "scope": ["contract/"]}
-    record |= {"criteria": "c", "done_when": _module().CONTRACT_STEPS["Contract"][1]}
+    record = {"id": "T0002", "title": "Slice: examples", "status": "open", "scope": ["contract/"]}
+    record |= {"criteria": "c", "done_when": _module().CONTRACT_STEPS[1]}
     (fake_beagle / "show.out").write_text(json.dumps(record))
     (fake_beagle / "next.out").write_text(json.dumps({"open": ["T0002"], "ready": []}))
     (fake_beagle / "brief.out").write_text("# T0002: Contract\n")
@@ -19865,16 +19771,17 @@ async def test_a_task_on_the_contract_witnesses_a_quote_not_code(
 
 
 def _sealed_contract(project: Path) -> Path:
-    """`project` with a contract of encode and decode entries, and beagle's seal."""
+    """`project` with a sealed slice of encode and decode entries, and beagle's seal."""
     module = _module()
-    (project / module.CONTRACT_PATH).parent.mkdir(exist_ok=True)
+    sealed = project / module.CONTRACT_SLICES / "01-examples" / "contract.json"
+    sealed.parent.mkdir(parents=True)
     entries = [
         {"id": "op", "kind": "operation", "operation": "encode(data: bytes) -> bytes"},
         {"id": "ex1", "kind": "example", "operation": "encode", "input": "00"},
         {"id": "ex2", "kind": "example", "operation": "cobs.decode", "input": "0100"},
     ]
-    (project / module.CONTRACT_PATH).write_text(json.dumps({"entries": entries}))
-    (project / module.CONTRACT_SEAL).write_text("{}\n")
+    sealed.write_text(json.dumps({"entries": entries}))
+    (project / module.CONTRACT_SEAL).write_text('{"slices": ["01-examples"]}\n')
     return project
 
 
@@ -19896,7 +19803,7 @@ def test_a_sealed_contract_refuses_a_check_that_asserts_answers_inline(tmp_path:
     # Not answers: an import or a version, and the contract's own steps.
     plain = "python3 -c 'import cobs; print(cobs.__version__)'"
     assert module._copied_answers_problem(plain, "Package", project) is None
-    assert module._copied_answers_problem(copied, "Reconcile", project) is None
+    assert module._copied_answers_problem(copied, "Slice: properties", project) is None
     assert module._copied_answers_problem("python3 -m pytest -q", "Tests", project) is None
 
 
@@ -20103,50 +20010,3 @@ async def test_pursuit_step_dispute_found_right_tells_the_next_worker_the_test_s
         in (_runs(fake_tau)[-1]["stdin"])
     )
     assert len(_runs(fake_tau)) == 3  # judged once under this seal, not again
-
-
-@pytest.mark.anyio
-async def test_a_close_reseals_an_altered_contract_with_the_dispute_reason(
-    tmp_path: Path,
-    beagle: Path,
-    fake_beagle: Path,
-    fake_tau: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    module = _module()
-    project = _sealed_contract(_contract_project(tmp_path))
-    monkeypatch.chdir(project)
-    _ready_task(fake_beagle)
-    title = f"{module.AMEND_TITLE}prop-marker-inside"
-    record = {"id": "T0002", "title": title, "intent": "fix it", "status": "pending"}
-    (fake_beagle / "show.out").write_text(
-        json.dumps({**record, "done_when": "grep -q done done.txt"})
-    )
-    (fake_beagle / "contract-status.out").write_text(json.dumps({"state": "altered"}))
-    upheld = {
-        "entry": "prop-marker-inside",
-        "verdict": "wrong",
-        "reason": "[81664] instead of [319]",
-    }
-    (project / module.CONTRACT_DISPUTES).write_text(json.dumps(upheld | {"seals": 1}) + "\n")
-    runtime, _ = _bound(tmp_path)
-
-    result = await _tool(runtime, "pursuit_step").execute(
-        "c1",
-        {
-            "task": "T0002",
-            "criteria": "c",
-            "done_when": "grep -q done done.txt",
-            "scope": ["done.txt"],
-        },
-    )
-
-    assert "closed done" in result.text
-    assert _pursuit_calls(fake_beagle, "contract") == [
-        ["status", "--json"],
-        ["seal", "--reason", "prop-marker-inside: [81664] instead of [319]"],
-    ]
-    assert "Sealed the contract (contract/contract.json) again" in result.text
-    # Altered by any other close, it is not sealed: that is drift, not an amend.
-    assert module._seal_when_ready(project, "Decode") == ""
-    assert _pursuit_calls(fake_beagle, "contract")[-1] == ["status", "--json"]

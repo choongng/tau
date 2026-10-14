@@ -313,55 +313,47 @@ LEAN_AUDIT_OFF = "\n[audit]\nevery = 0\n"
 
 #: R0003: setup is gather, then contract, then plan. Founding declares the
 #: contract before anyone knows the project's language, so it seals one
-#: directory, and the contract task writes its acceptance test there, in
-#: whatever language the work takes, run by one shell script.
+#: directory, and each slice's task writes its acceptance test there, in
+#: whatever language the work takes, run by one shell script. T0551: the
+#: contract is sealed in slices, each just ahead of the work it gates: the
+#: open one is drafted in `CONTRACT_DRAFT`, and its task's close moves it to
+#: `CONTRACT_SLICES`/NN-name, whose files never change.
 CONTRACT_DIR = "contract"
-CONTRACT_PATH = f"{CONTRACT_DIR}/contract.json"
-CONTRACT_SECOND = f"{CONTRACT_DIR}/contract.second.json"
-CONTRACT_ACCEPTANCE = f"sh {CONTRACT_DIR}/accept.sh"
+CONTRACT_SLICES = f"{CONTRACT_DIR}/slices"
+CONTRACT_DRAFT = f"{CONTRACT_DIR}/draft"
+#: Where `contract add` writes: the open slice's entries.
+CONTRACT_DRAFT_FILE = f"{CONTRACT_DRAFT}/contract.json"
 #: What founding adds to the goal file: beagle's [contract] table.
-CONTRACT_TABLE = (
-    "\n[contract]\n"
-    f'path = "{CONTRACT_PATH}"\n'
-    f'second = "{CONTRACT_SECOND}"\n'
-    f'acceptance = "{CONTRACT_ACCEPTANCE}"\n'
-    f'files = ["{CONTRACT_DIR}/"]\n'
-)
+CONTRACT_TABLE = f'\n[contract]\nslices = "{CONTRACT_SLICES}"\ndraft = "{CONTRACT_DRAFT}"\n'
 #: The criterion founding adds, so the goal's end is the contract passing.
 CONTRACT_CRITERION = (
-    f"Every entry of the contract ({CONTRACT_PATH}), sealed before the code was "
-    "planned, passes: `beagle pursuit contract run` exits 0."
+    f"Every live entry of the contract (the slices sealed in {CONTRACT_SLICES}/) "
+    "passes, and the contract covers its sources: `beagle pursuit contract run` "
+    "exits 0 and `beagle pursuit contract coverage` finds no normative source line "
+    "uncovered."
 )
-#: The tasks founding seeds ahead of the milestones, in order. beagle's brief
-#: gives each its inventory; the second does not read the first.
+#: A slice task's title: `Slice: examples`, `Slice: <op> limits and invalid
+#: inputs`, `Slice: properties`, `Slice: reread <source> <lines>`, `Slice:
+#: coverage`. beagle's brief gives each kind its inventory from the title.
+SLICE_PREFIX = "Slice:"
+#: The one task founding seeds ahead of the milestones: the first slice. Later
+#: slices are planned as the work reaches them (beagle refuses a milestone's
+#: `contract run --operation X` while no sealed slice holds an entry of X).
 CONTRACT_MILESTONES = (
-    "Contract::read the sources and list in "
-    f"{CONTRACT_PATH} what they pin down, each entry citing its source by line "
-    "anchor and added with `beagle pursuit contract add` as it is read, with "
-    f"{CONTRACT_DIR}/accept.sh running every entry against the code and printing one "
-    "line per entry, `ok <id>` or `FAIL <id>: why`, even before the code exists",
-    # R81: written as a second whole contract it took 11 minutes and 39 KB, when
-    # it is compared only by the lines its entries cite and the operations.
-    "Second extraction::without reading the first, list in "
-    f"{CONTRACT_SECOND} where the sources pin something, each entry only an id, "
-    "kind, operation, source and line-anchor cite",
-    # R83, R84: reconciling in the second's own task, its workers read the first
-    # before they wrote, and the two agreed by copying.
-    f"Reconcile::add to {CONTRACT_PATH} what the second extraction cites that it does "
-    "not, or exclude the passage with why, until `beagle pursuit contract check` passes",
+    f"{SLICE_PREFIX} examples::read the sources' worked examples and add each to "
+    f"{CONTRACT_DRAFT_FILE} with `beagle pursuit contract add` as it is read, each "
+    "entry citing its source by line anchor; write "
+    f"{CONTRACT_DRAFT}/accept.sh, which runs every entry against the code and prints "
+    "one line per entry, `ok <id>` or `FAIL <id>: why`, even before the code exists, "
+    f"and {CONTRACT_DRAFT}/standin/, the code with every answer wrong. Examples only: "
+    "limits, invalid inputs and properties are later slices. With no source to read, "
+    "the slice holds the experiments run and the gaps, each with its assumption",
 )
-#: Each contract milestone's scope and check, which pursuit_step gives it whatever
-#: the driver passed. R83, R84: the driver gave the second extraction the scope
-#: contract/, so beagle briefed it as contract work, with nothing to keep it from
-#: the first; R83's Contract worker then wrote the second itself.
-CONTRACT_STEPS = {
-    "Contract": ([f"{CONTRACT_DIR}/"], "beagle pursuit contract check --draft"),
-    "Second extraction": (
-        [CONTRACT_SECOND],
-        f"beagle pursuit contract check --file {CONTRACT_SECOND}",
-    ),
-    "Reconcile": ([f"{CONTRACT_DIR}/"], "beagle pursuit contract check"),
-}
+#: Every slice task's scope and check, which pursuit_step gives it whatever the
+#: driver passed. R83, R84: a driver-chosen scope let one contract task's worker
+#: write another's file; R87: a driver's check in place of this one could not
+#: refuse. The task's close seals the draft as the slice its title names.
+CONTRACT_STEPS = ([f"{CONTRACT_DIR}/"], "beagle pursuit contract check --draft")
 #: What pursuit_step says when a driver passes a contract step a check of its own.
 CONTRACT_CHECK_KEPT_NOTE = (
     "{title} keeps its check `{check}`: the contract's own check judges it, so the "
@@ -376,7 +368,9 @@ CONTRACT_LOCKS_NOTE = (
 )
 #: The milestone founding seeds when the driver named none but known answers,
 #: which the contract now is.
-CONTRACT_BUILD_MILESTONE = f"Build to the contract::make every entry of {CONTRACT_PATH} pass"
+CONTRACT_BUILD_MILESTONE = (
+    f"Build to the contract::make every entry of the contract ({CONTRACT_SLICES}/) pass"
+)
 
 
 def _lean() -> bool:
@@ -400,60 +394,59 @@ def _contract_work(scope: list[str], root: Path) -> bool:
     return within and _contract_declared(root)
 
 
-def _seal_when_ready(root: Path, title: str = "") -> str:
-    """Seal the contract once beagle reads it ready; a note saying so, or "".
+def _slice_name(title: str) -> str:
+    """The slice a `Slice:` task's title names, as `contract seal --slice` takes
+    it (`Slice: encode limits` is `encode-limits`); "" for any other title."""
+    head, colon, rest = title.strip().partition(":")
+    if not colon or head.strip().lower() != SLICE_PREFIX[:-1].lower():
+        return ""
+    name = re.sub(r"[^a-z0-9]+", "-", rest.lower()).strip("-")
+    return name[:40].strip("-") or "slice"
 
-    The work founding planned waits on the contract and its second extraction,
-    and beagle opens none of it before the seal. A close that leaves the
-    contract ready seals it, so the driver never needs the verb. A close of
-    the task titled `title` that amends a test a judge found wrong leaves it
-    altered, and seals it again with that dispute's reason.
+
+def _contract_step(title: str, root: Path) -> tuple[list[str], str] | None:
+    """`CONTRACT_STEPS` for a slice task of a pursuit that declares the contract; None."""
+    return CONTRACT_STEPS if _slice_name(title) and _contract_declared(root) else None
+
+
+def _seal_when_ready(root: Path, title: str) -> str:
+    """Seal the draft as the slice the task titled `title` names; a note saying so, or "".
+
+    A slice task's done close leaves its draft checked (`contract check
+    --draft`), and the work it gates waits on the seal; sealing it here means
+    the driver never needs the verb. Any other title, or no draft, seals nothing.
     """
-    if not _contract_declared(root):
+    name = _slice_name(title)
+    if not name or not _contract_declared(root) or not (root / CONTRACT_DRAFT_FILE).is_file():
         return ""
-    rc, out = _pursuit(["contract", "status", "--json"], root)
-    status = _json_reply(out)
-    state = status.get("state") if rc == 0 and isinstance(status, dict) else None
-    reason = _amend_reason(title, root) if state == "altered" else ""
-    if state != "ready" and not reason:
-        return ""
-    argv = ["contract", "seal", *(["--reason", reason] if reason else [])]
+    argv = ["contract", "seal", "--slice", name]
     rc, out = _pursuit(argv, root, timeout=CONTRACT_SEAL_TIMEOUT)
     if rc != 0:
         return (
-            f"The contract reads {'amended' if reason else 'ready'}, but sealing it failed "
-            f"(exit {rc}):\n{out[-PROVE_TAIL_CHARS:]}\n\n"
-        )
-    if reason:
-        return (
-            f"Sealed the contract ({CONTRACT_PATH}) again, kept with why: {reason}. The "
-            "tasks that waited on this fix open again.\n\n"
+            f"The draft ({CONTRACT_DRAFT}/) did not seal as slice {name} (exit {rc}), so "
+            f"what it gates stays shut:\n{out[-PROVE_TAIL_CHARS:]}\n\nPlan another "
+            f"`{title.strip()}` task with pursuit_plan to finish the draft; beagle's "
+            "refusal above says what it lacks.\n\n"
         )
     return (
-        f"Sealed the contract ({CONTRACT_PATH}): from here it is what done means, and "
-        f"the work after it opens. {_contract_run_note(root)}\n\n"
+        f"Sealed the draft as the contract's slice {name}: its entries are now part of "
+        f"what done means, and the work waiting on it opens. {_contract_run_note(root)}\n\n"
     )
 
 
-async def _settle_after_seal(task: str, root: Path) -> str:
-    """Close each contract milestone the seal left with nothing to do, done by `task`.
-
-    R85: the two extractions agreed, so the contract sealed when the second's
-    task closed, and Reconcile's check passed before any work. The driver could
-    neither open it nor drop it, and stopped after eight refusals with no code.
-    Each closes here as a done-by close does, its own check proven to refuse
-    with `task`'s work taken away; one that cannot is left for the driver.
-    """
-    nodes = _tree_nodes(root)
+def _rereads_due(root: Path) -> list[str]:
+    """beagle's `REREAD due` sections, each as the slice that re-reads it; [] if none."""
+    rc, out = _pursuit(["contract", "status", "--json"], root)
+    status = _json_reply(out) if rc == 0 else None
+    due = status.get("rereads") if isinstance(status, dict) else None
     said = []
-    for node in nodes:
-        if node.get("status") != "pending" or str(node.get("title") or "").strip() not in (
-            CONTRACT_STEPS
-        ):
+    for item in due if isinstance(due, list) else []:
+        if not isinstance(item, dict) or not item.get("source"):
             continue
-        reply = await _done_by(str(node.get("id")), task, {}, nodes, root)
-        said.append(reply if reply.startswith("pursuit_step:") else reply.split("\n\n")[0])
-    return "".join(f"{s}\n\n" for s in said)
+        lines = f"{item.get('first')}-{item.get('last')}"
+        why = "; ".join(_strings(item.get("triggers"))) or "due"
+        said.append(f"`{SLICE_PREFIX} reread {item['source']} {lines}` ({why})")
+    return said
 
 
 def _contract_verdict(gate: Any, root: Path) -> str:
@@ -461,34 +454,60 @@ def _contract_verdict(gate: Any, root: Path) -> str:
 
     `next` runs the acceptance when nothing is ready or open and puts its
     verdict in the reply. beagle words it with its own commands, which the
-    driver does not run, so it is said again here in pursuit_step's terms.
+    driver does not run, so it is said again here in pursuit_step's terms:
+    each shortfall names the slice to plan.
     """
     if not isinstance(gate, dict):
         return ""
     state = gate.get("state")
+    plan = "Plan it with pursuit_plan; pursuit_step gives a slice task its scope and check."
     if state == "ready":
-        sealed = _seal_when_ready(root)
+        sealed = _seal_when_ready(root, f"{SLICE_PREFIX} examples")
         if sealed.startswith("Sealed"):
-            return sealed + "Call pursuit_step again for the next task."
+            return f"{sealed}\n\nCall pursuit_step again for the next task."
     if state in ("none", "draft", "ready"):
         return (
-            f"The pursuit is NOT done: the contract ({CONTRACT_PATH}) is "
-            f"{'not written' if state == 'none' else state}, not sealed, so nothing says yet "
-            f"what done means. Add a task on {CONTRACT_DIR}/ with pursuit_plan to finish it; "
-            "its check is `beagle pursuit contract check`."
+            "The pursuit is NOT done: no slice of the contract is sealed yet (it is "
+            f"{'not written' if state == 'none' else state}), so nothing says what done "
+            f"means. The first is `{SLICE_PREFIX} examples`, the sources' worked examples. " + plan
         )
     if state == "altered":
         return (
-            "The pursuit is NOT done: files sealed with the contract changed since the "
-            f"seal ({', '.join(_strings(gate.get('altered')))}), so done cannot be judged. "
-            "Put them back with git, or change the contract in a task on "
-            f"{CONTRACT_DIR}/, which seals it again when it closes."
+            "The pursuit is NOT done: files of sealed slices changed since their seal "
+            f"({', '.join(_strings(gate.get('altered')))}), so done cannot be judged. "
+            "Sealed slices never change: put them back with git. What they lack goes in "
+            "a later slice."
+        )
+    rereads = _rereads_due(root)
+    reread = (
+        "\n\nA re-read is due, each a slice of its own: " + ", ".join(rereads) + ". " + plan
+        if rereads
+        else ""
+    )
+    pending = gate.get("pending")
+    if pending:
+        return (
+            f"The pursuit is NOT done: {pending} entries are drafted in {CONTRACT_DRAFT}/ "
+            "and not sealed. A slice task's close seals them: plan one titled for what "
+            f"they are (`{SLICE_PREFIX} <op> limits and invalid inputs`, `{SLICE_PREFIX} "
+            f"properties`). {plan}{reread}"
+        )
+    uncovered = _strings(gate.get("uncovered"))
+    if uncovered:
+        shown = ", ".join(uncovered[:6]) + (
+            f", and {len(uncovered) - 6} more" if len(uncovered) > 6 else ""
+        )
+        return (
+            f"The pursuit is NOT done: the contract does not cover its sources. "
+            f"{len(uncovered)} span(s) of normative source lines are neither cited by a "
+            f"live entry nor excluded with a why ({shown}). Plan `{SLICE_PREFIX} coverage`, "
+            f"whose entries cite or exclude each. {plan}{reread}"
         )
     run = gate.get("acceptance")
     if not isinstance(run, dict) or not gate.get("current"):
         return (
             "The pursuit is NOT done: the contract's acceptance has not run on the work as "
-            "it stands. Call pursuit_step again."
+            f"it stands. Call pursuit_step again.{reread}"
         )
     command = run.get("command", "")
     if not gate.get("met"):
@@ -496,18 +515,25 @@ def _contract_verdict(gate: Any, root: Path) -> str:
         return (
             f"The pursuit is NOT done: the contract's acceptance (`{command}`) exited "
             f"{run.get('code')}, so entries of the contract fail:\n{tail}\n\n"
-            "Add the work for what failed with pursuit_plan."
+            f"Add the work for what failed with pursuit_plan.{reread}"
         )
+    retired = _strings(gate.get("excused"))
     assumptions = _strings(gate.get("assumptions"))
     return (
-        f"Every entry of the contract passes (`{command}`). If every criterion of the "
-        "goal holds, tell the user the pursuit is done"
+        f"Every entry of the contract passes (`{command}`)"
+        + (
+            f", but for {', '.join(retired)}, which a dispute retired: their FAIL does not count"
+            if retired
+            else ""
+        )
+        + ". If every criterion of the goal holds, tell the user the pursuit is done"
         + (
             ", and put to them these assumptions the contract rests on, which no source "
             "settled:\n" + "\n".join(f"- {a}" for a in assumptions)
             if assumptions
             else "."
         )
+        + reread
     )
 
 
@@ -2774,6 +2800,35 @@ _TASK_ID = re.compile(r"\bT\d{4,}\b")
 _RANKED_BELOW = re.compile(
     r"ranks below (.+?)(?: \(`pursuit next` lists them\))?\. If this one should go first", re.S
 )
+#: beagle's refusal to open a check of `contract run --operation X` while no
+#: sealed slice holds an entry of X (T0551): the slice that adds them is due.
+_UNSEALED_OPERATION = re.compile(
+    r"no sealed slice holds an entry of (.+?), so `contract run\s+--operation ([^`\s]+)`"
+)
+
+
+def _slice_due(task: str, record: Mapping[str, Any], refusal: str) -> str | None:
+    """What pursuit_step says when beagle refused `task`'s open for want of a
+    sealed entry of the operation its check runs, or None for another refusal."""
+    found = _UNSEALED_OPERATION.search(refusal)
+    if found is None:
+        return None
+    op = found.group(2)
+    title = f"{SLICE_PREFIX} {op} limits and invalid inputs"
+    parent = str(record.get("parent") or "").strip()
+    under = f'task="{parent}"' if parent else "task=<the root task>"
+    part = (
+        f"{title}::add {op}'s stated limits and invalid inputs, and its worked examples "
+        "if no sealed slice holds them, each citing its source by line anchor"
+    )
+    return (
+        f"pursuit_step: {task} not opened — no sealed slice of the contract holds an entry "
+        f"of {found.group(1)}, so its check `beagle pursuit contract run --operation {op}` "
+        f"could not pass whatever the code does. The slice for it is due now, just ahead of "
+        f"this work: plan it with pursuit_plan {under} parts={json.dumps([part])}, step it "
+        f"(pursuit_step gives it its scope and check, and its close seals it), then step "
+        f"{task} again."
+    )
 
 
 def _step_result(text: str) -> AgentToolResult:
@@ -4837,14 +4892,13 @@ _FILE_TESTS = frozenset({"-f", "-e", "-s"})
 CONTRACT_CHECKS = (
     ("check",),
     ("check", "--draft"),
-    ("check", "--file", CONTRACT_SECOND),
     ("run",),
 )
 
 
 def _contract_command(words: list[str]) -> bool:
-    """Whether `words` is `beagle pursuit contract check [--draft]`, the second
-    extraction's `check --file`, or `... contract run [--operation OP]...`."""
+    """Whether `words` is `beagle pursuit contract check [--draft]` or `beagle
+    pursuit contract run [--operation OP]...`."""
     if not (
         len(words) >= 4
         and Path(words[0]).name == "beagle"
@@ -4871,14 +4925,23 @@ _INLINE_CODE = {"python": "-c", "python3": "-c", "node": "-e", "ruby": "-e", "pe
 
 
 def _contract_operations(root: Path) -> list[str]:
-    """The operations the contract names, by bare name, in its order; [] if none."""
-    try:
-        data = json.loads((root / CONTRACT_PATH).read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return []
-    entries = data.get("entries") if isinstance(data, dict) else None
+    """The operations the contract names, by bare name, in its order; [] if none.
+
+    Read from every sealed slice, in the order sealed, then the draft.
+    """
+    entries: list[Any] = []
+    for path in [
+        *sorted((root / CONTRACT_SLICES).glob("*/contract.json")),
+        root / CONTRACT_DRAFT_FILE,
+    ]:
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        found = data.get("entries") if isinstance(data, dict) else None
+        entries += found if isinstance(found, list) else []
     names: list[str] = []
-    for entry in entries if isinstance(entries, list) else []:
+    for entry in entries:
         op = str(entry.get("operation") or "") if isinstance(entry, dict) else ""
         name = op.split("(")[0].strip().rsplit(".", 1)[-1]
         if name and name not in names:
@@ -4892,10 +4955,11 @@ def _contract_run_note(root: Path) -> str:
     named = f" (its operations: {', '.join(ops)})" if ops else ""
     return (
         "Check each milestone against the part of the contract it builds: done_when "
-        f"`beagle pursuit contract run --operation <op>`, once per operation{named}. "
-        "Work the contract does not cover, such as tests or packaging, takes the goal's "
-        "own command. Do not copy entries into a check: the contract holds them, and a "
-        "copy can be wrong."
+        f"`beagle pursuit contract run --operation <op>`, once per operation{named}; an "
+        f"operation no sealed slice holds yet first gets its `{SLICE_PREFIX} <op> limits "
+        "and invalid inputs`. Work the contract does not cover, such as tests or "
+        "packaging, takes the goal's own command. Do not copy entries into a check: "
+        "the contract holds them, and a copy can be wrong."
     )
 
 
@@ -4907,7 +4971,7 @@ def _copied_answers_problem(command: str, title: str, root: Path) -> str | None:
     The second worker's code met the contract and failed the check; two
     workers and nine minutes went to it before the driver amended it.
     """
-    if title.strip() in CONTRACT_STEPS or not (root / CONTRACT_SEAL).is_file():
+    if _slice_name(title) or not (root / CONTRACT_SEAL).is_file():
         return None
 
     def inline(argv: list[str]) -> str | None:
@@ -7327,7 +7391,7 @@ def _check_broke(
 CONTRACT_WITNESS_NOTE = (
     "When the check passes, end your report with the WITNESS block below. It names one "
     "small defect the check must catch, in the contract file you wrote "
-    f"({CONTRACT_PATH}, or {CONTRACT_SECOND} for the second extraction): one entry's "
+    f"({CONTRACT_DRAFT_FILE}): one entry's "
     'cite with its anchor\'s hash changed ("83#a1f" made "83#a1e"), so it no longer '
     "names its source line. `prove` puts it back, and if the check still passes, the "
     "task is not done. The NEEDLE is text copied exactly from the file that occurs "
@@ -8496,7 +8560,7 @@ async def _prove(
     sources = [rel for rel in sources if os.path.normpath(rel) not in scripts]
     if sources:
         attempts.append([arg for rel in sources for arg in ("--absent", rel)])
-    # R95: Reconcile's first worker hit the wall with contract/contract.json,
+    # R95: a contract task's first worker hit the wall with contract/contract.json,
     # tracked before the task opened, edited so the check passed; the next
     # worker changed nothing and gave no WITNESS, and nothing was new to take
     # away. Putting back what changed since the open judges the task's change,
@@ -9112,15 +9176,6 @@ def _amend_check(eid: str, new: str, old: str, root: Path) -> str:
     if old and old != new:
         parts.append(f"! {lines} | grep -qwF -- {shlex.quote(old)}")
     return f"bash -c {shlex.quote(' && '.join(parts))}"
-
-
-def _amend_reason(title: str, root: Path) -> str:
-    """Why the contract is sealed again when the task titled `title` closes; "" if not an amend."""
-    if not title.startswith(AMEND_TITLE):
-        return ""
-    eid = title[len(AMEND_TITLE) :].strip()
-    upheld = [d for d in _disputes(root) if d.get("entry") == eid and d.get("verdict") == "wrong"]
-    return f"{eid}: {upheld[-1].get('reason') or 'its test was wrong'}" if upheld else ""
 
 
 def _stands_note(task: str, root: Path) -> str:
@@ -10136,9 +10191,9 @@ async def _done_by(
     given = str(arguments.get("done_when") or "").strip()
     check = given or str(record.get("done_when") or "").strip()
     title = str(record.get("title") or "")
-    # R85: offered `contract check`, the driver bound --draft to Reconcile's
-    # done-by close; it could not refuse with the second taken away.
-    fixed = CONTRACT_STEPS.get(title.strip()) if _contract_declared(root) else None
+    # R85: a contract task's done-by close took the driver's check, which could
+    # not refuse; a slice task keeps its own.
+    fixed = _contract_step(title, root)
     if fixed is not None:
         check = fixed[1]
         arguments = {**arguments, "scope": list(fixed[0])}
@@ -11614,7 +11669,7 @@ def make_step_tool() -> Any:
         criteria = str(arguments.get("criteria") or "").strip()
         done_when = str(arguments.get("done_when") or "").strip()
         scope = _strings(arguments.get("scope"))
-        fixed = CONTRACT_STEPS.get(title.strip()) if _contract_declared(root) else None
+        fixed = _contract_step(title, root)
         if fixed is not None:
             # R87: the Contract step opened on its check, then the driver passed
             # `test -f ... && assert len(entries) > 0` with its notes, which
@@ -12101,6 +12156,8 @@ def make_step_tool() -> Any:
                     f"pursuit_step: {task} not opened — it ranks below {ranked.group(1)}. "
                     f'Send {first.group()} first, with pursuit_step task="{first.group()}".'
                 )
+            if rc != 0 and (due := _slice_due(task, record, opened)) is not None:
+                return _step_result(due)
             if rc != 0:
                 return _step_result(
                     f"pursuit_step: `beagle pursuit open` refused (exit {rc}):\n{opened}"
@@ -12909,9 +12966,7 @@ def make_step_tool() -> Any:
         if rc == 0:
             _forget_task(root, task)
         superseded = _SUPERSEDED_REPORT_NOTE if rc == 0 and _report_claims_failure(shown) else ""
-        seal_note = _seal_when_ready(root, title) if rc == 0 else ""
-        if seal_note.startswith("Sealed"):
-            seal_note += await _settle_after_seal(task, root)
+        seal_note = _seal_when_ready(root, title) if rc == 0 and not retrying else ""
         return _step_result(
             f"{route}{task} — {title}: {state}.\n\n{committed}\n\n{closed}\n\n"
             f"{seal_note}{unrun_note}"
@@ -13276,91 +13331,6 @@ def _contract_add(argv: list[str]) -> str | None:
     words = [arg for arg in argv if not arg.startswith("-")]
     at = words.index("contract")
     return " ".join(argv) if words[at + 1 : at + 2] == ["add"] else None
-
-
-def _contract_file(argv: list[str]) -> tuple[str, str] | None:
-    """The verb and `--file` (or "") of a `beagle pursuit contract` argv, or None."""
-    if _pursuit_verb(argv) != "contract":
-        return None
-    rest = argv[argv.index("contract") + 1 :]
-    verb = next((arg for arg in rest if not arg.startswith("-")), "")
-    given = ""
-    for at, arg in enumerate(rest):
-        if arg == "--file" and at + 1 < len(rest):
-            given = rest[at + 1]
-        elif arg.startswith("--file="):
-            given = arg.partition("=")[2]
-    return verb, os.path.normpath(given) if given else ""
-
-
-def _second_extraction(scope: list[str]) -> bool:
-    """Whether `scope` is the second extraction's: its file, references aside."""
-    own = {os.path.normpath(e.rstrip("/")) for e in scope}
-    return {e for e in own if Path(e).parts[:1] != (REFERENCES_DIR,)} == {CONTRACT_SECOND}
-
-
-def _extraction_crossing(
-    tool: str, arguments: dict[str, Any], command: str, cwd: Path, scope: tuple[str, ...]
-) -> str | None:
-    """Why a worker on one extraction of the contract may not take this call, or None.
-
-    R83: the Contract worker read the full check's "second extraction does not
-    exist yet" and wrote it. R84: both second-extraction workers began with
-    `cat contract/contract.json`. Two readers who missed different things are
-    the point, and the second written after reading the first is its copy. So
-    the second's worker reads nothing of the first, and only it writes the
-    second.
-    """
-    goal = _find_goal(cwd)
-    if goal is None:
-        return None
-    root = _resolved(goal.parent.parent)
-    if not _contract_declared(root):
-        return None
-    first = Path(CONTRACT_PATH).name
-    calls: list[tuple[str, str]] = []
-
-    def contract(argv: list[str]) -> str | None:
-        found = _contract_file(argv)
-        if found is not None:
-            calls.append(found)
-        return None
-
-    if command:
-        _bash_find(command, contract)
-    if _second_extraction(list(scope)):
-        why = (
-            "this task is the second, independent extraction: it is written from the "
-            f"sources without reading {CONTRACT_PATH}, and a later task reconciles the two."
-        )
-        path = str(arguments.get("path") or "") if tool == "read" else ""
-        if path and _own_path(_resolved(cwd / path), root) == root / CONTRACT_PATH:
-            return f"refusing to read {CONTRACT_PATH}: {why}"
-        if first in command:
-            return f"refusing a command that names {first}: {why}"
-        for verb, given in calls:
-            if verb == "diff":
-                return f"refusing `beagle pursuit contract diff`: {why}"
-            if verb in ("add", "check") and given != CONTRACT_SECOND:
-                return (
-                    f"refusing `beagle pursuit contract {verb}` without `--file "
-                    f"{CONTRACT_SECOND}`: without it, it {verb}s {CONTRACT_PATH}, and {why}"
-                )
-        return None
-    why = (
-        f"the second extraction is another reader's, one who has not seen {CONTRACT_PATH}, "
-        "in a task of its own; one written here agrees with the first by copying it. "
-        "Leave it, and say in your report if it is missing."
-    )
-    if any(verb == "add" and given == CONTRACT_SECOND for verb, given in calls):
-        return f"refusing to add to {CONTRACT_SECOND}: {why}"
-    targets = _write_targets(tool, arguments, cwd, resolve=False)
-    script = _bash_find(command, _driver_change) if command else None
-    if script is not None and script.startswith(_INTERPRETERS):
-        targets += _script_write_targets(command, _cwd_after_cd(command, cwd))
-    if any(_own_path(target, root) == root / CONTRACT_SECOND for target in targets):
-        return f"refusing to write {CONTRACT_SECOND}: {why}"
-    return None
 
 
 def _contract_refs_call(command: str) -> bool:
@@ -13926,10 +13896,10 @@ def _truncated_call(arguments: Mapping[str, Any], earlier: int = 0) -> str | Non
         "shorter to generate with a short script run inline by bash (`python3 - <<'EOF'` "
         "... `EOF`) or saved to a scratch path outside the project, never saved in scope."
     )
-    if CONTRACT_PATH in text:
+    if CONTRACT_DRAFT_FILE in text:
         # R81: the contract worker's first draft, 51 KB in one write.
         refusal += (
-            f" The contract is not written whole: add its entries to {CONTRACT_PATH} a "
+            f" The contract is not written whole: add its entries to {CONTRACT_DRAFT_FILE} a "
             "few at a time with `beagle pursuit contract add` (the JSON on stdin, "
             "<<'EOF' ... EOF), which checks each against its source as it lands."
         )
@@ -14260,9 +14230,6 @@ def make_worker_scope_guard() -> Any:
             if sent is None:
                 return None
             task, scope = sent
-            crossed = _extraction_crossing(event.tool_name, arguments, command, cwd, scope)
-            if crossed is not None:
-                return ToolCallHookResult(block=True, reason=crossed)
             known = _only_data_and_tests(list(scope))
             free = _free_reference_call(event.tool_name, arguments, command, cwd, windows)
             # R79: `contract refs` is how a contract worker reads the references.
@@ -16216,22 +16183,25 @@ TESTS_ONLY_MUTATE_NOTE = (
 
 
 #: R0003: founding seeds the contract ahead of the milestones (CONTRACT_MILESTONES).
-#: The driver writes each step's check and scope, so it is told what they are.
+#: T0551: in slices, each sealed just ahead of the work it gates. The driver
+#: plans the later slices, so it is told their titles and when each is due.
 CONTRACT_FIRST_NOTE = (
-    "Contract first. Founding puts three tasks ahead of the milestones. 'Contract': a "
-    "sub-agent reads the sources (the references, the repo's docs, tests and types, a "
-    "named standard, experiments it runs) and lists in "
-    f"{CONTRACT_PATH} every worked example, stated limit, invalid input and operation "
-    "they define, each citing its source by line anchor and added a few at a time with "
-    f"`beagle pursuit contract add`, and writes {CONTRACT_DIR}/accept.sh, which "
-    "runs every entry against the code. 'Second extraction': another sub-agent, "
-    f"without reading the first, lists in {CONTRACT_SECOND} where the sources pin "
-    "something, by line anchor and operation only (no inputs or results). "
-    f"'Reconcile': a third adds to {CONTRACT_PATH} what the second cites that it does "
-    "not. pursuit_step gives these three their scope and check itself. "
-    "Nothing else opens until the contract is sealed; then plan each milestone from "
-    "it with pursuit_plan. Done is every entry passing (`beagle pursuit contract "
-    "run`), not the tests a task wrote."
+    f"Contract first, in slices. Founding puts one task ahead of the milestones, "
+    f"'{SLICE_PREFIX} examples': a sub-agent reads the sources (the references, the "
+    "repo's docs, tests and types, a named standard, experiments it runs) and adds "
+    "every worked example to the contract's draft, each citing its source by line "
+    "anchor and added a few at a time with `beagle pursuit contract add`, with an "
+    "accept.sh that runs every entry against the code and a stand-in, the code with "
+    "every answer wrong. A slice task's close seals its draft as the slice its title "
+    "names, and nothing else opens until the first is sealed. Then plan each milestone "
+    "with pursuit_plan and check it with `beagle pursuit contract run --operation "
+    "<op>`. Plan each later slice just ahead of the work it gates: before a milestone "
+    f"whose operation has no sealed limit or invalid input, `{SLICE_PREFIX} <op> limits "
+    f"and invalid inputs`; `{SLICE_PREFIX} properties` where no example pins a rule; "
+    f"last, `{SLICE_PREFIX} coverage`, which cites or excludes each normative source "
+    "line no entry cites. pursuit_step gives every slice task its scope and check "
+    "itself. Done is every live entry passing (`beagle pursuit contract run`) and the "
+    "sources covered, not the tests a task wrote."
 )
 
 #: Commits need an identity; a model that meets "Please tell me who you are"
