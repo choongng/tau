@@ -73,7 +73,7 @@ because a specific part of that model has no Tau equivalent:
   are refused: two writers on one tree lose one's work. Only the recorded
   driver session is held; a subagent's calls carry its own session id. A
   cancelled worker sends no notice to end that wait, so a `stop_subagent`
-  result while one stands says to clear it with a bare `beagle loop tick`.
+  result while one stands names the `beagle loop tick` that releases it.
 - **ended drivers** — workers and the wakeup end with the Tau session that
   started them, so a run whose driver session has ended is stopped at the
   next session start (`beagle loop stop`), and the next `/pursuit-run` is
@@ -1279,6 +1279,8 @@ class _AwaitedScope:
     awaiting: str
     tasks: tuple[str, ...]
     scope: tuple[str, ...]
+    #: The `beagle loop tick` that releases the wait (`_live_wait`).
+    release: str = "beagle loop tick --clear-awaiting"
 
 
 #: Root -> (loop file stat, session, scope), so beagle is asked once per change.
@@ -1346,18 +1348,33 @@ def _json_out(argv: list[str], root: Path) -> Any:
     return None
 
 
-def _live_wait(root: Path, session_id: str) -> str | None:
-    """What this session's run declares it is awaiting, while the lease holds.
+def _live_wait(root: Path, session_id: str) -> tuple[str, str] | None:
+    """What this session's run declares it is awaiting, while a lease holds, and
+    the `beagle loop tick` that releases it.
 
     None unless a run is in flight, this session is its recorded driver (a
-    subagent's own session never is), and the declared wait is in its lease.
+    subagent's own session never is), and a declared wait is in its lease.
+    0.48 keeps the unnamed wait (`--awaiting`, released by `--clear-awaiting`)
+    beside named ones (`--wait-id`, each released by `--clear-wait ID`), and a
+    bare tick releases neither.
     """
     record = _json_out(["loop", "read", "--json"], root)
-    if not isinstance(record, dict) or not record.get("awaiting"):
+    if not isinstance(record, dict):
         return None
     if not session_id or record.get("driver_session") != session_id:
         return None
-    return str(record["awaiting"]) if _lease_live(record) else None
+    live: list[tuple[str, str]] = []
+    if record.get("awaiting") and _lease_live(record):
+        live.append((str(record["awaiting"]), "beagle loop tick --clear-awaiting"))
+    for wait in record.get("waits") or ():
+        if isinstance(wait, dict) and wait.get("awaiting") and wait.get("id") and _lease_live(wait):
+            live.append((str(wait["awaiting"]), f"beagle loop tick --clear-wait {wait['id']}"))
+    if not live:
+        return None
+    if len(live) == 1:
+        return live[0][0], f"`{live[0][1]}`"
+    awaiting = '", "'.join(what for what, _ in live)
+    return awaiting, ", ".join(f'`{release}` for "{what}"' for what, release in live)
 
 
 def _read_awaited_scope(root: Path, session_id: str) -> _AwaitedScope | None:
@@ -1367,9 +1384,10 @@ def _read_awaited_scope(root: Path, session_id: str) -> _AwaitedScope | None:
     `awaiting` is free text, so which open task the worker holds cannot be
     read off it reliably.
     """
-    awaiting = _live_wait(root, session_id)
-    if awaiting is None:
+    wait = _live_wait(root, session_id)
+    if wait is None:
         return None
+    awaiting, release = wait
     listing = _json_out(["pursuit", "tree", "--json", "--status", "open"], root)
     tasks = [row["id"] for row in listing or () if isinstance(row, dict) and row.get("id")]
     scope: list[str] = []
@@ -1379,7 +1397,7 @@ def _read_awaited_scope(root: Path, session_id: str) -> _AwaitedScope | None:
         scope += [e for e in entries or () if isinstance(e, str) and e.strip()]
     if not scope:
         return None
-    return _AwaitedScope(awaiting, tuple(tasks), tuple(scope))
+    return _AwaitedScope(awaiting, tuple(tasks), tuple(scope), release)
 
 
 async def _awaited_scope(root: Path, session_id: str) -> _AwaitedScope | None:
@@ -1477,8 +1495,8 @@ def make_scope_guard() -> Any:
                 f"(`{entry}`), and this session is waiting on a worker for it "
                 f"({waiting.awaiting}). Two writers on one tree lose one's work. Wait "
                 "for its completion notice, steer it with `steer_subagent`, or stop it "
-                "and take the task back; if the worker is gone, clear the wait with a "
-                "bare `beagle loop tick` first."
+                "and take the task back; if the worker is gone, release its wait first: "
+                f"{waiting.release}."
             ),
         )
 
@@ -1490,8 +1508,8 @@ STOPPED_WORKER_NOTE = """
 
 beagle: this session's pursuit run still declares it is awaiting \
 "{awaiting}". If that was the worker just stopped, nothing will arrive to \
-clear it: run a bare `beagle loop tick` now, then take the task back or \
-dispatch it again."""
+release it: release it now with {release} (a bare `beagle loop tick` does \
+not), then take the task back or dispatch it again."""
 
 
 def make_stopped_worker_note() -> Any:
@@ -1513,10 +1531,13 @@ def make_stopped_worker_note() -> Any:
             if goal is None:
                 return None
             root, session = goal.parent.parent, context.session_id or ""
-            awaiting = await asyncio.to_thread(_live_wait, root, session)
-            if awaiting is None:
+            wait = await asyncio.to_thread(_live_wait, root, session)
+            if wait is None:
                 return None
-            text = event.result.text + STOPPED_WORKER_NOTE.format(awaiting=awaiting)
+            awaiting, release = wait
+            text = event.result.text + STOPPED_WORKER_NOTE.format(
+                awaiting=awaiting, release=release
+            )
         except Exception:  # noqa: BLE001 - fail open; a note must not break the tool
             return None
         return ToolResultHookResult(content=text)
@@ -8740,11 +8761,10 @@ def _blocked_brief(task: str, record: Mapping[str, Any]) -> str:
     return "\n".join(lines)
 
 
-#: What the auditing sub-agent is told beyond beagle's audit brief.
+#: What the auditing sub-agent is told beyond beagle's audit brief, which itself
+#: says to change nothing and to end the closes on a SOUND or DEFECTS line.
 AUDIT_NOTE = (
-    "\n\nRead the work and the checks; change nothing. Do not run `beagle pursuit "
-    "audit`: the session that sent you records what you report. End your report with "
-    "one line: SOUND, or DEFECTS and how many."
+    "\n\nDo not run `beagle pursuit audit`: the session that sent you records what you report."
 )
 #: Most of the auditor's report beagle keeps with the audit.
 AUDIT_NOTE_CHARS = 2_000
@@ -15657,17 +15677,14 @@ stopping condition.
 - Dispatching `beagle-dev:step-executor`: when the `agent` tool is available \
 (the tau-subagents extension), call it with `subagent_type: \
 "beagle-dev:step-executor"`, the brief as `prompt`, and `run_in_background: \
-true`, then end the turn exactly as the driver says for a dispatched worker — \
-arm `pursuit_wakeup` with a long delay and record `beagle loop tick --awaiting \
-"<worker> on <task>" --for N --resuming-in N`, `--for` the driver's believed \
-wait. The worker's completion arrives as a \
+true`, then end the turn exactly as the driver says for a dispatched worker, \
+with `pursuit_wakeup` as its wakeup. The worker's completion arrives as a \
 `<task-notification>` message that starts your next turn, an errored run's \
-too; clear the wait with a bare `beagle loop tick` whatever its status, \
-read the full report with `get_subagent_result` if the notification is \
-truncated, and run the close. Claude Code's `SendMessage` \
-to a running worker is `steer_subagent`; `get_subagent_result` with `wait: \
-true` blocks on one. Parallel independent tasks may each get a background \
-agent.
+too: release its wait as the driver says, read the full report with \
+`get_subagent_result` if the notification is truncated, and run the close. \
+Claude Code's `SendMessage` to a running worker is `steer_subagent`; \
+`get_subagent_result` with `wait: true` blocks on one. Parallel independent \
+tasks may each get a background agent.
 - Spawning a worker: leave `provider` and `model` unset, so it runs on this \
 session's own provider and model; Claude Code's `sonnet`-style picks name \
 nothing Tau serves. Set `max_turns` from the task's budget (`budget_tokens` in \
@@ -15684,8 +15701,8 @@ in a detached copy and its changes come back on a `tau-agent-<id>` branch for \
 you to merge. `isolated: true` is not that: it only spawns the worker without \
 extensions, so without beagle's skills and guards.
 - Without the `agent` tool, dispatch is the `pursuit_dispatch` tool. It \
-returns the worker's report within the same turn, so skip the `--awaiting` \
-tick and the bare tick that clears it; run the close straight after.
+returns the worker's report within the same turn, so declare no wait for \
+it; run the close straight after.
 - Skill scripts live under `${CLAUDE_PLUGIN_ROOT}`; the containment launcher \
 is `${CLAUDE_PLUGIN_ROOT}/skills/containment/scripts/run_contained.sh`. Use \
 that path, in briefs too, never a `~/.claude/plugins/cache/...` one, even if \

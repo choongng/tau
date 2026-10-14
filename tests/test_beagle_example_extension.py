@@ -583,7 +583,10 @@ def test_pursuit_run_injects_host_mapping_and_driver(tmp_path: Path, beagle: Pat
     # The host mapping qualifies the driver, so it sits inside the block ahead of it.
     assert body.index("Host mapping") < body.index(f"Arm with ScheduleWakeup; see {root}.")
     assert "`pursuit_wakeup`" in body and "`pursuit_dispatch`" in body
-    assert "--for N --resuming-in N" in body
+    # How a wait is declared and released is the driver's (0.48 pursuit-run.md);
+    # the mapping only points at it, and never at the bare tick 0.48 retired.
+    assert "release its wait as the driver says" in " ".join(body.split())
+    assert "--for N --resuming-in N" not in body and "bare tick" not in body
     assert "name: pursuit-run" not in turn
 
 
@@ -880,7 +883,7 @@ async def test_driver_is_kept_out_of_an_awaited_workers_scope(
 
     assert all("refusing to write" in r.text for r in blocked), [r.text for r in blocked]
     assert "T0002" in blocked[0].text and "`src/`" in blocked[0].text
-    assert "bare `beagle loop tick`" in blocked[0].text
+    assert "release its wait first: `beagle loop tick --clear-awaiting`." in blocked[0].text
     assert [r.text for r in allowed] == ["ran"] * 3
     # The loop record did not change, so beagle was asked once.
     assert [c["argv"][1] for c in _calls(fake_beagle)] == ["read", "tree", "show"]
@@ -1307,7 +1310,32 @@ async def test_stopping_a_worker_reminds_the_driver_to_clear_its_wait(
     assert result.text.startswith("ran")
     reminded = 'awaiting "step-executor on T0002"' in " ".join(result.text.split())
     assert reminded is noted
-    assert ("bare `beagle loop tick`" in result.text) is noted
+    assert ("`beagle loop tick --clear-awaiting`" in result.text) is noted
+
+
+@pytest.mark.anyio
+async def test_a_named_wait_holds_the_scope_and_names_its_own_release(
+    tmp_path: Path, beagle: Path, fake_beagle: Path
+) -> None:
+    """0.48's named waits (`--wait-id`) sit under `waits`, beside the unnamed one."""
+    project = _pursuit_project(tmp_path)
+    _awaiting_worker(project, fake_beagle)
+    record = json.loads((fake_beagle / "read.out").read_text(encoding="utf-8"))
+    wait = {k: record.pop(k) for k in ("awaiting", "awaiting_at", "awaiting_minutes")}
+    record["waits"] = [{"id": "T0002", **wait}]
+    for path in (project / ".beagle" / "loop.json", fake_beagle / "read.out"):
+        path.write_text(json.dumps(record), encoding="utf-8")
+    runtime, _ = _bound(tmp_path)
+
+    blocked = await _tool_with_hooks(runtime, "edit").execute(
+        "c1", {"path": "src/app.py", "old_text": "a", "new_text": "b"}
+    )
+    stopped = await _tool_with_hooks(runtime, "stop_subagent").execute("c2", {"agent_id": "a1"})
+
+    assert "refusing to write" in blocked.text
+    assert "`beagle loop tick --clear-wait T0002`" in blocked.text
+    assert 'awaiting "step-executor on T0002"' in " ".join(stopped.text.split())
+    assert "`beagle loop tick --clear-wait T0002`" in stopped.text
 
 
 def test_host_note_gives_the_worker_spawn_rules(tmp_path: Path, beagle: Path) -> None:

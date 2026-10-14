@@ -55,3 +55,114 @@ the markers (listing them in its output), or `open --dry-run` prints the
 accepted cites and cases in a form a host can read (a `--json`, or one
 `ties:` line). Tau's interim: read `cite=` from the markers and let
 `--dry-run` judge them (plan.md Changes Required 3).
+
+## 4. A dispatch role for the cases worker
+
+Spec-tying (rules 2e) adds a worker that writes a task's cases before its
+open, but `dispatch model` knows only three roles:
+
+```
+$ beagle dispatch model --for cases
+usage: beagle dispatch model [-h] --for {executor,scout,reviewer} [--json]
+                             [--host HOST] [--root ROOT] [--config CONFIG]
+beagle dispatch model: error: argument --for: invalid choice: 'cases' (choose from 'executor', 'scout', 'reviewer')
+```
+
+So a project cannot pin the cases worker apart from the executor, though the
+two do different work: one reads the source and writes tests that must fail,
+the other writes code until they pass. Tau sends its cases worker on the
+executor's pin until beagle has a dispatch role for it (found in T0601).
+
+Ask: a `cases` dispatch role (`dispatch model --for cases`, a `[cases]` line
+in `dispatch.toml`), inheriting the executor's pin when none is set.
+
+## 5. The orchestrator does not read the reference or work out the design
+
+The core rules say the orchestrator does not do the work, and that a fact
+nobody has read is a reconnaissance leaf:
+
+```
+$ beagle pursuit rules | sed -n '11p;19,20p'
+- The orchestrator does not do the work. Dispatch a worker with "run
+- Criteria you cannot state mean `split`. A check that rests on a fact nobody
+  has read makes that fact a reconnaissance leaf, not inline research (§3).
+$ beagle pursuit rules | grep -ciE 'the reference'
+0
+```
+
+A small driver does not read "the work" as including reading the reference
+or thinking through the algorithm: in every ITC trial a 9B driver fetched
+the paper and reasoned past its output limit (30K characters, then nothing)
+before it dispatched anything. Tau says it in its own words
+(`DRIVER_STEERS_NOTE`): do not fetch or read the reference, do not work out
+the design; a question you would have to think hard about is a task, sent
+with the reference and the one question in its notes; keep turns short.
+
+Ask: a core line saying so, in terms of the reference and the design, not
+only "the work", so every host's driver gets it from `rules` and
+`loop-report`.
+
+## 6. Found first, before reading the reference or designing
+
+`rules 1` says founding is an interview for the goal and the criteria, and
+nothing about what not to do before it:
+
+```
+$ beagle pursuit rules 1 | grep -ciE 'reference|design'
+0
+```
+
+Asked to set beagle up and build something, a small model reads the
+reference and designs the solution first, then founds with a "design"
+milestone, or with criteria for the wrong thing (R02 and R03 founded on
+interval trees for interval tree clocks). Tau steers it
+(`FOUND_FIRST_NOTE`): found first; workers read the references as each task
+needs them; the design is part of the implementation, not a milestone of its
+own; name the reference in the milestones.
+
+Ask: §1 (and its core line) says the founding comes before any reading of
+the reference or design, and that a design is not a milestone.
+
+## 7. A working habit for a hard part: cases first, one piece per turn
+
+The brief's habits say to run code rather than trace it by hand:
+
+```
+$ beagle pursuit brief T0603 | sed -n '/^Working habits/,/^- Report/p' | sed -n '4p'
+- Write the code, then run it or the check and read what fails, before you work a case through by hand. A case traced in your head costs a whole reply, and a reply that runs out before it acts leaves nothing in the tree.
+```
+
+That names the failure (a reply that runs out) but not the way round it
+when the code cannot be written yet because the rule is not known: a small
+worker then tries to solve the algorithm whole in one reply and loses it.
+Tau's worker prompt (`PIECE_BY_PIECE_NOTE`) gives the steps: write the
+smallest cases and their expected results to a file first; in a new turn
+find the rule that produces them and write it down; run the cases and fix
+from the first failure; going round the same question, write down what is
+known and the one open question; stay inside the task.
+
+Ask: a brief habit for a task that needs real working out, with those
+steps, so the habit reaches every host's worker.
+
+## 8. Prose in a shell argument
+
+Every pursuit verb that records prose (`add --intent`, `spawn --reason`,
+`close --reason`, `--approach-delta` on `add` and `spawn`, `audit --record
+--note`, `commit --why`) takes it as a shell argument, and nothing a driver
+reads says how to quote it:
+
+```
+$ beagle pursuit rules | grep -ciE 'quot|heredoc'
+0
+$ grep -ciE 'heredoc|single quotes' ~/beagle-wt/0.48/plugins/beagle-pursuit/commands/pursuit-run.md
+0
+```
+
+Only `owe add --help` warns that prose through a shell heredoc is a quoting
+failure waiting to happen. A model that writes a reason in double quotes has
+its backticks run as commands and its `$` expanded. Tau's host mapping says
+it (prose goes in a quoted heredoc, a file, or single quotes, never double
+quotes).
+
+Ask: a line in `rules` (or `pursuit-run.md`) on passing prose to a verb,
+or a `--*-file` form for each prose flag, as `owe add --from` has.
