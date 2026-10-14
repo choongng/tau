@@ -32,6 +32,7 @@ branch and sha. Grades come from `grade_<task>.py` over `runs/RNN/adapter.py`;
 | R97 | q35 | semver (bare goal) | contract-first 24bd167 (T0536, T0537, T0541); tau e66018d7 pinned | 58/76 at the 60 min cap (working tree; T0006 Core Version class open, uncommitted) | B07 plain 75/76 in 8.1 min |
 | S01 | q35 | semver (smoke, 25 min cap) | contract-first cde3fbd (incremental contract, T0554-T0560, T0566); tau 2ea8cd1b | not graded: capped at 1500 s mid-milestone; first code at 14.0 min (R97 31.6) | B07 plain 75/76 in 8.1 min |
 | R98 | q35 | wrenfold | contract-first 395d806 (incremental contract + S01 fixes T0567-T0581, oracle stand-in T0572); tau df13db3e | 54/54 in 49.9 min, ended on its own (codec.py committed) | R96 50/54 capped; B06 plain 54/54 in 9.1 min |
+| R99 | q35 | semver (bare goal) | contract-first 009c2b8 (R98 + bounded `run --operation`, caller env in contain); tau f061aa4a | 75/76 at the 60 min cap (working tree: src/ untracked, nothing committed; graded through runs/R99/adapter.py) | R97 58/76 capped; B07 plain 75/76 in 8.1 min |
 
 ## B06 — the invented spec was not hard
 
@@ -741,3 +742,20 @@ What it shows:
 - First code at 10.5 min (worker start) / 17.6 min (commit), against
   S01's 14.0 and R97's 31.6.
 
+## R99 — q35 semver, the last contract-mode run: 75/76, uncommitted
+
+The last run on the contract-first lineage before beagle 0.48 retired the
+contract verbs (beagle reported itself as 0.47.0 at 009c2b8; no 0.47 was
+released). Capped at 3600 s (exit 124). Founding and the examples slice
+(T0002, the only slice sealed) took about 53 of the 60 minutes; the code
+was written after that and never committed: `src/` is untracked in
+~/semver.
+
+Graded 75/76 through runs/R99/adapter.py, which wraps the run's
+`Version.parse` (prerelease and build split on ".", format from `repr`),
+the same score as plain tau (B07, 75/76 in 8.1 min) and up from R97's
+58/76. The code is right; the mode spent the hour before it.
+
+This closes the contract era's runs. The port to beagle 0.48 (task-level
+spec-tying, no contract) is dev-notes/beagle-0.48/plan.md, and its runs
+start at R100.
