@@ -416,17 +416,31 @@ def _contract_step(title: str, root: Path) -> tuple[list[str], str] | None:
     return (list(CONTRACT_STEPS[0]), _supersede_check(eid, root)) if eid else CONTRACT_STEPS
 
 
-def _seal_when_ready(root: Path, title: str) -> str:
+def _slice_dirs(root: Path) -> set[str]:
+    """The sealed slices' directories, relative to `root`."""
+    slices = root / CONTRACT_SLICES
+    found = slices.iterdir() if slices.is_dir() else ()
+    return {f"{CONTRACT_SLICES}/{path.name}" for path in found if path.is_dir()}
+
+
+def _seal_when_ready(root: Path, title: str, task: str = "") -> str:
     """Seal the draft as the slice the task titled `title` names; a note saying so, or "".
 
     A slice task's done close leaves its draft checked (`contract check
     --draft`), and the work it gates waits on the seal; sealing it here means
     the driver never needs the verb. Any other title, or no draft, seals nothing.
+
+    S01: the seal left the new slice untracked and the draft's removal
+    unstaged, the workspace-clean gate went red, and the driver's `git add` and
+    its repair task were refused; so the seal is committed here, the new slice
+    and the draft's removal alone. beagle's close has made its own commit by
+    then; a refused seal commits nothing.
     """
     name = _slice_name(title)
     if not name or not _contract_declared(root) or not (root / CONTRACT_DRAFT_FILE).is_file():
         return ""
     argv = ["contract", "seal", "--slice", name]
+    before = _slice_dirs(root)
     rc, out = _pursuit(argv, root, timeout=CONTRACT_SEAL_TIMEOUT)
     if rc != 0:
         return (
@@ -435,9 +449,22 @@ def _seal_when_ready(root: Path, title: str) -> str:
             f"`{title.strip()}` task with pursuit_plan to finish the draft; beagle's "
             "refusal above says what it lacks.\n\n"
         )
+    sealed = sorted(_slice_dirs(root) - before)
+    why = None
+    if sealed:
+        subject = f"contract: seal slice {name}" + (f" ({task})" if task else "")
+        trailer = [f"Task: {task}"] if task else []
+        why = _commit_only(root, [*sealed, CONTRACT_DRAFT], [subject, *trailer])
+    unsaved = (
+        f" The seal is not committed ({why}): {', '.join(sealed)} and the removal of "
+        f"{CONTRACT_DRAFT}/ stay in the tree; tell the user."
+        if why
+        else ""
+    )
     return (
         f"Sealed the draft as the contract's slice {name}: its entries are now part of "
-        f"what done means, and the work waiting on it opens. {_contract_run_note(root)}\n\n"
+        f"what done means, and the work waiting on it opens.{unsaved} "
+        f"{_contract_run_note(root)}\n\n"
     )
 
 
@@ -3273,34 +3300,37 @@ def _commit_setup(root: Path) -> str | None:
     """Commit beagle's setup (.beagle/ and .gitignore) alone; None, or why not.
 
     R08: `beagle init`'s files stayed untracked, so the workspace-clean gate
-    was red from the first task. A pathspec commit leaves whatever else the
-    user has staged or changed exactly as it was; a failed commit unstages
-    only what this call staged.
+    was red from the first task.
     """
-    pathspec = ["--", ".beagle", ".gitignore"]
-    rc, out = _run(["git", "diff", "--cached", "--name-only", *pathspec], root, timeout=30.0)
+    return _commit_only(root, [".beagle", ".gitignore"], ["pursuit: found — beagle setup"])
+
+
+def _commit_only(root: Path, specs: list[str], message: list[str]) -> str | None:
+    """Commit every change under `specs` and nothing else, one `-m` per item of
+    `message`; None (also when nothing there changed), or why not.
+
+    A pathspec commit leaves whatever else the user has staged or changed
+    exactly as it was; a failed commit unstages only what this call staged.
+    """
+    pathspec = ["--", *specs]
+    staged_now = ["git", "diff", "--cached", "--name-only", "--no-renames", *pathspec]
+    rc, out = _run(staged_now, root, timeout=30.0)
     if rc != 0:
         return f"`git diff --cached` failed: {out}"
     before = set(out.splitlines())
     rc, out = _run(["git", "add", "-A", *pathspec], root, timeout=30.0)
     if rc != 0:
         return f"`git add` failed: {out}"
-    rc, out = _run(["git", "diff", "--cached", "--name-only", *pathspec], root, timeout=30.0)
+    rc, out = _run(staged_now, root, timeout=30.0)
     if rc != 0:
         return f"`git diff --cached` failed: {out}"
     staged = out.splitlines()
-    specs = [
-        spec
-        for spec in (".beagle", ".gitignore")
-        if any(path == spec or path.startswith(f"{spec}/") for path in staged)
-    ]
-    if not specs:
+    if not staged:
         return None
-    rc, out = _run(
-        ["git", "commit", "-q", "-m", "pursuit: found — beagle setup", "--", *specs],
-        root,
-        timeout=60.0,
-    )
+    # Each path by name: `git commit -- <dir>` leaves a removed directory's
+    # deletions staged rather than committed.
+    paragraphs = [arg for para in message for arg in ("-m", para)]
+    rc, out = _run(["git", "commit", "-q", *paragraphs, "--", *staged], root, timeout=60.0)
     if rc != 0:
         added = [path for path in staged if path not in before]
         if added:
@@ -13007,7 +13037,7 @@ def make_step_tool() -> Any:
         if rc == 0:
             _forget_task(root, task)
         superseded = _SUPERSEDED_REPORT_NOTE if rc == 0 and _report_claims_failure(shown) else ""
-        seal_note = _seal_when_ready(root, title) if rc == 0 and not retrying else ""
+        seal_note = _seal_when_ready(root, title, task) if rc == 0 and not retrying else ""
         return _step_result(
             f"{route}{task} — {title}: {state}.\n\n{committed}\n\n{closed}\n\n"
             f"{seal_note}{unrun_note}"

@@ -19753,6 +19753,65 @@ async def test_close_seals_draft_as_slice(
     assert "Plan another `Slice: properties` task with pursuit_plan" in refused
 
 
+def test_slice_seal_is_committed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # T0571 (S01): the seal left contract/slices/01-examples untracked and the
+    # draft's removal unstaged, so the workspace-clean gate went red and the
+    # driver's repair was refused. The seal is committed: the new slice added and
+    # the draft removed, nothing else; a refused seal commits nothing.
+    module = _module()
+    project = _contract_project(tmp_path)
+    draft = project / "contract" / "draft"
+    draft.mkdir(parents=True)
+    (draft / "contract.json").write_text('{"entries": []}\n')
+    (draft / "accept.sh").write_text("true\n")
+    (project / "semver.py").write_text("x = 1\n")
+
+    def git(*args: str) -> str:
+        done = subprocess.run(
+            ["git", *args], cwd=project, capture_output=True, text=True, check=True
+        )
+        return done.stdout
+
+    git("init", "-q")
+    git("config", "user.email", "t@example.com")
+    git("config", "user.name", "t")
+    git("config", "commit.gpgsign", "false")
+    git("add", "-A")
+    git("commit", "-q", "-m", "start")
+    fake = tmp_path / "sealer"
+    fake.write_text(
+        "#!/bin/sh\n"
+        '[ "$2 $3" = "contract seal" ] || exit 0\n'
+        '[ -n "$FAKE_SEAL_REFUSES" ] && { echo "not sealed: no stand-in fails"; exit 1; }\n'
+        'mkdir -p contract/slices/01-"$5" && mv contract/draft/* contract/slices/01-"$5"/ '
+        "&& rmdir contract/draft && echo sealed\n"
+    )
+    fake.chmod(0o755)
+    monkeypatch.setattr(module, "BEAGLE_BIN", str(fake))
+
+    # A refused seal commits nothing.
+    monkeypatch.setenv("FAKE_SEAL_REFUSES", "1")
+    head = git("rev-parse", "HEAD")
+    assert "did not seal" in module._seal_when_ready(project, "Slice: examples", "T0002")
+    assert git("rev-parse", "HEAD") == head and git("status", "--porcelain") == ""
+
+    monkeypatch.delenv("FAKE_SEAL_REFUSES")
+    note = module._seal_when_ready(project, "Slice: examples", "T0002")
+
+    assert note.startswith("Sealed the draft as the contract's slice examples"), note
+    assert "not committed" not in note
+    assert git("status", "--porcelain") == ""
+    changed = git("show", "--name-status", "--no-renames", "--format=", "HEAD").split("\n")
+    assert sorted(line for line in changed if line) == [
+        "A\tcontract/slices/01-examples/accept.sh",
+        "A\tcontract/slices/01-examples/contract.json",
+        "D\tcontract/draft/accept.sh",
+        "D\tcontract/draft/contract.json",
+    ]
+    message = git("log", "-1", "--format=%B")
+    assert message.startswith("contract: seal slice examples (T0002)") and "Task: T0002" in message
+
+
 @pytest.mark.anyio
 async def test_nothing_ready_says_what_the_contracts_acceptance_found(
     tmp_path: Path, beagle: Path, fake_beagle: Path, monkeypatch: pytest.MonkeyPatch
