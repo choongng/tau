@@ -30,6 +30,7 @@ branch and sha. Grades come from `grade_<task>.py` over `runs/RNN/adapter.py`;
 | R96 | q35 | wrenfold | contract-first e02f316 (T0529, T0530); tau 7cb40c5e pinned | 50/54 at the 60 min cap (working tree; package ~/wrenfold/wrenfold, uncommitted) | R71 0/54; B06 plain 54/54 in 9.1 min |
 | B07 | q35 | semver (bare goal) | none (plain tau, no extensions) | 75/76 in 8.1 min, ended on its own | — (baseline for the bare-goal pursuit runs) |
 | R97 | q35 | semver (bare goal) | contract-first 24bd167 (T0536, T0537, T0541); tau e66018d7 pinned | 58/76 at the 60 min cap (working tree; T0006 Core Version class open, uncommitted) | B07 plain 75/76 in 8.1 min |
+| S01 | q35 | semver (smoke, 25 min cap) | contract-first cde3fbd (incremental contract, T0554-T0560, T0566); tau 2ea8cd1b | not graded: capped at 1500 s mid-milestone; first code at 14.0 min (R97 31.6) | B07 plain 75/76 in 8.1 min |
 
 ## B06 — the invented spec was not hard
 
@@ -675,3 +676,29 @@ its own entry's id and a statement that duplicates another; sealing must
 show each entry's test can fail once the code loads; and why a
 task whose check passed was dispatched again is read before it is fixed.
 
+
+## S01 — q35 semver smoke of the incremental contract: code at 14.0 min, 12 findings
+
+A 1500 s smoke (T0562), not a numbered trial. Founding at 1.3 min seeded one
+`Slice: examples` ahead of five milestones, as built. The slice sealed 17
+entries as `contract/slices/01-examples` at 10.9 min, and the first code
+commit came at 14.0 min, against R97's 31.6 and the design's 6-7. The cap
+fell inside the version-parsing milestone, so nothing was graded.
+
+Where the 9.6 min of the slice went: its worker could not save the spec
+(references/ is outside the slice's contract/ scope) and was refused
+`contract --help`, so it wrote `contract.json` by hand; `contract status`
+then said ready while the slice's check refused, the worker ran out of
+turns, and the slice was dispatched a second time.
+
+What sealed and should not have: `accept.sh` reads the input's `expect` for
+the comparison entries (a KeyError) and compares an order with itself, and
+the stand-in "failed" those entries too. Its root path is right only in
+`contract/draft`. The seal was not committed, so the workspace gate went red
+and the driver's repair was refused three times. Milestones were checked by
+pytest, not `contract run --operation`. The run's python came from
+tau-harness's venv.
+
+Fixes filed as T0567-T0575 (source saving, read-only verbs, status vs
+check, acceptance root, committed seal, a crashing test under the stand-in,
+milestones on `contract run`, the venv on PATH, `run --operation` noise).
