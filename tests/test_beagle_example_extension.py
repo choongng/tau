@@ -19682,6 +19682,8 @@ async def test_pursuit_step_spec_tied_writes_cases_then_opens_with_cites_and_cas
     assert cases["role"] == "cases" and code["role"] == "executor"
     assert cases["scope"] == "tests/test_parse.py"
     assert "`beagle pursuit rules 2e`" in cases["stdin"] and "the source spec" in cases["stdin"]
+    # Run R100: the cases that worked their own bytes out were the wrong ones.
+    assert "copy it exactly" in cases["stdin"] and "not an output you work out" in cases["stdin"]
     assert (
         "beagle pursuit open T0002 --criteria 'parse reads what the spec says' "
         "--done-when 'python3 -m pytest -q tests/test_parse.py' --scope parser.py "

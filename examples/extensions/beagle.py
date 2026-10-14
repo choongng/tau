@@ -11050,6 +11050,21 @@ def _cases_scope(done_when: str, root: Path) -> list[str]:
     ]
 
 
+#: Where a case's expected values come from. Run R100: of 17 cases, every one
+#: that copied the cited line's bytes was right; the three that worked bytes out
+#: (63 with its end marker dropped, the first values of the three- and five-byte
+#: forms) were wrong, and the code worker, held to them, edited the pinned cases
+#: and left the task unprovable. Interim, until `pursuit rules 2e` says it
+#: (dev-notes/beagle-0.48/upstream-asks.md, 10).
+CASES_VALUES_NOTE = (
+    "Assert only what the cited lines say. Where they give the output, copy it "
+    "exactly. Where they give a rule or a bound with no output, assert the rule "
+    "(which form, how many bytes, that it is refused, that it round-trips), not "
+    "an output you work out: a value you compute is a value you may get wrong, "
+    "and the code is held to it."
+)
+
+
 def _cases_brief(
     task: str,
     title: str,
@@ -11073,6 +11088,8 @@ def _cases_brief(
         "lines with `beagle refs find WORDS` and `beagle refs show NAME`.\n\n"
         f"The task: {criteria}\n"
         f"Write the cases in {', '.join(cases_scope)}, which its check runs: `{done_when}`\n\n"
+        + CASES_VALUES_NOTE
+        + "\n\n"
         "You are done when this passes, with your cites and case files added:\n"
         f"  {dry_run} --cites REF:ANCHOR ... --cases FILE ... --dry-run\n"
         "It passes while the tests fail: the code is not written yet. End with a report "

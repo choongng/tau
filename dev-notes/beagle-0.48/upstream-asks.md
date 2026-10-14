@@ -193,3 +193,14 @@ Ask: `open --cases` refuses unless the check runs the case files, at least
 when it names none of them or no test command. It could also say so where
 rule 2e is printed: "the check is the test command over the case files; the
 expected values live in the cases, not the check".
+
+## 10. Rule 2e: where a case's expected values come from
+
+Run R100 (q35 wrenfold): of 17 cases, every case that copied its cited line's output was right; the
+three that worked an output out (63 with the end marker dropped, the first values of the three- and
+five-byte forms, marked `kind=limit`) were wrong. The code worker, held to them, fixed them in the pinned
+file, and the task could not be proven. Rule 2e says where cases come from and that a wrong case is an
+`amend`, but not that a case asserts only what its lines say. Ask: add to 2e "Where the cited lines give
+the output, copy it; where they give a rule or a bound, assert the rule (which form, its length, the
+refusal, the round trip), not an output you work out." Tau carries it meanwhile as `CASES_VALUES_NOTE`
+in the cases brief (T0611).
