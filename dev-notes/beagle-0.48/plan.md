@@ -118,8 +118,9 @@ four-task q35 rotation as the before/after the owner asked for.
 - The driver's `pursuit_plan` milestone entry gains one optional field:
   `source`, a reference name such as `itc2008`, or `itc2008` plus the topic
   words. The cases worker finds the anchors with `beagle refs find` and cites
-  them. The extension takes `--cites` from the anchors of the cases the worker
-  wrote, by asking beagle (`--dry-run` output), not by parsing them itself.
+  them. The extension takes `--cites` from the `cite=` of the markers the
+  worker wrote (0.48 prints no accepted ties; upstream-asks.md 3), and the real
+  `open` re-judges them.
 - Anchors never pass through the driver, so a small driver cannot mistype them.
   This is the measured R94–R99 failure class, in a new place.
 - The cost: coverage of the whole source moves from a gate to
@@ -206,7 +207,7 @@ def _open_spec_tied(task: str, source: str, criteria: str, check: str, root: Pat
                              f"--cites <your cites> --cases <files> --dry-run` passes.")
     if not cases.ok:
         return StepOutcome.failed(cases.report)  # relayed to the driver as any worker failure
-    cites, files = _dry_run_ties(task, root)     # read from beagle's --dry-run output
+    cites, files = _marker_ties(cases.changed, root)  # cite= of each beagle-case: marker
     return _open(task, criteria, check, extra=["--cites", *cites, "--cases", *files])
 ```
 
@@ -214,9 +215,13 @@ def _open_spec_tied(task: str, source: str, criteria: str, check: str, root: Pat
   (0.46).
 - Its scope is test files and `references/`. It never gets the source
   directory, which keeps "a worker that will not write the code".
-- `_dry_run_ties` needs beagle to print the cites and cases it accepted. If
-  `--dry-run` does not print them in a parseable form, that is the first
-  upstream ask, and until then the cases worker reports them in its last line.
+- `_marker_ties` reads the `cite=` of each `beagle-case:` marker in the files
+  the cases worker changed. 0.48's `open --dry-run` prints only the check's
+  run, not the ties it accepted, `open` has no `--json`, and `coverage` counts
+  done tasks only (probed 10-14). Reading the markers copies beagle's marker
+  grammar into tau, so it is interim: upstream-asks.md 3 asks `open` to take
+  the cites from the markers. The real open re-judges them either way, so a
+  misread is a refusal, not a wrong tie.
 
 ### 4. `pursuit_plan` milestones take `source`
 
@@ -307,7 +312,7 @@ the `r98-time-recon.md` split (model generation against overhead).
 3. **Hand policy text back (T0586, scoped).** List every instruction or rule
    text in the extension that 0.48's `brief`, `rules` or refusals now carry,
    and delete tau's copy. What beagle lacks becomes an upstream ask in
-   `~/work/beagle-feedback/`, not a tau copy. The first ask: a brief for the
+   `dev-notes/beagle-0.48/upstream-asks.md`, not a tau copy. The first ask: a brief for the
    cases worker before `open`, which `pursuit brief` refuses since the task is
    not open. A full decide/carry move of the extension's other policy waits
    for the rotation's evidence.
@@ -342,7 +347,7 @@ the `r98-time-recon.md` split (model generation against overhead).
 - [ ] S02 and R100–R103 graded, with rows and sections in `eval.md`.
 - [ ] The before/after table is written and judged against each bar in Goals.
 - [ ] `beagle-0.48` merged to `choong-dev`, and `tau-harness` moved to it.
-- [ ] Upstream asks filed in `~/work/beagle-feedback/`.
+- [x] Upstream asks filed in `dev-notes/beagle-0.48/upstream-asks.md` (3, 10-14).
 
 ## Open Questions
 
