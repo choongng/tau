@@ -3150,49 +3150,6 @@ def _references_note(index: Mapping[str, Any], root: Path) -> str:
     )
 
 
-#: Asked of a known-answers task with references/ fetched. Runs R12 and R14:
-#: cases cited bare URLs, nothing, or a file:line that held a page number.
-QUOTED_SOURCE_NOTE = (
-    "Known answers: give each case a `source` that quotes, verbatim, the line of "
-    f"{REFERENCES_DIR}/*.txt it comes from, at least four words copied as written. "
-    "A bare file:line (such as `paper.txt:221`), a page number or a URL is not a "
-    "source: at close, a cases file most of whose sources quote nothing found in "
-    f"{REFERENCES_DIR}/*.txt keeps the task open."
-)
-
-#: A made-up, domain-free reference for the worked example: a rule line, then
-#: the line that gives a result. Runs R34-R40: workers quoted the case's input
-#: line or a rule line as the source, and invented the expected value.
-WORKED_EXAMPLE_RULE = "shift moves the first n letters to the end."
-WORKED_EXAMPLE_LINE = 'Example 2: shift("abc", 1) gives "bca".'
-WORKED_EXAMPLE_LINES = (WORKED_EXAMPLE_RULE, WORKED_EXAMPLE_LINE)
-#: Input and expected copied from WORKED_EXAMPLE_LINE, its source quoting it.
-WORKED_EXAMPLE_CASE = {
-    "name": "shift_one",
-    "input": {"text": "abc", "n": 1},
-    "expected": "bca",
-    "source": WORKED_EXAMPLE_LINE,
-}
-#: The commonest wrong shape: a rule line quoted for a result it does not give.
-WORKED_COUNTER_CASE = {
-    "name": "shift_two",
-    "input": {"text": "abc", "n": 2},
-    "expected": "cab",
-    "source": WORKED_EXAMPLE_RULE,
-}
-
-
-def _worked_example_note() -> str:
-    """One right cases.json entry and one wrong one, from the made-up reference lines."""
-    lines = "\n".join(f"  {line}" for line in WORKED_EXAMPLE_LINES)
-    return (
-        f"Example. Reference lines:\n{lines}\n"
-        f"Right (copied from the line that gives the result): {json.dumps(WORKED_EXAMPLE_CASE)}\n"
-        f'Wrong (that rule line does not give "{WORKED_COUNTER_CASE["expected"]}"): '
-        f"{json.dumps(WORKED_COUNTER_CASE)}"
-    )
-
-
 def _reference_search(words: str = "<words>") -> str:
     """The shell command that finds the lines of references/*.txt holding `words`.
 
@@ -3258,11 +3215,9 @@ def _references_brief(root: Path, context_only: bool = False, contract: bool = F
         )
         parts.append(f"{lead}:\n<<<\n{request}\n>>>")
     if context_only and fetched:
-        parts.append(f"{QUOTED_SOURCE_NOTE} {_reference_search_note()}")
-        parts.append(_worked_example_note())
+        parts.append(_reference_search_note())
         parts.append(
-            "A case needs only the lines it cites: read those by line range "
-            "(offset and limit), not the whole file."
+            "Read only the lines you cite, by line range (offset and limit), not the whole file."
         )
     return "\n\n".join(parts)
 
@@ -4426,7 +4381,7 @@ PLAN_PARAMETERS: dict[str, Any] = {
 def _uncommitted_in_scope(root: Path, task: str) -> tuple[list[str], list[str]]:
     """An open task's scope and the files git holds uncommitted in it, as it is split.
 
-    R09: T0007 was split with tests/cases.json uncommitted, and T0009's commit
+    R09: T0007 was split with its tests/ data file uncommitted, and T0009's commit
     took it beside src/itc/*.py, unlocked.
     """
     rc, out = _pursuit(["show", task], root)
@@ -5066,7 +5021,7 @@ def _check_problem(command: str) -> str | None:
     - a bare `&&`, `|` or `>`, which reaches the program as an argument;
     - a check that cannot fail: `true`, which run 9 bound to "abandon" a
       duplicate, or one that only shows a file is there (`cat docs/x.md`,
-      `python3 -m json.tool cases.json`) and passes whatever it says;
+      `python3 -m json.tool data.json`) and passes whatever it says;
     - a `bash -c '...'` script whose every `&&` part is one of the above.
     """
     try:
@@ -5480,7 +5435,7 @@ def _judged_sources(entries: list[str], root: Path, check: str = "") -> tuple[li
     """(source, helpers) among `entries`' non-test .py files.
 
     Run R31: a worker saved tests/casegen.py, a generator no test imported and the
-    check did not name, beside tests/cases.json, and 51 calls were refused for
+    check did not name, beside its tests/ data file, and 51 calls were refused for
     holding "the code it judges". A .py under a test directory that is on disk
     counts as judged code only when a scope test, or one the check names,
     imports it or the check names it; otherwise it is a helper.
@@ -5515,7 +5470,7 @@ def _scope_entries(scope: list[str], root: Path) -> list[str]:
     entries: list[str] = []
     for rel in scope:
         entries.append(rel)
-        # Run R09: scope src/, tests/ held tests/cases.json beside src/itc/*.py,
+        # Run R09: scope src/, tests/ held a tests/ data file beside src/itc/*.py,
         # and a directory entry has neither suffix, so it is judged by its files.
         if (root / rel).is_dir():
             entries.extend(_scope_dir_files(root, rel.rstrip("/")))
@@ -5638,7 +5593,7 @@ def _test_reads_file(test_path: Path, data_basename: str) -> bool:
     """Whether the test's code, not a docstring or comment, opens the data file.
 
     Run R14: test_cases.py held hand-written asserts and never opened
-    cases.json, so the locked known answers judged nothing. The read call
+    the data file, so the locked known answers judged nothing. The read call
     (open, Path, read_text, json.load) must take the file: a string naming it,
     or a name assigned from one. A message string naming it elsewhere does not.
     Run R33: `<path>.open()` and `json.load(fh)` on a `with ... as fh` handle
@@ -6783,7 +6738,7 @@ def _data_only_bind(
 def _check_data_reads(command: str, root: Path) -> list[str]:
     """The data files that tests run by `command`, importing no project module, open.
 
-    Run R21: T0005's check ran tests/test_case_data.py, which read tests/cases.json
+    Run R21: T0005's check ran tests/test_case_data.py, which read a tests/ data file
     and imported nothing; the scope held only the test, so the data file's absence,
     the one proof such a test has, was out of reach. Found from the test's code (the
     file it opens, by `_test_reads_file`) and `TEST_DATA_SUFFIXES`; a bare name
@@ -6823,7 +6778,7 @@ def _tests_only_proof_note(command: str, scope: list[str], root: Path | None) ->
     or the check's tests hold one, else a defect in the module the test imports.
 
     Run R21 E76 said "mutate the module the test imports" of a test that imported
-    none and read tests/cases.json, outside its scope.
+    none and read a tests/ data file, outside its scope.
     """
     reads = _check_data_reads(command, root) if root is not None and command else []
     if not _scope_has_data(scope, root) and not reads:
@@ -7081,7 +7036,7 @@ def _read_or_design_only(part: str) -> bool:
 
 
 def _names_known_answers(part: str) -> bool:
-    """Whether milestone `part` already names the known answers or a cases file."""
+    """Whether milestone `part` already names the known answers or its cases."""
     text = part.lower()
     return "known answer" in text or bool(re.search(r"\bcases\b", text))
 
@@ -7115,8 +7070,7 @@ def _reading_only_part(parts: list[str]) -> str | None:
         if _read_or_design_only(head):
             return (
                 f"{head!r} only reads the reference or chooses a design: a sub-agent "
-                f"reads the reference and writes the cases file and its test in the "
-                f"known-answers task ({KNOWN_ANSWERS_TITLE!r}), and the design is part "
+                "reads the reference in the task whose work needs it, and the design is part "
                 "of the implementation, not a part of its own. Fold it into the part "
                 "that uses it, and plan the parts that do the work."
             )
@@ -7719,7 +7673,7 @@ def _implementation_in_tests_lead(root: Path, scope: list[str], check: str = "")
             "task's work.\n\n"
         )
     if runners:
-        # Run R16: run_case only dispatched cases.json's ops to the module, and
+        # Run R16: run_case only dispatched the data file's ops to the module, and
         # calling it implementation sent the driver after the module itself.
         lead += (
             f"The sub-agent wrote a case runner into the test ({runners}), which cases "
@@ -7995,7 +7949,7 @@ _COLLECT_ONLY = re.compile(r"(?<![\w-])--(?:collect-only|co)(?![\w-])")
 def _amend_problem(check: str, bound: str) -> str | None:
     """Why `check` may not replace a task's bound check, judged before it runs.
 
-    Run R17 #26 swapped T0008's check, which loaded tests/cases.json, for
+    Run R17 #26 swapped T0008's check, which loaded a tests/ data file, for
     `pytest --collect-only -q tests/`, which passed before any work.
     """
     keep = (
@@ -8014,7 +7968,7 @@ def _amend_problem(check: str, bound: str) -> str | None:
 def _cwd_relative_data_lead(output: str, scope: list[str], root: Path) -> str:
     """The line a not-done result leads with when a test opened scoped data by a bare name.
 
-    Run R15: tests/test_case_data.py ran `open("cases.json")`; the check runs from
+    Run R15: tests/test_case_data.py ran `open("<data>.json")`; the check runs from
     the project root, so collection failed with FileNotFoundError.
     """
     for match in re.finditer(
@@ -8545,12 +8499,12 @@ async def _prove(
     when neither can be tried — no witness and no changed file — and the close
     decides.
 
-    q38fn 10-11 T0011: the witness in tests/cases.json was refused as a test
+    q38fn 10-11 T0011: the witness in a tests/ data file was refused as a test
     file, and the fallback took away tests/check_known_answers.py, the check's
     own script, so the check failed only on a missing file. The cases data the
     check reads is a site; a script the check runs is never taken away, and a
     witness in one under tests/ is refused (one elsewhere may be the program
-    under test). A file the check only reads (`grep -q out tests/cases.json`)
+    under test). A file the check only reads (`grep -q out tests/data.json`)
     is the work, and may be taken away.
     """
     attempts: list[list[str]] = []
@@ -10009,7 +9963,7 @@ def _own_test_import_note(command: str, scope: list[str], root: Path, task_text:
 def _absent_check_file_problem(command: str, scope: list[str], root: Path) -> str | None:
     """Why a check runs a test file that is not on disk and `scope` does not hold, or None.
 
-    Run R40 class 4: T0011, scope tests/cases.json, ran tests/test_cases_source.py,
+    Run R40 class 4: T0011, scope a tests/ data file, ran tests/test_cases_source.py,
     which was not on disk; pytest exited 4, and workers met 21 scope refusals writing
     it across three routes on the same scope. A test in scope and not on disk is the
     work, and is left alone.
@@ -10137,7 +10091,7 @@ def _sibling_owned_check_problem(
 ) -> str | None:
     """Why `task`'s check may not run a file a task waiting on it owns, or None.
 
-    Run R21 bound T0005, scope tests/cases.json, to T0006's tests/test_case_data.py;
+    Run R21 bound T0005, scope a tests/ data file, to T0006's tests/test_case_data.py;
     T0006 waited on T0005, so only T0005's worker could touch the failing test, and
     its scope forbade it. A file a done task committed is that task's work, not the
     waiter's to write.
@@ -10399,7 +10353,7 @@ def _changes_done_work(
     """How `task` is to change `done`'s work, by tau's own fix-route titles or the
     tree; "" when neither says so.
 
-    Run R28: "Fix known answers" and "Known answers: fix tests/cases.json" closed
+    Run R28: "Fix known answers" and "Known answers: fix <the data file>" closed
     as satisfied by T0002's commit, the work they were made to change.
     """
     if _fixes_known_answers(title):
@@ -10519,7 +10473,7 @@ def _done_by_unwitnessed(
     """The up-front refusal of a done-by close the witness rule would refuse; `lead`,
     when given, stands for its opening "pursuit_step: T not closed done by D — ".
 
-    Run R28: the offer widened eleven tasks' scope with tests/cases.json, T0002's
+    Run R28: the offer widened eleven tasks' scope with a tests/ data file, T0002's
     data, and each then closed as done by T0002. A file outside the paths is
     offered only when the task's title or criteria (`named`) names it, or when
     the paths are the check's `targets`, no scope the call or record chose.
@@ -11262,7 +11216,7 @@ def _unproven_data_route(
 
     Run R21: T0005's check passed but could not be shown to refuse, and every
     escalation asked for a new check. The check was right; the scope lacked
-    tests/cases.json, whose absence is the proof.
+    the tests/ data file, whose absence is the proof.
     """
     if root is None or not bound_check:
         return None
@@ -14238,7 +14192,7 @@ def _reread_refusal(
     file in the scope passes while its reads fit one pass through the file and a
     quarter of the cap: a write may need it, and a file too long to page within
     the cap is queried instead. `reads` counts each file's reads so far. Run
-    R34: W9 paged the in-scope 4048-line tests/cases.json 27 times and wrote nothing.
+    R34: W9 paged the in-scope 4048-line tests/ data file 27 times and wrote nothing.
     Run R40: workers re-read whole references 6-20 times; a refused read of one
     offers the search that finds the line instead.
     """
@@ -16375,13 +16329,13 @@ TESTS_ONLY_PROOF_NOTE = (
     "This scope holds only tests and data, so the data file's absence is the proof: "
     "the check must run a test that reads the data file this task writes, so that "
     "taking the file away makes it fail (e.g. tests/test_case_data.py must fail when "
-    "tests/cases.json is removed). That test reads only the data file, opened beside "
-    "it: `Path(__file__).with_name('cases.json')`, not `open('cases.json')`, which "
+    "tests/data.json is removed). That test reads only the data file, opened beside "
+    "it: `Path(__file__).with_name('data.json')`, not `open('data.json')`, which "
     "looks in the working directory."
 )
 
 #: Said instead of TESTS_ONLY_PROOF_NOTE when the scope holds no data file. Run
-#: R12: that note pointed T0008 at tests/cases.json, another task's locked file.
+#: R12: that note pointed T0008 at a tests/ data file, another task's locked file.
 TESTS_ONLY_MUTATE_NOTE = (
     "This scope holds only tests, so mutate the module the test imports: a WITNESS "
     "in that module, a NEEDLE there that the test must catch."

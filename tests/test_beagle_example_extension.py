@@ -3368,7 +3368,8 @@ def test_references_brief_says_how_to_search_references(
     brief = module._references_brief(tmp_path, context_only=True)
     tilth = 'tilth "<words>" --scope references'
     assert module._reference_search() == tilth
-    assert f"{module.QUOTED_SOURCE_NOTE} To find the line that gives a value" in brief
+    assert "To find the line that gives a value, search for words from it" in brief
+    assert not hasattr(module, "QUOTED_SOURCE_NOTE")
     assert f"`{tilth}`, rather than reading the reference through." in brief
     assert tilth not in module._references_brief(tmp_path)
 
@@ -3382,32 +3383,25 @@ def test_references_brief_says_how_to_search_references(
     assert "tilth" not in fallback
 
 
-def test_known_answers_brief_has_worked_example(tmp_path: Path) -> None:
-    # R34-R40: workers quoted the input or a rule line and invented expected values.
+def test_data_task_brief_has_no_cases_first_text(tmp_path: Path) -> None:
+    # T0578: T0493 deleted the cases file's close-time source judge, but the brief
+    # still told a data-file worker of it and showed a cases.json worked example.
     module = _module()
+    for gone in ("QUOTED_SOURCE_NOTE", "_worked_example_note", "WORKED_EXAMPLE_CASE"):
+        assert not hasattr(module, gone), gone
     refs = tmp_path / "references"
     refs.mkdir()
     (refs / "paper.txt").write_text("the value is 42\n")
     (refs / "index.json").write_text(
         json.dumps({"request": "x", "fetched": {"paper.txt": "https://e.org/p"}})
     )
-    example = module._worked_example_note()
     brief = module._references_brief(tmp_path, context_only=True)
-    assert example in brief
-    assert brief.index(module.QUOTED_SOURCE_NOTE) < brief.index(example)
-    for line in module.WORKED_EXAMPLE_LINES:
-        assert line in example
-    right = json.dumps(module.WORKED_EXAMPLE_CASE)
-    assert f"Right (copied from the line that gives the result): {right}" in example
-    wrong = json.dumps(module.WORKED_COUNTER_CASE)
-    assert f'Wrong (that rule line does not give "cab"): {wrong}' in example
-    assert example not in module._references_brief(tmp_path)
-
-    failed = {"request": "x", "failed": {"https://e.org/p": "404"}}
-    (refs / "index.json").write_text(json.dumps(failed))
-    unfetched = module._references_brief(tmp_path, context_only=True)
-    assert "could not fetch https://e.org/p: 404" in unfetched
-    assert example not in unfetched
+    assert "references/paper.txt (from https://e.org/p)" in brief
+    assert "as context only" in brief
+    assert module._reference_search_note() in brief
+    assert "Read only the lines you cite, by line range" in brief
+    for dead in ("cases file", "cases.json", "Known answers:", "keeps the task open", "Example."):
+        assert dead not in brief, dead
 
 
 def test_a_witness_block_is_read_from_the_end_of_a_report() -> None:
@@ -11037,7 +11031,7 @@ async def test_tests_only_unproven_next_names_no_import(
 
     assert "stays open" in result.text
     next_text = result.text[result.text.index("Next:") :]
-    assert "tests/test_case_data.py must fail when tests/cases.json is removed" in next_text
+    assert "tests/test_case_data.py must fail when tests/data.json is removed" in next_text
     for word in ("ImportError", "import the module", "from <package>", "test_cases.py"):
         assert word not in next_text, word
 
@@ -17847,7 +17841,8 @@ async def test_plan_refuses_reading_only_part(
     assert plan.text.startswith(
         "pursuit_plan: nothing added — 'Read both references' only reads the reference"
     )
-    assert "known-answers task" in plan.text
+    assert "reads the reference in the task whose work needs it" in plan.text
+    assert "cases file" not in plan.text
     assert _pursuit_calls(fake_beagle, "split") == []
     assert _pursuit_calls(fake_beagle, "add") == []
     module = _module()
