@@ -43,6 +43,21 @@ def anyio_backend() -> str:
     return "asyncio"
 
 
+@pytest.fixture(autouse=True)
+def _venv_bin_on_path(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Run as `uv run` would: the venv's bin/ first on PATH.
+
+    The checks these tests run say `python3 -m pytest`. Started as
+    `.venv/bin/python -m pytest` with no venv active (T0599's check), that
+    `python3` was the system one, which with HOME moved to tmp_path by
+    conftest has no pytest.
+    """
+    bin_dir = str(Path(sys.executable).parent)
+    path = os.environ.get("PATH", "")
+    if sys.prefix != sys.base_prefix and bin_dir not in path.split(os.pathsep):
+        monkeypatch.setenv("PATH", os.pathsep.join([bin_dir, path]) if path else bin_dir)
+
+
 EXTENSION = Path(__file__).resolve().parents[1] / "examples" / "extensions" / "beagle.py"
 
 
