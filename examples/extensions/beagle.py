@@ -4944,23 +4944,33 @@ def _contract_operations(root: Path) -> list[str]:
 
     Read from every sealed slice, in the order sealed, then the draft.
     """
-    entries: list[Any] = []
-    for path in [
-        *sorted((root / CONTRACT_SLICES).glob("*/contract.json")),
-        root / CONTRACT_DRAFT_FILE,
-    ]:
+    sealed = sorted((root / CONTRACT_SLICES).glob("*/contract.json"))
+    return _operation_names([*sealed, root / CONTRACT_DRAFT_FILE])
+
+
+def _sealed_operations(root: Path) -> list[str]:
+    """The operations the sealed slices hold, by bare name, in order; [] if none.
+
+    The draft is not read: `contract run --operation X` judges sealed entries.
+    """
+    return _operation_names(sorted((root / CONTRACT_SLICES).glob("*/contract.json")))
+
+
+def _operation_names(paths: list[Path]) -> list[str]:
+    """The operations the entries of the contract files `paths` name, by bare
+    name (`cobs.encode(data)` is `encode`), first seen first."""
+    names: list[str] = []
+    for path in paths:
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
             continue
         found = data.get("entries") if isinstance(data, dict) else None
-        entries += found if isinstance(found, list) else []
-    names: list[str] = []
-    for entry in entries:
-        op = str(entry.get("operation") or "") if isinstance(entry, dict) else ""
-        name = op.split("(")[0].strip().rsplit(".", 1)[-1]
-        if name and name not in names:
-            names.append(name)
+        for entry in found if isinstance(found, list) else []:
+            op = str(entry.get("operation") or "") if isinstance(entry, dict) else ""
+            name = op.split("(")[0].strip().rsplit(".", 1)[-1]
+            if name and name not in names:
+                names.append(name)
     return names
 
 
@@ -4973,7 +4983,8 @@ def _contract_run_note(root: Path) -> str:
         f"`beagle pursuit contract run --operation <op>`, once per operation{named}; an "
         f"operation no sealed slice holds yet first gets its `{SLICE_PREFIX} <op> limits "
         "and invalid inputs`. Work the contract does not cover, such as tests or "
-        "packaging, takes the goal's own command. Do not copy entries into a check: "
+        "packaging, takes a scope with no code outside tests/ and docs/, and the goal's "
+        "own command. Do not copy entries into a check: "
         "the contract holds them, and a copy can be wrong."
     )
 
@@ -5002,6 +5013,71 @@ def _copied_answers_problem(command: str, title: str, root: Path) -> str | None:
     return (
         "done_when asserts answers of its own inline, and the sealed contract holds "
         f"them. {_contract_run_note(root)} Call pursuit_step again with that."
+    )
+
+
+def _contract_run_operation(argv: list[str]) -> str | None:
+    """The operation a `beagle pursuit contract run --operation X` call names, or None."""
+    if Path(argv[0]).name != "beagle" or argv[1:4] != ["pursuit", "contract", "run"]:
+        return None
+    for at, arg in enumerate(argv[4:], 4):
+        if arg == "--operation" and at + 1 < len(argv):
+            return argv[at + 1]
+        if arg.startswith("--operation="):
+            return arg.partition("=")[2]
+    return None
+
+
+#: Top directories whose work no contract operation judges (T0573).
+_NO_OPERATION_DIRS = frozenset({"tests", "test", "docs", "doc", CONTRACT_DIR, REFERENCES_DIR})
+
+
+def _holds_operation_code(scope: list[str]) -> bool:
+    """Whether `scope` may hold code the contract's operations live in: a code
+    file, or a directory, outside tests/, docs/, contract/ and references/."""
+    for rel in scope:
+        path = Path(rel)
+        if not path.parts or path.parts[0] in _NO_OPERATION_DIRS:
+            continue
+        if path.name.startswith("test_") or path.name == "conftest.py":
+            continue
+        if rel.endswith("/") or not path.suffix or path.suffix in _CODE_SUFFIXES:
+            return True
+    return False
+
+
+def _uncontracted_check_problem(
+    command: str, title: str, scope: list[str], root: Path
+) -> str | None:
+    """Why a milestone's check that runs no `contract run --operation` may not
+    open under a contract with a sealed slice, or None.
+
+    S01: after `Slice: examples` sealed, the driver opened its milestones on
+    pytest checks of its own, though the seal said to use `contract run
+    --operation <op>`, so the sealed contract judged nothing. Before the first
+    seal beagle opens contract work alone, so the rule holds from the first
+    milestone. A check naming an operation no slice holds yet is beagle's to
+    refuse: the slice for it is then due (`_slice_due`). Work whose scope holds
+    no code outside tests/, docs/ and the contract (packaging, docs, tests) is
+    the way through: no operation lives there, and the close names any file
+    changed outside the scope, so the scope cannot hide the code's own work.
+    """
+    if _slice_name(title) or not _contract_declared(root):
+        return None
+    ops = _sealed_operations(root)
+    if not ops or not _holds_operation_code(scope):
+        return None
+    if _bash_find(command, _contract_run_operation) is not None:
+        return None
+    line = f"beagle pursuit contract run --operation {ops[0]}"
+    return (
+        "done_when runs no `beagle pursuit contract run --operation <op>`, so the sealed "
+        f"contract would judge nothing of this work. Begin done_when with `{line}` "
+        f"(the sealed slices hold the operations {', '.join(ops)}; name the one this "
+        "work builds); other commands may follow it, joined with &&. Work that builds "
+        "no operation (packaging, docs, tests) takes a scope with no code outside "
+        "tests/ and docs/, such as pyproject.toml or README.md, and keeps its own "
+        "check. Call pursuit_step again with that."
     )
 
 
@@ -11873,6 +11949,7 @@ def make_step_tool() -> Any:
                         done_when or old_check, route_scope, task, nodes, root
                     )
                     or _copied_answers_problem(done_when, title, root)
+                    or _uncontracted_check_problem(done_when or old_check, title, route_scope, root)
                     or _import_scope_problem(done_when or old_check, route_scope, root)
                     or _inverted_exit_problem(done_when or old_check)
                     or _absent_check_file_problem(done_when or old_check, route_scope, root)
@@ -12097,6 +12174,7 @@ def make_step_tool() -> Any:
                     or _scope_problem(scope, task, nodes, root)
                     or _sibling_owned_check_problem(done_when, scope, task, nodes, root)
                     or _copied_answers_problem(done_when, title, root)
+                    or _uncontracted_check_problem(done_when, title, scope, root)
                     or _doc_only_check_problem(done_when, scope, task, root)
                     or _import_scope_problem(done_when, scope, root)
                     or _inverted_exit_problem(done_when)

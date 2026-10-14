@@ -20120,6 +20120,52 @@ async def test_pursuit_step_refuses_copied_answers_once_the_contract_is_sealed(
     assert _pursuit_calls(fake_beagle, "open") == []
 
 
+@pytest.mark.anyio
+async def test_milestone_check_runs_contract_operation(
+    tmp_path: Path, beagle: Path, fake_beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # S01: after `Slice: examples` sealed, the driver opened its milestones on
+    # pytest checks, though the seal said `contract run --operation <op>`, so
+    # the sealed contract judged nothing.
+    module = _module()
+    problem = module._uncontracted_check_problem
+    pytest_only = "python3 -m pytest -q tests/test_cobs.py"
+    run = "beagle pursuit contract run --operation encode"
+    plain = _pursuit_project(tmp_path / "plain")
+    project = _contract_project(tmp_path)
+    # No declared contract: nothing changes, sealed slice or not.
+    assert problem(pytest_only, "Core encoding", ["src/cobs.py"], plain) is None
+    assert problem(pytest_only, "Core encoding", ["src/cobs.py"], _sealed_contract(plain)) is None
+    # Declared, and no slice sealed yet: today's behaviour (beagle opens contract work only).
+    assert problem(pytest_only, "Core encoding", ["src/cobs.py"], project) is None
+    _sealed_contract(project)
+    refused = str(problem(pytest_only, "Core encoding", ["src/cobs.py"], project))
+    assert refused.startswith("done_when runs no `beagle pursuit contract run --operation <op>`")
+    assert "Begin done_when with `beagle pursuit contract run --operation encode`" in refused
+    assert "the sealed slices hold the operations encode, decode" in refused
+    assert "takes a scope with no code outside tests/ and docs/" in refused
+    # A directory may hold the code too; a slice task keeps its own check.
+    assert problem(pytest_only, "Core encoding", ["src/"], project) is not None
+    assert problem(pytest_only, "Slice: decode limits", ["src/cobs.py"], project) is None
+    # The contract run, then other commands, wrapped or not, opens.
+    for check in (run, f"{run} && {pytest_only}", f"bash -c {shlex.quote(f'cd . && {run}')}"):
+        assert problem(check, "Core encoding", ["src/cobs.py"], project) is None, check
+    assert problem("beagle pursuit contract run --operation=decode", "D", ["a.py"], project) is None
+    # The way through: work that builds no operation keeps its own check.
+    for scope in (["pyproject.toml", "README.md"], ["tests/test_cobs.py"], ["docs/"]):
+        assert problem(pytest_only, "Package", scope, project) is None, scope
+    assert problem(pytest_only, "Package", ["pyproject.toml", "src/cobs.py"], project) is not None
+    # At pursuit_step, the refusal is the tool's result and nothing opens.
+    monkeypatch.chdir(project)
+    _ready_task(fake_beagle)
+    runtime, _ = _bound(tmp_path)
+    arguments = {"task": "T0002", "criteria": "c", "done_when": pytest_only, "scope": ["cobs.py"]}
+    result = await _tool(runtime, "pursuit_step").execute("c1", arguments)
+    assert result.text.startswith("pursuit_step: T0002 not opened — done_when runs no"), result.text
+    assert "`beagle pursuit contract run --operation encode`" in result.text
+    assert _pursuit_calls(fake_beagle, "open") == []
+
+
 #: R96's sealed test of prop-marker-inside, cut down: the code's answer is
 #: [81664], as the cited spec gives, and the test expected [319].
 WRENFOLD_ACCEPT = """\
