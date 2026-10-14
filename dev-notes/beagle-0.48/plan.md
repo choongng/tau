@@ -118,8 +118,9 @@ four-task q35 rotation as the before/after the owner asked for.
 - The driver's `pursuit_plan` milestone entry gains one optional field:
   `source`, a reference name such as `itc2008`, or `itc2008` plus the topic
   words. The cases worker finds the anchors with `beagle refs find` and cites
-  them. The extension takes `--cites` from the anchors of the cases the worker
-  wrote, by asking beagle (`--dry-run` output), not by parsing them itself.
+  them. The extension takes `--cites` from the `cite=` of the markers the
+  worker wrote (0.48 prints no accepted ties; upstream-asks.md 3), and the real
+  `open` re-judges them.
 - Anchors never pass through the driver, so a small driver cannot mistype them.
   This is the measured R94–R99 failure class, in a new place.
 - The cost: coverage of the whole source moves from a gate to
