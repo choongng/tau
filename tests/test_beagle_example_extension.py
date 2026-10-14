@@ -1451,13 +1451,16 @@ brief = sys.stdin.read()
 runs = here / "runs.jsonl"
 with runs.open("a") as log:
     scope = os.environ.get("BEAGLE_TAU_WORKER_SCOPE")
+    role = os.environ.get("BEAGLE_TAU_WORKER_ROLE")
     bash_timeout = os.environ.get("TAU_BASH_TIMEOUT_SECONDS")
     record = {"argv": sys.argv[1:], "stdin": brief, "scope": scope, "bash_timeout": bash_timeout}
-    log.write(json.dumps(record) + "\\n")
+    log.write(json.dumps({**record, "role": role}) + "\\n")
 attempt = len(runs.read_text().splitlines())
-if attempt >= int(os.environ.get("FAKE_TAU_SUCCEEDS_ON", "1")):
+# T0601: a cases worker writes only FAKE_TAU_CASES_WRITES.
+writes = "FAKE_TAU_CASES_WRITES" if role == "cases" else "FAKE_TAU_WRITES"
+if role != "cases" and attempt >= int(os.environ.get("FAKE_TAU_SUCCEEDS_ON", "1")):
     Path("done.txt").write_text("done")
-for rel, text in json.loads(os.environ.get("FAKE_TAU_WRITES") or "{}").items():
+for rel, text in json.loads(os.environ.get(writes) or "{}").items():
     Path(rel).parent.mkdir(parents=True, exist_ok=True)
     Path(rel).write_text(text)
 tamper = os.environ.get("FAKE_TAU_TAMPERS")
@@ -19599,3 +19602,267 @@ async def test_known_answers_worker_refs_reads_are_not_counted(
 
     assert all(result.text == "ran" for result in refs + others)
     assert "refusing to read notes.txt: 5 of 10 calls used and nothing written" in late.text
+
+
+# T0601: a milestone with a source is one spec-tied pursuit_step. A cases worker
+# writes beagle-case: marked tests from the source; the task opens with the
+# markers' cites and those files as its cases; then the code worker.
+
+SPEC_CASES = (
+    "from parser import parse\n\n\n"
+    "# beagle-case: parse-int cite=spec:2#ff4 kind=example op=parse\n"
+    "def test_parse_int():\n    assert parse('1') == 1\n\n\n"
+    "# beagle-case: parse-bad cite=spec:3#ab0-4#c01 kind=invalid op=parse\n"
+    "def test_parse_bad():\n    assert parse('x') is None\n"
+)
+
+
+def _source_task(fake: Path, source: str = "spec") -> None:
+    _ready_task(fake)
+    record = json.loads((fake / "show.out").read_text())
+    record["intent"] = f"reads input {_module().SOURCE_LEAD} {source}"
+    (fake / "show.out").write_text(json.dumps(record))
+
+
+SPEC_STEP = {
+    "task": "T0002",
+    "criteria": "parse reads what the spec says",
+    "done_when": "grep -q done done.txt",
+    "scope": ["done.txt"],
+}
+
+
+@pytest.mark.anyio
+async def test_pursuit_step_spec_tied_writes_cases_then_opens_with_cites_and_cases(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.chdir(_pursuit_project(tmp_path))
+    monkeypatch.setenv("FAKE_TAU_CASES_WRITES", json.dumps({"tests/test_parse.py": SPEC_CASES}))
+    _source_task(fake_beagle)
+    runtime, _ = _bound(tmp_path)
+    step = _tool(runtime, "pursuit_step")
+
+    shown = await step.execute("c0", {"task": "T0002"})
+    assert "Its source is spec" in shown.text and _runs(fake_tau) == []
+    result = await step.execute("c1", SPEC_STEP)
+
+    cases, code = _runs(fake_tau)
+    assert cases["role"] == "cases" and code["role"] == "executor"
+    assert cases["scope"] == "tests/"
+    assert "`beagle pursuit rules 2e`" in cases["stdin"] and "the source spec" in cases["stdin"]
+    assert (
+        "beagle pursuit open T0002 --criteria 'parse reads what the spec says' "
+        "--done-when 'grep -q done done.txt' --scope done.txt --cites REF:ANCHOR ... "
+        "--cases FILE ... --dry-run"
+    ) in cases["stdin"]
+    assert _pursuit_calls(fake_beagle, "open") == [
+        [
+            "T0002",
+            "--criteria",
+            "parse reads what the spec says",
+            "--done-when",
+            "grep -q done done.txt",
+            "--scope",
+            "done.txt",
+            "--cites",
+            "spec:2#ff4",
+            "spec:3#ab0-4#c01",
+            "--cases",
+            "tests/test_parse.py",
+        ]
+    ]
+    [commit] = [c for c in _pursuit_calls(fake_beagle, "commit") if "tests/test_parse.py" in c]
+    assert commit[:2] == ["T0002", "tests/test_parse.py"]
+    assert commit[commit.index("--subject") + 1] == "T0002: cases from spec"
+    [close] = _pursuit_calls(fake_beagle, "close")
+    assert close[:3] == ["T0002", "--outcome", "done"]
+    assert close[close.index("--spent") + 1] == "2000"  # the cases worker's too
+    assert "closed done" in result.text
+
+
+@pytest.mark.anyio
+async def test_pursuit_step_no_source_sends_no_cases_worker(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.chdir(_pursuit_project(tmp_path))
+    monkeypatch.setenv("FAKE_TAU_CASES_WRITES", json.dumps({"tests/test_parse.py": SPEC_CASES}))
+    _ready_task(fake_beagle)
+    runtime, _ = _bound(tmp_path)
+    step = _tool(runtime, "pursuit_step")
+
+    shown = await step.execute("c0", {"task": "T0002"})
+    result = await step.execute("c1", SPEC_STEP)
+
+    assert "source" not in shown.text
+    [run] = _runs(fake_tau)
+    assert run["role"] == "executor"
+    [opened] = _pursuit_calls(fake_beagle, "open")
+    assert "--cites" not in opened and "--cases" not in opened
+    assert "closed done" in result.text
+
+
+@pytest.mark.anyio
+async def test_pursuit_step_cases_worker_scope_is_the_tests_the_check_runs(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project = _pursuit_project(tmp_path)
+    monkeypatch.chdir(project)
+    # The worker also writes outside the check's test file: that is no case.
+    writes = {"tests/test_parse.py": SPEC_CASES, "tests/test_other.py": SPEC_CASES}
+    monkeypatch.setenv("FAKE_TAU_CASES_WRITES", json.dumps(writes))
+    monkeypatch.setenv("FAKE_TAU_SUCCEEDS_ON", "99")
+    _source_task(fake_beagle)
+    (fake_beagle / "open.out").write_text("beagle: refused for this test")
+    (fake_beagle / "open.rc").write_text("4")
+    runtime, _ = _bound(tmp_path)
+    module = _module()
+
+    await _tool(runtime, "pursuit_step").execute(
+        "c1", {**SPEC_STEP, "done_when": "grep -q done tests/test_parse.py"}
+    )
+
+    [cases] = _runs(fake_tau)
+    assert cases["scope"] == "tests/test_parse.py"
+    [opened] = _pursuit_calls(fake_beagle, "open")
+    assert opened[opened.index("--cases") + 1 :] == ["tests/test_parse.py"]
+    assert module._cases_scope("python3 -m pytest -q", project) == ["tests/"]
+
+
+@pytest.mark.anyio
+async def test_cases_worker_alone_may_dry_run_the_open(
+    tmp_path: Path, beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The cases worker's scope and its one extra read: open --dry-run, never a binding open.
+    runtime = _scoped_worker(tmp_path, monkeypatch, scope="tests/")
+    bash = _tool_with_hooks(runtime, "bash")
+    dry = "beagle pursuit open T0003 --criteria c --done-when 'pytest -q' --cites s:1#aa --dry-run"
+
+    monkeypatch.setenv("BEAGLE_TAU_WORKER_ROLE", "cases")
+    allowed = await bash.execute("c1", {"command": dry})
+    binding = await bash.execute("c2", {"command": dry.removesuffix(" --dry-run")})
+    monkeypatch.setenv("BEAGLE_TAU_WORKER_ROLE", "executor")
+    executor = await bash.execute("c3", {"command": dry})
+
+    assert allowed.text == "ran"
+    assert "Tool call blocked" in binding.text and "Tool call blocked" in executor.text
+
+
+@pytest.mark.anyio
+async def test_pursuit_step_spec_tied_cases_fail_without_a_marker_and_nothing_opens(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.chdir(_pursuit_project(tmp_path))
+    monkeypatch.setenv("FAKE_TAU_CASES_WRITES", json.dumps({"tests/test_parse.py": "x = 1\n"}))
+    monkeypatch.setenv("FAKE_TAU_REPORT", "the spec has no parse section")
+    _source_task(fake_beagle)
+    runtime, _ = _bound(tmp_path)
+
+    result = await _tool(runtime, "pursuit_step").execute("c1", SPEC_STEP)
+
+    assert "T0002 not opened" in result.text and "`beagle-case:` marker" in result.text
+    assert "the spec has no parse section" in result.text
+    assert [run["role"] for run in _runs(fake_tau)] == ["cases"]
+    assert _pursuit_calls(fake_beagle, "open") == []
+
+
+@pytest.mark.anyio
+async def test_pursuit_step_spec_tied_cases_fail_at_the_open_with_beagles_refusal(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.chdir(_pursuit_project(tmp_path))
+    monkeypatch.setenv("FAKE_TAU_CASES_WRITES", json.dumps({"tests/test_parse.py": SPEC_CASES}))
+    _source_task(fake_beagle)
+    refusal = (
+        "beagle: the cases do not tie to the cited source:\n  op=parse has no invalid or limit case"
+    )
+    (fake_beagle / "open.out").write_text(refusal)
+    (fake_beagle / "open.rc").write_text("4")
+    runtime, _ = _bound(tmp_path)
+
+    result = await _tool(runtime, "pursuit_step").execute("c1", SPEC_STEP)
+
+    assert "`beagle pursuit open` refused (exit 4)" in result.text
+    assert "op=parse has no invalid or limit case" in result.text
+    assert "T0002 is not opened" in result.text and "tests/test_parse.py" in result.text
+    assert [run["role"] for run in _runs(fake_tau)] == ["cases"]
+    assert not any("tests/test_parse.py" in c for c in _pursuit_calls(fake_beagle, "commit"))
+    assert (Path.cwd() / "tests/test_parse.py").exists()  # kept for the next call's worker
+
+
+@pytest.mark.anyio
+async def test_pursuit_plan_keeps_a_part_source_in_its_intent(
+    tmp_path: Path, beagle: Path, fake_beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(_pursuit_project(tmp_path))
+    runtime, _ = _bound(tmp_path)
+    plan = _tool(runtime, "pursuit_plan")
+    item = plan.parameters["properties"]["parts"]["items"]
+    assert {"type": "string"} in item["anyOf"]
+    assert "references/" in plan.parameters["properties"]["parts"]["description"]
+
+    await plan.execute(
+        "c1",
+        {
+            "task": "T0001",
+            "parts": [
+                {"part": "Parse::reads input", "source": "spec: parse"},
+                "Docs::so people can use it",
+            ],
+        },
+    )
+
+    [split] = _pursuit_calls(fake_beagle, "split")
+    assert "Parse::reads input Source: spec: parse" in split
+    assert "Docs::so people can use it" in split
+    record = {"intent": "reads input Source: spec: parse"}
+    assert _module()._task_source(record) == "spec: parse"
+    assert _module()._task_source({"intent": "reads input"}) == ""
+
+
+@pytest.mark.anyio
+async def test_pursuit_found_milestone_source_is_kept_like_a_plan_part(
+    tmp_path: Path, beagle: Path, fake_beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    monkeypatch.chdir(project)
+    (fake_beagle / "add.out").write_text("T0001  Ship it\n")
+    runtime, _ = _bound(tmp_path)
+    found = _tool(runtime, "pursuit_found")
+    milestones = found.parameters["properties"]["milestones"]
+    plan = _tool(runtime, "pursuit_plan").parameters["properties"]["parts"]
+    assert milestones["items"] == plan["items"]
+
+    await found.execute(
+        "c1",
+        {
+            "statement": "Ship it",
+            "criteria": ["`make test` exits 0"],
+            "milestones": [{"part": "Parser", "source": "spec"}, "CLI::wires it up"],
+            "user_confirmed": True,
+        },
+    )
+
+    assert _milestone_splits(fake_beagle) == [
+        ["T0001", "Parser::Source: spec", "CLI::wires it up", "--ordered"]
+    ]

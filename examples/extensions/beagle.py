@@ -300,6 +300,14 @@ WORKER_ENV = "BEAGLE_TAU_WORKER"
 #: no task (`pursuit_dispatch`, an audit) may read the pursuit.
 WORKER_TASK_ENV = "BEAGLE_TAU_WORKER_TASK"
 WORKER_SCOPE_ENV = "BEAGLE_TAU_WORKER_SCOPE"
+#: The role a `pursuit_step` worker was sent in: `EXECUTOR_ROLE` for the task's
+#: work, `CASES_ROLE` for the worker that writes a spec-tied task's cases before
+#: it opens. Only the cases worker may run `beagle pursuit open … --dry-run`.
+WORKER_ROLE_ENV = "BEAGLE_TAU_WORKER_ROLE"
+#: beagle 0.48's `pursuit rules 2e`: a task built from a source has its cases
+#: written, before the code, by "a worker that will not write the code". Its
+#: model is the executor's pin: `.beagle/dispatch.toml` has no role for it.
+CASES_ROLE = "cases"
 
 #: R0002's lean arm: set (to anything but "" or "0"), the mechanisms that caught
 #: nothing across the q35 runs do not fire: known-answers locks, the plan guards,
@@ -313,6 +321,13 @@ LEAN_AUDIT_OFF = "\n[audit]\nevery = 0\n"
 
 #: Where founding puts the references the user's prompt links to, as text.
 REFERENCES_DIR = "references"
+
+#: How a milestone's `source` is kept in its beagle task record: the last words
+#: of its intent, so a restarted session reads it back from `pursuit show`.
+SOURCE_LEAD = "Source:"
+_SOURCE_IN_INTENT = re.compile(r"(?:^|\s)Source:\s*(\S.*?)\s*$")
+#: A `beagle-case:` marker and its `cite=`, as `pursuit rules 2e` spells it.
+_CASE_CITE = re.compile(r"beagle-case:\s*\S+.*?\bcite=(\S+)")
 
 
 def _lean() -> bool:
@@ -788,12 +803,37 @@ def _shell_tokens(command: str) -> list[str] | None:
     for line in lines[1:]:
         text += ("\n" if quote else " ; ") + line
         quote = _heredoc_openers(line, quote)[1]
-    lexer = shlex.shlex(text, posix=True, punctuation_chars=True)
+    lexer = shlex.shlex(_word_hashes_literal(text), posix=True, punctuation_chars=True)
     lexer.whitespace_split = True
     try:
         return list(lexer)
     except ValueError:  # an unclosed quote: not a command this can read
         return None
+
+
+def _word_hashes_literal(text: str) -> str:
+    """`text` with each `#` inside a word escaped, as bash reads it.
+
+    shlex starts a comment at any `#`; bash only at a word's start. A cite's
+    anchor, `spec:2#ff4`, cut the cases worker's `open --dry-run` at its first
+    cite (T0601).
+    """
+    out: list[str] = []
+    quote = ""
+    escaped = False
+    for at, char in enumerate(text):
+        if escaped:
+            escaped = False
+        elif char == "\\" and quote != "'":
+            escaped = True
+        elif quote:
+            quote = "" if char == quote else quote
+        elif char in "'\"":
+            quote = char
+        elif char == "#" and at and not text[at - 1].isspace() and text[at - 1] not in "();<>|&":
+            out.append("\\")
+        out.append(char)
+    return "".join(out)
 
 
 def _is_operator(token: str) -> bool:
@@ -2216,12 +2256,14 @@ async def _run_worker(
     task: str = "",
     scope: list[str] | None = None,
     thinking: str | None = None,
+    role: str = EXECUTOR_ROLE,
 ) -> _WorkerRun:
     """Run one step-executor as a nested `tau -p --mode json` and read its report.
 
-    A task's scope rides in the worker's environment, where its scope guard
-    holds the worker's writes to it. `thinking` is a level the caller already
-    chose (`_worker_thinking`); None chooses it here.
+    A task's scope and the worker's role ride in the worker's environment, where
+    its guards hold the worker's writes to the scope and its beagle calls to the
+    role's. `thinking` is a level the caller already chose (`_worker_thinking`);
+    None chooses it here.
 
     The brief rides on stdin (tau prepends it to the prompt); the persona is
     appended to tau's base system prompt, not swapped for it, so the worker
@@ -2277,8 +2319,10 @@ async def _run_worker(
     env = {**os.environ, WORKER_ENV: "1", BASH_TIMEOUT_ENV_VAR: f"{_worker_bash_timeout():g}"}
     env.pop(WORKER_TASK_ENV, None)
     env.pop(WORKER_SCOPE_ENV, None)
+    env.pop(WORKER_ROLE_ENV, None)
     if task:
         env[WORKER_TASK_ENV] = task
+        env[WORKER_ROLE_ENV] = role
     if scope:
         env[WORKER_SCOPE_ENV] = "\n".join(scope)
     try:
@@ -3210,6 +3254,34 @@ def _strings(value: Any) -> list[str]:
     return [str(item).strip() for item in value if str(item).strip()]
 
 
+def _milestone_parts(value: Any) -> list[str]:
+    """Milestone entries as `title::intent` strings; an entry given a `source`
+    keeps it as the intent's last words, `Source: <ref>` (`_task_source`)."""
+    if isinstance(value, (str, dict)):
+        value = [value]
+    if not isinstance(value, list):
+        return []
+    parts = []
+    for item in value:
+        if not isinstance(item, dict):
+            parts.append(str(item).strip())
+            continue
+        part = str(item.get("part") or item.get("title") or "").strip()
+        source = " ".join(str(item.get("source") or "").split())
+        if part and source:
+            title, _, intent = part.partition("::")
+            part = f"{title.strip()}::{f'{intent.strip()} ' if intent.strip() else ''}"
+            part += f"{SOURCE_LEAD} {source}"
+        parts.append(part)
+    return [part for part in parts if part]
+
+
+def _task_source(record: Mapping[str, Any]) -> str:
+    """The reference a task's record names as its source (`_milestone_parts`), or ""."""
+    found = _SOURCE_IN_INTENT.search(str(record.get("intent") or ""))
+    return found.group(1).strip() if found else ""
+
+
 def _toml_string(text: str) -> str:
     # A JSON string is a valid TOML basic string: same quotes, same escapes.
     return json.dumps(text)
@@ -3218,6 +3290,37 @@ def _toml_string(text: str) -> str:
 def _tree(root: Path) -> str:
     rc, out = _pursuit(["tree"], root)
     return out if rc == 0 else ""
+
+
+#: The one sentence of planning guidance spec-tying needs: the rest is beagle's
+#: (`pursuit rules 2e`), read by the worker that writes the cases.
+SOURCE_SENTENCE = (
+    "Name a source for a part whose behaviour a file in references/ states: "
+    '{"part": "<title>::<what it is for>", "source": "<that file\'s name>"}.'
+)
+
+#: A milestone or plan part: the `title::intent` string, or that string with the
+#: reference it is built from. Fixed per build, as every tool schema is.
+MILESTONE_ITEM: dict[str, Any] = {
+    "anyOf": [
+        {"type": "string"},
+        {
+            "type": "object",
+            "properties": {
+                "part": {"type": "string", "description": "'<title>::<what it is for>'."},
+                "source": {
+                    "type": "string",
+                    "description": (
+                        "The file in references/ that states this part's behaviour, by "
+                        "name (itc2008), optionally with the topic's words. A sub-agent "
+                        "writes its cases from it before the work."
+                    ),
+                },
+            },
+            "required": ["part"],
+        },
+    ]
+}
 
 
 FOUND_PARAMETERS: dict[str, Any] = {
@@ -3240,10 +3343,10 @@ FOUND_PARAMETERS: dict[str, Any] = {
         },
         "milestones": {
             "type": "array",
-            "items": {"type": "string"},
+            "items": MILESTONE_ITEM,
             "description": (
                 "The parts of the goal you can already name, in order, each "
-                "'<title>::<what it is for>'. Three to seven is typical."
+                "'<title>::<what it is for>'. Three to seven is typical. " + SOURCE_SENTENCE
             ),
         },
         "ordered": {
@@ -3966,7 +4069,7 @@ def make_found_tool(
             )
         statement = str(arguments.get("statement") or "").strip()
         criteria = _strings(arguments.get("criteria"))
-        milestones = _strings(arguments.get("milestones"))
+        milestones = _milestone_parts(arguments.get("milestones"))
         if not statement or not criteria:
             return _step_result("pursuit_found: 'statement' and 'criteria' are both required.")
         if not milestones:
@@ -4101,8 +4204,8 @@ PLAN_PARAMETERS: dict[str, Any] = {
         },
         "parts": {
             "type": "array",
-            "items": {"type": "string"},
-            "description": "Its steps, each '<title>::<what it is for>'.",
+            "items": MILESTONE_ITEM,
+            "description": "Its steps, each '<title>::<what it is for>'. " + SOURCE_SENTENCE,
         },
         "ordered": {
             "type": "boolean",
@@ -4415,7 +4518,7 @@ def make_plan_tool() -> Any:
         if goal is None:
             return _step_result("pursuit_plan: no pursuit here yet; call pursuit_found first.")
         task = str(arguments.get("task") or "").strip()
-        parts = _strings(arguments.get("parts"))
+        parts = _milestone_parts(arguments.get("parts"))
         if not task or not parts:
             return _step_result("pursuit_plan: 'task' and 'parts' are both required.")
         parts, split_notes = _split_part_lines(parts)
@@ -10916,6 +11019,136 @@ def _not_workable_text(
     )
 
 
+def _cases_scope(done_when: str, root: Path) -> list[str]:
+    """Where a spec-tied task's cases worker may write: the test paths its check
+    names, so every case file is one the check runs; tests/ when it names none."""
+    named = [
+        rel
+        for rel in _check_run_files(done_when, root)
+        if _is_test_path(rel) or Path(rel).name in ("tests", "test")
+    ]
+    return named or ["tests/"]
+
+
+def _cases_brief(
+    task: str,
+    title: str,
+    source: str,
+    criteria: str,
+    done_when: str,
+    scope: list[str],
+    cases_scope: list[str],
+) -> str:
+    """The cases worker's brief: beagle's `pursuit rules 2e` is the policy, the
+    dry run of the task's own open is the stop; tau fills in the task, the
+    criteria and the check, the worker the cites and the case files."""
+    dry = ["beagle", "pursuit", "open", task, "--criteria", criteria, "--done-when", done_when]
+    if scope:
+        dry += ["--scope", *scope]
+    dry_run = " ".join(shlex.quote(word) for word in dry)
+    return (
+        f"You write the cases for {task} ({title}) from the source {source} in "
+        f"{REFERENCES_DIR}/. A later sub-agent writes the code: write only the tests.\n\n"
+        "Run `beagle pursuit rules 2e` first and do what it says. Find the source's "
+        "lines with `beagle refs find WORDS` and `beagle refs show NAME`.\n\n"
+        f"The task: {criteria}\n"
+        f"Write the cases in {', '.join(cases_scope)}, which its check runs: `{done_when}`\n\n"
+        "You are done when this passes, with your cites and case files added:\n"
+        f"  {dry_run} --cites REF:ANCHOR ... --cases FILE ... --dry-run\n"
+        "It passes while the tests fail: the code is not written yet. End with a report "
+        "naming the case files and the cites.\n\n"
+        + NO_BEAGLE_NOTE
+        + " You may also run that `beagle pursuit open ... --dry-run`."
+        + "\n\n"
+        + _turn_cap_note()
+    )
+
+
+def _marker_ties(root: Path, cases_scope: list[str]) -> tuple[list[str], list[str]]:
+    """The case files a cases worker left (changed files in `cases_scope` whose
+    new lines carry a `beagle-case:` marker) and the `cite=`s of those markers.
+
+    Interim, until beagle reads the ties from the markers itself
+    (dev-notes/beagle-0.48/upstream-asks.md, 3).
+    """
+    files: list[str] = []
+    cites: list[str] = []
+    candidates = _changed_files(root)
+    if _run(["git", "rev-parse", "--is-inside-work-tree"], root, 30.0)[0] != 0:
+        # No history to tell this worker's lines from older ones: every file there.
+        candidates = [
+            path.relative_to(root).as_posix()
+            for entry in cases_scope
+            for path in sorted([root / entry, *(root / entry).rglob("*")])
+            if path.is_file()
+        ]
+    for rel in candidates:
+        if not _in_scope(rel, cases_scope, root) or not (root / rel).is_file():
+            continue
+        rc, diff = _run(["git", "diff", "-U0", "HEAD", "--", rel], root, 30.0)
+        if rc == 0 and diff:
+            lines = [line[1:] for line in diff.splitlines() if line.startswith("+")]
+        else:
+            try:
+                lines = (root / rel).read_text(errors="replace").splitlines()
+            except OSError:
+                continue
+        found = [m.group(1) for line in lines if (m := _CASE_CITE.search(line))]
+        if found:
+            files.append(rel)
+            cites.extend(cite for cite in found if cite not in cites)
+    return files, cites
+
+
+async def _write_cases(
+    task: str,
+    title: str,
+    source: str,
+    criteria: str,
+    done_when: str,
+    scope: list[str],
+    arguments: Mapping[str, Any],
+    root: Path,
+    signal: Any = None,
+) -> tuple[list[str], list[str], int | None] | str:
+    """Run a spec-tied task's cases worker: its case files, their cites and the
+    tokens it spent, or the step's reply when the task cannot open on them.
+
+    One cases worker per pursuit_step call; what it wrote stays on disk, so the
+    next call's worker corrects it rather than starting over.
+    """
+    bad_thinking = _bad_thinking(arguments.get("thinking"))
+    if bad_thinking:
+        return f"pursuit_step: {task} not run — {bad_thinking}"
+    # dispatch.toml has no cases role: the executor's pin and the step's choices.
+    pin = _dispatch_pin(EXECUTOR_ROLE, root)
+    model, provider = _worker_target(arguments.get("model"), arguments.get("provider"), pin)
+    thinking = _worker_thinking(model, provider, arguments.get("thinking"), pin)
+    timeout = _worker_timeout(arguments.get("timeout"), _worker_wall(root, model, provider))[0]
+    cases_scope = _cases_scope(done_when, root)
+    brief = _cases_brief(task, title, source, criteria, done_when, scope, cases_scope)
+    run = await _run_worker(
+        brief, root, model, provider, timeout, signal, task, cases_scope, thinking, CASES_ROLE
+    )
+    said = f"\n\nIts report:\n{_capped_report(run)}" if run.report else ""
+    if run.problem is not None:
+        return (
+            f"pursuit_step: {task} not opened — the sub-agent writing its cases from "
+            f"{source} did not finish: {run.problem}{said}\n\nCall pursuit_step with "
+            f'task="{task}" again to have them written.'
+        )
+    files, cites = _marker_ties(root, cases_scope)
+    if not files:
+        return (
+            f"pursuit_step: {task} not opened — the sub-agent writing its cases from "
+            f"{source} left no test in {', '.join(cases_scope)} with a `beagle-case:` "
+            f"marker, so there is nothing to tie the task to.{said}\n\nCall pursuit_step "
+            f'with task="{task}" again to have them written, or with a done_when that '
+            "names the test file the cases go in."
+        )
+    return files, cites, run.spent
+
+
 def make_step_tool() -> Any:
     """Build `pursuit_step`: one task, opened, done by a sub-agent, checked and closed.
 
@@ -11330,6 +11563,10 @@ def make_step_tool() -> Any:
                         await _bound_check_fails(task, arguments, record, root),
                     )
                 )
+        # T0601: a task with a source has its cases written before it opens.
+        source = _task_source(record)
+        cases_spent: int | None = None
+        case_files: list[str] = []
         if not retrying and task not in open_ids and record.get("status") != "open":
             predecessor = str(record.get("sibling_of") or "").strip()
             carried = _carried_criteria(predecessor, root) if predecessor and not route else ""
@@ -11370,14 +11607,28 @@ def make_step_tool() -> Any:
                     "  notes: where to start, what to leave alone\n"
                     "A sub-agent does the work and the check decides. If you cannot write "
                     "the criteria yet, the task is too big: split it with pursuit_plan."
+                    + (
+                        f"\nIts source is {source}: first another sub-agent writes its "
+                        "cases from that as tests, in the test files done_when runs."
+                        if source
+                        else ""
+                    )
                 )
             chained, prose = _and_chain(done_when)
             if prose is not None or chained is None:
                 return _step_result(f"pursuit_step: {task} not opened — {prose}")
             route += _bound_note(done_when, chained)
             done_when = chained
+            if source:
+                cased = await _write_cases(
+                    task, title, source, criteria, done_when, scope, arguments, root, signal
+                )
+                if isinstance(cased, str):
+                    return _step_result(cased)
+                case_files, case_cites, cases_spent = cased
             rewritten_from: tuple[str, str] | None = None
-            data_only = _data_only_bind(done_when, scope, root)
+            # A spec-tied task's check runs its cases as they are: no data-test rewrite.
+            data_only = None if source else _data_only_bind(done_when, scope, root)
             if data_only is not None:
                 data_check, data_scope, data_note = data_only
                 probe = await _run_check(data_check, root, DEFAULT_CHECK_TIMEOUT)
@@ -11532,6 +11783,8 @@ def make_step_tool() -> Any:
             argv = ["open", task, "--criteria", criteria, "--done-when", done_when]
             if scope:
                 argv += ["--scope", *scope]
+            if case_files:
+                argv += ["--cites", *case_cites, "--cases", *case_files]
             budget = str(arguments.get("budget") or "").strip()
             if budget:
                 argv += ["--budget", budget]
@@ -11548,8 +11801,24 @@ def make_step_tool() -> Any:
                 refused, then = _relay_next(opened, "")
                 return _step_result(
                     f"pursuit_step: `beagle pursuit open` refused (exit {rc}):\n{refused}"
+                    + (
+                        f"\n\n{task} is not opened. The cases written from {source} stay "
+                        f"in {', '.join(case_files)}; the next pursuit_step for {task} has "
+                        "them corrected."
+                        if case_files
+                        else ""
+                    )
                     + (f"\n\n{then}" if then else "")
                 )
+            if case_files:
+                # beagle pins the cases by hash at the open; commit them as the
+                # task's first work, so the code worker starts from them.
+                subject = f"{task}: cases from {source}"
+                argv = ["commit", task, *case_files, "--subject", subject, "--no-claims"]
+                if _pursuit(argv, root)[0] != 0:
+                    unsaved = _commit_only(root, case_files, [subject])
+                    if unsaved:
+                        route += f"The cases are not committed: {unsaved}\n\n"
             if _KILLED_NOT_OPENED.get(str(_resolved(root)), ("",))[0] == task:
                 del _KILLED_NOT_OPENED[str(_resolved(root))]
             rc, out = _pursuit(["show", task], root)
@@ -11800,7 +12069,7 @@ def make_step_tool() -> Any:
             attempts = DEFAULT_STEP_ATTEMPTS
         check_timeout = float(record.get("check_timeout") or DEFAULT_CHECK_TIMEOUT)
 
-        spent: int | None = None
+        spent: int | None = cases_spent
         report = shown = ended = ""
         verdict: tuple[int, str] = (1, "")
         bad_thinking = _bad_thinking(arguments.get("thinking"))
@@ -12652,16 +12921,34 @@ def _worker_beagle_read(argv: list[str]) -> str | None:
     beagle 0.48 gives a spec-tied task's worker its reads: `refs find` and `refs
     show` print the numbered reference lines a cite copies, `pursuit rules
     [section]` the step's rules, and `pursuit coverage <ref>` the reference's
-    lines no done task cites. None of them writes.
+    lines no done task cites. None of them writes, and neither does the cases
+    worker's `pursuit open … --dry-run` (`_cases_dry_run`).
     """
     if not _named(argv, "beagle"):
         return None
+    if _cases_dry_run(argv):
+        return " ".join(argv)
     words = [arg for arg in argv[1:] if not arg.startswith("-")]
     if words[:2] in (["refs", "find"], ["refs", "show"]):
         return " ".join(argv)
     if words[:2] in (["pursuit", "rules"], ["pursuit", "coverage"]):
         return " ".join(argv)
     return None
+
+
+def _cases_dry_run(argv: list[str]) -> bool:
+    """Whether `argv` is `beagle pursuit open … --dry-run` in a cases worker.
+
+    A dry run makes every refusal and runs the check, binding nothing: the
+    cases worker's stop condition (`_cases_brief`). Every other worker, and
+    every open that binds, stays the parent's.
+    """
+    words = argv[1 : argv.index("--")] if "--" in argv else argv[1:]
+    return (
+        os.environ.get(WORKER_ROLE_ENV, "") == CASES_ROLE
+        and _pursuit_verb(argv) == "open"
+        and "--dry-run" in words
+    )
 
 
 def _refs_read_call(command: str) -> bool:
@@ -13761,7 +14048,9 @@ def make_worker_pursuit_guard() -> Any:
 
                 # S01: `--help` prints and exits, whatever verb it follows.
                 def write(argv: list[str]) -> str | None:
-                    return None if _beagle_help_or_doctor(argv) else _pursuit_write_verb(argv)
+                    if _beagle_help_or_doctor(argv) or _cases_dry_run(argv):
+                        return None
+                    return _pursuit_write_verb(argv)
 
                 verb = next(
                     (

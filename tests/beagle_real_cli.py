@@ -40,22 +40,31 @@ GIT_ID = {
 
 #: A `tau -p --mode json` worker: makes `STUB_TAU_WRITES` (a JSON map of path
 #: to text), commits it unless `STUB_TAU_COMMITS` is "0", and reports. With no
-#: map it does nothing at all.
+#: map it does nothing at all. Sent as a spec-tied task's cases worker
+#: (`BEAGLE_TAU_WORKER_ROLE=cases`), it makes `STUB_TAU_CASES_WRITES` instead and
+#: commits nothing, as the worker guards hold a real one to. The code worker's
+#: report ends with `STUB_TAU_REPORT` when it is set.
 STUB_TAU = """\
 import json, os, subprocess, sys
 from pathlib import Path
 
 brief = sys.stdin.read()
 here = Path(os.environ["STUB_TAU_DIR"])
+role = os.environ.get("BEAGLE_TAU_WORKER_ROLE")
 with (here / "runs.jsonl").open("a") as log:
-    log.write(json.dumps({"argv": sys.argv[1:], "cwd": os.getcwd(), "stdin": brief}) + "\\n")
-writes = json.loads(os.environ.get("STUB_TAU_WRITES") or "{}")
+    record = {"argv": sys.argv[1:], "cwd": os.getcwd(), "stdin": brief, "role": role}
+    log.write(json.dumps(record) + "\\n")
+cases = role == "cases"
+writes = json.loads(os.environ.get("STUB_TAU_CASES_WRITES" if cases else "STUB_TAU_WRITES") or "{}")
 for rel, text in writes.items():
+    Path(rel).parent.mkdir(parents=True, exist_ok=True)
     Path(rel).write_text(text)
-if writes and os.environ.get("STUB_TAU_COMMITS") != "0":
+if writes and not cases and os.environ.get("STUB_TAU_COMMITS") != "0":
     subprocess.run(["git", "add", *writes], check=True)
     subprocess.run(["git", "commit", "--quiet", "-m", "stub worker"], check=True)
 report = "made " + ", ".join(writes) if writes else "did nothing"
+if not cases and os.environ.get("STUB_TAU_REPORT"):  # a WITNESS block, say
+    report += "\\n\\n" + os.environ["STUB_TAU_REPORT"]
 message = {
     "role": "assistant",
     "content": [{"type": "text", "text": report}],

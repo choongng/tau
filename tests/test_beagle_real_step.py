@@ -4,15 +4,22 @@ from __future__ import annotations
 
 import json
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
 
 from beagle_real_cli import (
+    GOAL,
+    beagle_cli,
+    beagle_json,
+    bound,
     pinned_beagle,
     show,
     step_hello,
+    task_node,
 )
+from test_beagle_example_extension import _tool
 
 pytestmark = [pytest.mark.real_beagle, pytest.mark.anyio]
 
@@ -65,3 +72,93 @@ async def test_real_step_commits_work_a_worker_left_uncommitted_then_closes(
         text=True,
         check=True,
     ).stdout
+
+
+SPEC = (
+    "Calc.\n"
+    "add(a, b) returns the sum of a and b.\n"
+    "add raises TypeError when a or b is not a number.\n"
+)
+
+CALC = (
+    "def add(a, b):\n"
+    "    if not all(isinstance(x, (int, float)) for x in (a, b)):\n"
+    "        raise TypeError('add takes numbers')\n"
+    "    return a + b\n"
+)
+
+
+def _anchors(project: Path) -> dict[int, str]:
+    """`spec`'s line anchors as `beagle refs show` prints them: `2#ff4| add(...`."""
+    out = beagle_cli(project, "refs", "show", "spec").stdout
+    lines = [line.split("|", 1)[0].strip() for line in out.splitlines() if "|" in line]
+    return {int(anchor.split("#")[0]): anchor for anchor in lines if "#" in anchor}
+
+
+async def test_real_spec_tied_step_writes_cases_opens_tied_and_closes_done(
+    tmp_path: Path, real_beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # T0601: a milestone with a source is one pursuit_step: the cases worker's
+    # marked tests, an open 0.48 accepts with --cites/--cases, the code worker.
+    (real_beagle / "references").mkdir()
+    (real_beagle / "references" / "spec.txt").write_text(SPEC)
+    subprocess.run(["git", "add", "references"], cwd=real_beagle, check=True)
+    subprocess.run(["git", "commit", "--quiet", "-m", "spec"], cwd=real_beagle, check=True)
+    runtime = bound(tmp_path)
+    goal = {
+        **GOAL,
+        "statement": "A calculator",
+        "criteria": ["add works as the spec says", "bye.txt says bye"],
+        "milestones": [
+            {"part": "Add::add(a, b) in calc.py", "source": "spec"},
+            "Bye::write bye.txt saying bye",
+        ],
+    }
+    founded = await _tool(runtime, "pursuit_found").execute("c1", goal)
+    assert "root task" in founded.text, founded.text
+    tree = beagle_json(real_beagle, "pursuit", "tree", "--json")
+    add = task_node(tree, "Add")["id"]
+    assert show(real_beagle, add)["intent"].endswith("Source: spec")
+    anchors = _anchors(real_beagle)
+    cases = (
+        "import pytest\n"
+        "from calc import add\n\n\n"
+        f"# beagle-case: add-sum cite=spec:{anchors[2]} kind=example op=add\n"
+        "def test_add_sum():\n    assert add(2, 3) == 5\n\n\n"
+        f"# beagle-case: add-type cite=spec:{anchors[3]} kind=invalid op=add\n"
+        "def test_add_type():\n    with pytest.raises(TypeError):\n        add('2', 3)\n"
+    )
+    monkeypatch.setenv("STUB_TAU_CASES_WRITES", json.dumps({"tests/test_calc.py": cases}))
+    monkeypatch.setenv("STUB_TAU_WRITES", json.dumps({"calc.py": CALC}))
+    witness = "WITNESS: calc.py\nNEEDLE:\nreturn a + b\nREPLACEMENT:\nreturn a - b\nEND WITNESS"
+    monkeypatch.setenv("STUB_TAU_REPORT", witness)
+    step = _tool(runtime, "pursuit_step")
+    shown = await step.execute("c2", {})
+    assert add in shown.text and "Its source is spec" in shown.text, shown.text
+
+    result = await step.execute(
+        "c3",
+        {
+            "task": add,
+            "criteria": "add returns the sum and refuses what is not a number",
+            "done_when": f"{sys.executable} -m pytest -q -p no:cacheprovider tests/test_calc.py",
+            "scope": ["calc.py"],
+        },
+    )
+
+    runs = [json.loads(line) for line in (tmp_path / "stub-tau" / "runs.jsonl").open()]
+    assert [run["role"] for run in runs] == ["cases", "executor"], result.text
+    assert "beagle pursuit rules 2e" in runs[0]["stdin"]
+    record = show(real_beagle, add)
+    assert record["cites"] == [f"spec.txt:{anchors[2]}", f"spec.txt:{anchors[3]}"], record
+    assert record["cases"] == ["tests/test_calc.py"]
+    assert record["status"] == "done", result.text
+    assert "closed done" in result.text, result.text
+    committed = subprocess.run(
+        ["git", "log", "--format=%s", "--", "tests/test_calc.py"],
+        cwd=real_beagle,
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+    assert committed.strip(), result.text
