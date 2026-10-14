@@ -405,8 +405,15 @@ def _slice_name(title: str) -> str:
 
 
 def _contract_step(title: str, root: Path) -> tuple[list[str], str] | None:
-    """`CONTRACT_STEPS` for a slice task of a pursuit that declares the contract; None."""
-    return CONTRACT_STEPS if _slice_name(title) and _contract_declared(root) else None
+    """`CONTRACT_STEPS` for a slice task of a pursuit that declares the contract; None.
+
+    A slice superseding an entry an upheld dispute retired (`SUPERSEDE_TITLE`)
+    is checked for the superseding entry and the judge's value as well.
+    """
+    if not (_slice_name(title) and _contract_declared(root)):
+        return None
+    eid = _superseded(title)
+    return (list(CONTRACT_STEPS[0]), _supersede_check(eid, root)) if eid else CONTRACT_STEPS
 
 
 def _seal_when_ready(root: Path, title: str) -> str:
@@ -434,19 +441,33 @@ def _seal_when_ready(root: Path, title: str) -> str:
     )
 
 
-def _rereads_due(root: Path) -> list[str]:
-    """beagle's `REREAD due` sections, each as the slice that re-reads it; [] if none."""
+def _rereads_due(root: Path) -> str:
+    """beagle's `REREAD due` sections offered as the slices that re-read them,
+    as the pursuit_plan call that plans them; "" if none is due."""
     rc, out = _pursuit(["contract", "status", "--json"], root)
     status = _json_reply(out) if rc == 0 else None
     due = status.get("rereads") if isinstance(status, dict) else None
-    said = []
+    said, parts = [], []
     for item in due if isinstance(due, list) else []:
         if not isinstance(item, dict) or not item.get("source"):
             continue
-        lines = f"{item.get('first')}-{item.get('last')}"
+        source, lines = item["source"], f"{item.get('first')}-{item.get('last')}"
         why = "; ".join(_strings(item.get("triggers"))) or "due"
-        said.append(f"`{SLICE_PREFIX} reread {item['source']} {lines}` ({why})")
-    return said
+        said.append(f"{source} {lines} ({why})")
+        parts.append(
+            f"{SLICE_PREFIX} reread {source} {lines}::read {source} lines {lines} again, "
+            "fresh, as beagle's brief for a re-read says, and add to this slice each line "
+            "it pins that no entry cites, or exclude it with a why"
+        )
+    if not parts:
+        return ""
+    root_task = _root_task(root)
+    under = f'task="{root_task}"' if root_task else "task=<the root task>"
+    return (
+        f"\n\nA re-read is due, each a slice of its own: {', '.join(said)}. Plan it with "
+        f"pursuit_plan {under} parts={json.dumps(parts)}, then step each (pursuit_step "
+        "gives a slice task its scope and check, and its close seals it)."
+    )
 
 
 def _contract_verdict(gate: Any, root: Path) -> str:
@@ -478,12 +499,7 @@ def _contract_verdict(gate: Any, root: Path) -> str:
             "Sealed slices never change: put them back with git. What they lack goes in "
             "a later slice."
         )
-    rereads = _rereads_due(root)
-    reread = (
-        "\n\nA re-read is due, each a slice of its own: " + ", ".join(rereads) + ". " + plan
-        if rereads
-        else ""
-    )
+    reread = _rereads_due(root)
     pending = gate.get("pending")
     if pending:
         return (
@@ -3562,6 +3578,11 @@ def _tree_nodes(root: Path) -> list[dict[str, Any]]:
     return [n for n in nodes if isinstance(n, dict)] if isinstance(nodes, list) else []
 
 
+def _root_task(root: Path) -> str:
+    """The id of the pursuit's root task; "" when beagle cannot say."""
+    return next((str(n.get("id")) for n in _tree_nodes(root) if not n.get("parent")), "")
+
+
 def _duplicate_of(why: str, task: str, nodes: list[dict[str, Any]]) -> str | None:
     """The done or open task that `why` names as the one `task` repeats, or None."""
     status = {str(n.get("id")): n.get("status") for n in nodes}
@@ -4538,7 +4559,7 @@ def _steppable(ids: list[str], nodes: list[dict[str, Any]]) -> list[str]:
 
     Run R28 listed open container T0012 as workable; the driver stepped it
     seven times in a row and the breaker stopped the run. An open task made to
-    wait on the amend of a test it disputed (T0547) stays open, and waits.
+    wait on the slice superseding an entry it disputed (T0547) stays open, and waits.
     """
     waits = _hard_waits(nodes)
     return [t for t in ids if not _is_container(t, nodes) and t not in waits]
@@ -9073,13 +9094,12 @@ async def _audit(
 
 #: A worker's last line disputing a sealed test, as beagle's brief asks for it.
 _DISPUTE_LINE = re.compile(r"^\W*DISPUTE\W+([\w.:-]*\w)\W*$")
-#: The title of the task that amends a sealed test a judge found wrong; its entry follows.
-AMEND_TITLE = "Amend contract: "
+#: The title of the slice that supersedes a sealed entry a judge found wrong,
+#: before its id: sealed slices never change, so the fix is a new entry in a
+#: later slice with `"supersedes": "<id>"` (incremental-contract.md).
+SUPERSEDE_TITLE = f"{SLICE_PREFIX} supersede "
 #: Where beagle keeps each verdict on a disputed entry, one JSON object per line.
 CONTRACT_DISPUTES = Path(".beagle") / "contract-disputes.jsonl"
-#: Lines either side of an acceptance line naming the entry, as beagle's judge
-#: brief shows them: the amend's check reads the same lines.
-DISPUTE_CONTEXT = 4
 #: What the judging sub-agent is told beyond beagle's dispute brief.
 JUDGE_NOTE = (
     "\n\nRead only this brief and the source file it names; change nothing, and run no "
@@ -9149,33 +9169,43 @@ def _judged_values(said: str) -> tuple[str, str]:
     return clean(parts[0]), clean(parts[1]) if len(parts) > 1 else ""
 
 
-def _amend_check(eid: str, new: str, old: str, root: Path) -> str:
-    """The amend's check: the contract's own, with the test of `eid` pinned to `new`.
+def _superseded(title: str) -> str:
+    """The entry a `Slice: supersede <id>` title names; "" for any other title."""
+    head = SUPERSEDE_TITLE.strip().lower()
+    said = " ".join(title.split())
+    return said[len(head) :].strip() if said.lower().startswith(head + " ") else ""
 
-    The seal reruns the full check and refuses an entry that passes with no
-    code, but a softened test that accepts both values gets past both; so the
-    acceptance lines naming `eid` must hold the judge's value and no longer the
-    one the test expected. An entry no acceptance file names is tested from its
-    own input and expect, so then the contract's JSON is read instead.
+
+#: What a superseding slice's check runs over its draft, given the retired id
+#: and the judge's value: an entry superseding the id, and the value in that
+#: entry or the draft's acceptance, whitespace aside (JSON spreads a list).
+_SUPERSEDE_PROBE = (
+    "import json, os, re, sys; eid, value, draft, accept = sys.argv[1:5]; "
+    'flat = lambda text: re.sub(r"\\s+", "", text); '
+    'fixes = [e for e in json.load(open(draft)).get("entries") or [] '
+    'if isinstance(e, dict) and e.get("supersedes") in (eid,)]; '
+    'held = "".join(json.dumps(e, ensure_ascii=False) for e in fixes) '
+    '+ (open(accept).read() if os.path.isfile(accept) else ""); '
+    "sys.exit(0 if fixes and flat(value) in flat(held) else 1)"
+)
+
+
+def _supersede_check(eid: str, root: Path, value: str | None = None) -> str:
+    """The superseding slice's check: the draft checks, holds an entry superseding
+    `eid`, and holds the value the judge found the source gives.
+
+    T0547's audit: the amend's check grepped for the judge's value, so a bare
+    TEST WRONG pinned nothing and its close released the disputing task. The
+    value is the one beagle kept with the wrong verdict; a verdict without one
+    is never kept (`_judge_dispute`). `value`, when given, is that value.
     """
-    pattern = rf"(?<![\w-]){re.escape(eid)}(?![\w-])"
-    named = re.compile(pattern)
-    in_acceptance = any(
-        path.is_file()
-        and path.suffix != ".json"
-        and named.search(path.read_text(encoding="utf-8", errors="replace"))
-        for path in sorted((root / CONTRACT_DIR).rglob("*"))
-    )
-    excluded = ["--exclude=*.json"] if in_acceptance else []
-    lines = shlex.join(
-        ["grep", "-rhP", f"-C{DISPUTE_CONTEXT}", *excluded, "--", pattern, f"{CONTRACT_DIR}/"]
-    )
-    parts = ["beagle pursuit contract check"]
-    if new:
-        parts.append(f"{lines} | grep -qwF -- {shlex.quote(new)}")
-    if old and old != new:
-        parts.append(f"! {lines} | grep -qwF -- {shlex.quote(old)}")
-    return f"bash -c {shlex.quote(' && '.join(parts))}"
+    new = value or ""
+    for kept in _disputes(root) if value is None else []:
+        if kept.get("entry") == eid and kept.get("verdict") == "wrong":
+            new = _judged_values(str(kept.get("reason") or ""))[0]
+    accept = f"{CONTRACT_DRAFT}/accept.sh"
+    probe = shlex.join(["python3", "-c", _SUPERSEDE_PROBE, eid, new, CONTRACT_DRAFT_FILE, accept])
+    return f"bash -c {shlex.quote(f'{CONTRACT_STEPS[1]} && {probe}')}"
 
 
 def _stands_note(task: str, root: Path) -> str:
@@ -9211,6 +9241,10 @@ async def _judge_dispute(
     what the code does. Its verdict is kept by beagle. A test found wrong gets
     a task on the contract that `task` waits on. Returns whether it was found
     wrong, and what the driver is told.
+
+    T0547's audit: a TEST WRONG naming no value gives the superseding entry
+    nothing to hold, and its slice would release `task` on an empty fix; such a
+    verdict is not kept, and the test stands.
     """
     lead = f"Its sub-agent disputed the sealed test of entry {eid}"
     seals = _seals(root)
@@ -9239,7 +9273,14 @@ async def _judge_dispute(
     if not verdict:
         why = run.problem or "its report ends with no TEST WRONG or TEST RIGHT line"
         return False, f"{lead}; the judging sub-agent gave no verdict ({why}).\n\n"
-    reason = said or f"the cited source {'agrees with' if verdict == 'right' else 'contradicts'} it"
+    if verdict == "wrong" and not _judged_values(said)[0]:
+        return False, (
+            f"{lead}; the judging sub-agent said TEST WRONG but named no value the source "
+            "gives (`TEST WRONG: <value> instead of <expected>`), so its verdict is not kept "
+            "and nothing supersedes the entry: the test stands, and the next sub-agent on "
+            f"{task} works to it, or disputes it again.\n\n"
+        )
+    reason = said or "the cited source agrees with it"
     argv = ["contract", "dispute", eid, "--record", "--verdict", verdict, "--reason", reason]
     rc, kept_out = _pursuit([*argv, "--task", task], root, CONTRACT_SEAL_TIMEOUT)
     if rc != 0:
@@ -9256,13 +9297,18 @@ async def _judge_dispute(
     )
     if verdict == "right":
         return False, f"{judged} The test stands, and the next sub-agent on {task} is told so.\n\n"
-    return True, judged + "\n\n" + _amend_task(task, eid, said, brief, record, root)
+    return True, judged + "\n\n" + _supersede_task(task, eid, said, brief, record, root)
 
 
-def _amend_task(
+def _supersede_task(
     task: str, eid: str, said: str, brief: str, record: Mapping[str, Any], root: Path
 ) -> str:
-    """Open a task on the contract to fix the test of `eid`, and have `task` wait on it."""
+    """Open the slice that supersedes the retired entry `eid`, and have `task` wait on it.
+
+    Sealed slices never change (strict append-only, owner 2026-10-13): beagle
+    retired `eid` when it kept the wrong verdict, and its fix is a new entry
+    with `"supersedes"` in a later slice, sealed when this one closes.
+    """
     new, old = _judged_values(said)
     # The entry and the lines it cites, as beagle's judge brief has them.
     cited = brief.split("\nEntry (", 1)
@@ -9270,41 +9316,36 @@ def _amend_task(
     sourced = re.split(tail, "Entry (" + cited[1])[0] if len(cited) > 1 else ""
     intent = (
         f"A judge read the sealed test of entry {eid} against the source it cites: TEST "
-        f"WRONG: {said}. Change that test to what the cited words give.\n{sourced.strip()}"
+        f"WRONG: {said}. {eid} is retired, and its sealed slice is not changed: add a new "
+        f'entry with a new id and "supersedes": "{eid}", citing the same lines, that '
+        f"expects {new}, with `beagle pursuit contract add`, and its test in "
+        f"{CONTRACT_DRAFT}/accept.sh.\n{sourced.strip()}"
     )
-    parent = str(record.get("parent") or "") or next(
-        (str(n.get("id")) for n in _tree_nodes(root) if not n.get("parent")), ""
-    )
-    title = f"{AMEND_TITLE}{eid}"
+    parent = str(record.get("parent") or "") or _root_task(root)
+    title = f"{SUPERSEDE_TITLE}{eid}"
     rc, added = _pursuit(["add", title, "--parent", parent, "--intent", intent[:1000]], root)
     found = _TASK_ID.search(added) if rc == 0 else None
     if found is None:
-        return f"Adding the task to fix that test failed (exit {rc}):\n{added}\n\n"
-    amend = found.group()
+        return f"Adding the slice that supersedes {eid} failed (exit {rc}):\n{added}\n\n"
+    fix = found.group()
     criteria = (
-        f"The acceptance's test of {eid} expects {new or 'what its cited source gives'}"
-        f"{f', not {old}' if old else ''}, and `beagle pursuit contract check` passes."
+        f"The draft holds an entry superseding {eid} that expects {new}"
+        f"{f', not {old}' if old else ''}, and `{CONTRACT_STEPS[1]}` passes."
     )
-    argv = ["open", amend, "--criteria", criteria, "--done-when", _amend_check(eid, new, old, root)]
-    argv += [
-        "--scope",
-        f"{CONTRACT_DIR}/",
-        "--over",
-        f"{task} waits on it: its test of {eid} is wrong",
-    ]
+    check = _supersede_check(eid, root, new)
+    argv = ["open", fix, "--criteria", criteria, "--done-when", check]
+    argv += ["--scope", *CONTRACT_STEPS[0], "--over", f"{task} waits on it: {eid} is wrong"]
     rc, opened = _pursuit(argv, root, timeout=DEFAULT_CHECK_TIMEOUT + 60)
     if rc != 0:
-        return f"{amend} ({title}) was added, but opening it failed (exit {rc}):\n{opened}\n\n"
-    why = f"its test of {eid} is wrong; {amend} fixes it"
-    rc, waits = _pursuit(["depend", task, amend, "--hard", "--reason", why], root)
+        return f"{fix} ({title}) was added, but opening it failed (exit {rc}):\n{opened}\n\n"
+    why = f"its entry {eid} is wrong; {fix} supersedes it"
+    rc, waits = _pursuit(["depend", task, fix, "--hard", "--reason", why], root)
     if rc != 0:
-        return (
-            f"{amend} ({title}) is open, but {task} does not wait on it (exit {rc}):\n{waits}\n\n"
-        )
+        return f"{fix} ({title}) is open, but {task} does not wait on it (exit {rc}):\n{waits}\n\n"
     return (
-        f"{amend} ({title}) is open on {CONTRACT_DIR}/ to fix that test, and the contract is "
-        f"sealed again when it closes; {task} waits on it.\n\n"
-        f'Next: pursuit_step task="{amend}".'
+        f"{fix} ({title}) is open on {CONTRACT_DIR}/ to supersede that entry in a new slice, "
+        f"sealed when it closes; {task} waits on it.\n\n"
+        f'Next: pursuit_step task="{fix}".'
     )
 
 
@@ -13748,27 +13789,69 @@ def _own_path(path: Path, root: Path) -> Path:
     return own if own == root or root in own.parents else _resolved(path)
 
 
-def _sibling_read(tool: str, args: Mapping[str, Any], cwd: Path, root: Path) -> str | None:
-    """The path a read or a reading command names beside the project, or None."""
+def _read_path(
+    tool: str, args: Mapping[str, Any], cwd: Path, hit: Callable[[Path], bool]
+) -> str | None:
+    """The path a read or a reading command names for which `hit` holds, or None."""
 
-    def beside(word: str) -> bool:
+    def held(word: str) -> bool:
         try:
-            return _beside(cwd / Path(word).expanduser(), root)
+            return hit(cwd / Path(word).expanduser())
         except RuntimeError:  # `~user` with no such user
             return False
 
     if tool == "read":
         raw = str(args.get("path") or "")
-        return raw if raw.strip() and beside(raw) else None
+        return raw if raw.strip() and held(raw) else None
     if tool != "bash":
         return None
 
     def match(argv: list[str]) -> str | None:
         if Path(argv[0]).name not in _READERS:
             return None
-        return next((a for a in argv[1:] if a and not a.startswith("-") and beside(a)), None)
+        return next((a for a in argv[1:] if a and not a.startswith("-") and held(a)), None)
 
     return _bash_find(str(args.get("command", "")), match)
+
+
+def _sibling_read(tool: str, args: Mapping[str, Any], cwd: Path, root: Path) -> str | None:
+    """The path a read or a reading command names beside the project, or None."""
+    return _read_path(tool, args, cwd, lambda path: _beside(path, root))
+
+
+#: What a file of code is named, for `_code_read`.
+_CODE_SUFFIXES = frozenset(
+    {
+        ".py", ".pyi", ".pyx", ".rs", ".c", ".h", ".cc", ".cpp", ".cxx", ".hh", ".hpp",
+        ".go", ".js", ".mjs", ".cjs", ".ts", ".tsx", ".jsx", ".java", ".kt", ".rb", ".zig",
+        ".swift", ".cs", ".scala", ".hs", ".ml", ".ex", ".exs", ".erl", ".lua", ".jl",
+    }
+)  # fmt: skip
+#: Why a slice task's worker may not read the code (T0560).
+CODE_READ_REASON = (
+    "a slice task writes the contract from its sources, not from the code under test, "
+    "so that the contract cannot be fitted to what the code does. Read the sources, "
+    f"{REFERENCES_DIR}/ and {CONTRACT_DIR}/ only, and say in your report what the "
+    "sources leave open."
+)
+
+
+def _code_read(tool: str, args: Mapping[str, Any], cwd: Path, root: Path) -> str | None:
+    """The file of code in the project a read or a reading command names, outside
+    the contract and the references; None for any other.
+
+    incremental-contract.md: a slice's worker reads the sources, the
+    references and the contract, never the code its entries will judge.
+    """
+
+    def code(path: Path) -> bool:
+        path = _own_path(path, root)
+        if path.suffix not in _CODE_SUFFIXES or root not in path.parents:
+            return False
+        top = path.relative_to(root).parts[0]
+        return top not in (CONTRACT_DIR, REFERENCES_DIR, ".beagle")
+
+    return _read_path(tool, args, cwd, code)
 
 
 def _worker_scope() -> tuple[str, tuple[str, ...]] | None:
@@ -14230,6 +14313,13 @@ def make_worker_scope_guard() -> Any:
             if sent is None:
                 return None
             task, scope = sent
+            if home is not None and _contract_work(list(scope), _resolved(home.parent.parent)):
+                # T0560: a slice's worker cannot read the code its entries judge.
+                code = _code_read(event.tool_name, arguments, cwd, _resolved(home.parent.parent))
+                if code is not None:
+                    return ToolCallHookResult(
+                        block=True, reason=f"refusing to read {code}: {CODE_READ_REASON}"
+                    )
             known = _only_data_and_tests(list(scope))
             free = _free_reference_call(event.tool_name, arguments, command, cwd, windows)
             # R79: `contract refs` is how a contract worker reads the references.

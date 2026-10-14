@@ -7970,6 +7970,61 @@ async def test_worker_scope_guard_refuses_writes_into_beagle_store(
         assert "outside T0006's scope" not in result.text
 
 
+@pytest.mark.anyio
+async def test_slice_worker_refused_code_read(
+    tmp_path: Path, beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # T0560: a slice's worker writes the contract from the sources; read from the
+    # code under test, its entries would be fitted to what the code does.
+    module = _module()
+    runtime = _scoped_worker(tmp_path, monkeypatch, scope="contract/")
+    project = Path.cwd()
+    goal = project / ".beagle" / "pursuit.toml"
+    goal.write_text(goal.read_text() + module.CONTRACT_TABLE, encoding="utf-8")
+    for rel in (
+        "itc/clock.py",
+        "tests/test_itc.py",
+        "references/itc2008.txt",
+        "references/ref_impl.py",
+        "contract/draft/standin/itc.py",
+        "SPEC.md",
+    ):
+        (project / rel).parent.mkdir(parents=True, exist_ok=True)
+        (project / rel).write_text("x\n")
+    refused = [
+        ("read", {"path": "itc/clock.py"}),
+        ("read", {"path": f"{project}/tests/test_itc.py"}),
+        ("bash", {"command": "cat itc/clock.py"}),
+        ("bash", {"command": "grep -n fork tests/test_itc.py"}),
+        ("bash", {"command": "cd itc && sed -n 1,40p ./clock.py"}),
+    ]
+    allowed = [
+        ("read", {"path": "references/itc2008.txt"}),
+        ("read", {"path": "references/ref_impl.py"}),
+        ("read", {"path": "contract/draft/standin/itc.py"}),
+        ("read", {"path": "SPEC.md"}),
+        ("bash", {"command": "grep -n fork references/itc2008.txt"}),
+        ("bash", {"command": "ls itc"}),
+        ("read", {"path": "/tmp/probe.py"}),
+    ]
+
+    for tool, arguments in refused:
+        result = await _tool_with_hooks(runtime, tool).execute("c1", arguments)
+
+        assert "refusing to read " in result.text, arguments
+        assert module.CODE_READ_REASON in result.text, arguments
+    for tool, arguments in allowed:
+        assert (await _tool_with_hooks(runtime, tool).execute("c2", arguments)).text == "ran", (
+            arguments
+        )
+    # A worker on the code reads it as before.
+    coder = _scoped_worker(tmp_path / "coder", monkeypatch, scope="itc/")
+    (Path.cwd() / "itc").mkdir()
+    (Path.cwd() / "itc" / "clock.py").write_text("x\n")
+    read = {"path": "itc/clock.py"}
+    assert (await _tool_with_hooks(coder, "read").execute("c3", read)).text == "ran"
+
+
 def _known_answers_worker(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, title: str
 ) -> ExtensionRuntime:
@@ -19736,11 +19791,49 @@ async def test_nothing_ready_says_what_the_contracts_acceptance_found(
     rereads = [{"source": "spec.md", "first": 40, "last": 52, "triggers": ["dispute C4"]}]
     (fake_beagle / "contract-status.out").write_text(json.dumps({"rereads": rereads}))
     reread = await step(gate | {"met": True})
-    assert "A re-read is due, each a slice of its own: `Slice: reread spec.md 40-52`" in reread
-    assert "(dispute C4)" in reread
+    assert "A re-read is due, each a slice of its own: spec.md 40-52 (dispute C4)" in reread
     unsealed = await step({"state": "draft", "met": False})
     assert "no slice of the contract is sealed yet (it is draft)" in unsealed
     assert "The first is `Slice: examples`" in unsealed
+
+
+@pytest.mark.anyio
+async def test_reread_due_offers_slice(
+    tmp_path: Path, beagle: Path, fake_beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # T0560: beagle's `REREAD due` is offered as the slice that re-reads the
+    # section, in the pursuit_plan call that plans it under the root task.
+    module = _module()
+    project = _contract_project(tmp_path)
+    monkeypatch.chdir(project)
+    monkeypatch.setenv("PATH", f"{fake_beagle}{os.pathsep}{os.environ['PATH']}")
+    nodes = [{"id": "T0001", "title": "Ship it", "status": "open"}]
+    (fake_beagle / "tree.out").write_text(json.dumps({"goal": "Ship it", "nodes": nodes}))
+    rereads = [
+        {"source": "spec.md", "first": 40, "last": 52, "triggers": ["upheld dispute: C4"]},
+        {"source": "rfc.txt", "first": 7, "last": 9, "triggers": ["resistance: C9 failed"]},
+    ]
+    (fake_beagle / "contract-status.out").write_text(json.dumps({"rereads": rereads}))
+    run = {"command": "sh contract/accept.sh", "code": 1, "tail": ["FAIL C9"]}
+    gate = {"state": "sealed", "met": False, "acceptance": run, "current": True}
+
+    said = module._contract_verdict(gate, project)
+
+    assert ["status", "--json"] in _pursuit_calls(fake_beagle, "contract")
+    assert "A re-read is due, each a slice of its own: spec.md 40-52 (upheld dispute: C4), " in said
+    call = said.split('pursuit_plan task="T0001" parts=', 1)[1]
+    parts = json.loads(call[: call.index("]") + 1])
+    assert [p.split("::")[0] for p in parts] == [
+        "Slice: reread spec.md 40-52",
+        "Slice: reread rfc.txt 7-9",
+    ]
+    assert "lines 40-52 again, fresh" in parts[0]
+    # Each is a slice pursuit_step scopes, checks and seals by its title.
+    assert module._contract_step(parts[0].split("::")[0], project) == module.CONTRACT_STEPS
+    assert module._slice_name(parts[1].split("::")[0]) == "reread-rfc-txt-7-9"
+    # None due, none offered.
+    (fake_beagle / "contract-status.out").write_text(json.dumps({"rereads": []}))
+    assert "re-read" not in module._contract_verdict(gate, project)
 
 
 @pytest.mark.anyio
@@ -19873,14 +19966,14 @@ def _disputed_project(
     (fake_beagle / "next.out").write_text(json.dumps({"open": ["T0002"], "ready": []}))
     (fake_beagle / "brief.out").write_text("# T0002: Decode\n")
     (fake_beagle / "contract-dispute.out").write_text(WRENFOLD_JUDGE_BRIEF)
-    (fake_beagle / "add.out").write_text("T0009  Amend contract: prop-marker-inside\n")
+    (fake_beagle / "add.out").write_text("T0009  Slice: supersede prop-marker-inside\n")
     monkeypatch.setenv("PATH", f"{fake_beagle}{os.pathsep}{os.environ['PATH']}")
     monkeypatch.setenv("FAKE_TAU_SUCCEEDS_ON", "99")
     return project
 
 
 @pytest.mark.anyio
-async def test_pursuit_step_dispute_is_judged_and_an_upheld_one_amends_the_contract(
+async def test_upheld_dispute_supersedes(
     tmp_path: Path,
     beagle: Path,
     fake_beagle: Path,
@@ -19889,6 +19982,8 @@ async def test_pursuit_step_dispute_is_judged_and_an_upheld_one_amends_the_contr
 ) -> None:
     # R96: the sealed test invented decode(81 3f 00) == [319]; the spec gives 81664,
     # and the worker spent its wall deciding the contract was wrong but sealed.
+    # Strict append-only (T0560): the upheld dispute retires the entry, and a new
+    # slice supersedes it; the sealed slice is never amended.
     module = _module()
     project = _disputed_project(tmp_path, fake_beagle, fake_tau, monkeypatch)
     worker = "The spec makes 0x81 a three-byte form: 81664.\nDISPUTE `prop-marker-inside`."
@@ -19918,11 +20013,12 @@ async def test_pursuit_step_dispute_is_judged_and_an_upheld_one_amends_the_contr
             "T0002",
         ],
     ]
-    # A task on the contract, its brief carrying the entry, the cited words and the line.
+    # A slice task, its brief carrying the entry, the cited words and the line.
     [added] = _pursuit_calls(fake_beagle, "add")
-    assert added[:3] == ["Amend contract: prop-marker-inside", "--parent", "T0001"]
+    assert added[:3] == ["Slice: supersede prop-marker-inside", "--parent", "T0001"]
     intent = added[added.index("--intent") + 1]
     assert "TEST WRONG: [81664] instead of [319]" in intent
+    assert '"supersedes": "prop-marker-inside"' in intent and "expects [81664]" in intent
     assert '"statement": "inside a form 0x3F is a byte"' in intent
     assert "inside a two-, three- or five-byte form it is an ordinary byte" in intent
     [opened] = _pursuit_calls(fake_beagle, "open")
@@ -19931,30 +20027,74 @@ async def test_pursuit_step_dispute_is_judged_and_an_upheld_one_amends_the_contr
     assert module._check_problem(check) is None
     assert _pursuit_calls(fake_beagle, "depend")[0][:3] == ["T0002", "T0009", "--hard"]
     assert "TEST WRONG: [81664] instead of [319]" in result.text
+    assert "to supersede that entry in a new slice" in result.text
     assert 'Next: pursuit_step task="T0009"' in result.text
+    # The slice is a slice: sealed by its title at close, and stepped on this check
+    # again, derived from the verdict beagle kept.
+    assert module._slice_name("Slice: supersede prop-marker-inside") == (
+        "supersede-prop-marker-inside"
+    )
+    kept = {"entry": "prop-marker-inside", "verdict": "wrong", "seals": 1}
+    disputes = project / module.CONTRACT_DISPUTES
+    disputes.write_text(json.dumps(kept | {"reason": "[81664] instead of [319]"}) + "\n")
+    assert module._contract_step("Slice: supersede prop-marker-inside", project) == (
+        ["contract/"],
+        check,
+    )
 
-    # Its check is the contract's own and the judge's value: the sealed test and a
-    # softened one that takes both values fail it; the test the source gives passes.
-    accept = project / "contract" / "accept.sh"
+    # Its check: the draft checks, supersedes the entry and holds the judge's
+    # value; the sealed slice and its test are left as they are.
+    draft = project / module.CONTRACT_DRAFT_FILE
+    draft.parent.mkdir(parents=True)
 
-    async def passes(want: str) -> bool:
-        accept.write_text(WRENFOLD_ACCEPT.replace("want='[319]'", want))
+    async def passes(entry: dict[str, Any]) -> bool:
+        draft.write_text(json.dumps({"entries": [entry]}, indent=2) + "\n")
         return (await module._run_check(check, project, 30.0))[0] == 0
 
-    assert not await passes("want='[319]'")
-    assert not await passes("want='[319]' # or '[81664]'")
-    assert await passes("want='[81664]'")
-    (fake_beagle / "contract.rc").write_text("1")  # the contract's own check fails
-    assert not await passes("want='[81664]'")
+    fix = {"id": "prop-marker-inside-2", "kind": "example", "expect": [81664]}
+    assert await passes(fix | {"supersedes": "prop-marker-inside"})
+    assert not await passes(fix)  # supersedes nothing
+    assert not await passes(fix | {"supersedes": "prop-marker-inside", "expect": [319]})
+    (fake_beagle / "contract.rc").write_text("1")  # the draft's own check fails
+    assert not await passes(fix | {"supersedes": "prop-marker-inside"})
 
-    # T0002 waits on the amend: stepped again, it runs no worker.
+    # T0002 waits on the slice: stepped again, it runs no worker.
     nodes = [{"id": "T0002", "status": "open", "waiting_on": ["T0009"]}]
-    nodes += [{"id": "T0009", "status": "open", "title": "Amend contract: prop-marker-inside"}]
+    nodes += [{"id": "T0009", "status": "open", "title": "Slice: supersede prop-marker-inside"}]
     (fake_beagle / "tree.out").write_text(json.dumps({"goal": "Ship it", "nodes": nodes}))
     (fake_beagle / "next.out").write_text(json.dumps({"open": ["T0002", "T0009"], "ready": []}))
     again = await _tool(runtime, "pursuit_step").execute("c2", {"task": "T0002"})
     assert 'work T0009 first: pursuit_step task="T0009"' in again.text
     assert len(_runs(fake_tau)) == 2
+
+
+@pytest.mark.anyio
+async def test_upheld_dispute_without_value_refused(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # T0547's audit: a bare TEST WRONG pinned no value, so the amend's check was
+    # the contract's own, its close released T0002, and nothing had changed.
+    _disputed_project(tmp_path, fake_beagle, fake_tau, monkeypatch)
+    worker = "DISPUTE prop-marker-inside"
+    monkeypatch.setenv("FAKE_TAU_REPORTS", json.dumps([worker, "It disagrees.\nTEST WRONG"]))
+    runtime, _ = _bound(tmp_path)
+
+    result = await _tool(runtime, "pursuit_step").execute("c1", {"task": "T0002", "attempts": 1})
+
+    # The verdict is not kept, so beagle retires nothing; no slice, no wait.
+    assert _pursuit_calls(fake_beagle, "contract") == [["dispute", "prop-marker-inside", "--brief"]]
+    assert _pursuit_calls(fake_beagle, "add") == [] and _pursuit_calls(fake_beagle, "open") == []
+    assert _pursuit_calls(fake_beagle, "depend") == []
+    assert "said TEST WRONG but named no value the source gives" in result.text
+    assert "the test stands" in result.text
+    assert "the check still fails" in result.text
+    # A value with no expected value beside it is still a value.
+    assert _module()._judged_values("81664") == ("81664", "")
+    assert _module()._judged_values("") == ("", "")
 
 
 @pytest.mark.anyio
