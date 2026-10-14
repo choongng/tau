@@ -34,6 +34,7 @@ branch and sha. Grades come from `grade_<task>.py` over `runs/RNN/adapter.py`;
 | R98 | q35 | wrenfold | contract-first 395d806 (incremental contract + S01 fixes T0567-T0581, oracle stand-in T0572); tau df13db3e | 54/54 in 49.9 min, ended on its own (codec.py committed) | R96 50/54 capped; B06 plain 54/54 in 9.1 min |
 | R99 | q35 | semver (bare goal) | contract-first 009c2b8 (R98 + bounded `run --operation`, caller env in contain); tau f061aa4a | 75/76 at the 60 min cap (working tree: src/ untracked, nothing committed; graded through runs/R99/adapter.py) | R97 58/76 capped; B07 plain 75/76 in 8.1 min |
 | S02 | q35 | wrenfold (smoke, 25 min cap) | beagle 0.48.0 08e642c (spec-tying, no contract); tau beagle-0.48 fb3823e5 | 0/54: capped at 1500 s with T0002 (Encoder) open, no code written; the driver's done_when asserted wrong bytes (6 of 10), so both workers spent a 16k-token turn reconciling it with the spec | R98 54/54 in 49.9 min; B06 plain 54/54 in 9.1 min |
+| R100 | q35 | wrenfold | beagle 0.48.0 08e642c; tau ecb438ea (T0609) | 54/54 on the working tree, stopped at 35.6 min when runs went to a 30 min cap; nothing committed, no task done. The code was green at 14.6 min (reconstructed from the worker session) | S02 0/54; R98 54/54 in 49.9 min; B06 plain 54/54 in 9.1 min |
 
 ## B06 — the invented spec was not hard
 
@@ -809,3 +810,33 @@ Graded 0/54 through runs/S02/adapter.py (`No module named 'wrenfold'`).
   it: the cases are read from the source.
 - Upstream ask 9: `open --cites --cases` should refuse a check that does not
   run the case files.
+
+## R100 — q35 wrenfold on beagle 0.48: green at 14.6 min, then 21 min of bookkeeping
+
+Stopped at 35.6 min (exit 143) when runs went to a 30 min cap. Graded 54/54 on the untracked
+`wrenfold.py` (runs/R100/snap, adapter.py). Only the T0002 code worker ever wrote it.
+
+| min | what |
+|---|---|
+| 0–1.3 | founding: 4 milestones (Encoder, Decoder, Count, Tests), the spec as source |
+| 1.5 | T0609 fired: the driver's `python3 -c` asserts were refused; 0.4 min later it sent `pytest -q test_wrenfold.py` |
+| 2.0–7.3 | cases worker, T0002: 13 cases, 3 of them with expected bytes it worked out for inputs the spec gives no example of, all 3 wrong (63, 16384, 4194304) |
+| 7.3–15.3 | code worker, T0002: 5.6 min (one 16k length stop) to its one write of the whole module (encode, decode, count) at 12.9; it corrected the 3 wrong cases in test_wrenfold.py at 14.1; 17/17 at 14.6 |
+| 15.3 | prove refused: the bound check file changed since open. T0002 stays open |
+| 15.6–16.5 | the driver re-sent its old `python3 -c` check as a new route (T0006, refused by T0609), abandoned T0006 as a duplicate, then found T0002 superseded and tried to abandon the root |
+| 17.3–35.3 | two cases workers for T0003 (Decoder) over the same file: `open` refused the first ("op=encode has no invalid or limit case") at 20.4; the second spent 14.6 min, 42k output tokens, on markers |
+
+What it shows:
+
+1. **The spec-tied path can win the first 15 min.** Code that passes every hidden test at
+   14.6 min, against B06's 9.1 min for plain tau. The rest was ceremony after the work was done.
+2. **The cases worker computes bytes no better than the driver.** S02's failure moved one step:
+   every case that quoted a spec example was right, and every case it worked out itself was wrong.
+3. **A correct fix to a case has no channel.** The code worker was right to fix the cases, but
+   editing the bound check makes the task unprovable, and the driver could not recover it.
+4. **Milestones per function multiply the cases ceremony.** One module, one spec: the code
+   worker wrote all three functions at once, and the Decoder/Count milestones then had nothing to do
+   but write cases for code that already passed.
+
+From R100 on, runs cap at 30 min, and launch.sh copies the project each minute it changes to
+runs/RNN/snaps/tMM; `curve.py RNN` grades every snapshot and gives time-to-green.
