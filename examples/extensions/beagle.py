@@ -8072,9 +8072,14 @@ async def _prove(
     mutated = attempts[-1] if witness is not None and attempts else None
     opened = _opened_commit(task, root, record or None)
     changed = _changed_files(root)
+    # T0600: a worker that committed its work leaves git status clean; what
+    # changed since the open is the task's work all the same.
+    since = _run(["git", "diff", "--name-only", "--no-renames", opened, "--"], root, 30.0)
+    committed = since[1].splitlines() if opened and since[0] == 0 else []
+    committed = [rel for rel in committed if rel and Path(rel).parts[0] != ".beagle"]
     # q35 10-11: what the parent's split committed is this part's work.
     carried = _split_carried(task, root)
-    changed = list(dict.fromkeys([*changed, *carried.files]))
+    changed = list(dict.fromkeys([*changed, *committed, *carried.files]))
     sources = [
         rel
         for rel in changed
