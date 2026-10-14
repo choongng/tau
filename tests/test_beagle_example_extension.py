@@ -11715,13 +11715,86 @@ async def test_slice_step_scope_and_check_fixed(
         opens = _pursuit_calls(fake_beagle, "open")
         assert len(opens) == 1, (title, result.text)
         [opened] = opens
-        assert opened[opened.index("--scope") + 1 :] == ["contract/"], title
+        assert opened[opened.index("--scope") + 1 :] == ["contract/", "references/"], title
         assert opened[opened.index("--done-when") + 1] == module.CONTRACT_STEPS[1], title
-    assert module.CONTRACT_STEPS == (["contract/"], "beagle pursuit contract check --draft")
+    assert module.CONTRACT_STEPS == (
+        ["contract/", "references/"],
+        "beagle pursuit contract check --draft",
+    )
     # Only a `Slice:` title, and only under a declared contract.
     assert module._contract_step("Encode", project) is None
     assert module._contract_step("Contract", project) is None
     assert module._contract_step("Slice: examples", tmp_path) is None
+
+
+@pytest.mark.anyio
+async def test_slice_scope_admits_references(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # S01: the examples slice's worker could not save the spec, since its scope was
+    # contract/ alone. A slice's scope is contract/ and references/; any other
+    # task's scope that names references/ is still refused.
+    module = _module()
+    project = _pursuit_project(tmp_path)
+    goal = project / ".beagle" / "pursuit.toml"
+    goal.write_text(goal.read_text() + module.CONTRACT_TABLE, encoding="utf-8")
+    monkeypatch.chdir(project)
+    monkeypatch.setenv("PATH", f"{fake_beagle}{os.pathsep}{os.environ['PATH']}")
+    (fake_beagle / "contract.rc").write_text("1")
+    _ready_task(fake_beagle)
+    record = json.loads((fake_beagle / "show.out").read_text())
+    (fake_beagle / "show.out").write_text(json.dumps({**record, "title": "Slice: examples"}))
+
+    result = await _tool(_bound(tmp_path)[0], "pursuit_step").execute(
+        "c1",
+        {"task": "T0002", "criteria": "drafted", "done_when": "true", "scope": ["references/"]},
+    )
+
+    [opened] = _pursuit_calls(fake_beagle, "open")
+    assert opened[opened.index("--scope") + 1 :] == ["contract/", "references/"], result.text
+    slice_scope = ["contract/", "references/"]
+    assert module._scope_problem(slice_scope, "T0002", [], project) is None
+    assert "references/" in (module._scope_problem(["references/x.md"], "T0002", [], project) or "")
+    assert "references/" in (module._scope_problem(slice_scope, "T0002", [], tmp_path) or "")
+    # The read guard (T0560) and the write guard both let the slice worker at references/.
+    worker = _scoped_worker(tmp_path / "w", monkeypatch, scope="contract/\nreferences/")
+    home = Path.cwd()
+    (home / ".beagle" / "pursuit.toml").write_text(
+        (home / ".beagle" / "pursuit.toml").read_text() + module.CONTRACT_TABLE, encoding="utf-8"
+    )
+    assert module._code_read("read", {"path": "references/spec.txt"}, home, home) is None
+    wrote = {"path": "references/spec.txt", "content": "spec\n"}
+    assert (await _tool_with_hooks(worker, "write").execute("c2", wrote)).text == "ran"
+    fetch = {"command": "beagle refs fetch https://example.org/spec.txt"}
+    assert (await _tool_with_hooks(worker, "bash").execute("c3", fetch)).text == "ran"
+    refused = await _tool_with_hooks(worker, "write").execute(
+        "c4", {"path": "itc/clock.py", "content": "x\n"}
+    )
+    assert "outside T0003's scope" in refused.text
+    # A worker on the code is still kept from beagle.
+    coder = _scoped_worker(tmp_path / "coder", monkeypatch, scope="itc/")
+    kept = await _tool_with_hooks(coder, "bash").execute("c5", fetch)
+    assert module.NO_BEAGLE_REASON in kept.text
+
+
+def test_slice_worker_saves_a_source() -> None:
+    # S01: `contract add` refused entries whose source the contract did not name,
+    # and nothing said how; the worker wrote contract.json by hand. The examples
+    # slice says to save each source under references/ and name it by its stem,
+    # which `contract add` lists in the contract's sources itself.
+    module = _module()
+    [examples] = module.CONTRACT_MILESTONES
+    text = " ".join(examples.split())
+    assert "`beagle refs fetch <URL>`" in text
+    assert "references/<name>.txt" in text
+    assert '"source": "<name>"' in text
+    assert text.index("references/<name>.txt") < text.rindex("`contract add`")
+    # Nothing requires a source: a bare goal's slice holds experiments and gaps.
+    assert "With no source to read, the slice holds the experiments run" in text
 
 
 #: beagle's refusal to open a check of `contract run --operation encode` while
@@ -11805,7 +11878,12 @@ async def test_pursuit_step_keeps_an_open_contract_milestone_on_its_check(
     )
     forced = module.CONTRACT_STEPS[1]
     weak = "test -f contract/draft/contract.json"
-    record = {"id": "T0002", "title": "Slice: examples", "status": "open", "scope": ["contract/"]}
+    record = {
+        "id": "T0002",
+        "title": "Slice: examples",
+        "status": "open",
+        "scope": list(module.CONTRACT_STEPS[0]),
+    }
     show = fake_beagle / "show.out"
     step = {"task": "T0002", "done_when": weak, "scope": ["contract/", "references/"]}
 
@@ -20097,7 +20175,7 @@ async def test_upheld_dispute_supersedes(
     disputes = project / module.CONTRACT_DISPUTES
     disputes.write_text(json.dumps(kept | {"reason": "[81664] instead of [319]"}) + "\n")
     assert module._contract_step("Slice: supersede prop-marker-inside", project) == (
-        ["contract/"],
+        ["contract/", "references/"],
         check,
     )
 

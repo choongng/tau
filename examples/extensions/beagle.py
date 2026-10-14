@@ -319,6 +319,9 @@ LEAN_AUDIT_OFF = "\n[audit]\nevery = 0\n"
 #: open one is drafted in `CONTRACT_DRAFT`, and its task's close moves it to
 #: `CONTRACT_SLICES`/NN-name, whose files never change.
 CONTRACT_DIR = "contract"
+#: Where founding puts the references the user's prompt links to, as text, and
+#: where a slice's worker saves a source it reads (`beagle refs fetch`).
+REFERENCES_DIR = "references"
 CONTRACT_SLICES = f"{CONTRACT_DIR}/slices"
 CONTRACT_DRAFT = f"{CONTRACT_DIR}/draft"
 #: Where `contract add` writes: the open slice's entries.
@@ -346,14 +349,22 @@ CONTRACT_MILESTONES = (
     f"{CONTRACT_DRAFT}/accept.sh, which runs every entry against the code and prints "
     "one line per entry, `ok <id>` or `FAIL <id>: why`, even before the code exists, "
     f"and {CONTRACT_DRAFT}/standin/, the code with every answer wrong. Examples only: "
-    "limits, invalid inputs and properties are later slices. With no source to read, "
-    "the slice holds the experiments run and the gaps, each with its assumption",
+    "limits, invalid inputs and properties are later slices. Save each source under "
+    f"{REFERENCES_DIR}/ before you cite it, with `beagle refs fetch <URL>` or by writing "
+    f'the text to {REFERENCES_DIR}/<name>.txt, and give each entry "source": '
+    "\"<name>\", that file's stem: `contract add` then names it in the contract's "
+    "sources. With no source to read, the slice holds the experiments run and the "
+    "gaps, each with its assumption",
 )
 #: Every slice task's scope and check, which pursuit_step gives it whatever the
 #: driver passed. R83, R84: a driver-chosen scope let one contract task's worker
 #: write another's file; R87: a driver's check in place of this one could not
 #: refuse. The task's close seals the draft as the slice its title names.
-CONTRACT_STEPS = ([f"{CONTRACT_DIR}/"], "beagle pursuit contract check --draft")
+#: S01: references/ too, so the worker can save the sources it cites there.
+CONTRACT_STEPS = (
+    [f"{CONTRACT_DIR}/", f"{REFERENCES_DIR}/"],
+    "beagle pursuit contract check --draft",
+)
 #: What pursuit_step says when a driver passes a contract step a check of its own.
 CONTRACT_CHECK_KEPT_NOTE = (
     "{title} keeps its check `{check}`: the contract's own check judges it, so the "
@@ -2984,8 +2995,6 @@ def _ignore(root: Path, names: list[str]) -> None:
         ignore.write_text(have + sep + "".join(f"{name}/\n" for name in missing), encoding="utf-8")
 
 
-#: Where founding puts the references the user's prompt links to, as text.
-REFERENCES_DIR = "references"
 #: What founding recorded there: the request, and each URL's file or failure.
 REFERENCES_INDEX = "index.json"
 #: What `beagle refs fetch` may take per URL: a 30 s try, the 90 s one beagle
@@ -5421,7 +5430,8 @@ def _scope_problem(
     # Run R13: T0002 scoped references/NOTES.md, which founding git-ignores, so
     # the worker could write it but never commit it.
     refs = [path for path in scope if _under_references(path, root)]
-    if refs:
+    # S01: a slice's worker saves the sources it cites there; seal commits contract/.
+    if refs and not (root is not None and _contract_work(scope, root)):
         return (
             f"scope names {refs[0]}, but {REFERENCES_DIR}/ holds the fetched sources and "
             "is ignored by git, so nothing written there is committed; put the notes in "
@@ -13576,7 +13586,8 @@ NO_BEAGLE_REASON = (
 NO_BEAGLE_NOTE = (
     "Do not inspect .beagle/ or run beagle, apart from reading the contract "
     "(`beagle pursuit contract refs`, `check`, `status`, `diff`) and running it against "
-    "the code (`beagle pursuit contract run --operation <op>`)."
+    "the code (`beagle pursuit contract run --operation <op>`), and, with references/ "
+    "in your scope, saving a source (`beagle refs fetch <URL>`)."
 )
 #: Programs that only show what a path holds: a worker reading `.beagle/` with one
 #: is orienting, not working. A check script under it (`bash .beagle/checks/...`)
@@ -13624,6 +13635,19 @@ def _in_store(word: str) -> bool:
     return any(part == ".beagle" for part in Path(word).parts)
 
 
+def _slice_refs_fetch(argv: list[str]) -> bool:
+    """Whether `argv` is `beagle refs fetch` from a worker whose scope holds
+    references/, which only a slice's does (`_scope_problem`). S01: the
+    examples slice's worker had no way to save the spec it cited."""
+    sent = _worker_scope()
+    words = [arg for arg in argv[1:] if not arg.startswith("-")]
+    return (
+        words[:2] == ["refs", "fetch"]
+        and sent is not None
+        and any(Path(rel).parts[:1] == (REFERENCES_DIR,) for rel in sent[1])
+    )
+
+
 def _worker_orientation(tool: str, args: Mapping[str, Any], cwd: Path) -> str | None:
     """What a worker's call does to orient itself on beagle, or None.
 
@@ -13645,7 +13669,7 @@ def _worker_orientation(tool: str, args: Mapping[str, Any], cwd: Path) -> str | 
         if _named(argv, "beagle"):
             # R77: the contract worker, told to cite by `contract refs`, was
             # refused it and made anchors up. The contract's reads pass.
-            if _contract_read(argv):
+            if _contract_read(argv) or _slice_refs_fetch(argv):
                 return None
             return f"run `{' '.join(argv[:3])}`"
         if Path(argv[0]).name in _READERS and any(_in_store(a) for a in argv[1:]):
@@ -14185,6 +14209,13 @@ def _reread_refusal(
         seen = reads[target] = reads.get(target, 0) + 1
     if calls <= cap // 2:
         return None
+    # A slice's scope holds references/ (S01); its re-reads go by `contract refs`.
+    if root / REFERENCES_DIR in target.parents and _contract_work(list(scope), root):
+        return (
+            f"refusing to read {path}: {calls - 1} of {cap} calls used and nothing written. "
+            f"Read it with {_contract_refs_note(target.stem)}, then write "
+            f"{', '.join(scope)} now."
+        )
     if (target == root or root in target.parents) and _scope_hit(target, root, scope) is not None:
         size = _reads_needed(target)
         budget = max(1, cap // 4)
@@ -14204,13 +14235,7 @@ def _reread_refusal(
             "e.g. `python3 -c` over the file for the case or line you need, and write "
             f"{', '.join(scope)} now."
         )
-    # A scope never names references/ (`_scope_problem`), so their re-reads land here.
-    if root / REFERENCES_DIR in target.parents and _contract_work(list(scope), root):
-        return (
-            f"refusing to read {path}: {calls - 1} of {cap} calls used and nothing written. "
-            f"Read it with {_contract_refs_note(target.stem)}, then write "
-            f"{', '.join(scope)} now."
-        )
+    # Only a slice's scope names references/ (`_scope_problem`), so others land here.
     if root / REFERENCES_DIR in target.parents:
         return (
             f"refusing to read {path}: {calls - 1} of {cap} calls used and nothing written. "
