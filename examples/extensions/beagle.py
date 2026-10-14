@@ -11041,13 +11041,13 @@ def _not_workable_text(
 
 def _cases_scope(done_when: str, root: Path) -> list[str]:
     """Where a spec-tied task's cases worker may write: the test paths its check
-    names, so every case file is one the check runs; tests/ when it names none."""
-    named = [
+    names, so every case file is one the check runs. None when it names none: the
+    check runs no cases, and the task is not opened on it (S02)."""
+    return [
         rel
         for rel in _check_run_files(done_when, root)
         if _is_test_path(rel) or Path(rel).name in ("tests", "test")
     ]
-    return named or ["tests/"]
 
 
 def _cases_brief(
@@ -11137,6 +11137,19 @@ async def _write_cases(
     One cases worker per pursuit_step call; what it wrote stays on disk, so the
     next call's worker corrects it rather than starting over.
     """
+    cases_scope = _cases_scope(done_when, root)
+    if not cases_scope:
+        # Run S02: a `python3 -c` of asserts the driver worked out itself, six of
+        # ten wrong against the spec; the cases copied them, and the check never
+        # ran the case files.
+        return (
+            f"pursuit_step: {task} not opened — its source is {source}, so its check "
+            f"runs the cases a sub-agent writes from that, and done_when names no test "
+            f"file: `{done_when}`\n\nMake done_when the project's test command over the "
+            "file the cases go in, e.g. `python3 -m pytest -q tests/test_<part>.py`, with "
+            "no expected values in it: the cases read them from the source. Call "
+            f'pursuit_step with task="{task}" again.'
+        )
     bad_thinking = _bad_thinking(arguments.get("thinking"))
     if bad_thinking:
         return f"pursuit_step: {task} not run — {bad_thinking}"
@@ -11145,7 +11158,6 @@ async def _write_cases(
     model, provider = _worker_target(arguments.get("model"), arguments.get("provider"), pin)
     thinking = _worker_thinking(model, provider, arguments.get("thinking"), pin)
     timeout = _worker_timeout(arguments.get("timeout"), _worker_wall(root, model, provider))[0]
-    cases_scope = _cases_scope(done_when, root)
     brief = _cases_brief(task, title, source, criteria, done_when, scope, cases_scope)
     run = await _run_worker(
         brief, root, model, provider, timeout, signal, task, cases_scope, thinking, CASES_ROLE
@@ -11629,7 +11641,8 @@ def make_step_tool() -> Any:
                     "the criteria yet, the task is too big: split it with pursuit_plan."
                     + (
                         f"\nIts source is {source}: first another sub-agent writes its "
-                        "cases from that as tests, in the test files done_when runs."
+                        "cases from that as tests, in the test file done_when runs. Write "
+                        "no expected values in done_when: the cases read them from the source."
                         if source
                         else ""
                     )

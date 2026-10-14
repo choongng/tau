@@ -19655,8 +19655,8 @@ def _source_task(fake: Path, source: str = "spec") -> None:
 SPEC_STEP = {
     "task": "T0002",
     "criteria": "parse reads what the spec says",
-    "done_when": "grep -q done done.txt",
-    "scope": ["done.txt"],
+    "done_when": "python3 -m pytest -q tests/test_parse.py",
+    "scope": ["parser.py"],
 }
 
 
@@ -19680,11 +19680,12 @@ async def test_pursuit_step_spec_tied_writes_cases_then_opens_with_cites_and_cas
 
     cases, code = _runs(fake_tau)
     assert cases["role"] == "cases" and code["role"] == "executor"
-    assert cases["scope"] == "tests/"
+    assert cases["scope"] == "tests/test_parse.py"
     assert "`beagle pursuit rules 2e`" in cases["stdin"] and "the source spec" in cases["stdin"]
     assert (
         "beagle pursuit open T0002 --criteria 'parse reads what the spec says' "
-        "--done-when 'grep -q done done.txt' --scope done.txt --cites REF:ANCHOR ... "
+        "--done-when 'python3 -m pytest -q tests/test_parse.py' --scope parser.py "
+        "--cites REF:ANCHOR ... "
         "--cases FILE ... --dry-run"
     ) in cases["stdin"]
     assert _pursuit_calls(fake_beagle, "open") == [
@@ -19693,9 +19694,9 @@ async def test_pursuit_step_spec_tied_writes_cases_then_opens_with_cites_and_cas
             "--criteria",
             "parse reads what the spec says",
             "--done-when",
-            "grep -q done done.txt",
+            "python3 -m pytest -q tests/test_parse.py",
             "--scope",
-            "done.txt",
+            "parser.py",
             "--cites",
             "spec:2#ff4",
             "spec:3#ab0-4#c01",
@@ -19727,7 +19728,9 @@ async def test_pursuit_step_no_source_sends_no_cases_worker(
     step = _tool(runtime, "pursuit_step")
 
     shown = await step.execute("c0", {"task": "T0002"})
-    result = await step.execute("c1", SPEC_STEP)
+    result = await step.execute(
+        "c1", {**SPEC_STEP, "done_when": "grep -q done done.txt", "scope": ["done.txt"]}
+    )
 
     assert "source" not in shown.text
     [run] = _runs(fake_tau)
@@ -19765,7 +19768,33 @@ async def test_pursuit_step_cases_worker_scope_is_the_tests_the_check_runs(
     assert cases["scope"] == "tests/test_parse.py"
     [opened] = _pursuit_calls(fake_beagle, "open")
     assert opened[opened.index("--cases") + 1 :] == ["tests/test_parse.py"]
-    assert module._cases_scope("python3 -m pytest -q", project) == ["tests/"]
+    assert module._cases_scope("python3 -m pytest -q", project) == []
+
+
+@pytest.mark.anyio
+async def test_pursuit_step_source_task_refuses_a_check_that_runs_no_cases(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Run S02: the driver's own asserts, wrong against the spec, as the check of a
+    # task with a source; the cases copied them and the check never ran them.
+    monkeypatch.chdir(_pursuit_project(tmp_path))
+    monkeypatch.setenv("FAKE_TAU_CASES_WRITES", json.dumps({"tests/test_parse.py": SPEC_CASES}))
+    _source_task(fake_beagle)
+    runtime, _ = _bound(tmp_path)
+    step = _tool(runtime, "pursuit_step")
+    inline = "python3 -c \"from parser import parse; assert parse('1') == 2\""
+
+    shown = await step.execute("c0", {"task": "T0002"})
+    result = await step.execute("c1", {**SPEC_STEP, "done_when": inline})
+
+    assert "Write no expected values in done_when" in shown.text
+    assert "T0002 not opened" in result.text and "names no test file" in result.text
+    assert "no expected values in it" in result.text
+    assert _runs(fake_tau) == [] and _pursuit_calls(fake_beagle, "open") == []
 
 
 @pytest.mark.anyio
