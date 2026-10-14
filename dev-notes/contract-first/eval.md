@@ -33,6 +33,7 @@ branch and sha. Grades come from `grade_<task>.py` over `runs/RNN/adapter.py`;
 | S01 | q35 | semver (smoke, 25 min cap) | contract-first cde3fbd (incremental contract, T0554-T0560, T0566); tau 2ea8cd1b | not graded: capped at 1500 s mid-milestone; first code at 14.0 min (R97 31.6) | B07 plain 75/76 in 8.1 min |
 | R98 | q35 | wrenfold | contract-first 395d806 (incremental contract + S01 fixes T0567-T0581, oracle stand-in T0572); tau df13db3e | 54/54 in 49.9 min, ended on its own (codec.py committed) | R96 50/54 capped; B06 plain 54/54 in 9.1 min |
 | R99 | q35 | semver (bare goal) | contract-first 009c2b8 (R98 + bounded `run --operation`, caller env in contain); tau f061aa4a | 75/76 at the 60 min cap (working tree: src/ untracked, nothing committed; graded through runs/R99/adapter.py) | R97 58/76 capped; B07 plain 75/76 in 8.1 min |
+| S02 | q35 | wrenfold (smoke, 25 min cap) | beagle 0.48.0 08e642c (spec-tying, no contract); tau beagle-0.48 fb3823e5 | 0/54: capped at 1500 s with T0002 (Encoder) open, no code written; the driver's done_when asserted wrong bytes (6 of 10), so both workers spent a 16k-token turn reconciling it with the spec | R98 54/54 in 49.9 min; B06 plain 54/54 in 9.1 min |
 
 ## B06 — the invented spec was not hard
 
@@ -759,3 +760,52 @@ the same score as plain tau (B07, 75/76 in 8.1 min) and up from R97's
 This closes the contract era's runs. The port to beagle 0.48 (task-level
 spec-tying, no contract) is dev-notes/beagle-0.48/plan.md, and its runs
 start at R100.
+
+
+## S02 — q35 wrenfold smoke on beagle 0.48: 0/54, a check the spec contradicts
+
+The first live run of the port (tau beagle-0.48 fb3823e5, beagle 0.48.0).
+Capped at 1500 s (exit 124) with T0002, Encoder, open and no code written.
+
+**The spec-tied path ran end to end.** Founding planned Encoder, Decoder,
+Validation and Tests. The driver gave Encoder the source
+`references/wrenfold-r3.txt`, and the cases worker wrote 13 marked cases.
+`open --dry-run` and the real `open --cites --cases` accepted them, and the
+cases were committed (183beb0, 14.4 min). The code worker started at 14.5 min.
+
+**What sank it: the driver wrote the expected values.** T0002's done_when was
+a `python3 -c` with ten `assert encode([…]) == bytes([…])` lines the driver
+computed in its head. Six are wrong against the spec. For example, 63 is
+`40 3F` plus the end marker (spec lines 33–35), but the driver asserted
+`bytes([64, 63])`, and it put 64 in the three-byte form. Then:
+
+- The cases worker cited the right spec lines but copied the done_when's
+  values. 0.48 accepted the ties, because `open` checks that each cite is
+  there, not what the case asserts.
+- The check never ran the case files, although rule 2e says "the check runs
+  the cases through the project's own test command". `open` doesn't enforce
+  that.
+- Each worker hit the 16,384-token output limit in one turn, reconciling the
+  spec with the check. The cases worker took 30k chars of thinking, about
+  4.6 min; the code worker took 39k chars, about 4.7 min, ending on "But the
+  acceptance criteria says bytes([64, 63])".
+
+**Time:**
+
+- 0–4.1 min: the driver's first turn (160 output tokens on a 12.5k prompt).
+  This is most likely krang loading the model; the workers' first turns took
+  under a minute on the same size of prompt.
+- 4.5 min: founded.
+- 5.6–14.4 min: the cases worker, 4.6 min of it in the length-stopped turn.
+- 14.5–25 min: the code worker, which had written nothing at the cap.
+
+Graded 0/54 through runs/S02/adapter.py (`No module named 'wrenfold'`).
+
+**Fixes before R100:**
+
+- Tau (T0609): `pursuit_step` refuses a done_when for a task with a source
+  unless it runs a test file. The refusal and the next-task prompt say to use
+  the project's test command over the case file, with no expected values in
+  it: the cases are read from the source.
+- Upstream ask 9: `open --cites --cases` should refuse a check that does not
+  run the case files.
