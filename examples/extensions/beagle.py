@@ -13252,7 +13252,10 @@ def make_step_tool() -> Any:
             )
             argv = ["retry", task, "--because", because]
         else:
-            body = (unrun_note + report)[:CLOSE_BODY_CHARS] or "-"
+            # R116: beagle shows this body to the tasks that wait on this one, and
+            # T0003's worker took T0002's witness for its own; prove recorded it.
+            shown_on = _WITNESS.sub("", report).strip()
+            body = (unrun_note + shown_on)[:CLOSE_BODY_CHARS] or "-"
             argv = ["close", task, "--outcome", "done", "--body", body]
         if spent is not None:
             argv += ["--spent", str(spent)]
