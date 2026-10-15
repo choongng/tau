@@ -7112,11 +7112,16 @@ def _fold_into_next(
         del folded[index]
         into = index if index < len(folded) else index - 1
         target = folded[into]
-        cut = _SOURCE_IN_INTENT.search(target)
-        head, tail = (target[: cut.start()], target[cut.start() :]) if cut else (target, "")
-        joiner = "; " if "::" in head else "::"
-        text = _SOURCE_IN_INTENT.sub("", part).strip()
-        folded[into] = f"{head.rstrip()}{joiner}{text}{tail}"
+        # Split at '::' first: a part with no intent of its own is 'title::Source: x',
+        # where the source follows '::' and not a space.
+        title, _, intent = target.partition("::")
+        cut = _SOURCE_IN_INTENT.search(intent)
+        body, tail = (intent[: cut.start()], intent[cut.start() :]) if cut else (intent, "")
+        own_title, _, own_intent = part.partition("::")
+        own_intent = _SOURCE_IN_INTENT.sub("", own_intent).strip()
+        text = f"{own_title.strip()}::{own_intent}" if own_intent else own_title.strip()
+        merged = "; ".join(words for words in (body.strip(), text) if words)
+        folded[into] = f"{title.rstrip()}::{merged}{tail}"
         notes.append(
             f"Folded the {kind} milestone {part.split(':', 1)[0].strip()!r} into "
             f"{target.split(':', 1)[0].strip()!r}: {why}"

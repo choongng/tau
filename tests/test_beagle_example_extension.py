@@ -1682,6 +1682,17 @@ def test_found_offers_the_requests_link_as_a_milestone_source(tmp_path: Path) ->
         assert "a link in the user's request" in flat, text
 
 
+def test_plan_offers_the_requests_link_as_a_part_source(tmp_path: Path) -> None:
+    # T0624 named pursuit_plan beside pursuit_found: a part split later has the
+    # same sources to name as a milestone.
+    runtime, _ = _bound(tmp_path)
+    parts = _tool(runtime, "pursuit_plan").parameters["properties"]["parts"]
+    source = parts["items"]["anyOf"][1]["properties"]["source"]["description"]
+    for text in (parts["description"], source):
+        flat = " ".join(text.split())
+        assert "a link in the user's request" in flat, text
+
+
 @pytest.mark.anyio
 async def test_founding_on_a_bare_goal_plans_no_slice_before_the_first_milestone(
     tmp_path: Path, beagle: Path, fake_beagle: Path, monkeypatch: pytest.MonkeyPatch
@@ -4591,6 +4602,26 @@ def test_founding_folds_examine_and_understand_milestones_into_the_work() -> Non
     for title in ("Inspect the reference encoder", "Survey existing libraries"):
         assert module._design_only_milestone(title), title
     assert not module._design_only_milestone("Examine and fix the decoder")
+
+
+def test_founding_folds_a_design_milestone_ahead_of_its_targets_source() -> None:
+    # T0617's design fold: a design-only milestone's text joins the next part's
+    # intent ahead of that part's Source:, which `_task_source` reads as the last
+    # thing in the intent.
+    module = _module()
+    parts = module._milestone_parts(
+        [
+            {"part": "Design the encoder API", "source": "references/wrenfold-r3.txt"},
+            {"part": "Encoder :: encode integers", "source": "references/wrenfold-r3.txt"},
+            {"part": "Decoder :: decode them"},
+        ]
+    )
+    kept, notes = module._repair_milestones(parts)
+    assert [part.split("::")[0].strip() for part in kept] == ["Encoder", "Decoder"]
+    assert "Design the encoder API" in kept[0]
+    assert kept[0].count("Source:") == 1
+    assert kept[0].endswith("Source: references/wrenfold-r3.txt")
+    assert any("Folded the design milestone" in note for note in notes)
 
 
 def test_founding_folds_an_environment_milestone_with_no_source_into_the_first_work() -> None:
@@ -20401,6 +20432,32 @@ async def test_pursuit_step_spec_tied_scope_of_tests_only_gains_the_code_its_cas
     assert "data test" not in result.text
     assert "its cases import `parser`" in result.text
     assert "closed done" in result.text
+
+
+@pytest.mark.anyio
+async def test_pursuit_step_spec_tied_scope_of_tests_only_gains_src_code_under_src(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # T0625's src/ branch: in a project with src/, the code the cases import is
+    # added to the scope where it will live, src/<module>.
+    project = _pursuit_project(tmp_path)
+    (project / "src").mkdir()
+    monkeypatch.chdir(project)
+    monkeypatch.setenv("FAKE_TAU_CASES_WRITES", json.dumps({"tests/test_parse.py": SPEC_CASES}))
+    _source_task(fake_beagle)
+    runtime, _ = _bound(tmp_path)
+    step = _tool(runtime, "pursuit_step")
+
+    result = await step.execute("c1", {**SPEC_STEP, "scope": ["tests/test_parse.py"]})
+
+    [_dry_run, opened] = _pursuit_calls(fake_beagle, "open")
+    scoped = opened[opened.index("--scope") + 1 : opened.index("--cites")]
+    assert scoped == ["tests/test_parse.py", "src/parser.py", "src/parser/"]
+    assert "Added src/parser.py and src/parser/" in result.text
 
 
 @pytest.mark.anyio
