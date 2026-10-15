@@ -42,6 +42,7 @@ branch and sha. Grades come from `grade_<task>.py` over `runs/RNN/adapter.py`;
 | R104 | q35 | wrenfold (round 1, 30 min cap) | beagle 0.48.0 08e642c; tau 8f721639 (T0618 reasoning time cap, T0619 CASE line) | 12/54 at the cap, first at 22 min: encoding closed (T0002 at 18.5 min, T0003 at 21.3), decoding never reached; founding 1.7 min into 6 milestones; T0002's cases worker took 11.5 min, one 241 s turn cut by T0618 | S06 49/54 unclosed; B06 plain 9.1 min |
 | R105 | g26 | semver (round 2, 30 min cap) | beagle 0.48.0 08e642c; tau 4cf54474 (T0620) | 0/76 at the cap: founding's 'Environment setup' milestone took 18.5 min (13 of re-routing a check no defect could fail); T0003's source was the unfetched URL https://semver.org/, its first cases worker found no reference; the second was writing cases at the cap | B07 plain q35 75/76 in 8.1 min |
 | R106 | lfm24 | itc (round 3, 30 min cap) | beagle 0.48.0 08e642c; tau 79652f00 (T0621) | 0/42, ended at 11 min: the driver sent T0002's description as pursuit_step's task (criteria, done_when, scope right), was told to call with no arguments, then tried to write src/itc.py itself until the 8-refusal breaker stopped the run; no worker ran | — |
+| R107 | q35 | cobs (round 4, 30 min cap) | beagle 0.48.0 08e642c; tau b8f57402 (T0622, T0623) | 37/44, ended on its own at 27.8 min with all 6 tasks closed (T0002 at 23.6 min); no milestone named a source, so no cases worker ran: empty encode and the 5 malformed-decode cases fail | — |
 
 ## B06 — the invented spec was not hard
 
@@ -1032,3 +1033,26 @@ Fixes before round 4. This is two patches, each from its own run, in unrelated c
   The description joins the notes, and the reply says so.
 - **T0622 (fix 11, from R105):** a URL source is fetched by the host before the cases worker runs.
   An unfetchable one refuses the step, with beagle's reason.
+
+## R107 — round 4, q35 cobs: the first pursuit to close every task
+
+Every task closed and the run ended on its own at 27.8 min, scoring 37/44.
+
+- **Timeline:**
+  - founding took 2 min;
+  - T0002's code worker ran from 21:07, with two 240 s reasoning cuts (T0618), each followed by a
+    concrete step;
+  - T0002 committed and closed at 23.6 min;
+  - T0003–T0006 closed in the next 4 min on the driver's `python3 -c` and `ruff` checks, against
+    code T0002 had already written.
+- **Why the 7 failures:**
+  - Founding fetched the Wikipedia link only after the milestones were split.
+  - The `source` guidance asked for "a file in references/", which was empty at that moment, so
+    q35 named no source.
+  - With no source, no cases worker ran, and the driver set every expected value itself. One of
+    them was a wrong criterion: "Empty input encodes to a single zero byte" (the spec says `01 00`).
+  - That left empty encode and all five malformed-decode cases failing.
+  - The code was 37/44 from its first snapshot.
+
+Fix before round 5: **T0624 (fix 13)**. The milestone guidance and the `source` description now
+also offer "a link in the user's request"; T0622 fetches it before the cases worker runs.
