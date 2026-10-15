@@ -64,6 +64,7 @@ branch and sha. Grades come from `grade_<task>.py` over `runs/RNN/adapter.py`;
 | R126 | g26 | itc (round 23, 30 min cap) | beagle 0.48.0 08e642c; tau 78c9b702 (T0643) | **9/42**; founding kept 'Examine practical implementation patterns from <ferd.ca>' (with 'Understand ... from <paper>' folded in) as T0002, a study task (`tests/test_itc_study.py`); its worker wrote cases and an untracked itc.py (bitmask ids, flat events, no leq) and was killed at its 17 min wall; the second was running at the cap | — |
 | R127 | lfm24 | cobs (round 24, 30 min cap) | beagle 0.48.0 08e642c; tau 577f0b78 (T0644) | **0/44**, exit 0 at 12 min; founded, then three driver turns in a row ran to the output limit working out COBS itself; tau nudged two, the stop gate skipped the third, and the run ended with no pursuit_step | — |
 | R128 | q35 | wrenfold (round 25, 30 min cap) | beagle 0.48.0 08e642c; tau 7627899e (T0645) | **48/54**, capped; encoder (T0002) and decoder (T0003) closed, count's cases worker running at the cap; cases workers 7.6, 6.1, 7+ min against ~3 per code worker | — |
+| R129 | g26 | semver (round 26, 30 min cap) | beagle 0.48.0 08e642c; tau 9c06d5a6 (T0646) | **27/76** final, capped — but **75/76 at t13–t23** (own tests 8/8); a late code worker regressed it: deleted the build group from the regex, so Version() raises IndexError on every parse. 27 of 76 are the invalid bucket (refusing by crashing) | — |
 
 ## B06 — the invented spec was not hard
 
@@ -1623,3 +1624,34 @@ Replayed with the 239 s turn cut at 120 s and tau's time-cut nudge, q35 wrote th
 
 Fix before round 26: **T0646 (fix 33).** Cases workers get `CASES_REASONING_SECONDS` =
 120 s per turn; code workers keep 240.
+
+## R129 — g26 semver, round 26: a witness-ask follow-up regressed a green module (27/76)
+
+The curve tells the story: 0/76 through t07, **51/76 at t11, 75/76 from t13 to t23** (own
+8/8, the canonical `1.2.3\n` near-miss as R113/R117/R125), then **27/76 from t24**. The 27 are
+all the `invalid` bucket — parse now raises on every string, so every "should refuse" case
+passes and every real one fails.
+
+Timeline (driver `home-semver-8dc209`):
+
+- One `pursuit_step T0002` at 11:04 ran the cases worker and code worker #1. Code #1 left a
+  working `src/semver/version.py` (`Version(version_str)`, total ordering) and a proper WITNESS
+  block (mutate the major regex `0|[1-9]\d*` → `\d+`, a real leading-zero defect).
+- At close, beagle's auto-prove tried the witness mutate (needle didn't bite) then `--absent
+  version.py`, which failed **only on ImportError** — rightly judged weak (`_import_error_only`,
+  R55). So it returned ask_module: "no WITNESS named a defect in the module the test imports …
+  the task stays open" and told the driver to step again for a module witness.
+- The driver re-stepped T0002 at 11:21:42. That spawned **code worker #2**, a full executor,
+  which rewrote the regex — first deleting the whole `(?:\+(?P<build>…))?$` build alternation
+  while leaving `self.build = match.group("build")`, so every parse raises IndexError. 4 of the
+  8 own tests now fail; the hidden grader drops to 27/76.
+
+So a green milestone that beagle could not auto-witness was handed to a fresh code worker to
+earn the witness, and that worker regressed the implementation. The witness is a *verification*
+artifact; earning it must not endanger the passing code. Connects to R116 ("a second worker
+ran") and R117 ("10 min on a 280-char witness needle").
+
+Fix before round 27: **T0647 (fix 34).** When a step re-dispatches a worker on a task whose
+check already passed but lacked an accepted witness (the ask_module follow-up), the brief tells
+the worker the implementation already passes and to add only the WITNESS (and, if needed, a
+behavioural test that catches the named defect) — not to rewrite the passing implementation.
