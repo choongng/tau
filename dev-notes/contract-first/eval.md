@@ -55,6 +55,7 @@ branch and sha. Grades come from `grade_<task>.py` over `runs/RNN/adapter.py`;
 | R117 | g26 | semver (round 14, 30 min cap) | beagle 0.48.0 08e642c; tau 66af91e5 (T0634) | **75/76 at 14 min** (plain 8.1; R113 q35 4); the one miss, `1.2.3\n`, is accepted through `$`, as in R113; T0002 closed at 23.6 min, and T0003 (comparison) was open at the cap | — |
 | R118 | lfm24 | itc (round 15, 30 min cap) | beagle 0.48.0 08e642c; tau 5973453f (T0635) | **0/42**; founding kept 'Setup complete: beagle init written, pursuit founded …' as T0002, and the whole run went to that empty task; the itc.py one of its workers wrote models ids as integer pairs, not trees | — |
 | R119 | q35 | cobs (round 16, 30 min cap) | beagle 0.48.0 08e642c; tau 7008f5c8 (T0636) | **0/44**; no code and no test: both T0002 cases workers wrote their own encoder to check the source's examples table and chased where it disagreed; the first was cut at the reasoning limit three times | — |
+| R120 | g26 | wrenfold (round 17, 30 min cap) | beagle 0.48.0 08e642c; tau 2d8e309a (T0637) | **48/54**, encode/decode right at 17 min (t17); no `count`: founded from the steer's 1500-character extract of a 2586-character spec, and `count` is in the cut part | — |
 
 ## B06 — the invented spec was not hard
 
@@ -1395,3 +1396,29 @@ the source.
 Fix before round 17: **T0637 (fix 24).** The cases worker's work-it-out note now says the cited
 lines are right, not to write the code or a version of it to check them, and to write a
 shortened row out from the pattern it shows (`bytes(range(1, 255))`).
+
+## R120 — g26 wrenfold: founded from the extract, `count` never planned
+
+Round 17, g26, wrenfold, 30 min cap. Exit 124 at 06:07:32. The code is in `wrenfold/encoding.py`
+(`encode`, `decode`), and the grade is **48/54**: every encode and decode case passes from
+snapshot t17 on, and the six `count` cases fail because there is no `count`.
+
+The run went like this:
+
+1. **Founding.** The driver founded at 05:38:42 without reading the reference. The found-first
+   steer showed the first 1500 characters of the 2586-character spec. The criteria named the
+   encoder, the range, the decoder and the empty sequence. The milestones were "encoding and
+   decoding logic" and "verification through testing". Section 5's one sentence on `count`
+   was in the part the steer cut.
+2. **T0002** ran from 05:39:43 to 06:04:13 (24.5 min):
+   - The cases worker took 05:39:46 to 05:46:51, including one 161 s turn.
+   - The code worker took 05:46:56 to 05:58:42. Its turns included a 207 s write of the
+     encoder and a 163 s edit of one case, `encode(63)` with no end marker.
+   - `prove` refused the first witness, and the same worker retried from 05:58:45 to
+     06:04:09, including a 239 s reasoning cut.
+3. **T0003 ("verification")** began at 06:05:58, and its cases worker was still reading when the
+   cap fell.
+
+Fix before round 18: **T0638 (fix 25).** The found-first steer shows a reference of up to 6000
+characters whole, with its lines kept. A longer reference is still shown as the opening, now
+labelled with how many lines it has.
