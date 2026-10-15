@@ -36,6 +36,7 @@ branch and sha. Grades come from `grade_<task>.py` over `runs/RNN/adapter.py`;
 | S02 | q35 | wrenfold (smoke, 25 min cap) | beagle 0.48.0 08e642c (spec-tying, no contract); tau beagle-0.48 fb3823e5 | 0/54: capped at 1500 s with T0002 (Encoder) open, no code written; the driver's done_when asserted wrong bytes (6 of 10), so both workers spent a 16k-token turn reconciling it with the spec | R98 54/54 in 49.9 min; B06 plain 54/54 in 9.1 min |
 | R100 | q35 | wrenfold | beagle 0.48.0 08e642c; tau ecb438ea (T0609) | 54/54 on the working tree, stopped at 35.6 min when runs went to a 30 min cap; nothing committed, no task done. The code was green at 14.6 min (reconstructed from the worker session) | S02 0/54; R98 54/54 in 49.9 min; B06 plain 54/54 in 9.1 min |
 | S03 | q35 | wrenfold (smoke, 30 min cap) | beagle 0.48.0 08e642c; tau 3cf73fa3 (fix 1, T0611: cases quote) | 0/54: capped at 30 min with no task opened and no code; both T0002 cases workers wrote sound cases under markers beagle could not read (cite where the name goes; then `cite=` with no name) | R100 54/54 green at 14.6 min; B06 plain 54/54 in 9.1 min |
+| S04 | q35 | wrenfold (smoke, 30 min cap) | beagle 0.48.0 08e642c; tau 602750d9 (T0611-T0614: cases quote, case-correction route, marker naming) | 45/54 at the cap, first at 23 min; T0002 opened tied at 12.9 min (markers right first try), code worker still fixing 63 and the end-marker refusal at the cap | S03 0/54; R100 green at 14.6 min; B06 plain 9.1 min |
 
 ## B06 — the invented spec was not hard
 
@@ -866,3 +867,27 @@ What it shows:
 Fixes before S04: T0612 (a corrected pinned case is amended when it quotes its cited lines, else
 put back), T0613 (unnamed markers are named before ties are read), T0614 (the cases brief gives
 the marker's fields with the source's ref, and says the dry run's `--scope` is the code's).
+
+## S04 — q35 wrenfold smoke on T0611–T0614: tied on the first try, then two 16k-token turns
+
+Capped at 30 min (exit 124): 45/54 on the untracked package `wrenfold/` (runs/S04/snap). The curve
+(curve.py) is 0/54 until t23, then 45/54. The 9 misses are two defects: 63 written in the one-byte
+form (0x3F is the end marker), and decode/count accept input with no end marker. Both have failing
+cases in S04's own test file, so the code worker was on them when the cap hit.
+
+| min | what |
+|---|---|
+| 0–2.2 | setup and founding: 4 milestones (integer encoding, sequence encoding, decoder, count) |
+| 2.2–12.9 | cases worker, T0002: one 16k-token turn cut at the output limit; 30 cases with markers beagle read on the first try (`# beagle-case: zero-is-one-byte cite=wrenfold-r3:52#397 kind=example op=encode`); it stubbed `wrenfold` (first a conftest.py, then a try/except in the case file) because the file would not import before the code existed |
+| 12.9 | T0002 opened tied, cases committed |
+| 12.9–30 | code worker: a 16k-token first turn of bit layouts by hand ("15 zeros + 23 bits = 38"), wrong; one `python3 -c` then settled it; module written by t23; its `uv run -- pytest` saw the stub, not its code, until it set PYTHONPATH |
+
+What it shows:
+
+1. **T0613/T0614 worked**: the markers tied on the first try, against S03's whole run lost to them.
+2. **The 16k-token turn is now the biggest cost**: about 8 min in each worker, 16 of the 30 min. In
+   the code worker it was arithmetic a single run settles. R100's code worker had the same turn.
+3. **A cases worker stubs what will not import** unless told the import failure is the one expected.
+
+Fix before S05: T0616 (both worker briefs: work arithmetic and expected outputs out by running them;
+the cases brief: the import failure is expected, do not stub the code).
