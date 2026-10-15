@@ -2900,16 +2900,28 @@ def _fetched_source(source: str, root: Path) -> tuple[str, str]:
     """
     if not _PROMPT_URL.fullmatch(source):
         return source, ""
+    # R125 (q35 semver): v2.0.0.html, its #spec-item-11 and its #spec-item-9 came
+    # back as three copies of one page. A fragment names a place in the page.
+    page = source.partition("#")[0]
+
+    def on_disk() -> str:
+        index = _references_index(root) or {}
+        for name, url in (index.get("fetched") or {}).items():
+            if str(url).partition("#")[0] == page and (root / REFERENCES_DIR / name).is_file():
+                return f"{REFERENCES_DIR}/{name}"
+        return ""
+
+    if held := on_disk():
+        return held, ""
     rc, out = _run(
-        [BEAGLE_BIN, "refs", "fetch", source, "--no-exclude"],
+        [BEAGLE_BIN, "refs", "fetch", page, "--no-exclude"],
         root,
         timeout=60.0 + REFS_FETCH_SECONDS_PER_URL,
     )
+    if held := on_disk():
+        return held, ""
     index = _references_index(root) or {}
-    for name, url in (index.get("fetched") or {}).items():
-        if url == source and (root / REFERENCES_DIR / name).is_file():
-            return f"{REFERENCES_DIR}/{name}", ""
-    failed = str((index.get("failed") or {}).get(source) or "").strip()
+    failed = str((index.get("failed") or {}).get(page) or "").strip()
     last = (out.strip().splitlines() or [""])[-1]
     return source, failed or f"`beagle refs fetch` exited {rc}: {last}".rstrip(": ")
 
