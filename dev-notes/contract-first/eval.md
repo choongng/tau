@@ -56,6 +56,7 @@ branch and sha. Grades come from `grade_<task>.py` over `runs/RNN/adapter.py`;
 | R118 | lfm24 | itc (round 15, 30 min cap) | beagle 0.48.0 08e642c; tau 5973453f (T0635) | **0/42**; founding kept 'Setup complete: beagle init written, pursuit founded …' as T0002, and the whole run went to that empty task; the itc.py one of its workers wrote models ids as integer pairs, not trees | — |
 | R119 | q35 | cobs (round 16, 30 min cap) | beagle 0.48.0 08e642c; tau 7008f5c8 (T0636) | **0/44**; no code and no test: both T0002 cases workers wrote their own encoder to check the source's examples table and chased where it disagreed; the first was cut at the reasoning limit three times | — |
 | R120 | g26 | wrenfold (round 17, 30 min cap) | beagle 0.48.0 08e642c; tau 2d8e309a (T0637) | **48/54**, encode/decode right at 17 min (t17); no `count`: founded from the steer's 1500-character extract of a 2586-character spec, and `count` is in the cut part | — |
+| R121 | lfm24 | semver (round 18, 30 min cap) | beagle 0.48.0 08e642c; tau 8510ffd5 (T0638) | **0/76**; no code: founding gave every milestone `source: "N/A"`, T0002 went the spec-tied route, and three cases workers wrote cases from N/A that `open` refused | — |
 
 ## B06 — the invented spec was not hard
 
@@ -1422,3 +1423,30 @@ The run went like this:
 Fix before round 18: **T0638 (fix 25).** The found-first steer shows a reference of up to 6000
 characters whole, with its lines kept. A longer reference is still shown as the opening, now
 labelled with how many lines it has.
+
+## R121 — lfm24 semver: "N/A" taken for a source
+
+Round 18, lfm24, bare-goal semver (no link in the request), 30 min cap. Exit 124 at 06:45:30.
+Only `tests/test_t0002.py` is on disk, so the grade is **0/76**.
+
+The run went like this:
+
+1. **Founding** at 06:16:29: six milestones, each with `"source": "N/A"`. The first was "1: Project
+   structure and setup — pyproject.toml, src layout, package name", and it was not folded as
+   layout.
+2. **The driver's first two `pursuit_plan` calls** named the statement as the task, and both were
+   refused.
+3. **T0002** had "Source: N/A" in its intent, so each step took the spec-tied route:
+   - A cases worker wrote cases from "N/A" into `tests/test_t0002.py`, citing `pyproject`.
+   - `open` refused each time ("no reference 'pyproject' under references/: it holds none").
+   - Those workers ran from 06:17:08 to 06:21:24, 06:22:27 to 06:27:05 and 06:27:24 to
+     06:39:27. In between, the driver tried a `bash -c 'test -f ...'` check, a dispatch and its
+     own writes, and all were refused.
+4. **The last step** was sent at 06:40:15, and the cap fell during it.
+
+Fix before round 19: **T0639 (fix 26).** A milestone source that is a placeholder (N/A, none, null,
+TBD, unknown, not applicable, a dash) is dropped at founding, and `_task_source` reads one already
+written as none, so the task takes the plain route.
+
+Still open from this run: the "Project structure and setup — …" milestone, numbered and with an
+em dash instead of `::`, was kept as work.

@@ -40,7 +40,7 @@ Watch on lfm24: llama.cpp #30490. After about 8 rejected tool calls in a row it 
 | 15 | R118 | lfm24 | itc | **0/42**; founding kept a 'Setup complete: beagle init written …' milestone as T0002 and the 30 min went there | T0636 |
 | 16 | R119 | q35 | cobs | 0/44 (no code; cases workers checked the table with their own encoder) | T0637 |
 | 17 | R120 | g26 | wrenfold | 48/54 (encode/decode right at 17 min; no `count`: founded from a cut extract) | T0638 |
-| 18 | R121 | lfm24 | semver | | |
+| 18 | R121 | lfm24 | semver | 0/76 (no code; every milestone sourced "N/A", cases workers wrote from it) | T0639 |
 | 19 | R122 | q35 | itc | | |
 | 20 | R123 | g26 | cobs | | |
 | 21 | R124 | lfm24 | wrenfold | | |
