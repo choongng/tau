@@ -61,6 +61,7 @@ branch and sha. Grades come from `grade_<task>.py` over `runs/RNN/adapter.py`;
 | R123 | g26 | cobs (round 20, 30 min cap) | beagle 0.48.0 08e642c; tau 65000f86 (T0640) | **35/44**; founded with 'Project initialization and environment setup.' kept as T0002, which took 28 of 30 minutes (a refused `ls`, an unprovable pass, then `done_when: false` as a new route); the COBS code a worker wrote there misses the 254-byte block end and raises on no malformed input | — |
 | R124 | lfm24 | wrenfold (round 21, 30 min cap) | beagle 0.48.0 08e642c; tau 0209e174 (T0641) | **0/54**; every milestone's `source` described its part ('wrenfold.py with encode, decode, count functions implementing revision 3 spec'); T0002 went spec-tied, its cases worker wrote 118 lines of tests (6 min), the code worker hit three reasoning cuts (11 min) and its thinking-off successor a 274 s wall; no module | — |
 | R125 | q35 | semver (bare goal, round 22, 30 min cap) | beagle 0.48.0 08e642c; tau 5b8020f0 (T0642) | **75/76** at 27 min (45/76 at 12); T0002 model 1.5 min, T0003 parse 15.4 min (spec-tied: cases 6, code 5.4 + 3.8 correcting two cases), T0004 compare 7.4 min (cases 5.4); then T0005 extras at the cap; misses only `1.2.3\n` (`$`); the spec was fetched as three identical files, one per `#fragment` | B07 plain q35 75/76 in 8.1 min |
+| R126 | g26 | itc (round 23, 30 min cap) | beagle 0.48.0 08e642c; tau 78c9b702 (T0643) | **9/42**; founding kept 'Examine practical implementation patterns from <ferd.ca>' (with 'Understand ... from <paper>' folded in) as T0002, a study task (`tests/test_itc_study.py`); its worker wrote cases and an untracked itc.py (bitmask ids, flat events, no leq) and was killed at its 17 min wall; the second was running at the cap | — |
 
 ## B06 — the invented spec was not hard
 
@@ -1554,3 +1555,23 @@ and `v2.0.0-3.txt`, byte-identical.
 Fix before round 23: **T0643 (fix 30).** `_fetched_source` drops a URL's fragment and reuses a
 page already fetched, so a page is fetched once and every fragment of it reads the same file.
 Spec-tied tasks still cost 5–6 min of cases each: that, not the fetch, is the gap to plain.
+
+## R126 — g26 itc, round 23: a study milestone kept (9/42)
+
+g26 founded with four milestones: 'Understand the ITC mathematical model and operations from
+<paper>', 'Examine practical implementation patterns from <ferd.ca>', 'Implement core ITC data
+structure and operations in Python', 'Verify implementation with unit tests'. The last was
+dropped (re-runs a check). 'Understand' was folded as reading-only into the part after it, but
+that part, 'Examine ...', was not: 'examine' was not a reading word. So T0002 was a study task
+carrying both references:
+
+1. **09:23** the driver gave it `tests/test_itc_study.py` as its check, spec-tied on ferd.ca.
+   The cases worker's cases misread the paper's seed `(1, 0)` as an id tuple.
+2. **09:23–09:45** the code worker wrote `itc.py` (ids as bitmasks over `(l, r)`, flat int
+   events, fork only of the whole id, no `leq`) and was killed at its 1033 s wall.
+3. **09:45** a second worker on T0002 was running at the cap; 'Implement core ITC' never
+   opened. itc.py (untracked) grades 9/42.
+
+Fix before round 24: **T0644 (fix 31).** `examine`, `inspect`, `survey`, `familiarize`/
+`familiarise` and `skim` are reading words, so such a milestone folds into the work after it.
+Over 1027 past milestones only the two 'Examine ...' ones change.
