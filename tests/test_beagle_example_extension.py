@@ -4448,16 +4448,17 @@ def test_a_milestone_source_that_names_no_reference_joins_its_intent(tmp_path: P
         tmp_path,
         notes,
     )
+    intents = [{"intent": part.split("::", 1)[1]} for part in parts]
     assert parts[0] == "Module creation::wrenfold.py with encode, decode, count"
-    assert module._task_source({"intent": parts[0]}) == ""
-    assert module._task_source({"intent": parts[1]}) == "wrenfold-r3 section 4"
-    assert module._task_source({"intent": parts[2]}) == "references/wrenfold-r3.txt"
-    assert module._task_source({"intent": parts[3]}).startswith("http://")
+    assert module._task_source(intents[0]) == ""
+    assert module._task_source(intents[1]) == "wrenfold-r3 section 4"
+    assert module._task_source(intents[2]) == "references/wrenfold-r3.txt"
+    assert module._task_source(intents[3]).startswith("http://")
     assert parts[4] == "Rejection::index.json"
     assert len(notes) == 2 and "'Module creation'" in notes[0]
     # With no project to look in, a source is taken at its word.
     [kept] = module._milestone_parts([{"part": "Parsing", "source": "semver.org"}])
-    assert module._task_source({"intent": kept}) == "semver.org"
+    assert module._task_source({"intent": kept.split("::", 1)[1]}) == "semver.org"
 
 
 def test_founding_folds_an_environment_milestone_with_no_source_into_the_first_work() -> None:
@@ -20456,7 +20457,10 @@ async def test_pursuit_step_hands_a_refused_cases_dry_run_back_to_the_same_worke
 async def test_pursuit_plan_keeps_a_part_source_in_its_intent(
     tmp_path: Path, beagle: Path, fake_beagle: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.chdir(_pursuit_project(tmp_path))
+    project = _pursuit_project(tmp_path)
+    monkeypatch.chdir(project)
+    (project / "references").mkdir()
+    (project / "references" / "spec.txt").write_text("Parsing reads input.\n")
     runtime, _ = _bound(tmp_path)
     plan = _tool(runtime, "pursuit_plan")
     item = plan.parameters["properties"]["parts"]["items"]
@@ -20489,6 +20493,8 @@ async def test_pursuit_found_milestone_source_is_kept_like_a_plan_part(
     project = tmp_path / "project"
     project.mkdir()
     monkeypatch.chdir(project)
+    (project / "references").mkdir()
+    (project / "references" / "spec.html").write_text("The parser.\n")
     (fake_beagle / "add.out").write_text("T0001  Ship it\n")
     runtime, _ = _bound(tmp_path)
     found = _tool(runtime, "pursuit_found")
