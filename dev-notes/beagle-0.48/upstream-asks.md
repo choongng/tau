@@ -204,3 +204,15 @@ file, and the task could not be proven. Rule 2e says where cases come from and t
 the output, copy it; where they give a rule or a bound, assert the rule (which form, its length, the
 refusal, the round trip), not an output you work out." Tau carries it meanwhile as `CASES_VALUES_NOTE`
 in the cases brief (T0611).
+
+## 11. Rule 2e: the marker's first word is the case's name
+
+Run S03 (q35 wrenfold): two cases workers wrote 17 sound cases but no marker beagle could read. Rule
+2e's only example, `# beagle-case: fork-seed cite=itc2008:367#95b kind=example op=fork`, never says
+what `fork-seed` is; q35 took it for part of the cite and wrote the cite where the name goes, then,
+told "no cite=", a `cite=` with no name; told "no id: `beagle-case: <id> ...`", it guessed again. About
+15k thinking tokens and a 19-minute worker went to the guessing. Ask: rule 2e names each field ("NAME,
+a short name for the case, unique in its file"), and the open refusal for a missing one says
+"no name: the first word after `beagle-case:` is the case's own name, e.g. `zero-is-one-byte`".
+Tau carries it meanwhile as `CASES_MARKER_NOTE` in the cases brief (T0614), and names unnamed
+markers before reading ties (T0613).
