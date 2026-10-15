@@ -155,6 +155,10 @@ StopReason = Literal["stop", "length", "toolUse", "error", "aborted"]
 #: The diagnostic on a turn ended at the output limit because its reasoning
 #: looped rather than because it ran out: its reasoning is not replayed.
 REASONING_LOOP_CUT = "reasoning_loop_cut"
+#: The diagnostic on a turn ended at the output limit because it reasoned past
+#: the run's time budget before acting (`TAU_TURN_REASONING_SECONDS`): its
+#: reasoning is replayed.
+REASONING_TIME_CUT = "reasoning_time_cut"
 
 
 class AssistantMessage(WireModel):

@@ -215,6 +215,12 @@ PLUGIN_ROOT_VAR = "${CLAUDE_PLUGIN_ROOT}"
 GOAL_BASENAME = "pursuit.toml"
 
 DEFAULT_DISPATCH_TIMEOUT = 900.0
+#: Seconds a worker's turn may reason before its first tool call; tau then cuts
+#: the turn and asks it to act (TAU_TURN_REASONING_SECONDS). S04-S06 (q35): one
+#: worker turn in each run reasoned to the 16k output limit, about 11 min, over
+#: values one `python3 -c` settles; 95% of turns reasoned under 2k tokens.
+WORKER_REASONING_SECONDS = 240.0
+TURN_REASONING_ENV = "TAU_TURN_REASONING_SECONDS"
 #: Maximal turns (the model's max_tokens each) the worker wall holds at the decode
 #: rate measured on earlier workers, when that is longer than the default. q38fn
 #: 10-11: at ~20 tok/s and max_tokens 16384 one turn took 650-850 s, and 5 of 9
@@ -2339,6 +2345,7 @@ async def _run_worker(
 
     limit = _memory_max()
     env = {**os.environ, WORKER_ENV: "1", BASH_TIMEOUT_ENV_VAR: f"{_worker_bash_timeout():g}"}
+    env.setdefault(TURN_REASONING_ENV, f"{WORKER_REASONING_SECONDS:g}")
     env.pop(WORKER_TASK_ENV, None)
     env.pop(WORKER_SCOPE_ENV, None)
     env.pop(WORKER_ROLE_ENV, None)

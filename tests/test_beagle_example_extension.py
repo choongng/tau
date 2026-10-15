@@ -1482,6 +1482,7 @@ with runs.open("a") as log:
     role = os.environ.get("BEAGLE_TAU_WORKER_ROLE")
     bash_timeout = os.environ.get("TAU_BASH_TIMEOUT_SECONDS")
     record = {"argv": sys.argv[1:], "stdin": brief, "scope": scope, "bash_timeout": bash_timeout}
+    record["reasoning_seconds"] = os.environ.get("TAU_TURN_REASONING_SECONDS")
     log.write(json.dumps({**record, "role": role}) + "\\n")
 attempt = len(runs.read_text().splitlines())
 # T0601: a cases worker writes only FAKE_TAU_CASES_WRITES.
@@ -11886,6 +11887,7 @@ async def test_worker_bash_default_timeout_is_short(
     monkeypatch.chdir(_pursuit_project(tmp_path))
     monkeypatch.delenv(_module().WORKER_BASH_TIMEOUT_ENV, raising=False)
     monkeypatch.setenv("TAU_BASH_TIMEOUT_SECONDS", "999")
+    monkeypatch.delenv("TAU_TURN_REASONING_SECONDS", raising=False)
     _ready_task(fake_beagle)
     runtime, _ = _bound(tmp_path)
     args = {
@@ -11902,6 +11904,8 @@ async def test_worker_bash_default_timeout_is_short(
     assert 0 < default < DEFAULT_BASH_TIMEOUT_SECONDS
     assert run["bash_timeout"] == f"{default:g}"
     assert f"A bash command is stopped after {default:g} s" in run["stdin"]
+    # S06: a worker's turn reasons for at most WORKER_REASONING_SECONDS.
+    assert run["reasoning_seconds"] == f"{_module().WORKER_REASONING_SECONDS:g}"
     assert "unless the call passes a longer `timeout`" in run["stdin"]
 
     monkeypatch.setenv(_module().WORKER_BASH_TIMEOUT_ENV, "45")

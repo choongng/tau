@@ -7,6 +7,7 @@ import json
 import re
 import shutil
 import string
+import time
 from collections import Counter, deque
 from collections.abc import AsyncIterator, Callable, Hashable, Mapping, Sequence
 from contextlib import suppress
@@ -26,6 +27,7 @@ from tau_agent.events import (
 from tau_agent.harness import AgentHarness, AgentHarnessConfig, QueuedMessages
 from tau_agent.messages import (
     REASONING_LOOP_CUT,
+    REASONING_TIME_CUT,
     AgentMessage,
     AssistantMessage,
     AssistantMessageDiagnostic,
@@ -275,6 +277,18 @@ LOOP_CUT_NUDGE = (
     "dropped. Do not work the whole problem out again in your head: take the next "
     "concrete step now with a tool call, or answer briefly."
 )
+#: Seconds a turn may reason before its first tool call, when the environment
+#: sets it; unset, only the output limit ends a turn. S06 (q35 at ~25 tok/s):
+#: a worker's 16k-token turn of reasoning took about 11 min, checking by hand
+#: values one run settles; 6 of 355 worker turns that day ran to the limit.
+TURN_REASONING_SECONDS_ENV = "TAU_TURN_REASONING_SECONDS"
+#: The follow-up to a turn cut at that budget. Its reasoning is replayed.
+TIME_CUT_NUDGE = (
+    "Your last reply reasoned for minutes without acting and was stopped. Your "
+    "reasoning so far is kept above: do not start it over. Take the next concrete "
+    "step now with a tool call: run what you were working out, or write what you "
+    "have, then check it."
+)
 # A reply that ends on "stop" with no tool call, its text holding a chat
 # template's tool-call markup, wrote its call as text: the loop would end the
 # run there. R37 (qwen, dev-notes/itc-runs/R37.md, class 3): a worker's last
@@ -485,12 +499,33 @@ class _ReasoningLoopDetector:
         return True
 
 
+def _length_nudge(message: AssistantMessage) -> str:
+    """The follow-up to `message`, a turn ended at the output limit before it acted."""
+    if reasoning_loop_cut(message):
+        return LOOP_CUT_NUDGE
+    cuts = {diagnostic.type for diagnostic in message.diagnostics or []}
+    return TIME_CUT_NUDGE if REASONING_TIME_CUT in cuts else OUTPUT_LIMIT_NUDGE
+
+
+def _turn_reasoning_seconds() -> float | None:
+    """The run's reasoning budget per turn (`TURN_REASONING_SECONDS_ENV`), or None."""
+    try:
+        seconds = float(environ.get(TURN_REASONING_SECONDS_ENV, ""))
+    except ValueError:
+        return None
+    return seconds if seconds > 0 else None
+
+
+#: The clock the reasoning budget is measured on.
+_reasoning_clock: Callable[[], float] = time.monotonic
+
+
 class _RequestGuard:
     """The provider a harness run's loop sends its requests through.
 
-    Each request's reasoning is watched, and one that plainly loops is stopped
-    and ends as an output-limit cut-off, so the session nudges as it would at
-    the cap.
+    Each request's reasoning is watched, and one that plainly loops, or runs
+    past the run's reasoning budget before a tool call, is stopped and ends as
+    an output-limit cut-off, so the session nudges as it would at the cap.
     """
 
     def __init__(self, inner: ModelProvider) -> None:
@@ -517,24 +552,37 @@ class _RequestGuard:
                 tools=tools,
                 signal=signal,
                 session_id=session_id,
-            )
+            ),
+            _turn_reasoning_seconds(),
         )
 
 
 async def _cut_looping_reasoning(
-    source: AsyncIterator[AssistantMessageEvent],
+    source: AsyncIterator[AssistantMessageEvent], budget: float | None = None
 ) -> AsyncIterator[AssistantMessageEvent]:
-    """Pass a response's events on, ending it at the length limit if it loops."""
+    """Pass a response's events on, ending it at the length limit if it loops,
+    or if it reasons for more than `budget` seconds before a tool call."""
     detector = _ReasoningLoopDetector()
     watching = True
+    started: float | None = None
     try:
         async for event in source:
             yield event
             if isinstance(event, ToolCallStartEvent):
                 watching = False
-            if not (
-                watching and isinstance(event, ThinkingDeltaEvent) and detector.feed(event.delta)
-            ):
+            if not (watching and isinstance(event, ThinkingDeltaEvent)):
+                continue
+            if started is None:
+                started = _reasoning_clock()
+            if detector.feed(event.delta):
+                diagnostic = AssistantMessageDiagnostic(
+                    type=REASONING_LOOP_CUT, details=detector.details
+                )
+            elif budget is not None and _reasoning_clock() - started > budget:
+                diagnostic = AssistantMessageDiagnostic(
+                    type=REASONING_TIME_CUT, details={"seconds": budget}
+                )
+            else:
                 continue
             partial = event.partial
             block = (
@@ -546,9 +594,6 @@ async def _cut_looping_reasoning(
                 yield ThinkingEndEvent(
                     content_index=event.content_index, content=block.thinking, partial=partial
                 )
-            diagnostic = AssistantMessageDiagnostic(
-                type=REASONING_LOOP_CUT, details=detector.details
-            )
             message = partial.model_copy(
                 update={
                     "stop_reason": "length",
@@ -2264,9 +2309,7 @@ class CodingSession:
         ):
             return
         self._length_continuations += 1
-        nudge = UserMessage(
-            content=LOOP_CUT_NUDGE if reasoning_loop_cut(message) else OUTPUT_LIMIT_NUDGE
-        )
+        nudge = UserMessage(content=_length_nudge(message))
         self._queued_nudge = nudge
         self._record_message_origin(nudge, delivery="follow_up", source="extension")
         self._harness.follow_up_message(nudge)

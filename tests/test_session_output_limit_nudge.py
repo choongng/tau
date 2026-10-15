@@ -13,6 +13,7 @@ import pytest
 
 from conftest import isolate_home
 from tau_agent import AssistantMessage
+from tau_agent.messages import ThinkingContent
 from tau_ai import FakeProvider
 from tau_coding import CodingSession, OpenAICompatibleProviderConfig, ProviderSettings
 from tau_coding import session as coding_session_module
@@ -20,6 +21,8 @@ from tau_coding.session import (
     LOOP_CUT_NUDGE,
     MAX_OUTPUT_LIMIT_CONTINUATIONS,
     OUTPUT_LIMIT_NUDGE,
+    TIME_CUT_NUDGE,
+    TURN_REASONING_SECONDS_ENV,
 )
 from test_session_output_limit import (
     R36_OPENING,
@@ -156,3 +159,54 @@ async def test_output_limit_cut_nudge_keeps_the_session_provider(
     assert built == []
     assert session.messages[-1].text == "Acted on the nudge."
     assert session.thinking_level == "medium"
+
+
+@pytest.mark.anyio
+async def test_reasoning_past_the_turn_budget_is_cut_and_asked_to_act(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # S06 (q35): a worker reasoned 16k tokens, about 11 min, checking by hand
+    # values one run settles. With a budget set, the turn is cut and its
+    # reasoning kept for the nudge to build on.
+    monkeypatch.setenv(TURN_REASONING_SECONDS_ENV, "5")
+    ticks = iter(range(1000))
+    monkeypatch.setattr(coding_session_module, "_reasoning_clock", lambda: next(ticks))
+    long = " ".join(f"Byte {n} holds bits {n * 7} to {n * 7 + 6}." for n in range(40))
+    never_reached = AssistantMessage(content="The reasoning ran to its end.")
+    main = FakeProvider(
+        [_streamed_reasoning(long, then=never_reached), _answers("Acted on the nudge.")]
+    )
+    built: list[object] = []
+    session = await _thinking_session(monkeypatch, tmp_path, main, built)
+
+    async for _event in session.prompt("Encode it."):
+        pass
+
+    cut = session.messages[1]
+    assert isinstance(cut, AssistantMessage)
+    assert cut.stop_reason == "length"
+    assert [diagnostic.type for diagnostic in cut.diagnostics or []] == ["reasoning_time_cut"]
+    assert [call[2][-1].text for call in main.calls] == ["Encode it.", TIME_CUT_NUDGE]
+    replayed = main.calls[1][2][1]
+    assert isinstance(replayed, AssistantMessage)
+    assert any(isinstance(block, ThinkingContent) for block in replayed.content)
+    assert session.messages[-1].text == "Acted on the nudge."
+
+
+@pytest.mark.anyio
+async def test_reasoning_has_no_time_budget_unless_the_run_sets_one(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.delenv(TURN_REASONING_SECONDS_ENV, raising=False)
+    ticks = iter(range(0, 100000, 100))
+    monkeypatch.setattr(coding_session_module, "_reasoning_clock", lambda: next(ticks))
+    long = " ".join(f"Byte {n} holds bits {n * 7} to {n * 7 + 6}." for n in range(40))
+    main = FakeProvider([_streamed_reasoning(long, then=AssistantMessage(content="Done."))])
+    built: list[object] = []
+    session = await _thinking_session(monkeypatch, tmp_path, main, built)
+
+    async for _event in session.prompt("Encode it."):
+        pass
+
+    assert session.messages[-1].text == "Done."
+    assert len(main.calls) == 1
