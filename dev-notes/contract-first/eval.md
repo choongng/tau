@@ -45,6 +45,7 @@ branch and sha. Grades come from `grade_<task>.py` over `runs/RNN/adapter.py`;
 | R107 | q35 | cobs (round 4, 30 min cap) | beagle 0.48.0 08e642c; tau b8f57402 (T0622, T0623) | 37/44, ended on its own at 27.8 min with all 6 tasks closed (T0002 at 23.6 min); no milestone named a source, so no cases worker ran: empty encode and the 5 malformed-decode cases fail | — |
 | R108 | g26 | wrenfold (round 5, 30 min cap) | beagle 0.48.0 08e642c; tau 65aee9aa (T0624) | 0/54 at the cap, no code: T0002 scoped to its test file alone; tau's data-test refusal made a second cases worker (cases committed at 17.5 min, cites right) and the code worker, refused wrenfold.py, rewrote the tests | — |
 | R109 | lfm24 | semver (round 6, 30 min cap) | beagle 0.48.0 08e642c; tau fe94622d (T0625) | 0/76 at the cap, no code: six refused pursuit_plan calls, then three cases workers whose cites all carried #0b7 beside the right line numbers; open refused each | — |
+| R110 | q35 | itc (round 7, 30 min cap) | beagle 0.48.0 08e642c; tau a3eb469a (T0626) | 17/42 at the cap: T0002 tied at 11 min, code 22/24 of its cases by 23:16; three forced gap cases contradicted the paper, and two code workers' corrections were put back (CASE words were the docstring; the paper's words were in backticks beside) | — |
 
 ## B06 — the invented spec was not hard
 
@@ -1101,3 +1102,33 @@ made in the case files and in the open's `--cites`, and the step's reply names t
 worker points at a line; a three-hex anchor that happens to match another line is chance. On
 R109's own test file, all six cites re-anchor correctly (146#d11, 149#ef3, 177#a09, 188#474,
 206#70f, 403#a65).
+
+## R110 — round 7, q35 itc: the paper's words were there, beside the CASE line
+
+This is the first itc score since the port: 17/42 at the cap. `leq` was never written, and the
+event-tree join was left un-normalised. The founding happened at 22:57. T0002, "Core ITC data
+structure", with the paper as its source, opened tied at 23:07, 11 min in. It was the run's only
+task.
+
+1. **The cases worker wrote 21 cases. Beagle's open dry run asked for an invalid, limit or gap
+   case for create, fork and join.** The worker added three `kind=gap` cases assuming that a null
+   id is refused. The paper says otherwise: `split(0) = (0, 0)` (line 366) and `sum(0, i) = i`
+   (line 386). They also contradict the worker's own `fork-split-zero` case, so no code could
+   pass all 24.
+2. **Code worker 1 (23:14) and the fix-up worker (23:16)** found the contradiction and rewrote
+   the three tests. Each quoted the paper in backticks on the line naming the test:
+   `i ::= 0 | 1 | (i1, i2)`, `split(0) = (0, 0)`, `sum(0, i) = i`. But each `CASE` line held the
+   case's own docstring, so tau put the tests back both times.
+3. **The driver then read the put-back as a verdict that the tests were right.** Its third worker
+   (23:24) made the code refuse null ids, which broke `fork-split-zero`. The run reached the cap
+   with 22 of 24 cases green.
+
+Fix before round 8: **T0627 (fix 16).** When a pinned case is changed, its source words can come
+from the `CASE` line, or from a quoted span on a report line that names the case or its test.
+Spacing around brackets and commas is ignored, so the paper's `(i1 , i2 )` matches a worker's
+`(i1, i2)`. A `kind=gap` case claims the source is silent, so source words anywhere in
+references/ refute it. Other kinds keep to their cited paragraph. Replayed on R110's real
+report, all three corrections are accepted.
+
+An upstream lead: beagle's demand for a malformed-input case per op pushed the worker into
+inventing refusals the source contradicts.

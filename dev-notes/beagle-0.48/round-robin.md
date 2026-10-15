@@ -29,7 +29,7 @@ Watch on lfm24: llama.cpp #30490. After about 8 rejected tool calls in a row it 
 | 4 | R107 | q35 | cobs | 37/44; all 6 closed, ended at 27.8 min; no source named, so no cases | T0624 |
 | 5 | R108 | g26 | wrenfold | 0/54; tests-only scope, data-test route, 2 cases workers, code refused | T0625 |
 | 6 | R109 | lfm24 | semver | 0/76; 6 refused plans, 3 cases workers' cites all #0b7, open refused | T0626 |
-| 7 | R110 | q35 | itc | | |
+| 7 | R110 | q35 | itc | 17/42; tied at 11 min, 22/24 cases; gap-case corrections put back twice | T0627 |
 | 8 | R111 | g26 | cobs | | |
 | 9 | R112 | lfm24 | wrenfold | | |
 | 10 | R113 | q35 | semver | | |
