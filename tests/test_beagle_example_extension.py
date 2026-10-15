@@ -20174,6 +20174,33 @@ async def test_pursuit_step_does_not_run_a_cases_worker_on_a_url_it_cannot_fetch
 
 
 @pytest.mark.anyio
+async def test_pursuit_step_cases_worker_reasons_for_less_per_turn_than_the_code_worker(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # R128 (q35 wrenfold): the three cases workers took 7.6, 6.1 and 7+ of the run's
+    # 30 min, mostly in turns that drafted the test file early and then re-drafted
+    # it to the 240 s budget; cut at 120 s, the reply wrote it in 4 of 4 samples.
+    monkeypatch.delenv("TAU_TURN_REASONING_SECONDS", raising=False)
+    monkeypatch.chdir(_pursuit_project(tmp_path))
+    monkeypatch.setenv("FAKE_TAU_CASES_WRITES", json.dumps({"tests/test_parse.py": SPEC_CASES}))
+    _source_task(fake_beagle)
+    runtime, _ = _bound(tmp_path)
+
+    await _tool(runtime, "pursuit_step").execute("c1", SPEC_STEP)
+
+    module = _module()
+    cases, code = _runs(fake_tau)
+    assert cases["role"] == "cases" and code["role"] == "executor"
+    assert cases["reasoning_seconds"] == f"{module.CASES_REASONING_SECONDS:g}"
+    assert code["reasoning_seconds"] == f"{module.WORKER_REASONING_SECONDS:g}"
+    assert module.CASES_REASONING_SECONDS < module.WORKER_REASONING_SECONDS
+
+
+@pytest.mark.anyio
 async def test_pursuit_step_spec_tied_writes_cases_then_opens_with_cites_and_cases(
     tmp_path: Path,
     beagle: Path,
