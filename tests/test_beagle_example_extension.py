@@ -20131,6 +20131,35 @@ async def test_pursuit_step_spec_tied_scoped_into_references_is_refused_before_i
 
 
 @pytest.mark.anyio
+async def test_pursuit_step_spec_tied_with_no_scope_carries_its_predecessors_to_the_cases_worker(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The 10-15 audit: T0629's early refusal must leave a successor with no
+    # scope of its own to carry its predecessor's, as R18 #56 asked.
+    project = _pursuit_project(tmp_path)
+    (project / "references").mkdir(exist_ok=True)
+    monkeypatch.chdir(project)
+    monkeypatch.setenv("FAKE_TAU_CASES_WRITES", json.dumps({"tests/test_parse.py": SPEC_CASES}))
+    _source_task(fake_beagle)
+    record = json.loads((fake_beagle / "show.out").read_text())
+    (fake_beagle / "show.out").write_text(json.dumps({**record, "sibling_of": "T0009"}))
+    (fake_beagle / "show-T0009.out").write_text(
+        json.dumps({"id": "T0009", "criteria": SPEC_STEP["criteria"], "scope": ["parser.py"]})
+    )
+    runtime, _ = _bound(tmp_path)
+    call = {key: value for key, value in SPEC_STEP.items() if key != "scope"}
+
+    result = await _tool(runtime, "pursuit_step").execute("c1", call)
+
+    assert "no scope given" not in result.text
+    assert [run["role"] for run in _runs(fake_tau)][:1] == ["cases"]
+
+
+@pytest.mark.anyio
 async def test_pursuit_step_spec_tied_cases_fail_at_the_open_with_beagles_refusal(
     tmp_path: Path,
     beagle: Path,
