@@ -60,6 +60,7 @@ branch and sha. Grades come from `grade_<task>.py` over `runs/RNN/adapter.py`;
 | R122 | q35 | itc (round 19, 30 min cap) | beagle 0.48.0 08e642c; tau 1faccf24 (T0639) | **2/42**; founded from the paper's introduction as intervals [start, end) with counters, split and merge; T0002 Interval (11 min) and T0003 flat Clock (13 min) closed, no fork/event/join or trees | — |
 | R123 | g26 | cobs (round 20, 30 min cap) | beagle 0.48.0 08e642c; tau 65000f86 (T0640) | **35/44**; founded with 'Project initialization and environment setup.' kept as T0002, which took 28 of 30 minutes (a refused `ls`, an unprovable pass, then `done_when: false` as a new route); the COBS code a worker wrote there misses the 254-byte block end and raises on no malformed input | — |
 | R124 | lfm24 | wrenfold (round 21, 30 min cap) | beagle 0.48.0 08e642c; tau 0209e174 (T0641) | **0/54**; every milestone's `source` described its part ('wrenfold.py with encode, decode, count functions implementing revision 3 spec'); T0002 went spec-tied, its cases worker wrote 118 lines of tests (6 min), the code worker hit three reasoning cuts (11 min) and its thinking-off successor a 274 s wall; no module | — |
+| R125 | q35 | semver (bare goal, round 22, 30 min cap) | beagle 0.48.0 08e642c; tau 5b8020f0 (T0642) | **75/76** at 27 min (45/76 at 12); T0002 model 1.5 min, T0003 parse 15.4 min (spec-tied: cases 6, code 5.4 + 3.8 correcting two cases), T0004 compare 7.4 min (cases 5.4); then T0005 extras at the cap; misses only `1.2.3\n` (`$`); the spec was fetched as three identical files, one per `#fragment` | B07 plain q35 75/76 in 8.1 min |
 
 ## B06 — the invented spec was not hard
 
@@ -1530,3 +1531,26 @@ when it carries a link or names a file in references/ by name or stem; otherwise
 the part's intent, and founding (or plan) says so. Over 82 past sources from founding and plan
 calls, it keeps all 74 that named a reference and drops the 8 that did not: 'python-coding
 skill', 'python-coding', 'pyproject.toml' and R124's five.
+
+## R125 — q35 semver, round 22: 75/76 at 27 minutes
+
+Founding was quick (founded at 08:46, about 1.5 min in). The tasks:
+
+- **T0002** Core Version model, 08:46–08:48, plain.
+- **T0003** Parsing and validation, 08:48–09:03, spec-tied on `.../v2.0.0.html`: the cases
+  worker took 6 min (two refused opens over cites), the code worker 5.4 min, and a second
+  3.8 min correcting two cases the first flagged (`1.0.0-x-y-z.--.`, whose last dot is the
+  spec's sentence, and a build case asserting no pre-release).
+- **T0004** Comparison, 09:04–09:11, spec-tied on `...#spec-item-11`: the cases worker took
+  5.4 min, 1.5 of them on 25 `refs find`/`show` calls, several for "item-11".
+- **T0005** pre-release/build extras was at its cases worker at the cap.
+
+The score reached 75/76 at the T0004 close (minute 27). Plain q35 got the same 75/76 in 8.1
+min, missing the same `1.2.3\n` case (`$` matches before a trailing newline).
+
+The three sources were one page with three fragments, fetched as `v2.0.0.txt`, `v2.0.0-2.txt`
+and `v2.0.0-3.txt`, byte-identical.
+
+Fix before round 23: **T0643 (fix 30).** `_fetched_source` drops a URL's fragment and reuses a
+page already fetched, so a page is fetched once and every fragment of it reads the same file.
+Spec-tied tasks still cost 5–6 min of cases each: that, not the fetch, is the gap to plain.
