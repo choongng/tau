@@ -3443,11 +3443,13 @@ def _milestone_parts(
         return []
     parts = []
     for item in value:
-        if not isinstance(item, dict):
-            parts.append(str(item).strip())
-            continue
-        part = str(item.get("part") or item.get("title") or "").strip()
-        source = " ".join(str(item.get("source") or "").split())
+        if isinstance(item, dict):
+            part = str(item.get("part") or item.get("title") or "").strip()
+            source = " ".join(str(item.get("source") or "").split())
+        else:
+            part, source = str(item).strip(), ""
+        if part and (not source or _NO_SOURCE.match(source)):
+            part, source = _source_in_part(part, root)
         if part and source and not _NO_SOURCE.match(source):
             title, _, intent = part.partition("::")
             part = f"{title.strip()}::{f'{intent.strip()} ' if intent.strip() else ''}"
@@ -3463,6 +3465,32 @@ def _milestone_parts(
                     )
         parts.append(part)
     return [part for part in parts if part]
+
+
+#: The words that lead a link written into a milestone's part ("..., based on <link>").
+_LINK_LEAD = re.compile(r"[\s,;]*(?:\b(?:based on|according to|from|per|see)\s+)?$", re.I)
+
+
+def _source_in_part(part: str, root: Path | None) -> tuple[str, str]:
+    """A milestone `part` given no source, and the source it names in its own words:
+    a link, taken out of them, or under `root` a references/ file named in them;
+    "" when it names neither.
+
+    F011, F012 (g26 cobs): every part ended "... based on <the request's link>"
+    and none set a source, so no milestone kept Source:.
+    """
+    found = _PROMPT_URL.search(part)
+    if found:
+        link = found.group().rstrip(".,;:)")
+        before = _LINK_LEAD.sub("", part[: found.start()])
+        after = part[found.start() + len(link) :].lstrip(".,;:) ").strip()
+        return " ".join(w for w in (before.strip(), after) if w), link
+    if root is not None:
+        for word in re.finditer(r"[\w./-]+", part):
+            named = _named_reference(word.group().rstrip("."), root)
+            if named:
+                return part, named
+    return part, ""
 
 
 def _task_source(record: Mapping[str, Any]) -> str:

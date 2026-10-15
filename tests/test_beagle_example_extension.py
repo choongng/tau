@@ -4535,6 +4535,36 @@ def test_a_milestone_source_spelled_near_a_reference_names_that_file(tmp_path: P
     assert sources[2] == "" and len(notes) == 1
 
 
+def test_a_link_or_reference_written_in_a_milestone_part_becomes_its_source(
+    tmp_path: Path,
+) -> None:
+    # F011, F012 (g26 cobs): every milestone wrote the request's link in its part
+    # ("... based on https://en.wikipedia.org/...") and set no source, so no
+    # milestone kept Source: and the cases worker had no reference: the R123 path
+    # (g26 cobs, unsourced, 35/44 with cases from memory).
+    module = _module()
+    refs = tmp_path / "references"
+    refs.mkdir()
+    (refs / "itc2008.txt").write_text("ITC\n")
+    link = "https://en.wikipedia.org/wiki/Consistent_Overhead_Byte_Stuffing"
+    parts = module._milestone_parts(
+        [
+            {"part": f"COBS encoding::Implement the encoder, based on {link}"},
+            f"COBS Core Logic: Implement encode and decode based on {link}.",
+            {"part": "Fork::split an id as itc2008 section 5.3 defines"},
+            {"part": "Tests::round trips"},
+            {"part": f"Decode::reverse it per {link}", "source": "references/itc2008.txt"},
+        ],
+        tmp_path,
+    )
+    assert parts[0] == f"COBS encoding::Implement the encoder Source: {link}"
+    assert parts[1] == f"COBS Core Logic: Implement encode and decode::Source: {link}"
+    assert parts[2] == "Fork::split an id as itc2008 section 5.3 defines Source: itc2008"
+    assert parts[3] == "Tests::round trips"
+    # A source given is the source; the part keeps its words.
+    assert parts[4] == f"Decode::reverse it per {link} Source: references/itc2008.txt"
+
+
 def test_founding_folds_examine_and_understand_milestones_into_the_work() -> None:
     # R126 (g26 itc, 9/42): 'Understand the ITC mathematical model ... from <paper>' was
     # folded into 'Examine practical implementation patterns from <walkthrough>', which
