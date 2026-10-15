@@ -4383,6 +4383,19 @@ def test_founding_folds_a_sourced_layout_milestone_into_the_first_work() -> None
     assert module._layout_only_milestone("Package layout :: pyproject.toml, src/")
 
 
+def test_a_milestone_whose_source_is_a_placeholder_has_no_source() -> None:
+    # Run R121 (lfm24, bare-goal semver): every milestone came with "source": "N/A";
+    # T0002 went the spec-tied route, three cases workers wrote cases "from N/A"
+    # and cited pyproject, and `open` refused each: 22 of the 30 minutes.
+    module = _module()
+    for placeholder in ("N/A", "n/a", "none", "None.", "-", "\u2014", "TBD", "not applicable"):
+        [part] = module._milestone_parts([{"part": "Parsing:: parse()", "source": placeholder}])
+        assert part == "Parsing:: parse()", placeholder
+        assert module._task_source({"intent": f"parse() Source: {placeholder}"}) == ""
+    [kept] = module._milestone_parts([{"part": "Parsing:: parse()", "source": "semver.org"}])
+    assert module._task_source({"intent": kept.split("::", 1)[1]}) == "semver.org"
+
+
 def test_founding_folds_an_environment_milestone_with_no_source_into_the_first_work() -> None:
     # R105 (g26, bare-goal semver): 'Environment setup :: uv, ruff, pytest' opened as
     # T0002; no check of it could be shown to refuse, and the driver spent 13 min
