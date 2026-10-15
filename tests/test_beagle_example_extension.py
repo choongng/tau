@@ -4446,6 +4446,22 @@ def test_founding_folds_an_environment_milestone_with_no_source_into_the_first_w
     assert not module._layout_only_milestone("Environment variables :: read VERSION from env")
 
 
+def test_a_numbered_or_initialization_setup_milestone_is_layout() -> None:
+    # R123 (g26 cobs): 'Project initialization and environment setup.' stayed T0002 and
+    # took 28 of the 30 minutes; R121 (lfm24 semver): '1: Project structure and setup -
+    # pyproject.toml, src layout' was read as the title '1' and kept.
+    module = _module()
+    for part in (
+        "Project initialization and environment setup.",
+        "1: Project structure and setup \u2014 pyproject.toml, src layout, package name",
+        "Step 2. Repository bootstrap",
+        "3) Environment initialisation:: uv, ruff",
+    ):
+        assert module._layout_only_milestone(part), part
+    for part in ("1: Version parsing \u2014 parse() function", "2. Encoder:: encode bytes"):
+        assert not module._layout_only_milestone(part), part
+
+
 def test_founding_folds_a_design_milestone_into_the_next_when_known_answers_exist() -> None:
     # R19: after T0155, 'Design: settle the data structure and API …' became its
     # own task between known answers and Implement.
