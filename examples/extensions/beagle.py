@@ -6854,9 +6854,21 @@ def _reading_only_part(parts: list[str]) -> str | None:
 #: Words of a part that only lays the project out: run S05's 'Project
 #: scaffolding' (pyproject.toml, package layout) was given the spec as its
 #: source, so its cases had nothing to cite, and as a task it had nothing but an
-#: import to check.
+#: import to check. R105's 'Environment setup' (uv, ruff, pytest), with no
+#: source, had no check that could be shown to refuse.
 _LAYOUT_WORDS = _SETUP_WORDS | frozenset(
     {
+        "environment",
+        "env",
+        "dev",
+        "development",
+        "dependencies",
+        "deps",
+        "tools",
+        "toolchain",
+        "repository",
+        "repo",
+        "workspace",
         "scaffold",
         "scaffolding",
         "layout",

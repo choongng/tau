@@ -4186,6 +4186,27 @@ def test_founding_folds_a_sourced_layout_milestone_into_the_first_work() -> None
     assert module._layout_only_milestone("Package layout :: pyproject.toml, src/")
 
 
+def test_founding_folds_an_environment_milestone_with_no_source_into_the_first_work() -> None:
+    # R105 (g26, bare-goal semver): 'Environment setup :: uv, ruff, pytest' opened as
+    # T0002; no check of it could be shown to refuse, and the driver spent 13 min
+    # re-routing it. Its text joins the first work's intent.
+    module = _module()
+    parts = module._milestone_parts(
+        [
+            {"part": "Environment setup:: setting up the project with uv, ruff, and pytest."},
+            {"part": "Core parsing:: parse version strings per SemVer 2.0.0."},
+            {"part": "Comparison:: order versions by precedence."},
+        ]
+    )
+    kept, notes = module._repair_milestones(parts)
+    assert [part.split("::")[0] for part in kept] == ["Core parsing", "Comparison"]
+    assert "uv, ruff, and pytest" in kept[0]
+    assert any("Folded the layout milestone 'Environment setup'" in n for n in notes)
+    for title in ("Dev environment", "Tooling and dependencies", "Repository setup"):
+        assert module._layout_only_milestone(f"{title} :: pyproject.toml, ruff"), title
+    assert not module._layout_only_milestone("Environment variables :: read VERSION from env")
+
+
 def test_founding_folds_a_design_milestone_into_the_next_when_known_answers_exist() -> None:
     # R19: after T0155, 'Design: settle the data structure and API …' became its
     # own task between known answers and Implement.
