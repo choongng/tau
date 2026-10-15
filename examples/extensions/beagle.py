@@ -127,6 +127,7 @@ import asyncio
 import contextlib
 import fnmatch
 import functools
+import hashlib
 import importlib.util
 import itertools
 import json
@@ -11065,6 +11066,18 @@ CASES_VALUES_NOTE = (
 )
 
 
+#: How a case's marker reads, for the cases worker. Run S03: q35 took rule 2e's
+#: `fork-seed` for part of the cite, wrote the cite where the name goes, then a
+#: `cite=` with no name, and spent a 19-minute worker on the guessing.
+CASES_MARKER_NOTE = (
+    "Above each case put one marker line, `# beagle-case: NAME cite={ref}:LINE#HASH "
+    "kind=KIND op=FUNCTION`. NAME is a short name you give the case, unique in the "
+    "file (`zero-is-one-byte`); LINE#HASH is the anchor `beagle refs find` printed, "
+    "or LINE#HASH-LINE#HASH for a passage; KIND is example, invalid, limit or gap; "
+    "FUNCTION is the function the case calls."
+)
+
+
 def _cases_brief(
     task: str,
     title: str,
@@ -11090,15 +11103,71 @@ def _cases_brief(
         f"Write the cases in {', '.join(cases_scope)}, which its check runs: `{done_when}`\n\n"
         + CASES_VALUES_NOTE
         + "\n\n"
+        + CASES_MARKER_NOTE.format(ref=Path(source).stem)
+        + "\n\n"
         "You are done when this passes, with your cites and case files added:\n"
         f"  {dry_run} --cites REF:ANCHOR ... --cases FILE ... --dry-run\n"
-        "It passes while the tests fail: the code is not written yet. End with a report "
-        "naming the case files and the cites.\n\n"
+        "It passes while the tests fail: the code is not written yet. Its --scope is "
+        f"the code's, for the later sub-agent; you write only in {', '.join(cases_scope)}. "
+        "End with a report naming the case files and the cites.\n\n"
         + NO_BEAGLE_NOTE
         + " You may also run that `beagle pursuit open ... --dry-run`."
         + "\n\n"
         + _turn_cap_note()
     )
+
+
+#: A `beagle-case:` line whose first word is a cite where the id goes, with no
+#: `cite=`: run S03's cases worker wrote all 17 of its markers so.
+_CITE_AS_CASE_ID = re.compile(
+    r"^(?P<pre>.*beagle-case:\s*)(?P<cite>[\w.-]+:\d+#[0-9a-f]+(?:-\d+#[0-9a-f]+)?)(?P<rest>.*)$"
+)
+#: A `beagle-case:` line with no name, its first word already a `key=value`:
+#: S03's second cases worker, told "no cite=", moved to `beagle-case: cite=…`.
+_CASE_WITHOUT_ID = re.compile(r"^(?P<pre>.*beagle-case:\s*)(?P<rest>\w+=.*)$")
+
+
+def _case_name(fields: str, index: int) -> str:
+    """A name for an unnamed case: its `op=` (or `case`) and its line number."""
+    op = re.search(r"\bop=(\S+)", fields)
+    return f"{op.group(1) if op else 'case'}-{index + 1}"
+
+
+def _repair_case_markers(root: Path, cases_scope: list[str]) -> list[str]:
+    """Name each `beagle-case:` line in `cases_scope` that has no name: one with
+    its cite where the name goes (`_CITE_AS_CASE_ID`) also gets its `cite=`, one
+    whose first word is a `key=value` (`_CASE_WITHOUT_ID`) gets only the name.
+    The case files changed, for the step's result.
+
+    Run S03: the cases worker's 17 cases were sound but every marker read
+    `# beagle-case: wrenfold-r3:25#019 kind=example op=encode_single`; none tied,
+    and the whole round of cases was sent again, 6 min of a 30 min run.
+    """
+    repaired: list[str] = []
+    for rel in _changed_files(root):
+        if not _in_scope(rel, cases_scope, root) or not (root / rel).is_file():
+            continue
+        try:
+            lines = (root / rel).read_text().splitlines(keepends=True)
+        except (OSError, UnicodeDecodeError):
+            continue
+        changed = False
+        for n, line in enumerate(lines):
+            body = line.rstrip("\r\n")
+            ending = line[len(body) :]
+            as_id, no_id = _CITE_AS_CASE_ID.match(body), _CASE_WITHOUT_ID.match(body)
+            if as_id is not None and "cite=" not in body:
+                case = _case_name(as_id["rest"], n)
+                lines[n] = f"{as_id['pre']}{case} cite={as_id['cite']}{as_id['rest']}{ending}"
+            elif no_id is not None:
+                lines[n] = f"{no_id['pre']}{_case_name(no_id['rest'], n)} {no_id['rest']}{ending}"
+            else:
+                continue
+            changed = True
+        if changed:
+            (root / rel).write_text("".join(lines))
+            repaired.append(rel)
+    return repaired
 
 
 def _marker_ties(root: Path, cases_scope: list[str]) -> tuple[list[str], list[str]]:
@@ -11135,6 +11204,152 @@ def _marker_ties(root: Path, cases_scope: list[str]) -> tuple[list[str], list[st
             files.append(rel)
             cites.extend(cite for cite in found if cite not in cites)
     return files, cites
+
+
+#: The code worker's brief on a task with cases. Run R100: the T0002 code worker
+#: corrected three cases that read the source wrong, in the pinned file; the
+#: close refused the changed check and the task never closed, though its code
+#: passed every hidden test. `pursuit rules 2e`: "A case that reads the source
+#: wrong is a finding and an `amend`, never a quiet edit"; tau makes the amend
+#: from the worker's quotes (`_settle_case_edits`).
+CASES_PINNED_NOTE = (
+    "The cases in {files} were written from the source before this work, and the "
+    "check runs them as they are: write the code to them, not them to the code. If "
+    "a case reads the source wrong, correct only that case, and end your report with "
+    'one line per case you changed: `CASE <id>: "<the source\'s words>"`, the id from '
+    "its `beagle-case:` line and words copied from the lines its cite= names that "
+    "show the case was wrong. A case changed with no such line, or with words its "
+    "cited lines do not hold, is put back as it was."
+)
+
+_CASE_MARKER = re.compile(r"beagle-case:\s*(\S+)")
+_CASE_LINE = re.compile(r"^\s*[`*]*CASE\s+([^\s:`]+)\s*:\s*(.+?)\s*$", re.MULTILINE)
+
+
+def _case_blocks(text: str) -> tuple[str, dict[str, tuple[str, str]]]:
+    """`text` split at its `beagle-case:` lines: what comes before the first, and
+    each case's id with its cite and its lines up to the next marker."""
+    preamble: list[str] = []
+    blocks: dict[str, tuple[str, list[str]]] = {}
+    current: list[str] = preamble
+    for line in text.splitlines():
+        marker = _CASE_MARKER.search(line)
+        if marker is not None:
+            cite = _CASE_CITE.search(line)
+            current = [line]
+            blocks[marker.group(1)] = (cite.group(1) if cite else "", current)
+        else:
+            current.append(line)
+    return "\n".join(preamble).strip(), {
+        case: (cite, "\n".join(lines).strip()) for case, (cite, lines) in blocks.items()
+    }
+
+
+def _cited_text(cite: str, root: Path) -> str:
+    """The lines `cite` (`name:12#ab3` or `name:12#ab3-15#c01`) names in references/."""
+    name, _, anchors = cite.partition(":")
+    numbers = [int(n) for n in re.findall(r"(\d+)#", anchors)]
+    if not numbers:
+        return ""
+    path = root / REFERENCES_DIR / (name if name.endswith(".txt") else f"{name}.txt")
+    try:
+        lines = path.read_text(errors="replace").splitlines()
+    except OSError:
+        return ""
+    return "\n".join(lines[numbers[0] - 1 : numbers[-1]])
+
+
+def _squeezed(text: str) -> str:
+    return " ".join(text.replace("\u2212", "-").split()).casefold()
+
+
+def _pinned_text(rel: str, sha: str, root: Path) -> str | None:
+    """The text of `rel` whose sha256 is `sha`, from its recent history, or None."""
+    rc, out = _run(["git", "log", "--format=%H", "-n", "40", "--", rel], root, 30.0)
+    for commit in out.split() if rc == 0 else []:
+        shown = subprocess.run(
+            ["git", "show", f"{commit}:{rel}"], cwd=root, capture_output=True, check=False
+        )
+        if shown.returncode == 0 and hashlib.sha256(shown.stdout).hexdigest() == sha:
+            return shown.stdout.decode(errors="replace")
+    return None
+
+
+def _settle_case_edits(task: str, report: str, root: Path) -> str:
+    """Settle a code worker's edits to `task`'s pinned cases, before its check runs.
+
+    Each changed case needs a `CASE <id>: "<words>"` line in `report` whose words
+    the case's cited lines hold: then the check is re-pinned by `pursuit amend`,
+    with those lines as the reason. Otherwise the file is put back as pinned. What
+    happened, for the step's result, or "" when no case file changed.
+    """
+    rc, out = _pursuit(["show", task], root)
+    record = _json_reply(out) if rc == 0 else None
+    if not isinstance(record, dict) or not _strings(record.get("cases")):
+        return ""
+    pins = dict(
+        (path, sha)
+        for sha, _, path in (line.partition("  ") for line in _strings(record.get("check_files")))
+    )
+    quotes = {
+        case: words.strip().strip("`\"'\u201c\u201d") for case, words in _CASE_LINE.findall(report)
+    }
+    changed: dict[str, tuple[str, str]] = {}
+    for rel in _strings(record.get("cases")):
+        sha = pins.get(rel)
+        try:
+            now = (root / rel).read_bytes()
+        except OSError:
+            continue
+        if sha is None or hashlib.sha256(now).hexdigest() == sha:
+            continue
+        old = _pinned_text(rel, sha, root)
+        if old is None:
+            continue
+        changed[rel] = (old, now.decode(errors="replace"))
+    if not changed:
+        return ""
+    why: list[str] = []
+    reasons: list[str] = []
+    for rel, (old, new) in changed.items():
+        old_pre, old_cases = _case_blocks(old)
+        new_pre, new_cases = _case_blocks(new)
+        if old_pre != new_pre:
+            why.append(f"{rel}: the lines before its first case changed")
+        for case in sorted(set(old_cases) | set(new_cases)):
+            if old_cases.get(case) == new_cases.get(case):
+                continue
+            cite = (new_cases.get(case) or old_cases[case])[0]
+            words = quotes.get(case, "")
+            if not words:
+                why.append(f'case {case} changed with no `CASE {case}: "<words>"` line')
+            elif _squeezed(words) not in _squeezed(_cited_text(cite, root)):
+                why.append(f'case {case}: its cited lines ({cite}) do not hold "{words}"')
+            else:
+                reasons.append(f'{case}: "{words}"')
+    files = ", ".join(changed)
+    if not why:
+        reason = (
+            "cases read the source wrong; corrected by the code worker from " + "; ".join(reasons)
+        )[:900]
+        done_when = str(record.get("done_when") or "")
+        amend_rc, amended = _pursuit(
+            ["amend", task, "--done-when", done_when, "--reason", reason], root
+        )
+        if amend_rc == 0:
+            return (
+                f"The sub-agent corrected case(s) in {files} from the source "
+                f"({'; '.join(reasons)}); the check is re-pinned on the record by "
+                "`pursuit amend`, with those words as the reason."
+            )
+        why.append(f"`pursuit amend` refused: {amended.strip()[-300:]}")
+    for rel, (old, _new) in changed.items():
+        (root / rel).write_text(old)
+    return (
+        f"The sub-agent changed the pinned cases in {files}, so they are put back as "
+        f"pinned: {'; '.join(why)}. A case changes only with a "
+        '`CASE <id>: "<the source\'s words>"` line in the report, words its cited lines hold.'
+    )
 
 
 async def _write_cases(
@@ -11186,12 +11401,14 @@ async def _write_cases(
             f"{source} did not finish: {run.problem}{said}\n\nCall pursuit_step with "
             f'task="{task}" again to have them written.'
         )
+    _repair_case_markers(root, cases_scope)
     files, cites = _marker_ties(root, cases_scope)
     if not files:
         return (
             f"pursuit_step: {task} not opened — the sub-agent writing its cases from "
             f"{source} left no test in {', '.join(cases_scope)} with a `beagle-case:` "
-            f"marker, so there is nothing to tie the task to.{said}\n\nCall pursuit_step "
+            "marker of the form `# beagle-case: <id> cite=<ref>:<anchor> kind=<kind> "
+            f"op=<op>`, so there is nothing to tie the task to.{said}\n\nCall pursuit_step "
             f'with task="{task}" again to have them written, or with a done_when that '
             "names the test file the cases go in."
         )
@@ -12102,6 +12319,10 @@ def make_step_tool() -> Any:
         if references:
             brief = f"{brief}\n\n{references}"
         brief += _last_close_note((str(root), task))
+        if _strings(record.get("cases")):
+            brief += "\n\n" + CASES_PINNED_NOTE.format(
+                files=", ".join(_strings(record.get("cases")))
+            )
         briefed_scope = scope or _strings(record.get("scope"))
         if check and _scope_has_data(briefed_scope, root) and _only_data_and_tests(briefed_scope):
             # Run R35: workers took the data check's ImportError for the goal.
@@ -12320,6 +12541,9 @@ def make_step_tool() -> Any:
             helpers_left = _helpers_left_in_scope(root, scope, check)
             if helpers_left:
                 shown = f"{shown}\n\n{helpers_left.rstrip()}"
+            settled = _settle_case_edits(task, report, root)
+            if settled:
+                shown = f"{shown}\n\n{settled}"
             if not check:
                 verdict = (0, "")
                 break

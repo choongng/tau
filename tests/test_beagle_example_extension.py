@@ -19684,6 +19684,9 @@ async def test_pursuit_step_spec_tied_writes_cases_then_opens_with_cites_and_cas
     assert "`beagle pursuit rules 2e`" in cases["stdin"] and "the source spec" in cases["stdin"]
     # Run R100: the cases that worked their own bytes out were the wrong ones.
     assert "copy it exactly" in cases["stdin"] and "not an output you work out" in cases["stdin"]
+    # Run S03: q35 guessed at the marker's first word; the brief names each field.
+    assert "`# beagle-case: NAME cite=spec:LINE#HASH kind=KIND op=FUNCTION`" in cases["stdin"]
+    assert "Its --scope is the code's" in cases["stdin"]
     assert (
         "beagle pursuit open T0002 --criteria 'parse reads what the spec says' "
         "--done-when 'python3 -m pytest -q tests/test_parse.py' --scope parser.py "
