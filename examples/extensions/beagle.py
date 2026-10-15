@@ -2975,6 +2975,25 @@ def _reference_extract(text: str) -> str:
     return f"{title}\n\n{body}" if body else title
 
 
+#: A numbered section title on a line of its own: `5.3.2    Fork`, not `1. A sentence, ...`.
+_NUMBERED_HEADING = re.compile(r"^\s*(\d+(?:\.\d+)*)\.?[ \t]+([A-Z][^\n.:;,]{1,60}?)\s*$")
+
+
+def _numbered_sections(text: str) -> list[str]:
+    """The numbered section titles of a reference, in order, or [] for fewer than two.
+
+    Run R122 (q35 itc): shown the ITC paper's introduction, the driver founded
+    intervals with counters; "3 Fork-Event-Join Model" and "5.3 Operations over
+    ITC" were past the cut, and named what the paper defines.
+    """
+    titles = [
+        f"{m[1]} {' '.join(m[2].split())}"
+        for line in text.splitlines()
+        if (m := _NUMBERED_HEADING.match(line))
+    ]
+    return titles[:60] if len(titles) > 1 else []
+
+
 def _references_note(index: Mapping[str, Any], root: Path) -> str:
     """The found-first steer's part on the request's references: each whole when
     short, else an extract."""
@@ -2993,6 +3012,8 @@ def _references_note(index: Mapping[str, Any], root: Path) -> str:
         else:
             lines = len(text.splitlines())
             shown = f"its opening, of {lines} lines:\n<<<\n{_reference_extract(text)}\n>>>"
+            if sections := _numbered_sections(text):
+                shown += f"\nIts numbered sections: {'; '.join(sections)}."
         parts.append(f"From {url} ({REFERENCES_DIR}/{name}), {shown}")
     parts += [f"Could not fetch {url}: {why}" for url, why in failed.items()]
     return (
