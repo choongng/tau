@@ -6956,13 +6956,25 @@ _LAYOUT_WORDS = _SETUP_WORDS | frozenset(
         "skeleton",
         "tooling",
         "pyproject",
+        "initialization",
+        "initialisation",
+        "bootstrap",
+        "bootstrapping",
     }
 )
+#: A step number ahead of a milestone's title: `1:`, `2.`, `3)`, `Step 2.`. R121's
+#: '1: Project structure and setup — …' was read as the title '1'.
+_STEP_NUMBER = re.compile(r"(?i)^\s*(?:step\s+)?\d+\s*[.:)]\s*")
 
 
 def _layout_only_milestone(part: str) -> bool:
-    """Whether milestone `part` only lays the project out, judged by its title."""
-    title = re.split(r":| - | — ", _split_part(part)[0], maxsplit=1)[0]
+    """Whether milestone `part` only lays the project out, judged by its title.
+
+    R123 (g26 cobs): 'Project initialization and environment setup.' stayed a
+    task of its own and took 28 of the 30 minutes.
+    """
+    head = _STEP_NUMBER.sub("", _split_part(part)[0], count=1)
+    title = re.split(r":| - | — ", head, maxsplit=1)[0]
     words = set(re.findall(r"[a-z]+", title.lower()))
     return bool(words) and words <= _LAYOUT_WORDS
 
