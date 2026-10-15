@@ -44,6 +44,7 @@ branch and sha. Grades come from `grade_<task>.py` over `runs/RNN/adapter.py`;
 | R106 | lfm24 | itc (round 3, 30 min cap) | beagle 0.48.0 08e642c; tau 79652f00 (T0621) | 0/42, ended at 11 min: the driver sent T0002's description as pursuit_step's task (criteria, done_when, scope right), was told to call with no arguments, then tried to write src/itc.py itself until the 8-refusal breaker stopped the run; no worker ran | — |
 | R107 | q35 | cobs (round 4, 30 min cap) | beagle 0.48.0 08e642c; tau b8f57402 (T0622, T0623) | 37/44, ended on its own at 27.8 min with all 6 tasks closed (T0002 at 23.6 min); no milestone named a source, so no cases worker ran: empty encode and the 5 malformed-decode cases fail | — |
 | R108 | g26 | wrenfold (round 5, 30 min cap) | beagle 0.48.0 08e642c; tau 65aee9aa (T0624) | 0/54 at the cap, no code: T0002 scoped to its test file alone; tau's data-test refusal made a second cases worker (cases committed at 17.5 min, cites right) and the code worker, refused wrenfold.py, rewrote the tests | — |
+| R109 | lfm24 | semver (round 6, 30 min cap) | beagle 0.48.0 08e642c; tau fe94622d (T0625) | 0/76 at the cap, no code: six refused pursuit_plan calls, then three cases workers whose cites all carried #0b7 beside the right line numbers; open refused each | — |
 
 ## B06 — the invented spec was not hard
 
@@ -1076,3 +1077,27 @@ Fix before round 6: **T0625 (fix 14).** Once a source task's cases are written, 
 import that no path in scope creates is added to the scope as `<m>.py` and `<m>/` (under `src/`
 when the project has one), and the reply says so. The task opens with its cases and goes to the
 code worker. The data-test route stays for tasks without a source.
+
+## R109 — round 6, lfm24 semver: right lines, one anchor for all
+
+The founding (22:19:05) went well. Then lfm24 made six `pursuit_plan` calls in a row, all refused:
+first it split T0002 into parts that carried T0002's own title, then into parts labelled "T0002".
+After that it stepped T0002 itself, with the fetched `semver.org` as its source.
+
+1. **Three cases workers ran, finishing at 22:31, 22:36 and 22:46.** Each wrote sound cases in
+   `tests/test_parse.py`, and every marker cited the right line numbers (146, 149, 177, 188, 206,
+   403). But every marker used the same anchor, `#0b7`, which is line 136's anchor.
+2. **Each open was refused** with "cite 'semver.org:146#0b7': #0b7 is line 136's anchor: cite
+   136#0b7 if line 136 is the one meant, or 146#d11 for line 146". The route handed the refusal
+   back to the next cases worker, and each worker left the anchors the same.
+3. lfm24 also tried `pursuit_dispatch` (refused) and an edit of `.beagle` (blocked). The `<function=`
+   text bug was still not seen.
+
+The run reached the cap with only the founding commit: 0/76.
+
+Fix before round 7: **T0626 (fix 15).** After a cases worker, each case cite whose anchor is not
+its line's is given that line's anchor by `beagle refs show <ref> --from N --to N`. The fix is
+made in the case files and in the open's `--cites`, and the step's reply names the change. A
+worker points at a line; a three-hex anchor that happens to match another line is chance. On
+R109's own test file, all six cites re-anchor correctly (146#d11, 149#ef3, 177#a09, 188#474,
+206#70f, 403#a65).
