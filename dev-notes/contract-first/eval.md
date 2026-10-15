@@ -41,6 +41,7 @@ branch and sha. Grades come from `grade_<task>.py` over `runs/RNN/adapter.py`;
 | S06 | q35 | wrenfold (smoke, 30 min cap) | beagle 0.48.0 08e642c; tau 352f48e9 (T0617: fold a layout-only milestone) | 49/54 from 20 min to the cap, never closed: founding 5.5 min with scaffolding folded into Encoder; T0002 opened tied at 17.2 min; one wrong case (`encode([63])` without the end marker) put back three times, as the worker's CASE line named the test and the cite only the sentence's last line | S05 0/54; S04 45/54; B06 plain 9.1 min |
 | R104 | q35 | wrenfold (round 1, 30 min cap) | beagle 0.48.0 08e642c; tau 8f721639 (T0618 reasoning time cap, T0619 CASE line) | 12/54 at the cap, first at 22 min: encoding closed (T0002 at 18.5 min, T0003 at 21.3), decoding never reached; founding 1.7 min into 6 milestones; T0002's cases worker took 11.5 min, one 241 s turn cut by T0618 | S06 49/54 unclosed; B06 plain 9.1 min |
 | R105 | g26 | semver (round 2, 30 min cap) | beagle 0.48.0 08e642c; tau 4cf54474 (T0620) | 0/76 at the cap: founding's 'Environment setup' milestone took 18.5 min (13 of re-routing a check no defect could fail); T0003's source was the unfetched URL https://semver.org/, its first cases worker found no reference; the second was writing cases at the cap | B07 plain q35 75/76 in 8.1 min |
+| R106 | lfm24 | itc (round 3, 30 min cap) | beagle 0.48.0 08e642c; tau 79652f00 (T0621) | 0/42, ended at 11 min: the driver sent T0002's description as pursuit_step's task (criteria, done_when, scope right), was told to call with no arguments, then tried to write src/itc.py itself until the 8-refusal breaker stopped the run; no worker ran | — |
 
 ## B06 — the invented spec was not hard
 
@@ -1007,3 +1008,27 @@ no semver code was written.
 Fix before round 3: T0621 (fix 10). Founding folds an environment, tooling or dependency milestone
 into the first work. Queued as fix 11, after a round that doesn't need it: a URL source is fetched
 by the host before the cases worker runs.
+
+## R106 — round 3, lfm24 itc: the task id slot
+
+This was lfm2.5-24b's first pursuit. It reasons at length (up to 16k chars a turn), and its tool
+calls parsed until the breaker. The `<function=` text-call bug (llama.cpp #30490) never showed:
+tau's breaker stopped the run at the 8th refusal in a row, about where the bug reportedly starts.
+
+- **Founding** was sound: three tasks, with both reference URLs named.
+- **First step:** it asked for an assert-less `python3 -c` check, and was refused, correctly.
+- **The task id slot:** twice it sent a correct step (criteria, done_when `python3 -m pytest -q
+  tests/test_itc.py`, scope, notes) with T0002's description in `task`. Tau answered "is not a
+  task to work now ... Call pursuit_step with no arguments", which threw the good fields away.
+- **What followed:**
+  - `task: ""` calls without criteria;
+  - a `pursuit_dispatch`, refused;
+  - writes to `src/itc.py` from the driver, refused;
+  - the same refused heredoc six times.
+  The breaker then ended the run at 11 min, with exit 0, no worker run, and 0/42.
+
+Fixes before round 4. This is two patches, each from its own run, in unrelated code:
+- **T0623 (fix 12):** with one task workable and `task` not a task id, that task is the one meant.
+  The description joins the notes, and the reply says so.
+- **T0622 (fix 11, from R105):** a URL source is fetched by the host before the cases worker runs.
+  An unfetchable one refuses the step, with beagle's reason.

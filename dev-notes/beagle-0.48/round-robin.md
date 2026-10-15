@@ -25,7 +25,7 @@ Watch on lfm24: llama.cpp #30490. After about 8 rejected tool calls in a row it 
 |---|---|---|---|---|---|
 | 1 | R104 | q35 | wrenfold | 12/54; T0002+T0003 closed (18.5, 21.3 min) | T0620 |
 | 2 | R105 | g26 | semver | 0/76; setup milestone 18.5 min, URL source unfetched | T0621 |
-| 3 | R106 | lfm24 | itc | | |
+| 3 | R106 | lfm24 | itc | 0/42; prose in pursuit_step's task, breaker stop at 11 min | T0623 (+T0622) |
 | 4 | R107 | q35 | cobs | | |
 | 5 | R108 | g26 | wrenfold | | |
 | 6 | R109 | lfm24 | semver | | |
