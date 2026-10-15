@@ -43,7 +43,7 @@ Watch on lfm24: llama.cpp #30490. After about 8 rejected tool calls in a row it 
 | 18 | R121 | lfm24 | semver | 0/76 (no code; every milestone sourced "N/A", cases workers wrote from it) | T0639 |
 | 19 | R122 | q35 | itc | 2/42 (founded intervals-with-counters from the paper's introduction; no fork/event/join) | T0640 |
 | 20 | R123 | g26 | cobs | 35/44 (setup milestone kept as T0002, 28 min; code written under it) | T0641 |
-| 21 | R124 | lfm24 | wrenfold | | |
+| 21 | R124 | lfm24 | wrenfold | 0/54 (milestone sources were descriptions; spec-tied T0002 never reached code) | T0642 |
 | 22 | R125 | q35 | semver | | |
 | 23 | R126 | g26 | itc | | |
 | 24 | R127 | lfm24 | cobs | | |
