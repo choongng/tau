@@ -12302,6 +12302,63 @@ def test_stop_gate_founded_session_gets_no_unfounded_followup(
     assert not any("Nothing is founded" in s for s in sent)
 
 
+def test_stop_gate_follows_up_the_cut_off_that_tau_no_longer_nudges(
+    tmp_path: Path, beagle: Path, fake_beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # R127 (lfm24, cobs): after founding, three driver turns in a row reasoned
+    # out COBS to the output limit; tau nudged the first two and let the third
+    # end the run at 12 of 30 min, with no pursuit_step. Its nudges are left to
+    # tau; the cut-off past them gets the gate's follow-up.
+    from types import SimpleNamespace
+
+    from tau_agent.messages import REASONING_TIME_CUT
+    from tau_coding.session import MAX_OUTPUT_LIMIT_CONTINUATIONS, MAX_TIME_CUT_CONTINUATIONS
+
+    module = _module()
+    project = _pursuit_project(tmp_path)
+    root = {"id": "T0001", "parent": "", "status": "pending", "container": True}
+    leaf = {"id": "T0002", "parent": "T0001", "status": "pending"}
+    (fake_beagle / "tree.out").write_text(json.dumps({"nodes": [root, leaf]}))
+    sent: list[str] = []
+    gate = module.make_stop_gate(SimpleNamespace(send_user_message=sent.append))
+    context = SimpleNamespace(cwd=str(project), has_ui=False)
+
+    def turn(stop: str, *, calls: bool = False, diagnostics: tuple[str, ...] = ()) -> None:
+        message = SimpleNamespace(
+            role="assistant",
+            tool_calls=[object()] if calls else [],
+            stop_reason=stop,
+            diagnostics=[SimpleNamespace(type=d) for d in diagnostics],
+        )
+        asyncio.run(gate(SimpleNamespace(message=message, tool_results=[]), context))
+
+    module._reset_stop_gate(None, None)
+    for _ in range(MAX_OUTPUT_LIMIT_CONTINUATIONS):
+        turn("length")
+    assert sent == []
+    turn("length")
+    assert len(sent) == 1 and sent[0].startswith("[beagle]") and "T0002" in sent[0]
+    assert "pursuit_step" in sent[0]
+
+    # A turn that acts starts the count over.
+    module._reset_stop_gate(None, None)
+    sent.clear()
+    for _ in range(MAX_OUTPUT_LIMIT_CONTINUATIONS):
+        turn("length")
+    turn("toolUse", calls=True)
+    for _ in range(MAX_OUTPUT_LIMIT_CONTINUATIONS):
+        turn("length")
+    assert sent == []
+
+    # Time cuts get more nudges in a row from tau.
+    module._reset_stop_gate(None, None)
+    for _ in range(MAX_TIME_CUT_CONTINUATIONS):
+        turn("length", diagnostics=(REASONING_TIME_CUT,))
+    assert sent == []
+    turn("length", diagnostics=(REASONING_TIME_CUT,))
+    assert len(sent) == 1
+
+
 def test_stop_gate_accepts_a_stop_the_step_cap_offered(
     tmp_path: Path, beagle: Path, fake_beagle: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
