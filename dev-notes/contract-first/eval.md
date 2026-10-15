@@ -62,6 +62,7 @@ branch and sha. Grades come from `grade_<task>.py` over `runs/RNN/adapter.py`;
 | R124 | lfm24 | wrenfold (round 21, 30 min cap) | beagle 0.48.0 08e642c; tau 0209e174 (T0641) | **0/54**; every milestone's `source` described its part ('wrenfold.py with encode, decode, count functions implementing revision 3 spec'); T0002 went spec-tied, its cases worker wrote 118 lines of tests (6 min), the code worker hit three reasoning cuts (11 min) and its thinking-off successor a 274 s wall; no module | — |
 | R125 | q35 | semver (bare goal, round 22, 30 min cap) | beagle 0.48.0 08e642c; tau 5b8020f0 (T0642) | **75/76** at 27 min (45/76 at 12); T0002 model 1.5 min, T0003 parse 15.4 min (spec-tied: cases 6, code 5.4 + 3.8 correcting two cases), T0004 compare 7.4 min (cases 5.4); then T0005 extras at the cap; misses only `1.2.3\n` (`$`); the spec was fetched as three identical files, one per `#fragment` | B07 plain q35 75/76 in 8.1 min |
 | R126 | g26 | itc (round 23, 30 min cap) | beagle 0.48.0 08e642c; tau 78c9b702 (T0643) | **9/42**; founding kept 'Examine practical implementation patterns from <ferd.ca>' (with 'Understand ... from <paper>' folded in) as T0002, a study task (`tests/test_itc_study.py`); its worker wrote cases and an untracked itc.py (bitmask ids, flat events, no leq) and was killed at its 17 min wall; the second was running at the cap | — |
+| R127 | lfm24 | cobs (round 24, 30 min cap) | beagle 0.48.0 08e642c; tau 577f0b78 (T0644) | **0/44**, exit 0 at 12 min; founded, then three driver turns in a row ran to the output limit working out COBS itself; tau nudged two, the stop gate skipped the third, and the run ended with no pursuit_step | — |
 
 ## B06 — the invented spec was not hard
 
@@ -1575,3 +1576,25 @@ carrying both references:
 Fix before round 24: **T0644 (fix 31).** `examine`, `inspect`, `survey`, `familiarize`/
 `familiarise` and `skim` are reading words, so such a milestone folds into the work after it.
 Over 1027 past milestones only the two 'Examine ...' ones change.
+
+## R127 — lfm24 cobs, round 24: three cut-offs ended the run (0/44)
+
+lfm24 ran `beagle init` and founded at 09:59 with three milestones ('Reference understanding:
+internalize the COBS algorithm from <wikipedia>', 'Implementation ...', 'Tests ...'). The
+Founded result said to call pursuit_step with no arguments and not to work out the algorithm.
+The next turn's reasoning started on that, drifted into whether to do T0002 itself, and then
+traced COBS by hand to the 16k output limit (191 s). tau's nudge ("your reasoning so far is
+kept above ... take the next concrete step") drew two more such turns (224 s, 249 s), each with
+the previous 16k of reasoning replayed. Two nudges in a row is tau's cap, and the stop gate
+returned on every length stop, so the third cut-off ended the print-mode run at 12 of 30 min.
+No code was written.
+
+Replayed through the third cut-off (54.7k-token prompt, `preserve_thinking`), lfm24 called a
+pursuit tool in 7 of 7 samples within 50 s on the gate's follow-up or a cut-specific one.
+Ten past driver sessions (mimo 10-01 ×3, q35 10-13 ×2, g26 10-14/15 ×2, lfm24 10-15 ×3,
+R124 among them) ended on three cut-offs in a row.
+
+Fix before round 25: **T0645 (fix 32).** The stop gate counts driver cut-offs in a row as
+tau's session does (time cuts get `MAX_TIME_CUT_CONTINUATIONS`, others
+`MAX_OUTPUT_LIMIT_CONTINUATIONS`) and treats the one past tau's nudges as a stop: it gets the
+gate's follow-up, within the gate's two a run. 'internalize' as a reading word is left for now.
