@@ -34,7 +34,7 @@ Watch on lfm24: llama.cpp #30490. After about 8 rejected tool calls in a row it 
 | 9 | R112 | lfm24 | wrenfold | 0/54, no code; T0002 never opened: no-scope refusal came after a 6 min cases worker | T0629 |
 | 10 | R113 | q35 | semver | **75/76 at 4 min** (plain 8.1), all-done at 16 min | — |
 | 11 | R114 | g26 | itc | 0/42, no code; references/ scope refused after a 5 min cases worker; 2 open refusals (no per-op invalid case), workers skipped the dry run | T0630 |
-| 12 | R115 | lfm24 | cobs | | |
+| 12 | R115 | lfm24 | cobs | 0/44, no code; 12.5 min cases worker skipped its dry run and was refused at the open; second worker mending at the cap | T0633 |
 | 13 | R116 | q35 | wrenfold | | |
 | 14 | R117 | g26 | semver | | |
 | 15 | R118 | lfm24 | itc | | |

@@ -50,6 +50,7 @@ branch and sha. Grades come from `grade_<task>.py` over `runs/RNN/adapter.py`;
 | R112 | lfm24 | wrenfold (round 9, 30 min cap) | beagle 0.48.0 08e642c; tau 0280f1b5 (T0628) | 0/54 at the cap, no code: T0002 never opened; cases worker 1 cut off three times; the driver's next call had no scope, refused only after its cases worker ran 6 min; worker 3 still writing cases at the cap | — |
 | R113 | q35 | semver (round 10, 30 min cap) | beagle 0.48.0 08e642c; tau 5e458e36 (T0629) | 75/76 at 4 min (snapshot t04), all-done at 16 min, ended on its own; the miss is `1.2.3\n` accepted (`$`, not `\Z`) | B07 plain q35 75/76 in 8.1 min |
 | R114 | g26 | itc (round 11, 30 min cap) | beagle 0.48.0 08e642c; tau 4fc29568 (T0629) | 0/42 at the cap, no code: founding's first task was a reading task ('Examine practical implementation patterns'); its step scoped references/ and was refused only after a 5 min cases worker; two more were refused at the open for no invalid/limit case per op (none ran the dry-run its brief names); the fourth was running at the cap | — |
+| R115 | lfm24 | cobs (round 12, 30 min cap) | beagle 0.48.0 08e642c; tau 61255dbc (T0630) | 0/44 at the cap, no code: T0002's first cases worker ran 12.5 min, never ran its dry run, and the open refused it (a `kind=encode` marker with no op or cite; no invalid case for encode); the second worker ran the dry run itself and was still mending at the cap | — |
 
 ## B06 — the invented spec was not hard
 
@@ -1252,4 +1253,28 @@ T0617, T0624 and T0625.
 Next candidate: the cases worker's dry run is in its brief, and gemma skips it. The host could
 run the dry run itself when the worker ends, and hand a refusal back to the same worker. Its
 context, and prefix cache, still holds the source.
+
+## R115 — round 12, lfm24 cobs: a cases worker refused after it ended
+
+The run ended at the cap with 0/44. Only `tests/test_cobs.py` was written, and no `cobs.py`.
+
+1. **Founding, 02:21.** The first `pursuit_plan` named the goal's statement as its task and
+   was refused. The driver then took T0002 from `pursuit_step`.
+2. **Two refusals for `2>/dev/null`.** That is a bare '>' and the refusal is right. The driver
+   sent the same `done_when` again after the second refusal (02:41:32).
+3. **The first cases worker ran from 02:21:56 to 02:34:24.** It wrote the cases, then wrote
+   `cobs.py` (outside its scope), and ended without the `open --dry-run` its brief names. The
+   host's open then refused the cases: one marker read `kind=encode` with no op or cite, and
+   encode had no invalid or limit case. All 12.5 minutes went back to the driver as one
+   refusal.
+4. **The driver spent 02:35 to 02:40 on a 4.8 min turn cut at the output limit.** It then tried
+   to write `cobs.py` itself and was blocked.
+5. **The second cases worker started at 02:41:43.** It ran the dry run itself three times and
+   was still mending at the cap.
+
+Fix before round 13: **T0633 (fix 20).** When a cases worker ends, tau runs the open's dry run
+on its cases. A refusal over the cases resumes that same worker session (`tau -p --session`)
+with the refusal, at most twice and with a 5 min wall each. The source is already in that
+worker's context, and in its prefix cache. The real open runs only after a dry run passes.
+R114 (two refusals at the open) and R115 are the same class.
 
