@@ -54,6 +54,7 @@ branch and sha. Grades come from `grade_<task>.py` over `runs/RNN/adapter.py`;
 | R116 | q35 | wrenfold (round 13, 30 min cap) | beagle 0.48.0 08e642c; tau 72cc8154 (T0633) | **54/54 at 21 min** (plain 9.1; R98 49.9); T0002 encoder closed at 12.5 min and T0003 decoder at 26 min, each on one call; the cap fell during T0004 (examples) | — |
 | R117 | g26 | semver (round 14, 30 min cap) | beagle 0.48.0 08e642c; tau 66af91e5 (T0634) | **75/76 at 14 min** (plain 8.1; R113 q35 4); the one miss, `1.2.3\n`, is accepted through `$`, as in R113; T0002 closed at 23.6 min, and T0003 (comparison) was open at the cap | — |
 | R118 | lfm24 | itc (round 15, 30 min cap) | beagle 0.48.0 08e642c; tau 5973453f (T0635) | **0/42**; founding kept 'Setup complete: beagle init written, pursuit founded …' as T0002, and the whole run went to that empty task; the itc.py one of its workers wrote models ids as integer pairs, not trees | — |
+| R119 | q35 | cobs (round 16, 30 min cap) | beagle 0.48.0 08e642c; tau 7008f5c8 (T0636) | **0/44**; no code and no test: both T0002 cases workers wrote their own encoder to check the source's examples table and chased where it disagreed; the first was cut at the reasoning limit three times | — |
 
 ## B06 — the invented spec was not hard
 
@@ -1368,3 +1369,29 @@ Fix before round 16: **T0636 (fix 23).** A milestone is setup when its title hol
 other than a generic verb like create or start, and its text names beagle or the pursuit. Over
 610 past founding milestones, the rule drops only R118's one more.
 
+## R119 — q35 cobs: the cases workers checked the source with their own encoder
+
+Round 16, q35, cobs, 30 min cap. Exit 124 at 05:30:52. Snapshots t01 and t02 hold no `.py`
+file, so the grade is **0/44**.
+
+The run went like this:
+
+1. **Founding** at 05:02:26. The first `done_when` was refused for having no assert. The driver
+   then spent about 2.7 min on one turn and tried to edit `.beagle/pursuit.toml` and to write
+   tests itself; both were blocked.
+2. **The first T0002 cases worker** ran from 05:06:00 to 05:21:15 with thinking on. It found the
+   source's lines quickly. Then it wrote its own COBS encoder in `python3 -c` to check the
+   table's examples. Each time the encoder disagreed with the table (Ex7's first byte, Ex3), the
+   next turn reasoned for 237 s and was cut (`reasoning_time_cut`, about 30k characters each).
+   After the third cut the worker was ended with no test written.
+3. **The second cases worker** (thinking off) ran from 05:21:28 to the cap and did the same: it
+   compared four versions of its own encoder, one modelled on the source's C code, against the
+   rows the table shortens with `...`. It never wrote `tests/test_encode.py`.
+
+The table was right in each case; the encoders were wrong. The brief's note to check arithmetic
+"by running them" became a reason to write the code under test, and then to reconcile it with
+the source.
+
+Fix before round 17: **T0637 (fix 24).** The cases worker's work-it-out note now says the cited
+lines are right, not to write the code or a version of it to check them, and to write a
+shortened row out from the pattern it shows (`bytes(range(1, 255))`).
