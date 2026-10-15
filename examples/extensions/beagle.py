@@ -333,6 +333,11 @@ REFERENCES_DIR = "references"
 #: of its intent, so a restarted session reads it back from `pursuit show`.
 SOURCE_LEAD = "Source:"
 _SOURCE_IN_INTENT = re.compile(r"(?:^|\s)Source:\s*(\S.*?)\s*$")
+#: A source that names none. Run R121 (lfm24, bare-goal semver): every milestone
+#: came with "source": "N/A", and T0002's cases workers wrote cases from it.
+_NO_SOURCE = re.compile(
+    r"(?i)^(?:n/?a|none|null|nil|tbd|unknown|not applicable|no source|[-\u2013\u2014]+)\.?$"
+)
 #: A `beagle-case:` marker and its `cite=`, as `pursuit rules 2e` spells it.
 _CASE_CITE = re.compile(r"beagle-case:\s*\S+.*?\bcite=(\S+)")
 
@@ -3357,7 +3362,7 @@ def _milestone_parts(value: Any) -> list[str]:
             continue
         part = str(item.get("part") or item.get("title") or "").strip()
         source = " ".join(str(item.get("source") or "").split())
-        if part and source:
+        if part and source and not _NO_SOURCE.match(source):
             title, _, intent = part.partition("::")
             part = f"{title.strip()}::{f'{intent.strip()} ' if intent.strip() else ''}"
             part += f"{SOURCE_LEAD} {source}"
@@ -3368,7 +3373,8 @@ def _milestone_parts(value: Any) -> list[str]:
 def _task_source(record: Mapping[str, Any]) -> str:
     """The reference a task's record names as its source (`_milestone_parts`), or ""."""
     found = _SOURCE_IN_INTENT.search(str(record.get("intent") or ""))
-    return found.group(1).strip() if found else ""
+    source = found.group(1).strip() if found else ""
+    return "" if _NO_SOURCE.match(source) else source
 
 
 def _toml_string(text: str) -> str:
