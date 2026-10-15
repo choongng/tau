@@ -4155,6 +4155,36 @@ def test_founding_drops_a_found_the_pursuit_milestone() -> None:
     assert any("Create the interval tree clock type" in part for part in kept)
 
 
+def test_founding_folds_a_sourced_layout_milestone_into_the_first_work() -> None:
+    # Run S05: 'Project scaffolding' was given the spec as its source, and a cases
+    # worker searched the spec for pyproject.toml. Its text joins the encoder's
+    # intent, ahead of the encoder's own source, which stays last.
+    module = _module()
+    parts = module._milestone_parts(
+        [
+            {
+                "part": "Project scaffolding :: create pyproject.toml and package layout",
+                "source": "references/wrenfold-r3.txt",
+            },
+            {"part": "Encoder :: encode integers", "source": "references/wrenfold-r3.txt"},
+            {"part": "Tests :: round-trips"},
+        ]
+    )
+    kept, notes = module._repair_milestones(parts)
+    assert len(kept) == 2
+    assert kept[0].startswith("Encoder")
+    assert "create pyproject.toml and package layout" in kept[0]
+    assert kept[0].count("Source:") == 1
+    assert module._task_source({"intent": kept[0].split("::", 1)[1]}) == (
+        "references/wrenfold-r3.txt"
+    )
+    assert any(
+        "Folded the layout milestone 'Project scaffolding' into 'Encoder'" in n for n in notes
+    )
+    assert not module._layout_only_milestone("Encoder :: encode integers")
+    assert module._layout_only_milestone("Package layout :: pyproject.toml, src/")
+
+
 def test_founding_folds_a_design_milestone_into_the_next_when_known_answers_exist() -> None:
     # R19: after T0155, 'Design: settle the data structure and API …' became its
     # own task between known answers and Implement.

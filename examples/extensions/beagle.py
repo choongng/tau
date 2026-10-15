@@ -6675,8 +6675,8 @@ def _setup_milestone(parts: list[str]) -> str | None:
             return (
                 f"{title.strip()!r} is not part of the goal's work: pursuit_found is what "
                 "sets the pursuit up, and it is done once it is founded. Leave it out. If "
-                "the project itself needs scaffolding, name what, e.g. 'package layout::"
-                "pyproject.toml, src/ and tests/ so the later parts have a home'."
+                "the project itself needs a package layout, say so in the first part's "
+                "intent, e.g. 'encoder::… in src/, with pyproject.toml'."
             )
     return None
 
@@ -6834,39 +6834,84 @@ def _reading_only_part(parts: list[str]) -> str | None:
     return None
 
 
-def _fold_design_milestones(kept: list[str]) -> tuple[list[str], list[str]]:
-    """`kept` with each design-only milestone folded into the next one's intent.
+#: Words of a part that only lays the project out: run S05's 'Project
+#: scaffolding' (pyproject.toml, package layout) was given the spec as its
+#: source, so its cases had nothing to cite, and as a task it had nothing but an
+#: import to check.
+_LAYOUT_WORDS = _SETUP_WORDS | frozenset(
+    {
+        "scaffold",
+        "scaffolding",
+        "layout",
+        "package",
+        "packaging",
+        "structure",
+        "skeleton",
+        "tooling",
+        "pyproject",
+    }
+)
 
-    With known answers planned, a design milestone is part of the
-    implementation: its text joins the following milestone's intent, or the
-    one before it when none follows.
+
+def _layout_only_milestone(part: str) -> bool:
+    """Whether milestone `part` only lays the project out, judged by its title."""
+    title = re.split(r":| - | — ", _split_part(part)[0], maxsplit=1)[0]
+    words = set(re.findall(r"[a-z]+", title.lower()))
+    return bool(words) and words <= _LAYOUT_WORDS
+
+
+def _fold_into_next(
+    kept: list[str], only: Callable[[str], bool], kind: str, why: str
+) -> tuple[list[str], list[str]]:
+    """`kept` with each milestone `only` accepts folded into the next one's intent.
+
+    Its text, less any source of its own, joins the following milestone's
+    intent, or the one before it when none follows, ahead of that milestone's
+    `Source:`, which must stay last (`_task_source`).
     """
     folded = list(kept)
     notes: list[str] = []
     index = 0
     while index < len(folded):
         part = folded[index]
-        if len(folded) < 2 or not _design_only_milestone(part):
+        if len(folded) < 2 or not only(part):
             index += 1
             continue
         del folded[index]
         into = index if index < len(folded) else index - 1
         target = folded[into]
-        joiner = "; " if "::" in target else "::"
-        folded[into] = f"{target}{joiner}{part.strip()}"
+        cut = _SOURCE_IN_INTENT.search(target)
+        head, tail = (target[: cut.start()], target[cut.start() :]) if cut else (target, "")
+        joiner = "; " if "::" in head else "::"
+        text = _SOURCE_IN_INTENT.sub("", part).strip()
+        folded[into] = f"{head.rstrip()}{joiner}{text}{tail}"
         notes.append(
-            f"Folded the design milestone {part.split(':', 1)[0].strip()!r} into "
-            f"{target.split(':', 1)[0].strip()!r}: the design is part of the "
-            "implementation, not a milestone of its own."
+            f"Folded the {kind} milestone {part.split(':', 1)[0].strip()!r} into "
+            f"{target.split(':', 1)[0].strip()!r}: {why}"
         )
     return folded, notes
+
+
+def _fold_design_milestones(kept: list[str]) -> tuple[list[str], list[str]]:
+    """`kept` with each design-only milestone folded into the work after it.
+
+    With known answers planned, a design milestone is part of the
+    implementation.
+    """
+    return _fold_into_next(
+        kept,
+        _design_only_milestone,
+        "design",
+        "the design is part of the implementation, not a milestone of its own.",
+    )
 
 
 def _repair_milestones(milestones: list[str]) -> tuple[list[str], list[str]]:
     """`milestones` with what founding can fix fixed, and a note for each fix.
 
     A setup milestone and one that only re-runs a check are dropped, a
-    design-only milestone is folded into the next milestone's intent, a lone
+    design-only or layout-only milestone is folded into the next milestone's
+    intent, a lone
     milestone that only reads the reference or chooses a design is retitled as
     the known answers, and an over-long title is cut at a word, its whole text
     moved after '::'. With
@@ -6900,6 +6945,14 @@ def _repair_milestones(milestones: list[str]) -> tuple[list[str], list[str]]:
     # A milestone that only reads or designs is folded into the work after it:
     # the design is part of the implementation.
     kept, fold_notes = _fold_design_milestones(kept)
+    notes.extend(fold_notes)
+    kept, fold_notes = _fold_into_next(
+        kept,
+        _layout_only_milestone,
+        "layout",
+        "the files the code lives in are part of its first work, and a task that only "
+        "lays them out has nothing to check.",
+    )
     notes.extend(fold_notes)
     for index, part in enumerate(kept, 1):
         title, sep, intent = part.partition("::")
