@@ -2765,6 +2765,56 @@ async def test_pursuit_step_runs_a_worker_until_the_check_passes_then_closes(
     assert "closed done" in result.text and "pursuit_step with no arguments" in result.text
 
 
+@pytest.mark.anyio
+async def test_pursuit_step_takes_a_described_task_as_the_one_workable_task(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # R106 (lfm24): the driver sent criteria, done_when and scope right, with the
+    # task's description in `task`; told "call pursuit_step with no arguments", it
+    # lost them and spent 6 min on the step. With one task workable, that is the
+    # task, and the description joins the notes.
+    project = _pursuit_project(tmp_path)
+    monkeypatch.chdir(project)
+    _ready_task(fake_beagle)
+    runtime, _ = _bound(tmp_path)
+
+    result = await _tool(runtime, "pursuit_step").execute(
+        "c1",
+        {
+            "task": "Implement the parser.\n\nDeliverables: parser.py",
+            "criteria": "done.txt exists",
+            "done_when": "grep -q done done.txt",
+            "scope": ["done.txt"],
+            "notes": "Start in the project root.",
+        },
+    )
+
+    assert [call[0] for call in _pursuit_calls(fake_beagle, "open")] == ["T0002"]
+    [run] = _runs(fake_tau)
+    assert "Implement the parser." in run["stdin"] and "Start in the project root." in run["stdin"]
+    assert "Took the task described as T0002, the one task workable now" in result.text
+
+
+@pytest.mark.anyio
+async def test_pursuit_step_keeps_refusing_a_task_id_that_is_not_workable(
+    tmp_path: Path, beagle: Path, fake_beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(_pursuit_project(tmp_path))
+    _ready_task(fake_beagle)
+    runtime, _ = _bound(tmp_path)
+
+    result = await _tool(runtime, "pursuit_step").execute(
+        "c1", {"task": "T0009", "criteria": "x", "done_when": "grep -q done done.txt"}
+    )
+
+    assert "T0009 is not a task to work now" in result.text
+    assert _pursuit_calls(fake_beagle, "open") == []
+
+
 SUPERSEDED_NOTE = (
     "The check passed at close: failures this report names are from before the "
     "worker's last edit, and are fixed."

@@ -11683,6 +11683,24 @@ def make_step_tool() -> Any:
             return _step_result(_abandon(task, abandon, root, goal))
         if ready.get("audit_due") and not _lean():
             return _step_result(await _audit(root, signal, on_update))
+        workable = list(dict.fromkeys(open_ids + ready_ids))
+        if (
+            task
+            and not _TASK_ID.fullmatch(task)
+            and len(workable) == 1
+            and not any(str(n.get("id")) == task for n in nodes)
+        ):
+            # R106 (lfm24): criteria, done_when and scope right, the task's
+            # description in `task`; told to call with no arguments, it lost
+            # them. With one task workable, that is the task.
+            notes = str(arguments.get("notes") or "").strip()
+            arguments = {**arguments, "task": workable[0], "notes": f"{task}\n\n{notes}".strip()}
+            kept_lead.append(
+                f"Took the task described as {workable[0]}, the one task workable now; "
+                f'its description went into the notes. Name it as task="{workable[0]}".\n\n'
+            )
+            task = workable[0]
+            stepped[:] = [task]
         if not task:
             task = (open_ids or ready_ids or [""])[0]
             if not task:
