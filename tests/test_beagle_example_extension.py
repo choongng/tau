@@ -4425,6 +4425,41 @@ def test_a_milestone_whose_source_is_a_placeholder_has_no_source() -> None:
     assert module._task_source({"intent": kept.split("::", 1)[1]}) == "semver.org"
 
 
+def test_a_milestone_source_that_names_no_reference_joins_its_intent(tmp_path: Path) -> None:
+    # R124 (lfm24 wrenfold, 0/54): every milestone's "source" described the part
+    # ("wrenfold.py with encode, decode, count functions implementing revision 3
+    # spec"); T0002's cases worker wrote cases "from" that description, and the code
+    # worker spent the rest of the run on them. A source names a file in
+    # references/ or a link; anything else is what the part is for.
+    module = _module()
+    refs = tmp_path / "references"
+    refs.mkdir()
+    (refs / "wrenfold-r3.txt").write_text("Wrenfold sequence encoding, revision 3\n")
+    (refs / "index.json").write_text("{}")
+    notes: list[str] = []
+    parts = module._milestone_parts(
+        [
+            {"part": "Module creation", "source": "wrenfold.py with encode, decode, count"},
+            {"part": "Decoder:: decode()", "source": "wrenfold-r3 section 4"},
+            {"part": "Encoder", "source": "references/wrenfold-r3.txt"},
+            {"part": "Counter", "source": "http://127.0.0.1:8737/wrenfold-r3.html"},
+            {"part": "Rejection", "source": "index.json"},
+        ],
+        tmp_path,
+        notes,
+    )
+    assert parts[0] == "Module creation::wrenfold.py with encode, decode, count"
+    assert module._task_source({"intent": parts[0]}) == ""
+    assert module._task_source({"intent": parts[1]}) == "wrenfold-r3 section 4"
+    assert module._task_source({"intent": parts[2]}) == "references/wrenfold-r3.txt"
+    assert module._task_source({"intent": parts[3]}).startswith("http://")
+    assert parts[4] == "Rejection::index.json"
+    assert len(notes) == 2 and "'Module creation'" in notes[0]
+    # With no project to look in, a source is taken at its word.
+    [kept] = module._milestone_parts([{"part": "Parsing", "source": "semver.org"}])
+    assert module._task_source({"intent": kept}) == "semver.org"
+
+
 def test_founding_folds_an_environment_milestone_with_no_source_into_the_first_work() -> None:
     # R105 (g26, bare-goal semver): 'Environment setup :: uv, ruff, pytest' opened as
     # T0002; no check of it could be shown to refuse, and the driver spent 13 min
