@@ -3370,8 +3370,9 @@ def _tree(root: Path) -> str:
 #: The one sentence of planning guidance spec-tying needs: the rest is beagle's
 #: (`pursuit rules 2e`), read by the worker that writes the cases.
 SOURCE_SENTENCE = (
-    "Name a source for a part whose behaviour a file in references/ states: "
-    '{"part": "<title>::<what it is for>", "source": "<that file\'s name>"}.'
+    "Name a source for a part whose behaviour a file in references/ or a link in the "
+    "user's request states: "
+    '{"part": "<title>::<what it is for>", "source": "<that file\'s name, or the link>"}.'
 )
 
 #: A milestone or plan part: the `title::intent` string, or that string with the
@@ -3387,8 +3388,9 @@ MILESTONE_ITEM: dict[str, Any] = {
                     "type": "string",
                     "description": (
                         "The file in references/ that states this part's behaviour, by "
-                        "name (itc2008), optionally with the topic's words. A sub-agent "
-                        "writes its cases from it before the work."
+                        "name (itc2008), optionally with the topic's words, or a link in "
+                        "the user's request that states it, fetched first (R107). A "
+                        "sub-agent writes its cases from it before the work."
                     ),
                 },
             },
