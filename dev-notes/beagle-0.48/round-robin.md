@@ -41,7 +41,7 @@ Watch on lfm24: llama.cpp #30490. After about 8 rejected tool calls in a row it 
 | 16 | R119 | q35 | cobs | 0/44 (no code; cases workers checked the table with their own encoder) | T0637 |
 | 17 | R120 | g26 | wrenfold | 48/54 (encode/decode right at 17 min; no `count`: founded from a cut extract) | T0638 |
 | 18 | R121 | lfm24 | semver | 0/76 (no code; every milestone sourced "N/A", cases workers wrote from it) | T0639 |
-| 19 | R122 | q35 | itc | | |
+| 19 | R122 | q35 | itc | 2/42 (founded intervals-with-counters from the paper's introduction; no fork/event/join) | T0640 |
 | 20 | R123 | g26 | cobs | | |
 | 21 | R124 | lfm24 | wrenfold | | |
 | 22 | R125 | q35 | semver | | |

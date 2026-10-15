@@ -57,6 +57,7 @@ branch and sha. Grades come from `grade_<task>.py` over `runs/RNN/adapter.py`;
 | R119 | q35 | cobs (round 16, 30 min cap) | beagle 0.48.0 08e642c; tau 7008f5c8 (T0636) | **0/44**; no code and no test: both T0002 cases workers wrote their own encoder to check the source's examples table and chased where it disagreed; the first was cut at the reasoning limit three times | — |
 | R120 | g26 | wrenfold (round 17, 30 min cap) | beagle 0.48.0 08e642c; tau 2d8e309a (T0637) | **48/54**, encode/decode right at 17 min (t17); no `count`: founded from the steer's 1500-character extract of a 2586-character spec, and `count` is in the cut part | — |
 | R121 | lfm24 | semver (round 18, 30 min cap) | beagle 0.48.0 08e642c; tau 8510ffd5 (T0638) | **0/76**; no code: founding gave every milestone `source: "N/A"`, T0002 went the spec-tied route, and three cases workers wrote cases from N/A that `open` refused | — |
+| R122 | q35 | itc (round 19, 30 min cap) | beagle 0.48.0 08e642c; tau 1faccf24 (T0639) | **2/42**; founded from the paper's introduction as intervals [start, end) with counters, split and merge; T0002 Interval (11 min) and T0003 flat Clock (13 min) closed, no fork/event/join or trees | — |
 
 ## B06 — the invented spec was not hard
 
@@ -1450,3 +1451,33 @@ written as none, so the task takes the plain route.
 
 Still open from this run: the "Project structure and setup — …" milestone, numbered and with an
 em dash instead of `::`, was kept as work.
+
+## R122 — q35 itc: founded from the introduction, the paper's operations never planned
+
+Round 19, q35, itc, 30 min cap. Exit 124 at 07:21:43. On disk: `src/itc/interval.py` (a float
+`Interval` with ordering, containment and split) and `src/itc/clock.py` (a `Clock` with a flat
+int id and an event counter). The grade is **2/42**: seed and one event. There are no id or event
+trees, and no fork, join or leq.
+
+The steer showed each reference's opening. For the paper, that opening is the introduction, since
+it has no abstract heading, and the introduction speaks of key spaces but never of fork, event,
+join or trees. The driver founded at 06:53:17 with:
+
+- **Statement:** "interval-based key space division".
+- **Milestones:** Project setup; Interval type `[start, end)`; Clock state "mapping intervals to
+  counters"; Core operations "Split … and merge"; and so on, each sourced `itc2008`.
+
+The tasks ran as follows:
+
+1. **T0002 (Interval)** closed at 07:04:42 (11 min).
+2. **T0003 (Clock state)** closed at 07:18:05 (13 min). Both were spec-tied to a paper that
+   defines neither.
+3. **T0004 (split/merge)** was running at the cap.
+
+The paper's numbered sections name everything founding missed: 3 Fork-Event-Join Model, 5.2
+Normal form, 5.3 Operations over ITC (5.3.1 Comparison, 5.3.2 Fork, 5.3.3 Join, 5.3.4 Event).
+
+Fix before round 20: **T0640 (fix 27).** After a cut reference's opening, the steer lists its
+numbered section titles: lines that are a number and a short capitalised title, two or more, up
+to 60. On the four tasks' references, it finds the paper's 14 titles and none in cobs, semver or
+the ferd.ca walkthrough.
