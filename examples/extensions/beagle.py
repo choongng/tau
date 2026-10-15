@@ -2882,6 +2882,31 @@ def _fetch_references(root: Path, prompt: str) -> dict[str, Any]:
     return index
 
 
+def _fetched_source(source: str, root: Path) -> tuple[str, str]:
+    """`source` as the reference file a cases worker reads, and why it is not one.
+
+    Run R105: founding named T0003's source as https://semver.org/ and nothing
+    fetched it; the cases worker, barred from `beagle refs fetch`, searched an
+    empty references/ for 5 min. A URL is fetched here (`refs fetch` keeps a
+    reference already on disk) and comes back as `references/<file>`; anything
+    else comes back as it is.
+    """
+    if not _PROMPT_URL.fullmatch(source):
+        return source, ""
+    rc, out = _run(
+        [BEAGLE_BIN, "refs", "fetch", source, "--no-exclude"],
+        root,
+        timeout=60.0 + REFS_FETCH_SECONDS_PER_URL,
+    )
+    index = _references_index(root) or {}
+    for name, url in (index.get("fetched") or {}).items():
+        if url == source and (root / REFERENCES_DIR / name).is_file():
+            return f"{REFERENCES_DIR}/{name}", ""
+    failed = str((index.get("failed") or {}).get(source) or "").strip()
+    last = (out.strip().splitlines() or [""])[-1]
+    return source, failed or f"`beagle refs fetch` exited {rc}: {last}".rstrip(": ")
+
+
 def _references_for(root: Path, prompt: str) -> dict[str, Any]:
     """`references/index.json` if it already holds `prompt`'s fetch, else a fresh fetch.
 
@@ -11512,6 +11537,14 @@ async def _write_cases(
     bad_thinking = _bad_thinking(arguments.get("thinking"))
     if bad_thinking:
         return f"pursuit_step: {task} not run — {bad_thinking}"
+    source, unfetched = await asyncio.to_thread(_fetched_source, source, root)
+    if unfetched:
+        return (
+            f"pursuit_step: {task} not opened — its source {source} could not be "
+            f"fetched, so there is nothing to write its cases from: {unfetched}\n\n"
+            f"Fetch it with `beagle refs fetch <url>` (a copy of the page, or a "
+            f'mirror), then call pursuit_step with task="{task}" again.'
+        )
     # dispatch.toml has no cases role: the executor's pin and the step's choices.
     pin = _dispatch_pin(EXECUTOR_ROLE, root)
     model, provider = _worker_target(arguments.get("model"), arguments.get("provider"), pin)

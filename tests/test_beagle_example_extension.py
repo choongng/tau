@@ -19716,6 +19716,55 @@ SPEC_STEP = {
 
 
 @pytest.mark.anyio
+async def test_pursuit_step_fetches_a_url_source_before_its_cases_worker(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # R105: founding named T0003's source as https://semver.org/ and nothing fetched
+    # it; the cases worker searched an empty references/ for 5 min, barred from
+    # `beagle refs fetch`. The host fetches it and names the file in the brief.
+    monkeypatch.chdir(_pursuit_project(tmp_path))
+    monkeypatch.setenv("FAKE_TAU_CASES_WRITES", json.dumps({"tests/test_parse.py": SPEC_CASES}))
+    _fake_web(fake_beagle, {"https://semver.org/": "Semantic Versioning 2.0.0\n"})
+    _source_task(fake_beagle, "https://semver.org/")
+    runtime, _ = _bound(tmp_path)
+    step = _tool(runtime, "pursuit_step")
+
+    await step.execute("c1", SPEC_STEP)
+
+    assert _refs_asked(fake_beagle) == ["https://semver.org/"]
+    cases = _runs(fake_tau)[0]
+    assert cases["role"] == "cases"
+    assert "from the source references/semver.txt in references/" in cases["stdin"]
+    assert "cite=semver:LINE#HASH" in cases["stdin"]
+
+
+@pytest.mark.anyio
+async def test_pursuit_step_does_not_run_a_cases_worker_on_a_url_it_cannot_fetch(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.chdir(_pursuit_project(tmp_path))
+    _fake_web(fake_beagle, {})
+    _source_task(fake_beagle, "https://semver.org/")
+    runtime, _ = _bound(tmp_path)
+    step = _tool(runtime, "pursuit_step")
+
+    result = await step.execute("c1", SPEC_STEP)
+
+    assert _runs(fake_tau) == []
+    assert "T0002 not opened" in result.text
+    assert "https://semver.org/ could not be fetched" in result.text
+    assert "Name or service not known" in result.text
+
+
+@pytest.mark.anyio
 async def test_pursuit_step_spec_tied_writes_cases_then_opens_with_cites_and_cases(
     tmp_path: Path,
     beagle: Path,
