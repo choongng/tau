@@ -47,6 +47,7 @@ branch and sha. Grades come from `grade_<task>.py` over `runs/RNN/adapter.py`;
 | R109 | lfm24 | semver (round 6, 30 min cap) | beagle 0.48.0 08e642c; tau fe94622d (T0625) | 0/76 at the cap, no code: six refused pursuit_plan calls, then three cases workers whose cites all carried #0b7 beside the right line numbers; open refused each | — |
 | R110 | q35 | itc (round 7, 30 min cap) | beagle 0.48.0 08e642c; tau a3eb469a (T0626) | 17/42 at the cap: T0002 tied at 11 min, code 22/24 of its cases by 23:16; three forced gap cases contradicted the paper, and two code workers' corrections were put back (CASE words were the docstring; the paper's words were in backticks beside) | — |
 | R111 | g26 | cobs (round 8, 30 min cap) | beagle 0.48.0 08e642c; tau 93cf761e (T0627) | 3/44 at the cap: cases tied at 15 min (15 cases); the code worker's three 240 s turns in a row reasoned COBS out by hand and never acted, the bound of two nudges ended it; a second worker wrote a placeholder cobs.py just before the cap | — |
+| R112 | lfm24 | wrenfold (round 9, 30 min cap) | beagle 0.48.0 08e642c; tau 0280f1b5 (T0628) | 0/54 at the cap, no code: T0002 never opened; cases worker 1 cut off three times; the driver's next call had no scope, refused only after its cases worker ran 6 min; worker 3 still writing cases at the cap | — |
 
 ## B06 — the invented spec was not hard
 
@@ -1171,4 +1172,29 @@ about 1 in 16. The prompt is the same, so there is no prefix-cache cost. Other l
 the bound of two.
 
 Still open: the nudge text claims the reasoning is kept, which is false on gemma's template.
+
+## R112 — round 9, lfm24 wrenfold: a missing scope, found after the worker
+
+The run ended at the cap with 0/54 and no code: T0002 ("Integer encoding") never opened. The
+founding happened at 00:45. Lfm wrote no `<function=` text this run.
+
+1. **The driver's first call put its own asserts in done_when** (`python3 -c "... assert
+   encode_int(0) == b'\x00' ..."`). It was refused at 00:46, as designed. Three calls then
+   left out the criteria and were refused (00:47).
+2. **Cases worker 1 ran from 00:47 to 00:59.** It wrote markers without `cite=`, then was cut
+   off three times at the output limit (one reasoning-time cut, two output-limit stops).
+   The step refused: no marker of the cited form.
+3. **The driver's next call (01:00:25) had criteria but no scope.** Cases worker 2 ran for 6
+   min. It wrote 12 cited cases and corrected one cite. Only then did the step refuse: "no
+   scope given". The scope check came after the cases worker.
+4. **The call with scope (01:06:22) started cases worker 3.** It found worker 2's file and
+   rewrote it, tried twice to write `wrenfold/__init__.py` outside its scope, and was still
+   going at the cap.
+
+Fix before round 10: **T0629 (fix 18).** A spec-tied step with no scope, and no predecessor
+scope to carry, is refused "no scope given" before its cases worker runs. In R112 that would
+have saved worker 2's 6 min, and worker 3 would not have been needed.
+
+Still open: the driver's slow recovery from refusals (four calls before it sent criteria and a
+plain test command), and the first worker's three cut-offs.
 
