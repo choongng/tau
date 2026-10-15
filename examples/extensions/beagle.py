@@ -12073,6 +12073,19 @@ def make_step_tool() -> Any:
                 if isinstance(cased, str):
                     return _step_result(cased)
                 case_files, case_cites, cases_spent = cased
+                # R108 (g26): T0002's scope held only its test file, and the
+                # data-test route that refused it made a second cases worker
+                # and left the code worker no file to write. The cases import
+                # the code this task writes, so its scope holds that code.
+                unwritten = _imports_unwritten(done_when, scope, root)
+                if unwritten is not None:
+                    _test, module, _via = unwritten
+                    top = f"{'src/' if (root / 'src').is_dir() else ''}{module.split('.')[0]}"
+                    scope = [*scope, f"{top}.py", f"{top}/"]
+                    route += (
+                        f"Added {top}.py and {top}/ to {task}'s scope: its cases import "
+                        f"`{module}`, the code this task writes.\n\n"
+                    )
             rewritten_from: tuple[str, str] | None = None
             # A spec-tied task's check runs its cases as they are: no data-test rewrite.
             data_only = None if source else _data_only_bind(done_when, scope, root)
