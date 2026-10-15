@@ -52,7 +52,7 @@ branch and sha. Grades come from `grade_<task>.py` over `runs/RNN/adapter.py`;
 | R114 | g26 | itc (round 11, 30 min cap) | beagle 0.48.0 08e642c; tau 4fc29568 (T0629) | 0/42 at the cap, no code: founding's first task was a reading task ('Examine practical implementation patterns'); its step scoped references/ and was refused only after a 5 min cases worker; two more were refused at the open for no invalid/limit case per op (none ran the dry-run its brief names); the fourth was running at the cap | — |
 | R115 | lfm24 | cobs (round 12, 30 min cap) | beagle 0.48.0 08e642c; tau 61255dbc (T0630) | 0/44 at the cap, no code: T0002's first cases worker ran 12.5 min, never ran its dry run, and the open refused it (a `kind=encode` marker with no op or cite; no invalid case for encode); the second worker ran the dry run itself and was still mending at the cap | — |
 | R116 | q35 | wrenfold (round 13, 30 min cap) | beagle 0.48.0 08e642c; tau 72cc8154 (T0633) | **54/54 at 21 min** (plain 9.1; R98 49.9); T0002 encoder closed at 12.5 min and T0003 decoder at 26 min, each on one call; the cap fell during T0004 (examples) | — |
-| R117 | g26 | semver (round 14, 30 min cap) | beagle 0.48.0 08e642c; tau 66af91e5 (T0634) | **75/76 at 14 min** (plain 8.1; R113 q35 4); the one miss, `1.2.3\\n`, is accepted through `$`, as in R113; T0002 closed at 23.6 min, and T0003 (comparison) was open at the cap | — |
+| R117 | g26 | semver (round 14, 30 min cap) | beagle 0.48.0 08e642c; tau 66af91e5 (T0634) | **75/76 at 14 min** (plain 8.1; R113 q35 4); the one miss, `1.2.3\n`, is accepted through `$`, as in R113; T0002 closed at 23.6 min, and T0003 (comparison) was open at the cap | — |
 
 ## B06 — the invented spec was not hard
 
