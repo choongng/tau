@@ -3389,20 +3389,40 @@ def _strings(value: Any) -> list[str]:
     return [str(item).strip() for item in value if str(item).strip()]
 
 
-def _names_a_reference(source: str, root: Path) -> bool:
-    """Whether `source` carries a link or names a file in `root`'s references/,
-    by name or stem."""
+def _reference_key(name: str) -> str:
+    return re.sub(r"[\W_]+", "", name).lower()
+
+
+def _named_reference(source: str, root: Path) -> str | None:
+    """`source` as naming what it names: itself when it carries a link or names
+    a file in `root`'s references/ by name or stem; with the file's own name put
+    in when a word of it, or the whole of it, spells one with other case or
+    separators; None when it names none.
+
+    F000 (q35 cobs): every source was references/ConsistentOverheadByteStuffing.txt
+    for Consistent_Overhead_Byte_Stuffing.txt, and each joined its intent.
+    """
     if _PROMPT_URL.search(source):
-        return True
+        return source
     try:
         files = [f for f in (root / REFERENCES_DIR).iterdir() if f.name != REFERENCES_INDEX]
     except OSError:
-        return False
-    return any(
+        return None
+    if any(
         re.search(rf"(?i)(?<![\w-]){re.escape(word)}(?![\w-])", source)
         for f in files
         for word in {f.name, f.stem}
-    )
+    ):
+        return source
+    names = {_reference_key(word): word for f in files for word in (f.stem, f.name)}
+    if _reference_key(source) in names:
+        return names[_reference_key(source)]
+    for found in re.finditer(r"[\w./-]+", source):
+        head, _, word = found.group().rpartition("/")
+        if (key := _reference_key(word)) and key in names:
+            named = f"{head}/{names[key]}" if head else names[key]
+            return source[: found.start()] + named + source[found.end() :]
+    return None
 
 
 def _milestone_parts(
@@ -3431,8 +3451,9 @@ def _milestone_parts(
         if part and source and not _NO_SOURCE.match(source):
             title, _, intent = part.partition("::")
             part = f"{title.strip()}::{f'{intent.strip()} ' if intent.strip() else ''}"
-            if root is None or _names_a_reference(source, root):
-                part += f"{SOURCE_LEAD} {source}"
+            named = source if root is None else _named_reference(source, root)
+            if named:
+                part += f"{SOURCE_LEAD} {named}"
             else:
                 part += source
                 if notes is not None:

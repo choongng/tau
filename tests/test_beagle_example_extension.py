@@ -4504,6 +4504,37 @@ def test_a_milestone_source_that_names_no_reference_joins_its_intent(tmp_path: P
     assert module._task_source({"intent": kept.split("::", 1)[1]}) == "semver.org"
 
 
+def test_a_milestone_source_spelled_near_a_reference_names_that_file(tmp_path: Path) -> None:
+    # F000 (q35 cobs): every source was references/ConsistentOverheadByteStuffing.txt,
+    # the file Consistent_Overhead_Byte_Stuffing.txt; each joined its intent as plain
+    # words, and no milestone kept a Source:. Case and separators are not the name.
+    module = _module()
+    refs = tmp_path / "references"
+    refs.mkdir()
+    (refs / "Consistent_Overhead_Byte_Stuffing.txt").write_text("COBS\n")
+    (refs / "index.json").write_text("{}")
+    notes: list[str] = []
+    parts = module._milestone_parts(
+        [
+            {
+                "part": "COBS encode::bytes to COBS",
+                "source": "references/ConsistentOverheadByteStuffing.txt",
+            },
+            {"part": "COBS decode", "source": "consistent-overhead-byte-stuffing section 2"},
+            {"part": "Framing", "source": "Consistent Overhead"},
+        ],
+        tmp_path,
+        notes,
+    )
+    sources = [module._task_source({"intent": part.split("::", 1)[1]}) for part in parts]
+    assert sources[:2] == [
+        "references/Consistent_Overhead_Byte_Stuffing.txt",
+        "Consistent_Overhead_Byte_Stuffing section 2",
+    ]
+    # Part of a name is not the name.
+    assert sources[2] == "" and len(notes) == 1
+
+
 def test_founding_folds_examine_and_understand_milestones_into_the_work() -> None:
     # R126 (g26 itc, 9/42): 'Understand the ITC mathematical model ... from <paper>' was
     # folded into 'Examine practical implementation patterns from <walkthrough>', which
