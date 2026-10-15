@@ -23,7 +23,7 @@ Watch on lfm24: llama.cpp #30490. After about 8 rejected tool calls in a row it 
 
 | Round | Run | Model | Task | Result | Fix after |
 |---|---|---|---|---|---|
-| 1 | R104 | q35 | wrenfold | | |
+| 1 | R104 | q35 | wrenfold | 12/54; T0002+T0003 closed (18.5, 21.3 min) | T0620 |
 | 2 | R105 | g26 | semver | | |
 | 3 | R106 | lfm24 | itc | | |
 | 4 | R107 | q35 | cobs | | |

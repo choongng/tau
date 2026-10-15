@@ -39,6 +39,7 @@ branch and sha. Grades come from `grade_<task>.py` over `runs/RNN/adapter.py`;
 | S04 | q35 | wrenfold (smoke, 30 min cap) | beagle 0.48.0 08e642c; tau 602750d9 (T0611-T0614: cases quote, case-correction route, marker naming) | 45/54 at the cap, first at 23 min; T0002 opened tied at 12.9 min (markers right first try), code worker still fixing 63 and the end-marker refusal at the cap | S03 0/54; R100 green at 14.6 min; B06 plain 9.1 min |
 | S05 | q35 | wrenfold (smoke, 30 min cap) | beagle 0.48.0 08e642c; tau 5cd51a62 (T0616: work arithmetic out by running it; cases don't stub the code) | 0/54 at the cap: founding made 'Project scaffolding' a sourced milestone; its cases (cited to the title line) opened at 19.6 min, closed done at 25.5 min; the encoder never opened | S04 45/54; B06 plain 9.1 min |
 | S06 | q35 | wrenfold (smoke, 30 min cap) | beagle 0.48.0 08e642c; tau 352f48e9 (T0617: fold a layout-only milestone) | 49/54 from 20 min to the cap, never closed: founding 5.5 min with scaffolding folded into Encoder; T0002 opened tied at 17.2 min; one wrong case (`encode([63])` without the end marker) put back three times, as the worker's CASE line named the test and the cite only the sentence's last line | S05 0/54; S04 45/54; B06 plain 9.1 min |
+| R104 | q35 | wrenfold (round 1, 30 min cap) | beagle 0.48.0 08e642c; tau 8f721639 (T0618 reasoning time cap, T0619 CASE line) | 12/54 at the cap, first at 22 min: encoding closed (T0002 at 18.5 min, T0003 at 21.3), decoding never reached; founding 1.7 min into 6 milestones; T0002's cases worker took 11.5 min, one 241 s turn cut by T0618 | S06 49/54 unclosed; B06 plain 9.1 min |
 
 ## B06 — the invented spec was not hard
 
@@ -958,3 +959,26 @@ Fixes before S07:
   reasoning is kept.
 - **T0619:** a CASE line counts by the test's name, keeps only its first quoted span, and is
   checked against the cited lines' paragraph (up to 4 lines either side).
+
+## R104 — round 1, q35 wrenfold: the first closed tasks, at one milestone in six
+
+Capped at 30 min, 12/54. All 12 encode cases pass; decoding was never written. The founding took
+1.7 min and made six milestones: integer encoding, sequence encoding, integer decoding, sequence
+decoding, error handling, tests. T0002 closed done at 18.5 min, the first close of the smokes, and
+T0003 closed at 21.3 min. The T0004 cases worker ran from 21.6 to 28.6 min.
+
+- **T0618 fired once and worked.** The T0002 cases worker's turn was cut at 241 s (38.7k
+  reasoning chars) and the next turn wrote the case file. Without the cut it would have run to
+  the 16k limit, about 4 more minutes.
+- **What that turn was weighing:** a contradiction in the cases brief. T0616's shared note said to
+  work out expected outputs by running them, and T0611 said to assert no output you work out. The
+  worker had run a reference encoder to get the limit values, then went back and forth on whether
+  it could assert them.
+- **T0619 had no case correction to handle.** The cases were right.
+- **Cost per milestone:** the cases worker takes 2–11.5 min and the code worker 1–5 min. Six
+  milestones at that cost don't fit in 30 min, and plain tau writes the whole thing in 9.1.
+
+Fix before round 2: T0620. The cases brief now has its own note: check arithmetic by running it,
+but expected values still come from the cited lines. Next to look at is milestone granularity:
+"error handling" and "tests" as their own milestones, and integer versus sequence as separate
+milestones.
