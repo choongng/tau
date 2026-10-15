@@ -43,6 +43,7 @@ branch and sha. Grades come from `grade_<task>.py` over `runs/RNN/adapter.py`;
 | R105 | g26 | semver (round 2, 30 min cap) | beagle 0.48.0 08e642c; tau 4cf54474 (T0620) | 0/76 at the cap: founding's 'Environment setup' milestone took 18.5 min (13 of re-routing a check no defect could fail); T0003's source was the unfetched URL https://semver.org/, its first cases worker found no reference; the second was writing cases at the cap | B07 plain q35 75/76 in 8.1 min |
 | R106 | lfm24 | itc (round 3, 30 min cap) | beagle 0.48.0 08e642c; tau 79652f00 (T0621) | 0/42, ended at 11 min: the driver sent T0002's description as pursuit_step's task (criteria, done_when, scope right), was told to call with no arguments, then tried to write src/itc.py itself until the 8-refusal breaker stopped the run; no worker ran | — |
 | R107 | q35 | cobs (round 4, 30 min cap) | beagle 0.48.0 08e642c; tau b8f57402 (T0622, T0623) | 37/44, ended on its own at 27.8 min with all 6 tasks closed (T0002 at 23.6 min); no milestone named a source, so no cases worker ran: empty encode and the 5 malformed-decode cases fail | — |
+| R108 | g26 | wrenfold (round 5, 30 min cap) | beagle 0.48.0 08e642c; tau 65aee9aa (T0624) | 0/54 at the cap, no code: T0002 scoped to its test file alone; tau's data-test refusal made a second cases worker (cases committed at 17.5 min, cites right) and the code worker, refused wrenfold.py, rewrote the tests | — |
 
 ## B06 — the invented spec was not hard
 
@@ -1056,3 +1057,22 @@ Every task closed and the run ended on its own at 27.8 min, scoring 37/44.
 
 Fix before round 5: **T0624 (fix 13)**. The milestone guidance and the `source` description now
 also offer "a link in the user's request"; T0622 fetches it before the cases worker runs.
+
+## R108 — round 5, g26 wrenfold: a tests-only scope met a known-answers-era route
+
+Gemma named the URL as T0002's source, and the source was fetched; its title was "Wrenfold encoding
+specification". The driver read T0002 as "write the tests" and scoped it to
+`tests/test_wrenfold_spec.py` alone.
+
+1. **First cases worker (6 min).** Its cases imported `wrenfold`, so `scope_refusal` sent the
+   driver down the known-answers-era data-test route: "check runs the data test only
+   (`tests/test_case_data.py`)".
+2. **Second cases worker (10 min).** It ran on that check and wrote good cases (right cites,
+   committed at 17.5 min). The cases still imported `wrenfold`.
+3. **Code worker.** Refused `wrenfold.py` as out of scope, it rewrote the tests and stripped the
+   import from the cases file. A third worker was still running at the cap: 0/54.
+
+Fix before round 6: **T0625 (fix 14).** Once a source task's cases are written, a module they
+import that no path in scope creates is added to the scope as `<m>.py` and `<m>/` (under `src/`
+when the project has one), and the reply says so. The task opens with its cases and goes to the
+code worker. The data-test route stays for tasks without a source.
