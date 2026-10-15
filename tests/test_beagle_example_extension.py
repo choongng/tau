@@ -19940,7 +19940,7 @@ async def test_pursuit_step_reanchors_a_cite_to_the_line_it_names(
     wrong = SPEC_CASES.replace("spec:2#ff4", "spec:2#0b7")
     monkeypatch.setenv("FAKE_TAU_CASES_WRITES", json.dumps({"tests/test_parse.py": wrong}))
     _source_task(fake_beagle)
-    (fake_beagle / "refs-show.out").write_text("2#ff4| parse reads an int\n")
+    (fake_beagle / "show-spec.out").write_text("2#ff4| parse reads an int\n")
     runtime, _ = _bound(tmp_path)
     step = _tool(runtime, "pursuit_step")
 

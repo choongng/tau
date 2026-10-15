@@ -11292,6 +11292,58 @@ def _repair_case_markers(root: Path, cases_scope: list[str]) -> list[str]:
     return repaired
 
 
+_SHOWN_ANCHOR = re.compile(r"^(\d+)#([0-9a-f]+)\|", re.MULTILINE)
+
+
+def _line_anchor(name: str, line: int, root: Path) -> str | None:
+    """The anchor `beagle refs show` gives line `line` of reference `name`, or None."""
+    rc, out = _run(
+        [BEAGLE_BIN, "refs", "show", name, "--from", str(line), "--to", str(line)], root, 30.0
+    )
+    shown = {int(n): anchor for n, anchor in _SHOWN_ANCHOR.findall(out)} if rc == 0 else {}
+    return shown.get(line)
+
+
+def _reanchor_cites(root: Path, files: list[str], cites: list[str]) -> dict[str, str]:
+    """Each of `cites` whose anchors are not those of the lines it names, mapped to
+    the cite with beagle's anchors for those lines, rewritten so in the case files.
+
+    Run R109 (lfm24): every marker carried the anchor #0b7 beside the right line
+    numbers; `open` refused 146#0b7 as line 136's anchor, and three cases
+    workers in a row left it so. A worker points at a line; a short anchor
+    that fits another line is chance, so the line decides.
+    """
+    fixed: dict[str, str] = {}
+    known: dict[tuple[str, int], str | None] = {}
+    for cite in cites:
+        name, sep, anchors = cite.partition(":")
+        if not sep:
+            continue
+        parts = re.findall(r"(\d+)#([0-9a-f]+)", anchors)
+        if not parts:
+            continue
+        new = anchors
+        for number, anchor in parts:
+            key = (name, int(number))
+            if key not in known:
+                known[key] = _line_anchor(name, key[1], root)
+            right = known[key]
+            if right is not None and right != anchor:
+                new = re.sub(rf"\b{number}#{anchor}\b", f"{number}#{right}", new)
+        if new != anchors:
+            fixed[cite] = f"{name}:{new}"
+    if fixed:
+        for rel in files:
+            path = root / rel
+            text = path.read_text()
+            changed = re.sub(
+                r"(cite=)(\S+)", lambda m: m.group(1) + fixed.get(m.group(2), m.group(2)), text
+            )
+            if changed != text:
+                path.write_text(changed)
+    return fixed
+
+
 def _marker_ties(root: Path, cases_scope: list[str]) -> tuple[list[str], list[str]]:
     """The case files a cases worker left (changed files in `cases_scope` whose
     new lines carry a `beagle-case:` marker) and the `cite=`s of those markers.
@@ -11516,9 +11568,10 @@ async def _write_cases(
     arguments: Mapping[str, Any],
     root: Path,
     signal: Any = None,
-) -> tuple[list[str], list[str], int | None] | str:
-    """Run a spec-tied task's cases worker: its case files, their cites and the
-    tokens it spent, or the step's reply when the task cannot open on them.
+) -> tuple[list[str], list[str], int | None, str] | str:
+    """Run a spec-tied task's cases worker: its case files, their cites, the
+    tokens it spent and a note of the cites it re-anchored, or the step's reply
+    when the task cannot open on them.
 
     One cases worker per pursuit_step call; what it wrote stays on disk, so the
     next call's worker corrects it rather than starting over.
@@ -11574,7 +11627,14 @@ async def _write_cases(
             f'with task="{task}" again to have them written, or with a done_when that '
             "names the test file the cases go in."
         )
-    return files, cites, run.spent
+    reanchored = _reanchor_cites(root, files, cites)
+    if reanchored:
+        cites = [reanchored.get(cite, cite) for cite in cites]
+    note = "".join(
+        f"Re-anchored the cite {old} to {new}: the anchor of the line it names.\n"
+        for old, new in reanchored.items()
+    )
+    return files, cites, run.spent, note
 
 
 def make_step_tool() -> Any:
@@ -12072,7 +12132,8 @@ def make_step_tool() -> Any:
                 )
                 if isinstance(cased, str):
                     return _step_result(cased)
-                case_files, case_cites, cases_spent = cased
+                case_files, case_cites, cases_spent, reanchored = cased
+                route += f"{reanchored}\n" if reanchored else ""
                 # R108 (g26): T0002's scope held only its test file, and the
                 # data-test route that refused it made a second cases worker
                 # and left the code worker no file to write. The cases import
