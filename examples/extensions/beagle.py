@@ -7275,9 +7275,11 @@ WITNESS_NOTE = (
     "small defect the check must catch, in the code you wrote — or, if this task only "
     "adds tests, in the code they test — never in a test file: "
     "`prove` puts it back, and if the check still passes, the task is not done. The "
-    "NEEDLE is text copied exactly from the file that occurs there only once; the "
-    "REPLACEMENT is the same text made wrong (a flipped condition, a wrong constant, a "
-    "dropped step).\n\n"
+    "NEEDLE is text copied exactly from the file that occurs there only once, part of "
+    "one line; the REPLACEMENT is the same text made wrong (a flipped condition, a "
+    "wrong constant, a dropped step). The host puts it back and runs the check itself: "
+    "a NEEDLE it cannot find once, or a defect the check misses, it tells you and asks "
+    "for another.\n\n"
     "WITNESS: <path of the source file>\n"
     "NEEDLE:\n<exact text from the file>\n"
     "REPLACEMENT:\n<that text with the defect>\n"
@@ -12873,6 +12875,9 @@ def make_step_tool() -> Any:
         # Run R39: one step is bounded by one budget, not a full timeout per attempt.
         step_budget = timeout * STEP_BUDGET_FACTOR
         budget_spent = ""
+        # R117 (g26): a worker copied its 280-char NEEDLE in its reasoning for 10
+        # min, since a refused witness cost a new worker; the same session mends it.
+        resume = ""
         for attempt in range(1, attempts + 1):
             if verdict[0] == 0 and (proof is None or proof.proven):
                 break
@@ -12893,7 +12898,7 @@ def make_step_tool() -> Any:
                 with contextlib.suppress(Exception):
                     on_update(_step_result(f"{task}: sub-agent attempt {attempt} of {attempts}"))
             run = await _run_worker(
-                brief + retry_note,
+                retry_note.strip() if resume else brief + retry_note,
                 root,
                 model,
                 provider,
@@ -12902,7 +12907,9 @@ def make_step_tool() -> Any:
                 task,
                 scope,
                 thinking=thinking,
+                resume=resume,
             )
+            resume = ""
             worker_ran = True
             if run.spent is not None:
                 spent = (spent or 0) + run.spent
@@ -12989,6 +12996,8 @@ def make_step_tool() -> Any:
                         "source file you changed (not a test)."
                     )
                 )
+                if run.transcript is not None and not run.unreported:
+                    resume = run.transcript.stem
                 continue
             retry_note = (
                 f"\n\nAn earlier attempt {ended}, but the check still fails (exit "
