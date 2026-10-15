@@ -221,6 +221,12 @@ DEFAULT_DISPATCH_TIMEOUT = 900.0
 #: worker turn in each run reasoned to the 16k output limit, about 11 min, over
 #: values one `python3 -c` settles; 95% of turns reasoned under 2k tokens.
 WORKER_REASONING_SECONDS = 240.0
+#: The cases worker's budget. R128 (q35 wrenfold): its three cases workers took
+#: 7.6, 6.1 and 7+ of the run's 30 min against ~3 per code worker; the long turns
+#: had the test file drafted in their first quarter and re-drafted it to 240 s.
+#: Replayed with that turn cut at 120 s, the nudge's reply wrote the whole file
+#: in 4 of 4 samples within 17 s; cut at 60 s, in 2 of 3.
+CASES_REASONING_SECONDS = 120.0
 TURN_REASONING_ENV = "TAU_TURN_REASONING_SECONDS"
 #: Maximal turns (the model's max_tokens each) the worker wall holds at the decode
 #: rate measured on earlier workers, when that is longer than the default. q38fn
@@ -2353,7 +2359,8 @@ async def _run_worker(
 
     limit = _memory_max()
     env = {**os.environ, WORKER_ENV: "1", BASH_TIMEOUT_ENV_VAR: f"{_worker_bash_timeout():g}"}
-    env.setdefault(TURN_REASONING_ENV, f"{WORKER_REASONING_SECONDS:g}")
+    reasoning = CASES_REASONING_SECONDS if role == CASES_ROLE else WORKER_REASONING_SECONDS
+    env.setdefault(TURN_REASONING_ENV, f"{reasoning:g}")
     env.pop(WORKER_TASK_ENV, None)
     env.pop(WORKER_SCOPE_ENV, None)
     env.pop(WORKER_ROLE_ENV, None)
