@@ -49,6 +49,7 @@ branch and sha. Grades come from `grade_<task>.py` over `runs/RNN/adapter.py`;
 | R111 | g26 | cobs (round 8, 30 min cap) | beagle 0.48.0 08e642c; tau 93cf761e (T0627) | 3/44 at the cap: cases tied at 15 min (15 cases); the code worker's three 240 s turns in a row reasoned COBS out by hand and never acted, the bound of two nudges ended it; a second worker wrote a placeholder cobs.py just before the cap | — |
 | R112 | lfm24 | wrenfold (round 9, 30 min cap) | beagle 0.48.0 08e642c; tau 0280f1b5 (T0628) | 0/54 at the cap, no code: T0002 never opened; cases worker 1 cut off three times; the driver's next call had no scope, refused only after its cases worker ran 6 min; worker 3 still writing cases at the cap | — |
 | R113 | q35 | semver (round 10, 30 min cap) | beagle 0.48.0 08e642c; tau 5e458e36 (T0629) | 75/76 at 4 min (snapshot t04), all-done at 16 min, ended on its own; the miss is `1.2.3\n` accepted (`$`, not `\Z`) | B07 plain q35 75/76 in 8.1 min |
+| R114 | g26 | itc (round 11, 30 min cap) | beagle 0.48.0 08e642c; tau 4fc29568 (T0629) | 0/42 at the cap, no code: founding's first task was a reading task ('Examine practical implementation patterns'); its step scoped references/ and was refused only after a 5 min cases worker; two more were refused at the open for no invalid/limit case per op (none ran the dry-run its brief names); the fourth was running at the cap | — |
 
 ## B06 — the invented spec was not hard
 
@@ -1222,4 +1223,33 @@ The source-less path held up: T0002 was not spec-tied (bare goal), so no cases w
 
 No fix this round. The refusals were right, and the time after 4 min went to what the goal's
 own criteria asked for.
+
+## R114 — round 11, g26 itc: a wrong scope found after the worker, and skipped dry runs
+
+The run ended at the cap with 0/42 and no code. Only `tests/test_itc_properties.py` was ever
+written. The founding happened at 01:40.
+
+1. **The founding's first task was a reading task.** T0002 was "Examine practical implementation
+   patterns and ID subdivision from ferd.ca/…". Its intent glued two sources together
+   (`…interval-tree-clocks.txt; Analyze the algorithm…::Source: references/itc2008.txt`). A later
+   `pursuit_plan` that tried the same split was refused as reading-only. The founding was not.
+2. **The first spec-tied call (01:41:43) scoped `references`.** Its cases worker ran until
+   01:46:59. Only then did the step refuse: "scope names references … ignored by git". Fix 18
+   had moved only the no-scope check ahead of the worker. This is the same class of waste.
+3. **Two cases workers (01:47 to 01:51, 01:52 to 01:57) were refused at the open.** The open
+   wanted an invalid or limit case for each op (initial_id, fork, join; then split, sum, join).
+   Each brief names `beagle pursuit open … --dry-run`, but none of the four workers ran it.
+4. **The fourth cases worker was still running at the cap.**
+
+Fix before round 12: **T0630 (fix 19).** It widens T0629: a scope refused on its own is refused
+before the cases worker. That covers no scope, `references/`, and `.beagle/`. The 10-15 audit
+of T0629 found its predecessor-scope clause untested, so T0630 pins that too.
+
+The audit also replaced T0605 (it named runs R101 to R103, which were never run) with T0631, a
+before/after table after the round robin. T0632 holds the untested clauses it found in T0616,
+T0617, T0624 and T0625.
+
+Next candidate: the cases worker's dry run is in its brief, and gemma skips it. The host could
+run the dry run itself when the worker ends, and hand a refusal back to the same worker. Its
+context, and prefix cache, still holds the source.
 
