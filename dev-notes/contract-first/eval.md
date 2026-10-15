@@ -48,6 +48,7 @@ branch and sha. Grades come from `grade_<task>.py` over `runs/RNN/adapter.py`;
 | R110 | q35 | itc (round 7, 30 min cap) | beagle 0.48.0 08e642c; tau a3eb469a (T0626) | 17/42 at the cap: T0002 tied at 11 min, code 22/24 of its cases by 23:16; three forced gap cases contradicted the paper, and two code workers' corrections were put back (CASE words were the docstring; the paper's words were in backticks beside) | — |
 | R111 | g26 | cobs (round 8, 30 min cap) | beagle 0.48.0 08e642c; tau 93cf761e (T0627) | 3/44 at the cap: cases tied at 15 min (15 cases); the code worker's three 240 s turns in a row reasoned COBS out by hand and never acted, the bound of two nudges ended it; a second worker wrote a placeholder cobs.py just before the cap | — |
 | R112 | lfm24 | wrenfold (round 9, 30 min cap) | beagle 0.48.0 08e642c; tau 0280f1b5 (T0628) | 0/54 at the cap, no code: T0002 never opened; cases worker 1 cut off three times; the driver's next call had no scope, refused only after its cases worker ran 6 min; worker 3 still writing cases at the cap | — |
+| R113 | q35 | semver (round 10, 30 min cap) | beagle 0.48.0 08e642c; tau 5e458e36 (T0629) | 75/76 at 4 min (snapshot t04), all-done at 16 min, ended on its own; the miss is `1.2.3\n` accepted (`$`, not `\Z`) | B07 plain q35 75/76 in 8.1 min |
 
 ## B06 — the invented spec was not hard
 
@@ -1197,4 +1198,28 @@ have saved worker 2's 6 min, and worker 3 would not have been needed.
 
 Still open: the driver's slow recovery from refusals (four calls before it sent criteria and a
 plain test command), and the first worker's three cut-offs.
+
+## R113 — round 10, q35 semver: plain's score in half plain's time
+
+This is the first round-robin run to beat plain tau's bar. It scored 75/76 by the 4-minute
+snapshot; plain q35 (B07) took 8.1 min. The earlier pursuit semver runs were R97 (58/76 at the
+60-min cap) and R99 (75/76 at the cap). The only miss is the same one B07 had: `1.2.3\n` is
+accepted, because the regex ends on `$` rather than `\Z`.
+
+The founding happened at 01:23:33. T0002 ("Version parsing") closed at 01:26, 4 min in, with
+`parse_version` and a `Version` that has total ordering. The rest added no score:
+
+- **T0003 ("Validation"), 3 min.** It was refused six times between 01:26 and 01:29:
+  - two checks with no assert;
+  - one whose asserts were in a list comprehension;
+  - two with a `try:` on one line (SyntaxError);
+  - one that already passed.
+  The driver then closed it as done by T0002, with the check that already passed.
+- **T0004 to T0006, 01:29 to 01:38.** These were comparison operators, `bump_version`, and a
+  114-test suite. They added no score, but the run ended on its own at 16 min.
+
+The source-less path held up: T0002 was not spec-tied (bare goal), so no cases worker ran.
+
+No fix this round. The refusals were right, and the time after 4 min went to what the goal's
+own criteria asked for.
 
