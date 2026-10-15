@@ -58,6 +58,7 @@ branch and sha. Grades come from `grade_<task>.py` over `runs/RNN/adapter.py`;
 | R120 | g26 | wrenfold (round 17, 30 min cap) | beagle 0.48.0 08e642c; tau 2d8e309a (T0637) | **48/54**, encode/decode right at 17 min (t17); no `count`: founded from the steer's 1500-character extract of a 2586-character spec, and `count` is in the cut part | — |
 | R121 | lfm24 | semver (round 18, 30 min cap) | beagle 0.48.0 08e642c; tau 8510ffd5 (T0638) | **0/76**; no code: founding gave every milestone `source: "N/A"`, T0002 went the spec-tied route, and three cases workers wrote cases from N/A that `open` refused | — |
 | R122 | q35 | itc (round 19, 30 min cap) | beagle 0.48.0 08e642c; tau 1faccf24 (T0639) | **2/42**; founded from the paper's introduction as intervals [start, end) with counters, split and merge; T0002 Interval (11 min) and T0003 flat Clock (13 min) closed, no fork/event/join or trees | — |
+| R123 | g26 | cobs (round 20, 30 min cap) | beagle 0.48.0 08e642c; tau 65000f86 (T0640) | **35/44**; founded with 'Project initialization and environment setup.' kept as T0002, which took 28 of 30 minutes (a refused `ls`, an unprovable pass, then `done_when: false` as a new route); the COBS code a worker wrote there misses the 254-byte block end and raises on no malformed input | — |
 
 ## B06 — the invented spec was not hard
 
@@ -1481,3 +1482,29 @@ Fix before round 20: **T0640 (fix 27).** After a cut reference's opening, the st
 numbered section titles: lines that are a number and a short capitalised title, two or more, up
 to 60. On the four tasks' references, it finds the paper's 14 titles and none in cobs, semver or
 the ferd.ca walkthrough.
+
+## R123 — g26 cobs, round 20: the setup milestone ate the run (35/44)
+
+g26 founded with three milestones: 'Project initialization and environment setup.', 'Implementation
+of COBS encoding and decoding logic.', 'Verification via unit tests.' The first was not folded as
+layout: its title has `initialization`, which was not a layout word. It became T0002 and held the
+run:
+
+1. **07:30** the driver's `ls pyproject.toml src/cobs tests` was refused (passes on the file being
+   there), so it sent a `python3 -c` existence check. The first worker (07:30–07:40, three
+   reasoning cuts) set the project up, but the check could not be shown to refuse: nothing was
+   left to put back.
+2. **07:40** offered a new route, the driver sent `done_when: "false"`. Two more T0002 workers
+   (07:40–07:57) wrote `src/cobs/core.py` and a test under a task whose check can never pass.
+3. The cap fell with T0002 open and the code task never begun.
+
+The code scores 35/44: no 254-byte block end (an 0xFF block at the end of the input adds a code
+byte), and decode raises on no malformed input.
+
+R121's `1: Project structure and setup — …` slipped the same rule another way: the title was read
+as `1`.
+
+Fix before round 21: **T0641 (fix 28).** `_layout_only_milestone` strips a leading step number
+(`1:`, `2.`, `3)`, `Step 2.`) and counts `initialization`, `initialisation` and `bootstrap` as
+layout words. Over 1003 milestones from past founding and plan calls, it changes only these four
+setup titles.
