@@ -20034,6 +20034,39 @@ async def test_pursuit_step_fetches_a_url_source_before_its_cases_worker(
 
 
 @pytest.mark.anyio
+async def test_pursuit_step_reads_a_url_source_with_a_fragment_from_the_page_on_disk(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # R125 (q35 semver): the sources .../v2.0.0.html, ...#spec-item-11 and
+    # ...#spec-item-9 were fetched as three copies of one page; T0004's cases worker
+    # searched its copy for "item-11" for 1.5 min. A fragment names a place in the
+    # page, not another page: the page already on disk is the source.
+    project = _pursuit_project(tmp_path)
+    monkeypatch.chdir(project)
+    refs = project / "references"
+    refs.mkdir()
+    (refs / "semver.txt").write_text("Semantic Versioning 2.0.0\n")
+    (refs / "index.json").write_text(
+        json.dumps({"fetched": {"semver.txt": "https://semver.org/spec/v2.0.0.html"}, "failed": {}})
+    )
+    monkeypatch.setenv("FAKE_TAU_CASES_WRITES", json.dumps({"tests/test_parse.py": SPEC_CASES}))
+    _fake_web(fake_beagle, {})
+    _source_task(fake_beagle, "https://semver.org/spec/v2.0.0.html#spec-item-11")
+    runtime, _ = _bound(tmp_path)
+    step = _tool(runtime, "pursuit_step")
+
+    await step.execute("c1", SPEC_STEP)
+
+    assert _refs_asked(fake_beagle) == []
+    cases = _runs(fake_tau)[0]
+    assert "from the source references/semver.txt in references/" in cases["stdin"]
+
+
+@pytest.mark.anyio
 async def test_pursuit_step_does_not_run_a_cases_worker_on_a_url_it_cannot_fetch(
     tmp_path: Path,
     beagle: Path,
