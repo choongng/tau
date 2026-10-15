@@ -1,8 +1,4 @@
 {
- "T0612": {
-  "at": "2026-10-15T00:33:15+00:00",
-  "kind": "--criteria is required: T follows no attempt whose criteria it could take. Say what will be true when it is done; being unable to is the signal to `split` it."
- },
  "T0613": {
   "at": "2026-10-15T00:33:16+00:00",
   "kind": "--criteria is required: T follows no attempt whose criteria it could take. Say what will be true when it is done; being unable to is the signal to `split` it."
