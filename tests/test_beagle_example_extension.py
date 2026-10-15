@@ -20081,6 +20081,31 @@ async def test_pursuit_step_spec_tied_cases_fail_without_a_marker_and_nothing_op
 
 
 @pytest.mark.anyio
+async def test_pursuit_step_spec_tied_with_no_scope_is_refused_before_its_cases_worker(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # R112 (lfm24, wrenfold): T0002's call with no scope ran a cases worker for
+    # 6 min, then was refused "no scope given"; the next call ran another.
+    project = _pursuit_project(tmp_path)
+    (project / "references").mkdir(exist_ok=True)
+    monkeypatch.chdir(project)
+    monkeypatch.setenv("FAKE_TAU_CASES_WRITES", json.dumps({"tests/test_parse.py": SPEC_CASES}))
+    _source_task(fake_beagle)
+    runtime, _ = _bound(tmp_path)
+    call = {key: value for key, value in SPEC_STEP.items() if key != "scope"}
+
+    result = await _tool(runtime, "pursuit_step").execute("c1", call)
+
+    assert "T0002 not opened — no scope given" in result.text
+    assert _runs(fake_tau) == []
+    assert _pursuit_calls(fake_beagle, "open") == []
+
+
+@pytest.mark.anyio
 async def test_pursuit_step_spec_tied_cases_fail_at_the_open_with_beagles_refusal(
     tmp_path: Path,
     beagle: Path,
