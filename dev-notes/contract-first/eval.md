@@ -52,6 +52,7 @@ branch and sha. Grades come from `grade_<task>.py` over `runs/RNN/adapter.py`;
 | R114 | g26 | itc (round 11, 30 min cap) | beagle 0.48.0 08e642c; tau 4fc29568 (T0629) | 0/42 at the cap, no code: founding's first task was a reading task ('Examine practical implementation patterns'); its step scoped references/ and was refused only after a 5 min cases worker; two more were refused at the open for no invalid/limit case per op (none ran the dry-run its brief names); the fourth was running at the cap | — |
 | R115 | lfm24 | cobs (round 12, 30 min cap) | beagle 0.48.0 08e642c; tau 61255dbc (T0630) | 0/44 at the cap, no code: T0002's first cases worker ran 12.5 min, never ran its dry run, and the open refused it (a `kind=encode` marker with no op or cite; no invalid case for encode); the second worker ran the dry run itself and was still mending at the cap | — |
 | R116 | q35 | wrenfold (round 13, 30 min cap) | beagle 0.48.0 08e642c; tau 72cc8154 (T0633) | **54/54 at 21 min** (plain 9.1; R98 49.9); T0002 encoder closed at 12.5 min and T0003 decoder at 26 min, each on one call; the cap fell during T0004 (examples) | — |
+| R117 | g26 | semver (round 14, 30 min cap) | beagle 0.48.0 08e642c; tau 66af91e5 (T0634) | **75/76 at 14 min** (plain 8.1; R113 q35 4); the one miss, `1.2.3\\n`, is accepted through `$`, as in R113; T0002 closed at 23.6 min, and T0003 (comparison) was open at the cap | — |
 
 ## B06 — the invented spec was not hard
 
@@ -1304,4 +1305,35 @@ tau took 9.1 min.
 
 Fix before round 14: **T0634 (fix 21).** A done close's body leaves out the WITNESS block;
 `prove` has already recorded it.
+
+## R117 — round 14, g26 semver: 75/76 at 14 min, 10 min spent on a witness
+
+The run reached 75/76 at the t14 snapshot and stayed there. The miss is `invalid_trailing_newline`:
+`re.match` with `$` accepts `"1.2.3\n"`. R113's q35 run missed the same case. The spec says
+nothing about it, and no case covered it.
+
+1. **Founding, 03:43 to 03:46.** The driver's `uv init` was blocked. It then sent four
+   `done_when` checks that only test whether a file exists, and the tool refused each one.
+2. **T0002 (parsing), 03:46:05 to 04:06:40.**
+   - The cases worker ran from 03:46:07 to 03:52:47.
+   - The code worker started at 03:52:51 and its check passed at 03:56:51; its code already
+     graded 75/76.
+   - It then spent almost 10 minutes on the WITNESS:
+     - 1.5 min shell-quoting a regex needle for `grep`;
+     - a 125 s turn of reasoning;
+     - a 240 s turn cut by the worker reasoning budget. That turn rewrote the final report again
+       and again, re-checking the 4-line, 280-char regex needle byte by byte, then looped on
+       "Final, final, … check: I'm done." 69 times.
+   - The nudged reply reported in 13 s, and `prove` passed on the first try.
+   - The reasoning-loop guard missed it: distinct lines never fell below 30 of 64, because the
+     filler lines were interleaved with varied re-checks. A rule that fires when one line
+     dominates the window would have fired only at line 502 of 552, and on 31,724 past turns
+     it misfires on code fences.
+3. **T0003 (comparison)** was opened at 04:07:29. Its first worker was still running at the cap.
+
+Fix before round 15: **T0635 (fix 22).** When the check passes but `prove` refuses the witness,
+the next attempt resumes the same worker session with the refusal, instead of starting a fresh
+brief. The brief now asks for a NEEDLE that is part of one line, and says the host checks it and
+asks again. A worker loses nothing by naming a short needle without checking it, and a refused
+witness costs one turn rather than a new worker (R116 T0003: 5 min).
 
