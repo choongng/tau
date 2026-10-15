@@ -149,7 +149,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from tau_agent.messages import TextContent
+from tau_agent.messages import REASONING_LOOP_CUT, REASONING_TIME_CUT, TextContent
 from tau_agent.tools import (
     AgentTool,
     AgentToolResult,
@@ -169,6 +169,7 @@ from tau_coding.provider_config import (
     resolve_provider_selection,
 )
 from tau_coding.resources import parse_markdown_resource
+from tau_coding.session import MAX_OUTPUT_LIMIT_CONTINUATIONS, MAX_TIME_CUT_CONTINUATIONS
 from tau_coding.skills import Skill, format_skill_invocation
 from tau_coding.tool_buffers import WINDOW_LINES, read_request
 from tau_coding.tools import BASH_TIMEOUT_ENV_VAR
@@ -15898,13 +15899,37 @@ MAX_STOP_GATE_FOLLOWUPS = 2
 _STOP_GATE_SENT = 0
 #: Whether the last pursuit tool result in this run offered STOP_OPTION.
 _STOP_OFFERED = False
+#: Driver turns in a row that ended at the output limit without acting.
+_CUTS_IN_A_ROW = 0
 
 
 def _reset_stop_gate(event: Any, context: ExtensionContext) -> None:
-    global _STOP_GATE_SENT, _STOP_OFFERED
+    global _STOP_GATE_SENT, _STOP_OFFERED, _CUTS_IN_A_ROW
     del event, context
     _STOP_GATE_SENT = 0
     _STOP_OFFERED = False
+    _CUTS_IN_A_ROW = 0
+
+
+def _tau_nudges_cut(message: Any) -> bool:
+    """Whether tau sends its own follow-up to `message`, a turn cut off at the limit.
+
+    Counts the cut-offs in a row as the session does
+    (`CodingSession._continue_after_output_limit`): a turn that acts starts
+    over, and a time cut is allowed more nudges than an output-limit one.
+    """
+    global _CUTS_IN_A_ROW
+    if getattr(message, "stop_reason", None) != "length" or getattr(message, "tool_calls", None):
+        _CUTS_IN_A_ROW = 0
+        return False
+    _CUTS_IN_A_ROW += 1
+    cuts = {getattr(d, "type", None) for d in getattr(message, "diagnostics", None) or ()}
+    in_a_row = (
+        MAX_TIME_CUT_CONTINUATIONS
+        if REASONING_TIME_CUT in cuts and REASONING_LOOP_CUT not in cuts
+        else MAX_OUTPUT_LIMIT_CONTINUATIONS
+    )
+    return in_a_row >= _CUTS_IN_A_ROW
 
 
 def _note_stop_offer(results: Any) -> None:
@@ -15931,6 +15956,13 @@ def make_stop_gate(tau: ExtensionAPI) -> Any:
 
     Run R44: an escalation offered T0002's driver a stop, the driver took it,
     and this refused it. A stop the last pursuit tool result offered goes through.
+
+    Run R127 (lfm24, cobs): after founding, three driver turns in a row
+    reasoned out COBS to the output limit; tau nudged the first two and let
+    the third end the run at 12 of 30 min. A cut-off tau still nudges is left
+    to it; the one past its nudges is a stop like any other. Replayed with
+    its 48k tokens of cut reasoning, that turn's follow-up drew a pursuit
+    call in 7 of 7 samples.
     """
 
     async def gate(event: Any, context: ExtensionContext) -> None:
@@ -15940,8 +15972,9 @@ def make_stop_gate(tau: ExtensionAPI) -> Any:
             _note_stop_offer(getattr(event, "tool_results", None))
         if (
             getattr(message, "role", None) != "assistant"
+            or _tau_nudges_cut(message)
             or getattr(message, "tool_calls", None)
-            or getattr(message, "stop_reason", None) in ("error", "aborted", "length")
+            or getattr(message, "stop_reason", None) in ("error", "aborted")
             or _STOP_GATE_SENT >= MAX_STOP_GATE_FOLLOWUPS
             or _STOP_OFFERED
         ):
