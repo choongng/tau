@@ -11297,6 +11297,29 @@ CASES_PINNED_NOTE = (
 
 _CASE_MARKER = re.compile(r"beagle-case:\s*(\S+)")
 _CASE_LINE = re.compile(r"^\s*[`*]*CASE\s+([^\s:`]+)\s*:\s*(.+?)\s*$", re.MULTILINE)
+_QUOTE_CLOSE = {'"': '"', "`": "`", "\u201c": "\u201d"}
+
+
+def _case_key(case: str) -> str:
+    """`case` as a CASE line may name it: the marker's id or its test's name, so
+    `test_sixty_three_two_byte` and `sixty-three-two-byte` are one case."""
+    key = case.strip().casefold().replace("_", "-")
+    return key.removeprefix("test-")
+
+
+def _case_quotes(report: str) -> dict[str, str]:
+    """The words of each `CASE <id>: "<words>"` line in `report`, by `_case_key`.
+    Run S06: q35 named the case by its test and put its reason after the quote, so
+    a quoted line keeps only its first quoted span."""
+    quotes: dict[str, str] = {}
+    for case, words in _CASE_LINE.findall(report):
+        words = words.strip()
+        close = _QUOTE_CLOSE.get(words[:1])
+        end = words.find(close, 1) if close else -1
+        if end > 1:
+            words = words[1:end]
+        quotes[_case_key(case)] = words.strip().strip("`\"'\u201c\u201d")
+    return quotes
 
 
 def _case_blocks(text: str) -> tuple[str, dict[str, tuple[str, str]]]:
@@ -11318,8 +11341,13 @@ def _case_blocks(text: str) -> tuple[str, dict[str, tuple[str, str]]]:
     }
 
 
+CITE_CONTEXT_LINES = 4
+
+
 def _cited_text(cite: str, root: Path) -> str:
-    """The lines `cite` (`name:12#ab3` or `name:12#ab3-15#c01`) names in references/."""
+    """The lines `cite` (`name:12#ab3` or `name:12#ab3-15#c01`) names in references/,
+    with the rest of their paragraph, up to CITE_CONTEXT_LINES either side. Run S06:
+    a cite names one line, and the sentence that line ends began two lines above."""
     name, _, anchors = cite.partition(":")
     numbers = [int(n) for n in re.findall(r"(\d+)#", anchors)]
     if not numbers:
@@ -11329,7 +11357,13 @@ def _cited_text(cite: str, root: Path) -> str:
         lines = path.read_text(errors="replace").splitlines()
     except OSError:
         return ""
-    return "\n".join(lines[numbers[0] - 1 : numbers[-1]])
+    start = first = numbers[0] - 1
+    end = last = numbers[-1]
+    while start > 0 and first - start < CITE_CONTEXT_LINES and lines[start - 1].strip():
+        start -= 1
+    while end < len(lines) and end - last < CITE_CONTEXT_LINES and lines[end].strip():
+        end += 1
+    return "\n".join(lines[start:end])
 
 
 def _squeezed(text: str) -> str:
@@ -11364,9 +11398,7 @@ def _settle_case_edits(task: str, report: str, root: Path) -> str:
         (path, sha)
         for sha, _, path in (line.partition("  ") for line in _strings(record.get("check_files")))
     )
-    quotes = {
-        case: words.strip().strip("`\"'\u201c\u201d") for case, words in _CASE_LINE.findall(report)
-    }
+    quotes = _case_quotes(report)
     changed: dict[str, tuple[str, str]] = {}
     for rel in _strings(record.get("cases")):
         sha = pins.get(rel)
@@ -11393,7 +11425,7 @@ def _settle_case_edits(task: str, report: str, root: Path) -> str:
             if old_cases.get(case) == new_cases.get(case):
                 continue
             cite = (new_cases.get(case) or old_cases[case])[0]
-            words = quotes.get(case, "")
+            words = quotes.get(_case_key(case), "")
             if not words:
                 why.append(f'case {case} changed with no `CASE {case}: "<words>"` line')
             elif _squeezed(words) not in _squeezed(_cited_text(cite, root)):
