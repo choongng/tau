@@ -1,1 +1,6 @@
-{}
+{
+ "T0623": {
+  "at": "2026-10-15T04:01:36+00:00",
+  "kind": "T is open (Fix #: a URL source is fetched before its cases worker runs) and its scope meets this one's: examples/extensions/beagle.py ~ examples/extensions/beag"
+ }
+}
