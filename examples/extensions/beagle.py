@@ -12175,6 +12175,15 @@ def make_step_tool() -> Any:
                 return _step_result(f"pursuit_step: {task} not opened — {prose}")
             route += _bound_note(done_when, chained)
             done_when = chained
+            # R112 (lfm24): a call with no scope ran a cases worker for 6 min and
+            # was refused only then; a missing scope costs the driver seconds.
+            no_scope = (
+                _no_scope_problem(scope or _predecessor_scope(record, root), root)
+                if source
+                else None
+            )
+            if no_scope is not None:
+                return _step_result(f"pursuit_step: {task} not opened — {no_scope}")
             if source:
                 cased = await _write_cases(
                     task, title, source, criteria, done_when, scope, arguments, root, signal
