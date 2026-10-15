@@ -49,7 +49,7 @@ Watch on lfm24: llama.cpp #30490. After about 8 rejected tool calls in a row it 
 | 24 | R127 | lfm24 | cobs | 0/44 at 12 min (three driver cut-offs in a row after founding; tau's nudges ran out and the run ended) | T0645 |
 | 25 | R128 | q35 | wrenfold | 48/54 capped (encoder, decoder closed; cases workers ~21 of 30 min) | T0646 |
 | 26 | R129 | g26 | semver | 27/76 final; **75/76 at t13–t23** then a witness-ask follow-up worker regressed the regex | T0647 |
-| 27 | R130 | lfm24 | itc | | |
+| 27 | R130 | lfm24 | itc | 0/42, no code; cases cited interval-tree-clocks lines under itc2008, re-anchoring made one a blank line, 3 cases workers | T0657 |
 | 28 | R131 | q35 | cobs | | |
 | 29 | R132 | g26 | wrenfold | | |
 | 30 | R133 | lfm24 | semver | | |

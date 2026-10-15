@@ -1655,3 +1655,39 @@ Fix before round 27: **T0647 (fix 34).** When a step re-dispatches a worker on a
 check already passed but lacked an accepted witness (the ask_module follow-up), the brief tells
 the worker the implementation already passes and to add only the WITNESS (and, if needed, a
 behavioural test that catches the named defect) — not to rewrite the passing implementation.
+
+## R130 — lfm24 itc, round 27: a cite from the other reference, re-anchored onto a blank line (0/42)
+
+Capped at 30 min with no code: all 42 fail as `Missing: adapter lacks seed`. Founding was sound
+(rubric: UNSOURCED 'Pure Python implementation with tests', COUNT 6, both unconfirmed flags;
+event, fork, join and compare each a milestone, sourced), so the founding fixes are not at play.
+The 30 min went to T0002's cases, which never opened.
+
+Timeline (driver `home-itc-bf8992/041e6e9d`):
+
+- 0–3 min: founding. T0002 is 'ITC class and interval tree representation'; the driver's
+  criteria name things the paper never states ("[low, high] tuples", "optional id parameter").
+- 3–9.5 min: cases worker 1, 60 bash calls of `grep`/`sed`/`refs find` hunting lines for those
+  criteria; it wrote nothing ("left no test ... with a `beagle-case:` marker").
+- 10–21 min: cases worker 2 wrote 14 cases. Its fork/event/join cites were
+  `itc2008:46#de3`, `48#015`, `50#87e` — lines 46/48/50 **of interval-tree-clocks.txt**, as
+  `refs find` printed them, under the paper's name. T0626's re-anchoring trusts the line, so they
+  became `itc2008:46#605`, `48#e3b`, `50#f6d`: the paper's Related Work text, and line 48 blank.
+  The host dry run refused "cite 'itc2008:48#e3b' names only blank lines"; each mend put #015 (or
+  `3#e3b`, another blank line) back, and after two mends the refusal went to the driver.
+- 23–30 min: the driver re-stepped; cases worker 3 tried three times to write `itc.py` outside
+  its tests-only scope (refused), then ran to the cap.
+
+So the defect that cost the run is the re-anchor: a line number *and* its anchor matched another
+reference exactly, and the host overrode that with the named file's line. Replayed on a copy of
+the run with real beagle: the fix moves all three cites to `interval-tree-clocks:46#de3/48#015/
+50#87e`, and the dry run's cite errors go; what is left is ordinary case content (no invalid
+case per op), which the dry-run mends exist for. The invented representation criteria made the
+cases slow but are not tied to this outcome beyond worker 1's 6.5 min; noted, not fixed.
+
+Also seen: worker 3 ran `find /home/choong -name itc.py` and tried to read an earlier round's
+snapshot; the out-of-tree read guard refused it.
+
+Fix before round 28: **T0657 (fix 35).** A cite whose anchor is wrong for the named reference
+but whose every line#anchor is exactly one other reference's is moved to that reference, not
+re-anchored; the step's reply says so.
