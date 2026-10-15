@@ -240,3 +240,47 @@ async def test_real_spec_tied_step_puts_back_a_case_changed_without_the_source_w
     assert "its cited lines (spec" in result.text and "put back as pinned" in result.text, (
         result.text
     )
+
+
+async def test_real_spec_tied_step_repairs_markers_with_the_cite_where_the_id_goes(
+    tmp_path: Path, real_beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Run S03: every marker read `# beagle-case: wrenfold-r3:25#019 kind=example
+    # op=encode_single`; none tied, and a whole round of sound cases was redone.
+    (real_beagle / "references").mkdir()
+    (real_beagle / "references" / "spec.txt").write_text(SPEC)
+    subprocess.run(["git", "add", "references"], cwd=real_beagle, check=True)
+    subprocess.run(["git", "commit", "--quiet", "-m", "spec"], cwd=real_beagle, check=True)
+    runtime = bound(tmp_path)
+    goal = {
+        **GOAL,
+        "statement": "A calculator",
+        "criteria": ["add works as the spec says"],
+        "milestones": [{"part": "Add::add(a, b) in calc.py", "source": "spec"}],
+    }
+    await _tool(runtime, "pursuit_found").execute("c1", goal)
+    add = task_node(beagle_json(real_beagle, "pursuit", "tree", "--json"), "Add")["id"]
+    anchors = _anchors(real_beagle)
+    cases = (
+        "import pytest\nfrom calc import add\n\n\n"
+        f"# beagle-case: spec:{anchors[2]} kind=example op=add\n"
+        "def test_add_sum():\n    assert add(2, 3) == 5\n\n\n"
+        f"# beagle-case: spec:{anchors[3]} kind=invalid op=add\n"
+        "def test_add_type():\n    with pytest.raises(TypeError):\n        add('2', 3)\n"
+    )
+    monkeypatch.setenv("STUB_TAU_CASES_WRITES", json.dumps({"tests/test_calc.py": cases}))
+    monkeypatch.setenv("STUB_TAU_WRITES", json.dumps({"calc.py": CALC}))
+    witness = "WITNESS: calc.py\nNEEDLE:\nreturn a + b\nREPLACEMENT:\nreturn a - b\nEND WITNESS"
+    monkeypatch.setenv("STUB_TAU_REPORT", witness)
+    result = await _tool(runtime, "pursuit_step").execute(
+        "c2",
+        {
+            "task": add,
+            "criteria": "add returns the sum and refuses what is not a number",
+            "done_when": f"{sys.executable} -m pytest -q -p no:cacheprovider tests/test_calc.py",
+            "scope": ["calc.py"],
+        },
+    )
+    assert show(real_beagle, add)["status"] == "done", result.text
+    written = (real_beagle / "tests" / "test_calc.py").read_text()
+    assert f"# beagle-case: add-5 cite=spec:{anchors[2]} kind=example op=add" in written

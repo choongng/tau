@@ -11102,6 +11102,47 @@ def _cases_brief(
     )
 
 
+#: A `beagle-case:` line whose first word is a cite where the id goes, with no
+#: `cite=`: run S03's cases worker wrote all 17 of its markers so.
+_CITE_AS_CASE_ID = re.compile(
+    r"^(?P<pre>.*beagle-case:\s*)(?P<cite>[\w.-]+:\d+#[0-9a-f]+(?:-\d+#[0-9a-f]+)?)(?P<rest>.*)$"
+)
+
+
+def _repair_case_markers(root: Path, cases_scope: list[str]) -> list[str]:
+    """Give each `beagle-case:` line in `cases_scope` that has its cite where the
+    id goes (`_CITE_AS_CASE_ID`) an id and a `cite=`: the id is its `op=` (or
+    `case`) and its line number. The case files changed, for the step's result.
+
+    Run S03: the cases worker's 17 cases were sound but every marker read
+    `# beagle-case: wrenfold-r3:25#019 kind=example op=encode_single`; none tied,
+    and the whole round of cases was sent again, 6 min of a 30 min run.
+    """
+    repaired: list[str] = []
+    for rel in _changed_files(root):
+        if not _in_scope(rel, cases_scope, root) or not (root / rel).is_file():
+            continue
+        try:
+            lines = (root / rel).read_text().splitlines(keepends=True)
+        except (OSError, UnicodeDecodeError):
+            continue
+        changed = False
+        for n, line in enumerate(lines):
+            body = line.rstrip("\r\n")
+            match = _CITE_AS_CASE_ID.match(body)
+            if match is None or "cite=" in body:
+                continue
+            op = re.search(r"\bop=(\S+)", match["rest"])
+            case = f"{op.group(1) if op else 'case'}-{n + 1}"
+            ending = line[len(body) :]
+            lines[n] = f"{match['pre']}{case} cite={match['cite']}{match['rest']}{ending}"
+            changed = True
+        if changed:
+            (root / rel).write_text("".join(lines))
+            repaired.append(rel)
+    return repaired
+
+
 def _marker_ties(root: Path, cases_scope: list[str]) -> tuple[list[str], list[str]]:
     """The case files a cases worker left (changed files in `cases_scope` whose
     new lines carry a `beagle-case:` marker) and the `cite=`s of those markers.
@@ -11333,12 +11374,14 @@ async def _write_cases(
             f"{source} did not finish: {run.problem}{said}\n\nCall pursuit_step with "
             f'task="{task}" again to have them written.'
         )
+    _repair_case_markers(root, cases_scope)
     files, cites = _marker_ties(root, cases_scope)
     if not files:
         return (
             f"pursuit_step: {task} not opened — the sub-agent writing its cases from "
             f"{source} left no test in {', '.join(cases_scope)} with a `beagle-case:` "
-            f"marker, so there is nothing to tie the task to.{said}\n\nCall pursuit_step "
+            "marker of the form `# beagle-case: <id> cite=<ref>:<anchor> kind=<kind> "
+            f"op=<op>`, so there is nothing to tie the task to.{said}\n\nCall pursuit_step "
             f'with task="{task}" again to have them written, or with a done_when that '
             "names the test file the cases go in."
         )
