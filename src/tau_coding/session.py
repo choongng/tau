@@ -289,6 +289,15 @@ TIME_CUT_NUDGE = (
     "step now with a tool call: run what you were working out, or write what you "
     "have, then check it."
 )
+#: The share of the budget a time cut's nudge reply may reason, and the nudges
+#: in a row time cuts allow. R111 (gemma, cobs): a code worker's three 240 s
+#: turns in a row reasoned by hand and never acted, and the run ended at the
+#: bound of two nudges; on its prompt after the cut, gemma acted in 5 of 10
+#: samples, each within 23 s, and the rest reasoned to the limit. A reply that
+#: will act does so early, so short tries cost little: the same prompt goes
+#: again, and four take no longer than one full turn.
+TIME_CUT_REPLY_SHARE = 0.25
+MAX_TIME_CUT_CONTINUATIONS = 4
 # A reply that ends on "stop" with no tool call, its text holding a chat
 # template's tool-call markup, wrote its call as text: the loop would end the
 # run there. R37 (qwen, dev-notes/itc-runs/R37.md, class 3): a worker's last
@@ -516,6 +525,16 @@ def _turn_reasoning_seconds() -> float | None:
     return seconds if seconds > 0 else None
 
 
+def _request_reasoning_seconds(messages: list[AgentMessage]) -> float | None:
+    """The reasoning budget of a request on `messages`: a time cut's nudge reply
+    has its share (`TIME_CUT_REPLY_SHARE`)."""
+    budget = _turn_reasoning_seconds()
+    last = messages[-1] if messages else None
+    if budget is not None and isinstance(last, UserMessage) and last.text == TIME_CUT_NUDGE:
+        return budget * TIME_CUT_REPLY_SHARE
+    return budget
+
+
 #: The clock the reasoning budget is measured on.
 _reasoning_clock: Callable[[], float] = time.monotonic
 
@@ -553,7 +572,7 @@ class _RequestGuard:
                 signal=signal,
                 session_id=session_id,
             ),
-            _turn_reasoning_seconds(),
+            _request_reasoning_seconds(messages),
         )
 
 
@@ -2279,7 +2298,8 @@ class CodingSession:
         thinking-off twin for nudged requests reprocessed 32,877-42,815 input
         tokens per switch, 661 s over 20 turns, and its replies acted no
         better than R36's thinking-on ones.
-        Bounded in a row, so a model that never acts does stop, and per run
+        Bounded in a row, so a model that never acts does stop (time cuts allow
+        more, their replies being short: `MAX_TIME_CUT_CONTINUATIONS`), and per run
         over the nudges whose reply made no tool call, so a model that keeps
         thinking itself out of room, acting just enough in between, stops too.
 
@@ -2302,14 +2322,19 @@ class CodingSession:
         if message.stop_reason != "length" or message.tool_calls:
             self._length_continuations = 0
             return
+        nudge = UserMessage(content=_length_nudge(message))
+        in_a_row = (
+            MAX_TIME_CUT_CONTINUATIONS
+            if nudge.text == TIME_CUT_NUDGE
+            else MAX_OUTPUT_LIMIT_CONTINUATIONS
+        )
         if (
             self._nudge_queued()
-            or self._length_continuations >= MAX_OUTPUT_LIMIT_CONTINUATIONS
+            or self._length_continuations >= in_a_row
             or self._run_length_continuations >= MAX_OUTPUT_LIMIT_CONTINUATIONS_PER_RUN
         ):
             return
         self._length_continuations += 1
-        nudge = UserMessage(content=_length_nudge(message))
         self._queued_nudge = nudge
         self._record_message_origin(nudge, delivery="follow_up", source="extension")
         self._harness.follow_up_message(nudge)
