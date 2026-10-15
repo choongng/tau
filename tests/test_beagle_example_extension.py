@@ -2978,6 +2978,40 @@ async def test_pursuit_step_proves_the_workers_witness_then_closes_and_commits(
 
 
 @pytest.mark.anyio
+async def test_pursuit_step_closes_with_the_report_but_not_its_witness(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # R116 (q35): T0002's close body kept its WITNESS block; beagle shows a done
+    # task's result to the tasks that wait on it, and T0003's worker named that
+    # encoder line as the decoder's witness. It survived, and a second worker ran.
+    project = _git_project(tmp_path, monkeypatch)
+    monkeypatch.chdir(project)
+    monkeypatch.setenv("FAKE_TAU_REPORT", WITNESSED_REPORT)
+    _ready_task(fake_beagle)
+    (fake_beagle / "prove.out").write_text("T0002: PROVEN — refuses when `a + b` is `a - b`\n")
+    runtime, _ = _bound(tmp_path)
+
+    await _tool(runtime, "pursuit_step").execute(
+        "c1",
+        {
+            "task": "T0002",
+            "criteria": "c",
+            "done_when": "grep -q done done.txt",
+            "scope": ["done.txt"],
+        },
+    )
+
+    [close] = _pursuit_calls(fake_beagle, "close")
+    body = close[close.index("--body") + 1]
+    assert "wrote done.txt" in body
+    assert "WITNESS" not in body and "return a + b" not in body
+
+
+@pytest.mark.anyio
 async def test_pursuit_step_takes_the_work_away_when_the_worker_names_no_witness(
     tmp_path: Path,
     beagle: Path,
