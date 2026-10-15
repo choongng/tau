@@ -11471,6 +11471,51 @@ def _squeezed(text: str) -> str:
     return " ".join(text.replace("\u2212", "-").split()).casefold()
 
 
+def _loose(text: str) -> str:
+    """`text` squeezed, without the spacing around brackets and commas: the paper's
+    `(i1 , i2 )` is a worker's `(i1, i2)`."""
+    return re.sub(r"\s*([()\[\]{},])\s*", r"\1", _squeezed(text))
+
+
+_QUOTED_SPAN = re.compile(r"`([^`\n]+)`|\"([^\"\n]+)\"|\u201c([^\u201d\n]+)\u201d")
+QUOTED_SPAN_MIN = 8  # shorter spans (`0`, `fork`) are held by any source
+
+
+def _case_source_words(
+    report: str, case: str, test_names: list[str], cite: str, kind: str, root: Path
+) -> str:
+    """The source words `report` gives for changing `case`, or "": its CASE line's
+    words, else a quoted span on a report line naming the case or its test, held by
+    the case's cited paragraph; a `kind=gap` case, which says the source is silent,
+    is answered by words anywhere in references/.
+
+    Run R110 (q35): two code workers corrected gap cases that the paper's
+    `split(0) = (0, 0)` and `sum(0, i) = i` contradict, quoting them in backticks
+    beside the test's name, and put the case's docstring in the CASE line.
+    """
+    keys = {_case_key(case), *(_case_key(name) for name in test_names)}
+    candidates = [words for key, words in _case_quotes(report).items() if key in keys]
+    for line in report.splitlines():
+        if _CASE_LINE.match(line):
+            continue
+        named = re.sub(r"(?<![\w-])test-", "", line.casefold().replace("_", "-"))
+        if not any(re.search(rf"(?<![\w-]){re.escape(key)}(?![\w-])", named) for key in keys):
+            continue
+        for span in _QUOTED_SPAN.finditer(line):
+            words = next(group for group in span.groups() if group).strip()
+            if len(_loose(words)) >= QUOTED_SPAN_MIN:
+                candidates.append(words)
+    if kind == "gap":
+        source = "\n".join(
+            path.read_text(errors="replace")
+            for path in sorted((root / REFERENCES_DIR).glob("*.txt"))
+        )
+    else:
+        source = _cited_text(cite, root)
+    held = _loose(source)
+    return next((words for words in candidates if words and _loose(words) in held), "")
+
+
 def _pinned_text(rel: str, sha: str, root: Path) -> str | None:
     """The text of `rel` whose sha256 is `sha`, from its recent history, or None."""
     rc, out = _run(["git", "log", "--format=%H", "-n", "40", "--", rel], root, 30.0)
@@ -11526,13 +11571,17 @@ def _settle_case_edits(task: str, report: str, root: Path) -> str:
             if old_cases.get(case) == new_cases.get(case):
                 continue
             cite = (new_cases.get(case) or old_cases[case])[0]
+            blocks = [b[1] for b in (old_cases.get(case), new_cases.get(case)) if b]
+            kind = next(iter(re.findall(r"\bkind=(\S+)", blocks[0])), "")
+            names = re.findall(r"def\s+(test_\w+)", "\n".join(blocks))
             words = quotes.get(_case_key(case), "")
-            if not words:
+            held = _case_source_words(report, case, names, cite, kind, root)
+            if held:
+                reasons.append(f'{case}: "{held}"')
+            elif not words:
                 why.append(f'case {case} changed with no `CASE {case}: "<words>"` line')
-            elif _squeezed(words) not in _squeezed(_cited_text(cite, root)):
-                why.append(f'case {case}: its cited lines ({cite}) do not hold "{words}"')
             else:
-                reasons.append(f'{case}: "{words}"')
+                why.append(f'case {case}: its cited lines ({cite}) do not hold "{words}"')
     files = ", ".join(changed)
     if not why:
         reason = (
