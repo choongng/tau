@@ -1665,6 +1665,20 @@ def test_found_criteria_leave_values_to_the_sources(tmp_path: Path) -> None:
         assert "a value written from memory can contradict them" in flat
 
 
+def test_found_offers_the_requests_link_as_a_milestone_source(tmp_path: Path) -> None:
+    # R107: the request gave a Wikipedia link, which founding fetches only after
+    # the milestones are split. Asked for "a file in references/", q35 named no
+    # source on any milestone, so no case was read from the spec and the driver's
+    # own checks closed code that failed 7 of the grader's 44 cases.
+    runtime, _ = _bound(tmp_path)
+    found = _tool(runtime, "pursuit_found")
+    milestones = found.parameters["properties"]["milestones"]
+    source = milestones["items"]["anyOf"][1]["properties"]["source"]["description"]
+    for text in (milestones["description"], source):
+        flat = " ".join(text.split())
+        assert "a link in the user's request" in flat, text
+
+
 @pytest.mark.anyio
 async def test_founding_on_a_bare_goal_plans_no_slice_before_the_first_milestone(
     tmp_path: Path, beagle: Path, fake_beagle: Path, monkeypatch: pytest.MonkeyPatch
