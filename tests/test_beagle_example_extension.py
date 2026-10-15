@@ -4268,6 +4268,25 @@ def test_setup_milestone_titled_with_a_dash_and_naming_beagle_is_dropped() -> No
     assert setup(["Implement the beagle exporter - configure its output paths"]) is None
 
 
+def test_setup_milestone_whose_purpose_names_the_pursuit_is_dropped() -> None:
+    # R118 (lfm24): 'Setup complete: beagle init written, pursuit founded with goal
+    # and criteria' kept its first place, since its title names neither beagle nor
+    # the pursuit; the run spent its 30 min proving a check over that setup.
+    module = _module()
+    setup = module._setup_milestone
+    assert setup(["Setup complete: beagle init written, pursuit founded with goal"]) is not None
+    assert setup(["Set up the project layout: src/ and tests/"]) is None
+    assert setup(["Create the clock type: the pursuit's first module"]) is None
+    assert setup(["Implement the beagle exporter - configure its output paths"]) is None
+    kept, _notes = module._repair_milestones(
+        [
+            "Setup complete: beagle init written, pursuit founded with goal and criteria",
+            "Core ITC implementation: interval tree clocks (create, increment, compare)",
+        ]
+    )
+    assert [part.split(":")[0] for part in kept] == ["Core ITC implementation"]
+
+
 R19_MILESTONES = [
     "Found the pursuit: implement interval tree clocks in modern Python (see skill) against "
     "https://gsd.di.uminho.pt/members/cbm/ps/itc2008.pdf and "
