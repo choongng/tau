@@ -1691,3 +1691,43 @@ snapshot; the out-of-tree read guard refused it.
 Fix before round 28: **T0657 (fix 35).** A cite whose anchor is wrong for the named reference
 but whose every line#anchor is exactly one other reference's is moved to that reference, not
 re-anchored; the step's reply says so.
+
+## R131 — q35 cobs, round 28: a worked-out limit case no route could dispute (3/44)
+
+Capped at 30 min (tau ff88b2c3). Grade 3/44: 18 `Missing: adapter lacks decode`, and every
+encode case wrong by one trailing `01` byte. Timeline: founding 2.3 min; T0002's cases worker
+2.3–10.1 min (21 cases, dry run clean); code worker 10.3–28.9 min; T0002 superseded by a retry at
+the cap. Decode (T0003) never started.
+
+Tied to the grade:
+
+- **Decode never started (33 of 44 need it).** The clock: encode alone took 26 min. The code
+  worker spent ~12 of its 18.5 min in three turns cut at the 240 s reasoning limit; the host's
+  note after each was acted on.
+- **Encode regressed at the end (8/44 → 3/44).** The worker's second write passed 19/21 local
+  cases and grades 8/44 (10 of 11 wiki-encode; fails the 255-byte full-window case, a real bug,
+  and empty input). Its last write, made after a cut spent on the two failures, appended an extra
+  `01` and failed 17/21; the cap left that tree. Writes kept in itc-harness `runs/R131/writes/`.
+- **The failure it chased was a wrong case.** `all_zeros` (`kind=limit`, `cite=...:72#cd3`, the
+  input line of the table's example 2, `00 00`) asserts `encode(00 00 00) == 01 01 01 00`: the
+  cases worker worked the value out ("each zero byte becomes its own group") and miscounted;
+  the reference gives `01 01 01 01 00` (20/21 of the cases pass against the reference encoder;
+  this is the one). `CASES_VALUES_NOTE` forbids it in prose; nothing checks it. The code worker
+  saw it ("the test is wrong") but its one route, `CASE <id>: "<source words>"`, needs words
+  from the cite that show the case wrong, and line 72 says nothing about three zeros.
+- **Empty input (2 `empty` + 1 `roundtrip`).** From the founding criteria, not the source:
+  "Empty input encodes to a single zero byte" (the prompt gives only the Wikipedia link; the
+  reference's encoder gives `01`). Same invented value as R107. Founding is the user's line;
+  noted for the founding work (T0653), not fixed here.
+
+T0637 (cases worker must not write its own encoder): partly held. The cases worker still ran
+the article's C code as a `python3 -c` once (to settle the end marker), but wrote all 21 tests in
+8 min, against R119's two cases workers and no test in 24 min.
+
+No fix filed. Checked and rejected: (1) refusing a `limit`/`invalid` case whose cite overlaps an
+`example` case's cite: it fires on legitimate bounds in R112, R122, S02, S04, where one line
+states both an example and the form's min/max or valid range; (2) a host check that a case's
+values are held by its cite needs per-task literal parsing (bytes, tuples, version strings);
+(3) letting a code worker drop a case by quoting its cite would let it rewrite any case. The
+sound place is beagle `rules 2e` (a case's asserted values are held by its cited lines), an
+upstream ask.
