@@ -2384,6 +2384,35 @@ async def test_found_first_steer_carries_reference_extracts(
     assert "in the reference's own terms, not from the name alone" in note
 
 
+@pytest.mark.anyio
+async def test_found_first_steer_lists_a_cut_references_numbered_sections(
+    tmp_path: Path, beagle: Path, fake_beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Run R122 (q35 itc): the steer showed the paper's introduction only; the driver
+    # founded "intervals [start, end) with counters, split and merge", and the paper's
+    # fork, event, join and normal form, in its section titles, never reached a task.
+    runtime, session = _bound(tmp_path)
+    monkeypatch.chdir(tmp_path / "project")
+    session.is_running = True
+    paper = "https://example.org/papers/itc2008.pdf"
+    body = "\n".join(f"Line {i} of the body, with words enough to fill it." for i in range(200))
+    page = (
+        f"{ITC_ABSTRACT}\n1    Introduction\n{body}\n3    Fork-Event-Join Model\n{body}\n"
+        f"5.2     Normal form\n1. a numbered list item, which is a sentence.\n"
+        f"5.3.2    Fork\n{body}\n"
+    )
+    _fake_web(fake_beagle, {paper: page})
+
+    await runtime.emit_session_start("startup")
+    await runtime.run_input_hooks(f"Implement interval tree clocks, as a beagle pursuit: {paper}")
+    await runtime.emit_event(AgentStartEvent())
+
+    [note] = session.steered
+    assert "its opening, of" in note
+    sections = "Its numbered sections: 1 Introduction; 3 Fork-Event-Join Model; 5.2 Normal form; 5.3.2 Fork."
+    assert sections in note
+
+
 #: A short spec whose last section names an operation once, as wrenfold's names `count`.
 SHORT_SPEC = (
     "Wrenfold sequence encoding, revision 3\n\n"
