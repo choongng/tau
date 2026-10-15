@@ -205,6 +205,12 @@ the output, copy it; where they give a rule or a bound, assert the rule (which f
 refusal, the round trip), not an output you work out." Tau carries it meanwhile as `CASES_VALUES_NOTE`
 in the cases brief (T0611).
 
+Run R131 (q35 cobs), with the note in the brief: again the one wrong case of 21 was a `kind=limit` case
+whose output was worked out (`encode(00 00 00)`, cited to the `00 00` row). The code worker saw it was
+wrong but had no words to quote, since its cite does not mention the input; it reasoned through two cut
+turns over it and the run ended on a regressed tree. Prose alone does not hold it: the open or the case
+scan could refuse a `limit` case that asserts a whole output its cited lines do not contain.
+
 ## 11. Rule 2e: the marker's first word is the case's name
 
 Run S03 (q35 wrenfold): two cases workers wrote 17 sound cases but no marker beagle could read. Rule
