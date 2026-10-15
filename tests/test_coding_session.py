@@ -1,5 +1,6 @@
 import asyncio
 import json
+import shutil
 import sys
 from collections.abc import AsyncIterator
 from io import BytesIO
@@ -7911,8 +7912,15 @@ async def test_session_runs_a_repeated_call_whose_result_changes(tmp_path: Path)
 
 
 @pytest.mark.anyio
-async def test_session_refuses_a_tool_run_through_bash(tmp_path: Path) -> None:
+async def test_session_refuses_a_tool_run_through_bash(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     # Run 11c: `cd ~/itc && pursuit_step` through bash, "command not found" each time.
+    # util-linux ships a `look` program; this test's `look` is only a tool.
+    which = shutil.which
+    monkeypatch.setattr(
+        shutil, "which", lambda name, *a, **k: None if name == "look" else which(name, *a, **k)
+    )
     shell: list[object] = []
 
     async def bash(
