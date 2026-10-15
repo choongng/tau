@@ -46,6 +46,7 @@ branch and sha. Grades come from `grade_<task>.py` over `runs/RNN/adapter.py`;
 | R108 | g26 | wrenfold (round 5, 30 min cap) | beagle 0.48.0 08e642c; tau 65aee9aa (T0624) | 0/54 at the cap, no code: T0002 scoped to its test file alone; tau's data-test refusal made a second cases worker (cases committed at 17.5 min, cites right) and the code worker, refused wrenfold.py, rewrote the tests | — |
 | R109 | lfm24 | semver (round 6, 30 min cap) | beagle 0.48.0 08e642c; tau fe94622d (T0625) | 0/76 at the cap, no code: six refused pursuit_plan calls, then three cases workers whose cites all carried #0b7 beside the right line numbers; open refused each | — |
 | R110 | q35 | itc (round 7, 30 min cap) | beagle 0.48.0 08e642c; tau a3eb469a (T0626) | 17/42 at the cap: T0002 tied at 11 min, code 22/24 of its cases by 23:16; three forced gap cases contradicted the paper, and two code workers' corrections were put back (CASE words were the docstring; the paper's words were in backticks beside) | — |
+| R111 | g26 | cobs (round 8, 30 min cap) | beagle 0.48.0 08e642c; tau 93cf761e (T0627) | 3/44 at the cap: cases tied at 15 min (15 cases); the code worker's three 240 s turns in a row reasoned COBS out by hand and never acted, the bound of two nudges ended it; a second worker wrote a placeholder cobs.py just before the cap | — |
 
 ## B06 — the invented spec was not hard
 
@@ -1132,3 +1133,42 @@ report, all three corrections are accepted.
 
 An upstream lead: beagle's demand for a malformed-input case per op pushed the worker into
 inventing refusals the source contradicts.
+
+## R111 — round 8, g26 cobs: three time cuts in a row, no action
+
+The run ended at the cap with 3/44: `decode` was missing and `encode` was a placeholder. The
+three passing checks hold for any output (empty input, no zero byte, overhead bound). The
+founding happened at 23:36, and the cases worker ran from 23:37 to 23:51. It wrote 15 cases,
+and the task opened tied at 23:51, 15 min in.
+
+1. **Code worker 1 (23:51 to 00:04) never made a tool call.** Each of its three turns reasoned
+   for 240 s, about 29k characters each, tracing COBS frames byte by byte. Each was cut at the
+   reasoning budget and nudged. After the bound of two nudges in a row, the worker's run ended
+   with nothing written: 13 min gone.
+2. **A second worker started at 00:05 and wrote a placeholder `cobs.py`** just before the cap.
+3. **Across all sessions, the reply to a time cut's nudge acts or doesn't, by model.** Qwen
+   acted on 6 of 6. Gemma acted on 4 and was cut again on 4.
+
+I probed the cut worker's own prompt on krang (max_tokens 7000):
+
+- **Replayed reasoning makes no difference to gemma.** Its chat template drops a
+  reasoning-only assistant turn, so the prompts with and without the replayed reasoning render
+  byte-identical (22,066 characters). So the nudge's "Your reasoning so far is kept above" is
+  not true there.
+- **On that one prompt, gemma acted in 5 of 10 samples.** Each acting reply came within 23 s:
+  `ls cobs.py`, a test run, or writing `cobs.py`. The other 5 reasoned to the limit (129 to
+  142 s).
+- **Showing the reasoning's last 3,000 characters as visible text did worse.** Gemma acted in
+  1 of 6.
+- **`tool_choice: "required"` did not help.** The reply still reasoned to the limit with no
+  call.
+
+Fix before round 9: **T0628 (fix 17), in tau core.** A reply that will act does so early, so
+retries are cheap if they are short. The reply to a time cut's nudge gets a quarter of the turn
+budget (60 s of 240), and time cuts allow four nudges in a row instead of two. Worst case is
+240 + 4 × 60 = 480 s, against 720 s before. At gemma's 1-in-2 rate, four tries all failing is
+about 1 in 16. The prompt is the same, so there is no prefix-cache cost. Other length stops keep
+the bound of two.
+
+Still open: the nudge text claims the reasoning is kept, which is false on gemma's template.
+

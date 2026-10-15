@@ -30,7 +30,7 @@ Watch on lfm24: llama.cpp #30490. After about 8 rejected tool calls in a row it 
 | 5 | R108 | g26 | wrenfold | 0/54; tests-only scope, data-test route, 2 cases workers, code refused | T0625 |
 | 6 | R109 | lfm24 | semver | 0/76; 6 refused plans, 3 cases workers' cites all #0b7, open refused | T0626 |
 | 7 | R110 | q35 | itc | 17/42; tied at 11 min, 22/24 cases; gap-case corrections put back twice | T0627 |
-| 8 | R111 | g26 | cobs | | |
+| 8 | R111 | g26 | cobs | 3/44; tied at 15 min; code worker 3 time cuts in a row, no action; placeholder cobs.py | T0628 |
 | 9 | R112 | lfm24 | wrenfold | | |
 | 10 | R113 | q35 | semver | | |
 | 11 | R114 | g26 | itc | | |
