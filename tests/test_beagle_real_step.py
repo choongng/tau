@@ -242,11 +242,11 @@ async def test_real_spec_tied_step_puts_back_a_case_changed_without_the_source_w
     )
 
 
-async def test_real_spec_tied_step_repairs_markers_with_the_cite_where_the_id_goes(
+async def test_real_spec_tied_step_names_cases_whose_markers_have_no_name(
     tmp_path: Path, real_beagle: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # Run S03: every marker read `# beagle-case: wrenfold-r3:25#019 kind=example
-    # op=encode_single`; none tied, and a whole round of sound cases was redone.
+    # Run S03: the markers read `# beagle-case: wrenfold-r3:25#019 kind=… op=…`, then
+    # `# beagle-case: cite=wrenfold-r3:25#019 …`; none tied, and sound cases were redone.
     (real_beagle / "references").mkdir()
     (real_beagle / "references" / "spec.txt").write_text(SPEC)
     subprocess.run(["git", "add", "references"], cwd=real_beagle, check=True)
@@ -265,7 +265,7 @@ async def test_real_spec_tied_step_repairs_markers_with_the_cite_where_the_id_go
         "import pytest\nfrom calc import add\n\n\n"
         f"# beagle-case: spec:{anchors[2]} kind=example op=add\n"
         "def test_add_sum():\n    assert add(2, 3) == 5\n\n\n"
-        f"# beagle-case: spec:{anchors[3]} kind=invalid op=add\n"
+        f"# beagle-case: cite=spec:{anchors[3]} kind=invalid op=add\n"
         "def test_add_type():\n    with pytest.raises(TypeError):\n        add('2', 3)\n"
     )
     monkeypatch.setenv("STUB_TAU_CASES_WRITES", json.dumps({"tests/test_calc.py": cases}))
@@ -284,3 +284,4 @@ async def test_real_spec_tied_step_repairs_markers_with_the_cite_where_the_id_go
     assert show(real_beagle, add)["status"] == "done", result.text
     written = (real_beagle / "tests" / "test_calc.py").read_text()
     assert f"# beagle-case: add-5 cite=spec:{anchors[2]} kind=example op=add" in written
+    assert f"# beagle-case: add-10 cite=spec:{anchors[3]} kind=invalid op=add" in written

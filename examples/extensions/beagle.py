@@ -11066,6 +11066,18 @@ CASES_VALUES_NOTE = (
 )
 
 
+#: How a case's marker reads, for the cases worker. Run S03: q35 took rule 2e's
+#: `fork-seed` for part of the cite, wrote the cite where the name goes, then a
+#: `cite=` with no name, and spent a 19-minute worker on the guessing.
+CASES_MARKER_NOTE = (
+    "Above each case put one marker line, `# beagle-case: NAME cite={ref}:LINE#HASH "
+    "kind=KIND op=FUNCTION`. NAME is a short name you give the case, unique in the "
+    "file (`zero-is-one-byte`); LINE#HASH is the anchor `beagle refs find` printed, "
+    "or LINE#HASH-LINE#HASH for a passage; KIND is example, invalid, limit or gap; "
+    "FUNCTION is the function the case calls."
+)
+
+
 def _cases_brief(
     task: str,
     title: str,
@@ -11091,10 +11103,13 @@ def _cases_brief(
         f"Write the cases in {', '.join(cases_scope)}, which its check runs: `{done_when}`\n\n"
         + CASES_VALUES_NOTE
         + "\n\n"
+        + CASES_MARKER_NOTE.format(ref=Path(source).stem)
+        + "\n\n"
         "You are done when this passes, with your cites and case files added:\n"
         f"  {dry_run} --cites REF:ANCHOR ... --cases FILE ... --dry-run\n"
-        "It passes while the tests fail: the code is not written yet. End with a report "
-        "naming the case files and the cites.\n\n"
+        "It passes while the tests fail: the code is not written yet. Its --scope is "
+        f"the code's, for the later sub-agent; you write only in {', '.join(cases_scope)}. "
+        "End with a report naming the case files and the cites.\n\n"
         + NO_BEAGLE_NOTE
         + " You may also run that `beagle pursuit open ... --dry-run`."
         + "\n\n"
@@ -11107,12 +11122,22 @@ def _cases_brief(
 _CITE_AS_CASE_ID = re.compile(
     r"^(?P<pre>.*beagle-case:\s*)(?P<cite>[\w.-]+:\d+#[0-9a-f]+(?:-\d+#[0-9a-f]+)?)(?P<rest>.*)$"
 )
+#: A `beagle-case:` line with no name, its first word already a `key=value`:
+#: S03's second cases worker, told "no cite=", moved to `beagle-case: cite=…`.
+_CASE_WITHOUT_ID = re.compile(r"^(?P<pre>.*beagle-case:\s*)(?P<rest>\w+=.*)$")
+
+
+def _case_name(fields: str, index: int) -> str:
+    """A name for an unnamed case: its `op=` (or `case`) and its line number."""
+    op = re.search(r"\bop=(\S+)", fields)
+    return f"{op.group(1) if op else 'case'}-{index + 1}"
 
 
 def _repair_case_markers(root: Path, cases_scope: list[str]) -> list[str]:
-    """Give each `beagle-case:` line in `cases_scope` that has its cite where the
-    id goes (`_CITE_AS_CASE_ID`) an id and a `cite=`: the id is its `op=` (or
-    `case`) and its line number. The case files changed, for the step's result.
+    """Name each `beagle-case:` line in `cases_scope` that has no name: one with
+    its cite where the name goes (`_CITE_AS_CASE_ID`) also gets its `cite=`, one
+    whose first word is a `key=value` (`_CASE_WITHOUT_ID`) gets only the name.
+    The case files changed, for the step's result.
 
     Run S03: the cases worker's 17 cases were sound but every marker read
     `# beagle-case: wrenfold-r3:25#019 kind=example op=encode_single`; none tied,
@@ -11129,13 +11154,15 @@ def _repair_case_markers(root: Path, cases_scope: list[str]) -> list[str]:
         changed = False
         for n, line in enumerate(lines):
             body = line.rstrip("\r\n")
-            match = _CITE_AS_CASE_ID.match(body)
-            if match is None or "cite=" in body:
-                continue
-            op = re.search(r"\bop=(\S+)", match["rest"])
-            case = f"{op.group(1) if op else 'case'}-{n + 1}"
             ending = line[len(body) :]
-            lines[n] = f"{match['pre']}{case} cite={match['cite']}{match['rest']}{ending}"
+            as_id, no_id = _CITE_AS_CASE_ID.match(body), _CASE_WITHOUT_ID.match(body)
+            if as_id is not None and "cite=" not in body:
+                case = _case_name(as_id["rest"], n)
+                lines[n] = f"{as_id['pre']}{case} cite={as_id['cite']}{as_id['rest']}{ending}"
+            elif no_id is not None:
+                lines[n] = f"{no_id['pre']}{_case_name(no_id['rest'], n)} {no_id['rest']}{ending}"
+            else:
+                continue
             changed = True
         if changed:
             (root / rel).write_text("".join(lines))
