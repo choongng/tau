@@ -37,7 +37,7 @@ Watch on lfm24: llama.cpp #30490. After about 8 rejected tool calls in a row it 
 | 12 | R115 | lfm24 | cobs | 0/44, no code; 12.5 min cases worker skipped its dry run and was refused at the open; second worker mending at the cap | T0633 |
 | 13 | R116 | q35 | wrenfold | **54/54 at 21 min** (plain 9.1); T0003's worker borrowed T0002's witness from its close body, a second worker ran | T0634 |
 | 14 | R117 | g26 | semver | **75/76 at 14 min** (plain 8.1); misses `1.2.3\n` as R113; code passed 4 min into its worker, then 10 min went on a 280-char witness needle | T0635 |
-| 15 | R118 | lfm24 | itc | | |
+| 15 | R118 | lfm24 | itc | **0/44**; founding kept a 'Setup complete: beagle init written …' milestone as T0002 and the 30 min went there | T0636 |
 | 16 | R119 | q35 | cobs | | |
 | 17 | R120 | g26 | wrenfold | | |
 | 18 | R121 | lfm24 | semver | | |
