@@ -3012,6 +3012,45 @@ async def test_pursuit_step_closes_with_the_report_but_not_its_witness(
 
 
 @pytest.mark.anyio
+async def test_pursuit_step_hands_a_refused_witness_back_to_the_same_worker(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # R117 (g26): the code passed at 4 min, then the worker spent 10 more on its
+    # WITNESS, copying a 280-char regex byte by byte in its reasoning, since a
+    # refused witness costs a new worker that starts over. R116 (q35): T0003's
+    # second worker ran 5 min to name another defect in code it had not written.
+    monkeypatch.chdir(_git_project(tmp_path, monkeypatch))
+    monkeypatch.setenv("FAKE_TAU_REPORT", WITNESSED_REPORT)
+    _ready_task(fake_beagle)
+    (fake_beagle / "prove.out").write_text(
+        "T0002: NOT PROVEN — the check STILL PASSES with the defect put back\n"
+    )
+    (fake_beagle / "prove.rc").write_text("9")
+    runtime, _ = _bound(tmp_path)
+
+    await _tool(runtime, "pursuit_step").execute(
+        "c1",
+        {
+            "task": "T0002",
+            "criteria": "c",
+            "done_when": "grep -q done done.txt",
+            "scope": ["done.txt"],
+        },
+    )
+
+    first, again = _runs(fake_tau)
+    assert "asks for another" in first["stdin"] and "part of one line" in first["stdin"]
+    worker = first["argv"][first["argv"].index("--session-id") + 1]
+    assert again["argv"][again["argv"].index("--session") + 1] == worker
+    assert "so it does not catch that defect" in again["stdin"]
+    assert "WITNESS: <path of the source file>" not in again["stdin"]
+
+
+@pytest.mark.anyio
 async def test_pursuit_step_takes_the_work_away_when_the_worker_names_no_witness(
     tmp_path: Path,
     beagle: Path,
