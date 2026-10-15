@@ -19924,6 +19924,38 @@ async def test_pursuit_step_spec_tied_scope_of_tests_only_gains_the_code_its_cas
 
 
 @pytest.mark.anyio
+async def test_pursuit_step_reanchors_a_cite_to_the_line_it_names(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # R109 (lfm24): every marker carried the same anchor, #0b7, beside the
+    # right line numbers. `open` refused 146#0b7 as line 136's anchor, and three
+    # cases workers in a row, 27 min, left it so. The line is what a worker
+    # points at; the anchor of that line is beagle's to give.
+    project = _pursuit_project(tmp_path)
+    monkeypatch.chdir(project)
+    wrong = SPEC_CASES.replace("spec:2#ff4", "spec:2#0b7")
+    monkeypatch.setenv("FAKE_TAU_CASES_WRITES", json.dumps({"tests/test_parse.py": wrong}))
+    _source_task(fake_beagle)
+    (fake_beagle / "refs-show.out").write_text("2#ff4| parse reads an int\n")
+    runtime, _ = _bound(tmp_path)
+    step = _tool(runtime, "pursuit_step")
+
+    result = await step.execute("c1", SPEC_STEP)
+
+    shows = [c["argv"] for c in _calls(fake_beagle) if c["argv"][:2] == ["refs", "show"]]
+    assert ["refs", "show", "spec", "--from", "2", "--to", "2"] in shows
+    [opened] = _pursuit_calls(fake_beagle, "open")
+    assert "spec:2#ff4" in opened and "spec:2#0b7" not in opened
+    assert "cite=spec:2#ff4" in (project / "tests/test_parse.py").read_text()
+    assert "spec:2#0b7" in result.text and "spec:2#ff4" in result.text
+    assert "closed done" in result.text
+
+
+@pytest.mark.anyio
 async def test_pursuit_step_no_source_sends_no_cases_worker(
     tmp_path: Path,
     beagle: Path,
