@@ -35,6 +35,7 @@ branch and sha. Grades come from `grade_<task>.py` over `runs/RNN/adapter.py`;
 | R99 | q35 | semver (bare goal) | contract-first 009c2b8 (R98 + bounded `run --operation`, caller env in contain); tau f061aa4a | 75/76 at the 60 min cap (working tree: src/ untracked, nothing committed; graded through runs/R99/adapter.py) | R97 58/76 capped; B07 plain 75/76 in 8.1 min |
 | S02 | q35 | wrenfold (smoke, 25 min cap) | beagle 0.48.0 08e642c (spec-tying, no contract); tau beagle-0.48 fb3823e5 | 0/54: capped at 1500 s with T0002 (Encoder) open, no code written; the driver's done_when asserted wrong bytes (6 of 10), so both workers spent a 16k-token turn reconciling it with the spec | R98 54/54 in 49.9 min; B06 plain 54/54 in 9.1 min |
 | R100 | q35 | wrenfold | beagle 0.48.0 08e642c; tau ecb438ea (T0609) | 54/54 on the working tree, stopped at 35.6 min when runs went to a 30 min cap; nothing committed, no task done. The code was green at 14.6 min (reconstructed from the worker session) | S02 0/54; R98 54/54 in 49.9 min; B06 plain 54/54 in 9.1 min |
+| S03 | q35 | wrenfold (smoke, 30 min cap) | beagle 0.48.0 08e642c; tau 3cf73fa3 (fix 1, T0611: cases quote) | 0/54: capped at 30 min with no task opened and no code; both T0002 cases workers wrote sound cases under markers beagle could not read (cite where the name goes; then `cite=` with no name) | R100 54/54 green at 14.6 min; B06 plain 54/54 in 9.1 min |
 
 ## B06 — the invented spec was not hard
 
@@ -840,3 +841,28 @@ What it shows:
 
 From R100 on, runs cap at 30 min, and launch.sh copies the project each minute it changes to
 runs/RNN/snaps/tMM; `curve.py RNN` grades every snapshot and gives time-to-green.
+
+## S03 — q35 wrenfold smoke on fix 1: the markers, not the cases, cost the run
+
+Capped at 30 min (exit 124) with T0002 never opened and no module written: 0/54. Fix 1 (T0611)
+held: this time the cases asserted the form a bound gives (`len(encode_single(16384)) == 3`), not
+bytes worked out. What failed was the marker line around them.
+
+| min | what |
+|---|---|
+| 0–2.0 | setup and founding: 5 per-function milestones, the spec as source |
+| 2.3–5.0 | cases worker 1, T0002: 17 sound cases, every marker `# beagle-case: wrenfold-r3:25#019 kind=… op=…` (the cite where the case's name goes); it also tried to write `wrenfold/`, reading the dry run's `--scope` as its own. Tau found no tied marker and opened nothing |
+| 5.5–24.9 | cases worker 2, T0002: a 16k-token turn (50k chars of thinking) and a 15.7k-char one; the dry run said "no cite=", it moved to `beagle-case: cite=…`, the dry run said "no id"; killed at the 900 s wall |
+| 26.6–30 | a third round of cases, cut by the cap |
+
+What it shows:
+
+1. **Rule 2e's marker example doesn't say what its first word is.** q35 read `fork-seed` in
+   `# beagle-case: fork-seed cite=itc2008:367#95b` as part of the cite, and the "no id" refusal
+   didn't tell it otherwise. Beagle-side ask: say the first word is the case's own name.
+2. **Malformed but sound markers cost a whole round.** Tau can name them mechanically; beagle
+   still checks every tie.
+
+Fixes before S04: T0612 (a corrected pinned case is amended when it quotes its cited lines, else
+put back), T0613 (unnamed markers are named before ties are read), T0614 (the cases brief gives
+the marker's fields with the source's ref, and says the dry run's `--scope` is the code's).
