@@ -3088,12 +3088,17 @@ WORK_IT_OUT_NOTE = (
 )
 #: The cases worker's form of it. Run R104: told both to work expected outputs
 #: out by running them and to assert no output it works out (CASES_VALUES_NOTE),
-#: a cases worker spent a 241 s turn weighing the two.
+#: a cases worker spent a 241 s turn weighing the two. Run R119 (q35 cobs): both
+#: cases workers wrote their own encoder to check the source's table, chased
+#: where it disagreed (the rows shortened with `...`), and wrote no test in 24 min.
 CASES_WORK_IT_OUT_NOTE = (
     "Check arithmetic and bit layouts by running them (`python3 -c`), not in your "
     "reasoning: a long turn of reasoning is cut, costs minutes, and is no surer "
     "than the run. A run only checks a case; its expected values still come from "
-    "the cited lines."
+    "the cited lines. The cited lines are right: do not write the code, or a "
+    "version of it, to check them, for that version is what would be wrong. Where "
+    "a row is shortened (`...`), write it out from the pattern it shows "
+    "(`bytes(range(1, 255))`)."
 )
 
 
