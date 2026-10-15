@@ -51,6 +51,7 @@ branch and sha. Grades come from `grade_<task>.py` over `runs/RNN/adapter.py`;
 | R113 | q35 | semver (round 10, 30 min cap) | beagle 0.48.0 08e642c; tau 5e458e36 (T0629) | 75/76 at 4 min (snapshot t04), all-done at 16 min, ended on its own; the miss is `1.2.3\n` accepted (`$`, not `\Z`) | B07 plain q35 75/76 in 8.1 min |
 | R114 | g26 | itc (round 11, 30 min cap) | beagle 0.48.0 08e642c; tau 4fc29568 (T0629) | 0/42 at the cap, no code: founding's first task was a reading task ('Examine practical implementation patterns'); its step scoped references/ and was refused only after a 5 min cases worker; two more were refused at the open for no invalid/limit case per op (none ran the dry-run its brief names); the fourth was running at the cap | — |
 | R115 | lfm24 | cobs (round 12, 30 min cap) | beagle 0.48.0 08e642c; tau 61255dbc (T0630) | 0/44 at the cap, no code: T0002's first cases worker ran 12.5 min, never ran its dry run, and the open refused it (a `kind=encode` marker with no op or cite; no invalid case for encode); the second worker ran the dry run itself and was still mending at the cap | — |
+| R116 | q35 | wrenfold (round 13, 30 min cap) | beagle 0.48.0 08e642c; tau 72cc8154 (T0633) | **54/54 at 21 min** (plain 9.1; R98 49.9); T0002 encoder closed at 12.5 min and T0003 decoder at 26 min, each on one call; the cap fell during T0004 (examples) | — |
 
 ## B06 — the invented spec was not hard
 
@@ -1277,4 +1278,30 @@ on its cases. A refusal over the cases resumes that same worker session (`tau -p
 with the refusal, at most twice and with a 5 min wall each. The source is already in that
 worker's context, and in its prefix cache. The real open runs only after a dry run passes.
 R114 (two refusals at the open) and R115 are the same class.
+
+## R116 — round 13, q35 wrenfold: green at 21 min, one witness borrowed
+
+The run graded 54/54 at the t21 snapshot and held it to the cap. That beats R98's 49.9 min. Plain
+tau took 9.1 min.
+
+1. **Founding at 03:07, with two blocked writes and one refused plan.** The driver tried to write
+   `pyproject.toml`, and its "project setup" part was refused. It put the setup in T0002's notes.
+2. **T0002 (encoder), 03:08:14 to 03:18:51.**
+   - The cases worker ran its own dry run twice. The host's dry run (fix 20) passed, so nothing
+     was mended.
+   - The first code worker's encoder was right, but the check `python -m pytest` could not
+     import `wrenfold` from `src/`. A second worker added `tests/conftest.py`, which took 1.6
+     min.
+3. **T0003 (decoder), 03:19:41 to 03:32:04.**
+   - The first code worker's code was right, but it named T0002's witness (an encoder line)
+     with a new replacement. The decoder's check does not catch that line, so the witness
+     survived.
+   - A second worker ran for 5 min and was stopped once for reasoning without acting.
+   - The WITNESS block reached T0003's brief through T0002's close body, which beagle shows
+     under "Established by the finished tasks this one waits on".
+4. **The `workspace-clean` gate was red from T0002 on**, because `uv.lock` was untracked. The
+   driver added T0006 for it. That is noise, not a failure.
+
+Fix before round 14: **T0634 (fix 21).** A done close's body leaves out the WITNESS block;
+`prove` has already recorded it.
 
