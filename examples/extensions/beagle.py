@@ -3369,9 +3369,34 @@ def _strings(value: Any) -> list[str]:
     return [str(item).strip() for item in value if str(item).strip()]
 
 
-def _milestone_parts(value: Any) -> list[str]:
+def _names_a_reference(source: str, root: Path) -> bool:
+    """Whether `source` carries a link or names a file in `root`'s references/,
+    by name or stem."""
+    if _PROMPT_URL.search(source):
+        return True
+    try:
+        files = [f for f in (root / REFERENCES_DIR).iterdir() if f.name != REFERENCES_INDEX]
+    except OSError:
+        return False
+    return any(
+        re.search(rf"(?i)(?<![\w-]){re.escape(word)}(?![\w-])", source)
+        for f in files
+        for word in {f.name, f.stem}
+    )
+
+
+def _milestone_parts(
+    value: Any, root: Path | None = None, notes: list[str] | None = None
+) -> list[str]:
     """Milestone entries as `title::intent` strings; an entry given a `source`
-    keeps it as the intent's last words, `Source: <ref>` (`_task_source`)."""
+    keeps it as the intent's last words, `Source: <ref>` (`_task_source`).
+
+    Under a project `root`, a source that names no reference there and carries
+    no link is what the part is for, and joins its intent (a note says so in
+    `notes`). R124 (lfm24 wrenfold): every source described its part
+    ("wrenfold.py with encode, decode, count functions implementing revision 3
+    spec"), and T0002's cases were written from that.
+    """
     if isinstance(value, (str, dict)):
         value = [value]
     if not isinstance(value, list):
@@ -3386,7 +3411,15 @@ def _milestone_parts(value: Any) -> list[str]:
         if part and source and not _NO_SOURCE.match(source):
             title, _, intent = part.partition("::")
             part = f"{title.strip()}::{f'{intent.strip()} ' if intent.strip() else ''}"
-            part += f"{SOURCE_LEAD} {source}"
+            if root is None or _names_a_reference(source, root):
+                part += f"{SOURCE_LEAD} {source}"
+            else:
+                part += source
+                if notes is not None:
+                    notes.append(
+                        f"Took the source of {title.strip()!r} as what it is for: a "
+                        f"source names a file in {REFERENCES_DIR}/ or a link."
+                    )
         parts.append(part)
     return [part for part in parts if part]
 
@@ -4187,7 +4220,8 @@ def make_found_tool(
             )
         statement = str(arguments.get("statement") or "").strip()
         criteria = _strings(arguments.get("criteria"))
-        milestones = _milestone_parts(arguments.get("milestones"))
+        source_notes: list[str] = []
+        milestones = _milestone_parts(arguments.get("milestones"), root, source_notes)
         if not statement or not criteria:
             return _step_result("pursuit_found: 'statement' and 'criteria' are both required.")
         if not milestones:
@@ -4206,7 +4240,7 @@ def make_found_tool(
             milestones, repairs = _milestones_from_criteria(given, criteria, repairs)
             if not milestones:
                 return _step_result(f"pursuit_found: nothing written — {repairs[0]}")
-        repairs = [*criteria_notes, *repairs]
+        repairs = [*criteria_notes, *source_notes, *repairs]
         repaired = "".join(f"{note}\n\n" for note in repairs)
         delegated = arguments.get("user_delegated") is True
         inferred = None
@@ -4636,12 +4670,14 @@ def make_plan_tool() -> Any:
         if goal is None:
             return _step_result("pursuit_plan: no pursuit here yet; call pursuit_found first.")
         task = str(arguments.get("task") or "").strip()
-        parts = _milestone_parts(arguments.get("parts"))
+        source_notes: list[str] = []
+        parts = _milestone_parts(arguments.get("parts"), root, source_notes)
         if not task or not parts:
             return _step_result("pursuit_plan: 'task' and 'parts' are both required.")
         parts, split_notes = _split_part_lines(parts)
         if not parts:
             return _step_result(f"pursuit_plan: nothing added — {split_notes[0]}")
+        split_notes += source_notes
         cut = [part for part in parts if _fit_part(part) != part]
         parts = [_fit_part(part) for part in parts]
         for part in cut:
