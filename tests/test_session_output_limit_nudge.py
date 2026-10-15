@@ -210,3 +210,35 @@ async def test_reasoning_has_no_time_budget_unless_the_run_sets_one(
 
     assert session.messages[-1].text == "Done."
     assert len(main.calls) == 1
+
+
+@pytest.mark.anyio
+async def test_a_time_cut_nudges_reply_reasons_on_a_quarter_budget_four_times_in_a_row(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # R111 (gemma, cobs): a code worker's three 240 s turns in a row reasoned by
+    # hand and never acted, and the run ended at the bound of two nudges, 12 min
+    # gone. On its prompt after the cut, gemma acted in 5 of 10 samples, each
+    # within 23 s; the rest reasoned to the limit. A nudge's reply has a quarter
+    # of the budget, and a time cut allows four nudges in a row: 480 s at most.
+    monkeypatch.setenv(TURN_REASONING_SECONDS_ENV, "40")
+    ticks = iter(range(100000))
+    monkeypatch.setattr(coding_session_module, "_reasoning_clock", lambda: next(ticks))
+    long = " ".join(f"Byte {n} holds bits {n * 7} to {n * 7 + 6}." for n in range(40))
+    never_reached = AssistantMessage(content="The reasoning ran to its end.")
+    main = FakeProvider(
+        [*[_streamed_reasoning(long, then=never_reached) for _ in range(4)], _answers("Acted.")]
+    )
+    built: list[object] = []
+    session = await _thinking_session(monkeypatch, tmp_path, main, built)
+
+    async for _event in session.prompt("Encode it."):
+        pass
+
+    assert [call[2][-1].text for call in main.calls] == ["Encode it.", *[TIME_CUT_NUDGE] * 4]
+    cuts = [m for m in session.messages if isinstance(m, AssistantMessage) and m.diagnostics]
+    reasoned = [
+        sum(len(b.thinking) for b in m.content if isinstance(b, ThinkingContent)) for m in cuts
+    ]
+    assert len(reasoned) == 4 and all(r * 3 < reasoned[0] for r in reasoned[1:]), reasoned
+    assert session.messages[-1].text == "Acted."
