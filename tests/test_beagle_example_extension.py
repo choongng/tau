@@ -2364,7 +2364,8 @@ async def test_found_first_steer_carries_reference_extracts(
     monkeypatch.chdir(tmp_path / "project")
     session.is_running = True
     walkthrough = "https://example.org/blog/interval-tree-clocks.html"
-    _fake_web(fake_beagle, {walkthrough: ITC_ABSTRACT})
+    page = ITC_ABSTRACT + "\n" + "\n".join(f"Line {i} of the body." for i in range(300))
+    _fake_web(fake_beagle, {walkthrough: page})
 
     await runtime.emit_session_start("startup")
     await runtime.run_input_hooks(ITC_PROMPT)
@@ -2373,13 +2374,50 @@ async def test_found_first_steer_carries_reference_extracts(
     [note] = session.steered
     module = _loaded_module()
     assert note.startswith(module.FOUND_FIRST_NOTE)
-    extract = module._reference_extract(ITC_ABSTRACT)
+    extract = module._reference_extract(page)
     assert extract.startswith("Interval Tree Clocks: A Logical Clock for Dynamic Systems")
     assert f"From {walkthrough}" in note and extract in note
+    assert f"its opening, of {len(page.splitlines())} lines" in note
     assert "Causality tracking mechanisms" in note
     failed = "Could not fetch https://example.org/papers/itc2008.pdf: Name or service not known"
     assert failed in note
     assert "in the reference's own terms, not from the name alone" in note
+
+
+#: A short spec whose last section names an operation once, as wrenfold's names `count`.
+SHORT_SPEC = (
+    "Wrenfold sequence encoding, revision 3\n\n"
+    + "\n".join(
+        f"{n}. Section {n}: the forms and their bytes, as rule {n} says." for n in range(1, 40)
+    )
+    + "\n\nA reader that needs only how many integers a sequence holds uses\n"
+    "count, which returns that number without building the list.\n"
+)
+
+
+@pytest.mark.anyio
+async def test_found_first_steer_carries_a_short_reference_whole(
+    tmp_path: Path, beagle: Path, fake_beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Run R120 (g26 wrenfold): the steer showed 1500 characters of a 2586-character
+    # spec; the criteria and the milestones left out `count`, named in the cut part.
+    runtime, session = _bound(tmp_path)
+    monkeypatch.chdir(tmp_path / "project")
+    session.is_running = True
+    spec = "https://example.org/wrenfold-r3.html"
+    _fake_web(fake_beagle, {spec: SHORT_SPEC})
+
+    await runtime.emit_session_start("startup")
+    await runtime.run_input_hooks(
+        f"Implement the wrenfold encoding, revision 3, as a beagle pursuit: {spec}"
+    )
+    await runtime.emit_event(AgentStartEvent())
+
+    [note] = session.steered
+    assert len(SHORT_SPEC) > 2000
+    assert f"From {spec} (references/wrenfold-r3.txt), the whole of it:" in note
+    assert "count, which returns that number without building the list." in note
+    assert "1. Section 1: the forms and their bytes, as rule 1 says.\n2. Section 2" in note
 
 
 @pytest.mark.anyio
