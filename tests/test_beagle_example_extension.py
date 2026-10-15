@@ -19894,6 +19894,36 @@ async def test_pursuit_step_spec_tied_writes_cases_then_opens_with_cites_and_cas
 
 
 @pytest.mark.anyio
+async def test_pursuit_step_spec_tied_scope_of_tests_only_gains_the_code_its_cases_import(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # R108 (g26): T0002 was scoped to its test file alone. Told to bind a data
+    # test instead, the driver ran a second cases worker, and the code worker,
+    # refused wrenfold.py, rewrote the tests until the cap.
+    monkeypatch.chdir(_pursuit_project(tmp_path))
+    monkeypatch.setenv("FAKE_TAU_CASES_WRITES", json.dumps({"tests/test_parse.py": SPEC_CASES}))
+    _source_task(fake_beagle)
+    runtime, _ = _bound(tmp_path)
+    step = _tool(runtime, "pursuit_step")
+
+    result = await step.execute("c1", {**SPEC_STEP, "scope": ["tests/test_parse.py"]})
+
+    cases, code = _runs(fake_tau)
+    assert cases["role"] == "cases" and code["role"] == "executor"
+    assert "parser.py" in code["scope"] and "parser/" in code["scope"]
+    [opened] = _pursuit_calls(fake_beagle, "open")
+    scoped = opened[opened.index("--scope") + 1 : opened.index("--cites")]
+    assert scoped == ["tests/test_parse.py", "parser.py", "parser/"]
+    assert "data test" not in result.text
+    assert "its cases import `parser`" in result.text
+    assert "closed done" in result.text
+
+
+@pytest.mark.anyio
 async def test_pursuit_step_no_source_sends_no_cases_worker(
     tmp_path: Path,
     beagle: Path,
