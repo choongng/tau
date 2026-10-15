@@ -1495,6 +1495,9 @@ for rel, text in json.loads(os.environ.get(writes) or "{}").items():
 tamper = os.environ.get("FAKE_TAU_TAMPERS")
 if tamper:
     Path(tamper).write_text("tampered")
+mends = os.environ.get("FAKE_TAU_RESUMED_MENDS")
+if mends and "--session" in sys.argv:  # a resumed worker clears what refused its cases
+    Path(mends).unlink(missing_ok=True)
 reports = json.loads(os.environ.get("FAKE_TAU_REPORTS") or "[]")  # one per run, in order
 message = {
     "role": "assistant",
@@ -20182,9 +20185,44 @@ async def test_pursuit_step_spec_tied_cases_fail_at_the_open_with_beagles_refusa
     assert "`beagle pursuit open` refused (exit 4)" in result.text
     assert "op=parse has no invalid or limit case" in result.text
     assert "T0002 is not opened" in result.text and "tests/test_parse.py" in result.text
-    assert [run["role"] for run in _runs(fake_tau)] == ["cases"]
+    # The worker was handed the dry run's refusal twice, then it was relayed.
+    assert [run["role"] for run in _runs(fake_tau)] == ["cases"] * 3
+    assert all("--dry-run" in call for call in _pursuit_calls(fake_beagle, "open"))
     assert not any("tests/test_parse.py" in c for c in _pursuit_calls(fake_beagle, "commit"))
     assert (Path.cwd() / "tests/test_parse.py").exists()  # kept for the next call's worker
+
+
+@pytest.mark.anyio
+async def test_pursuit_step_hands_a_refused_cases_dry_run_back_to_the_same_worker(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # R114 (g26) and R115 (lfm24): cases workers ended without the dry run their
+    # brief names, and the open refused them 5-12 min in; the next call's worker
+    # started over. The host runs the dry run and the same session mends it.
+    monkeypatch.chdir(_pursuit_project(tmp_path))
+    monkeypatch.setenv("FAKE_TAU_CASES_WRITES", json.dumps({"tests/test_parse.py": SPEC_CASES}))
+    monkeypatch.setenv("FAKE_TAU_RESUMED_MENDS", str(fake_beagle / "open.rc"))
+    _source_task(fake_beagle)
+    refusal = "beagle: the cases do not tie to the cited source:\n  op=parse has no invalid case"
+    (fake_beagle / "open.out").write_text(refusal)
+    (fake_beagle / "open.rc").write_text("4")
+    runtime, _ = _bound(tmp_path)
+
+    result = await _tool(runtime, "pursuit_step").execute("c1", SPEC_STEP)
+
+    first, mend, *rest = _runs(fake_tau)
+    assert rest == [] or rest[0]["role"] != "cases", rest
+    assert mend["role"] == "cases"
+    worker = first["argv"][first["argv"].index("--session-id") + 1]
+    assert mend["argv"][mend["argv"].index("--session") + 1] == worker
+    assert "op=parse has no invalid case" in mend["stdin"]
+    dry, opened = _pursuit_calls(fake_beagle, "open")[:2]
+    assert "--dry-run" in dry and "--dry-run" not in opened
+    assert "not opened" not in result.text
 
 
 @pytest.mark.anyio
