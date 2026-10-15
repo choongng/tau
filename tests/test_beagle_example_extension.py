@@ -20106,6 +20106,31 @@ async def test_pursuit_step_spec_tied_with_no_scope_is_refused_before_its_cases_
 
 
 @pytest.mark.anyio
+async def test_pursuit_step_spec_tied_scoped_into_references_is_refused_before_its_cases_worker(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # R114 (g26, itc): T0002's scope named references; its cases worker ran
+    # 5 min, then the step refused the scope, which needed no worker to judge.
+    project = _pursuit_project(tmp_path)
+    (project / "references").mkdir(exist_ok=True)
+    monkeypatch.chdir(project)
+    monkeypatch.setenv("FAKE_TAU_CASES_WRITES", json.dumps({"tests/test_parse.py": SPEC_CASES}))
+    _source_task(fake_beagle)
+    runtime, _ = _bound(tmp_path)
+    call = {**SPEC_STEP, "scope": ["parser.py", "references"]}
+
+    result = await _tool(runtime, "pursuit_step").execute("c1", call)
+
+    assert "T0002 not opened — scope names references" in result.text
+    assert _runs(fake_tau) == []
+    assert _pursuit_calls(fake_beagle, "open") == []
+
+
+@pytest.mark.anyio
 async def test_pursuit_step_spec_tied_cases_fail_at_the_open_with_beagles_refusal(
     tmp_path: Path,
     beagle: Path,
