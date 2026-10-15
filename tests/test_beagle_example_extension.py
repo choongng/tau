@@ -3118,6 +3118,45 @@ async def test_pursuit_step_hands_a_refused_witness_back_to_the_same_worker(
 
 
 @pytest.mark.anyio
+async def test_pursuit_step_warns_a_fresh_worker_not_to_rewrite_a_check_that_already_passes(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # R129 (g26 semver): a worker made the check pass (75/76) and gave a WITNESS,
+    # but it exhausted the step's budget before the witness was accepted, so the
+    # step ended ask_module and the driver re-stepped. The fresh worker rewrote
+    # the passing module and regressed it to 27/76. _WITNESS_PENDING carries the
+    # "it already passes; add only the WITNESS, do not rewrite it" instruction to
+    # that next worker.
+    module = _module()
+    module._WITNESS_PENDING.clear()
+    monkeypatch.chdir(_git_project(tmp_path, monkeypatch))
+    monkeypatch.setenv("FAKE_TAU_REPORT", WITNESSED_REPORT)
+    _ready_task(fake_beagle)
+    (fake_beagle / "prove.out").write_text("T0002: PROVEN — refuses with done.txt gone\n")
+    module._WITNESS_PENDING.add((str(_pursuit_project(tmp_path)), "T0002"))
+    runtime, _ = _bound(tmp_path)
+
+    await _tool(runtime, "pursuit_step").execute(
+        "c1",
+        {
+            "task": "T0002",
+            "criteria": "c",
+            "done_when": "grep -q done done.txt",
+            "scope": ["done.txt"],
+        },
+    )
+
+    [run] = _runs(fake_tau)
+    assert "already" in run["stdin"] and "do not rewrite" in run["stdin"].lower()
+    assert module.WITNESS_PENDING_NOTE in run["stdin"]
+    assert (str(_pursuit_project(tmp_path)), "T0002") not in module._WITNESS_PENDING
+
+
+@pytest.mark.anyio
 async def test_pursuit_step_takes_the_work_away_when_the_worker_names_no_witness(
     tmp_path: Path,
     beagle: Path,
