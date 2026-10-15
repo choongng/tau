@@ -38,6 +38,7 @@ branch and sha. Grades come from `grade_<task>.py` over `runs/RNN/adapter.py`;
 | S03 | q35 | wrenfold (smoke, 30 min cap) | beagle 0.48.0 08e642c; tau 3cf73fa3 (fix 1, T0611: cases quote) | 0/54: capped at 30 min with no task opened and no code; both T0002 cases workers wrote sound cases under markers beagle could not read (cite where the name goes; then `cite=` with no name) | R100 54/54 green at 14.6 min; B06 plain 54/54 in 9.1 min |
 | S04 | q35 | wrenfold (smoke, 30 min cap) | beagle 0.48.0 08e642c; tau 602750d9 (T0611-T0614: cases quote, case-correction route, marker naming) | 45/54 at the cap, first at 23 min; T0002 opened tied at 12.9 min (markers right first try), code worker still fixing 63 and the end-marker refusal at the cap | S03 0/54; R100 green at 14.6 min; B06 plain 9.1 min |
 | S05 | q35 | wrenfold (smoke, 30 min cap) | beagle 0.48.0 08e642c; tau 5cd51a62 (T0616: work arithmetic out by running it; cases don't stub the code) | 0/54 at the cap: founding made 'Project scaffolding' a sourced milestone; its cases (cited to the title line) opened at 19.6 min, closed done at 25.5 min; the encoder never opened | S04 45/54; B06 plain 9.1 min |
+| S06 | q35 | wrenfold (smoke, 30 min cap) | beagle 0.48.0 08e642c; tau 352f48e9 (T0617: fold a layout-only milestone) | 49/54 from 20 min to the cap, never closed: founding 5.5 min with scaffolding folded into Encoder; T0002 opened tied at 17.2 min; one wrong case (`encode([63])` without the end marker) put back three times, as the worker's CASE line named the test and the cite only the sentence's last line | S05 0/54; S04 45/54; B06 plain 9.1 min |
 
 ## B06 — the invented spec was not hard
 
@@ -914,3 +915,46 @@ What it shows:
 Fix before S06: T0617. Founding folds a layout-only milestone into the next part's intent, ahead
 of that part's `Source:`. The design fold had the same latent bug of writing after the source. The
 setup refusal now says to name the package layout in the first part's intent.
+
+## S06 — q35 wrenfold smoke on T0617: right code at 20 min, held open by one wrong case
+
+Capped at 30 min. The code graded 49/54 from the 20-min snapshot to the cap; the 5 misses are 3
+malformed inputs and 2 `count` cases, a later milestone. The founding took 5.5 min and made three
+sourced milestones, with T0617 folding the scaffolding into Encoder. A cases worker opened T0002
+tied at 17.2 min. On the way it had one 16k length stop (about 11 min of decode), checking the
+spec's worked examples by hand, so T0616's note did not prevent it.
+
+The cases pinned `encode([63]) == b"\x40\x3f"`. The spec gives 63's two-byte form, but `encode`
+also appends the 0x3F end marker. The code worker corrected the case three times, at 22.8, 25.4
+and 27.5 min, and each correction was put back:
+
+1. It wrote `CASE test_sixty_three_two_byte: …`, naming the test function. The case's id is
+   `sixty-three-two-byte`.
+2. Then it named the right id but added commentary after the quote, and the whole tail was
+   checked as the quote.
+3. Neither form could have passed. The cite named line 35, `0x40 0x3F.`, which ends a sentence
+   begun on line 33, and the quote was that sentence.
+
+After three steps the step guidance offered a split, and the driver split Encoder into scaffold,
+impl and tests. That throws away a task whose code already worked.
+
+Grading note: a code worker ran `pip install --break-system-packages -e .` so that its check,
+`python3 -m pytest`, could import from `src/`. That put `~/wrenfold/src` on every python3's path
+through the user site and shadowed each snapshot, so every minute graded 49/54. The install was
+removed, and `curve.py` now grades with `PYTHONNOUSERSITE=1`.
+
+What it shows:
+
+1. **The pinned-case correction path is the bottleneck once the code is right.** The code was done
+   about 3 min into the code worker's run. Everything after was the correction ritual failing on
+   form, not substance.
+2. **The cases worker's values still come from reading, not running.** No code exists yet, and the
+   spec's worked example gives a form, not the full output.
+3. **Time to T0002 is still 12–17 min** (S04 12.9, S06 17.2), against plain tau's whole run of 9.1.
+
+Fixes before S07:
+
+- **T0618:** a worker turn that reasons for 240 s without acting is cut and asked to act; its
+  reasoning is kept.
+- **T0619:** a CASE line counts by the test's name, keeps only its first quoted span, and is
+  checked against the cited lines' paragraph (up to 4 lines either side).
