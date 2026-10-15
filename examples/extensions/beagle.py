@@ -6702,6 +6702,10 @@ _SETUP_ACTS = frozenset(
     }
 )
 
+#: Setup acts that also open real work ('Create the clock type'): with one of
+#: these, only a title naming beagle or the pursuit is setup.
+_GENERIC_ACTS = frozenset({"create", "start"})
+
 
 def _setup_milestone(parts: list[str]) -> str | None:
     """Why one of `parts` is not work toward the goal, or None.
@@ -6717,6 +6721,12 @@ def _setup_milestone(parts: list[str]) -> str | None:
         title = re.split(r":| - | — ", _split_part(part)[0], maxsplit=1)[0]
         words = set(re.findall(r"[a-z]+", title.lower()))
         names_setup = bool(words & _PURSUIT_NAMES) and bool(words & _SETUP_ACTS)
+        # R118: 'Setup complete: beagle init written, pursuit founded …' named
+        # the pursuit after its title only.
+        names_setup = names_setup or (
+            bool(words & _SETUP_ACTS - _GENERIC_ACTS)
+            and bool(set(re.findall(r"[a-z]+", part.lower())) & _PURSUIT_NAMES)
+        )
         if (words and words <= _SETUP_WORDS) or names_setup or ".beagle" in part:
             return (
                 f"{title.strip()!r} is not part of the goal's work: pursuit_found is what "
