@@ -2285,6 +2285,7 @@ async def _run_worker(
     scope: list[str] | None = None,
     thinking: str | None = None,
     role: str = EXECUTOR_ROLE,
+    resume: str = "",
 ) -> _WorkerRun:
     """Run one step-executor as a nested `tau -p --mode json` and read its report.
 
@@ -2297,7 +2298,8 @@ async def _run_worker(
     appended to tau's base system prompt, not swapped for it, so the worker
     keeps the built-in tool guidance and only gains the persona. JSON mode is
     for the usage figures: `pursuit close --spent` wants what the work cost,
-    and beagle cannot see it from a subprocess.
+    and beagle cannot see it from a subprocess. `resume` is an earlier worker's
+    session id: this run continues it, with `brief` as its next prompt.
     """
     step_executor = _LAYOUT.step_executor
     if step_executor is None:
@@ -2305,14 +2307,14 @@ async def _run_worker(
             problem=f"no beagle plugin ships {STEP_EXECUTOR_REL} "
             f"(looked in {_LAYOUT.found_by or BEAGLE})."
         )
-    session_id = uuid.uuid4().hex
+    session_id = resume or uuid.uuid4().hex
     transcript = TauPaths().project_session_dir(cwd) / f"{session_id}.jsonl"
     cmd = [
         TAU_BIN,
         "-p",
         "--mode",
         "json",
-        "--session-id",
+        "--session" if resume else "--session-id",
         session_id,
         "--cwd",
         str(cwd),
@@ -11667,6 +11669,53 @@ async def _write_cases(
         )
     _repair_case_markers(root, cases_scope)
     files, cites = _marker_ties(root, cases_scope)
+    spent, reanchored = run.spent, {}
+    # R114 (g26) and R115 (lfm24): workers ended without the dry run their brief
+    # names, and the open refused them 5-12 min in; the next call's worker read
+    # the source again. The host runs it, and the same session mends the cases.
+    for mends in range(CASES_DRY_RUN_MENDS + 1):
+        if not files:
+            break
+        moved = _reanchor_cites(root, files, cites)
+        reanchored.update(moved)
+        cites = [moved.get(cite, cite) for cite in cites]
+        refused = _cases_dry_run_refusal(task, criteria, done_when, scope, files, cites, root)
+        if refused is None:
+            break
+        if mends == CASES_DRY_RUN_MENDS or run.transcript is None:
+            rc, said_open = refused
+            relayed, then = _relay_next(said_open, "")
+            return (
+                f"pursuit_step: `beagle pursuit open` refused (exit {rc}):\n{relayed}\n\n"
+                f"{task} is not opened. The cases written from {source} stay in "
+                f"{', '.join(files)}; the next pursuit_step for {task} has them corrected."
+                + (f"\n\n{then}" if then else "")
+            )
+        brief = _cases_mend_brief(refused[1], cases_scope)
+        wall = min(timeout, CASES_MEND_SECONDS)
+        run = await _run_worker(
+            brief,
+            root,
+            model,
+            provider,
+            wall,
+            signal,
+            task,
+            cases_scope,
+            thinking,
+            CASES_ROLE,
+            resume=run.transcript.stem,
+        )
+        spent = max(spent or 0, run.spent or 0) or None
+        if run.problem is not None:
+            said = f"\n\nIts report:\n{_capped_report(run)}" if run.report else ""
+            return (
+                f"pursuit_step: {task} not opened — the sub-agent mending its cases from "
+                f"{source} after beagle refused them did not finish: {run.problem}{said}"
+                f'\n\nCall pursuit_step with task="{task}" again to have them written.'
+            )
+        _repair_case_markers(root, cases_scope)
+        files, cites = _marker_ties(root, cases_scope)
     if not files:
         return (
             f"pursuit_step: {task} not opened — the sub-agent writing its cases from "
@@ -11676,14 +11725,48 @@ async def _write_cases(
             f'with task="{task}" again to have them written, or with a done_when that '
             "names the test file the cases go in."
         )
-    reanchored = _reanchor_cites(root, files, cites)
-    if reanchored:
-        cites = [reanchored.get(cite, cite) for cite in cites]
     note = "".join(
         f"Re-anchored the cite {old} to {new}: the anchor of the line it names.\n"
         for old, new in reanchored.items()
     )
-    return files, cites, run.spent, note
+    return files, cites, spent, note
+
+
+#: How many times a refused cases dry run goes back to the worker that wrote them.
+CASES_DRY_RUN_MENDS = 2
+#: The wall of a cases worker resumed to mend its cases: its source is in context.
+CASES_MEND_SECONDS = 300.0
+#: A dry run's refusal that is the cases' to mend, not the task's.
+_CASES_REFUSAL = re.compile(r"\bcases?\b|beagle-case|\bcites?\b|\bop=")
+
+
+def _cases_dry_run_refusal(
+    task: str,
+    criteria: str,
+    done_when: str,
+    scope: list[str],
+    files: list[str],
+    cites: list[str],
+    root: Path,
+) -> tuple[int, str] | None:
+    """beagle's exit and words when the task's open, dry run, refuses its cases."""
+    argv = ["open", task, "--criteria", criteria, "--done-when", done_when]
+    if scope:
+        argv += ["--scope", *scope]
+    argv += ["--cites", *cites, "--cases", *files, "--dry-run"]
+    rc, said = _pursuit(argv, root, timeout=DEFAULT_CHECK_TIMEOUT + 60)
+    return (rc, said) if rc != 0 and _CASES_REFUSAL.search(said) else None
+
+
+def _cases_mend_brief(refusal: str, cases_scope: list[str]) -> str:
+    """The next prompt of a cases worker whose open, dry run, beagle refused."""
+    return (
+        "You ended, and the host ran the dry run of the task's open on your cases. "
+        f"beagle refused it:\n\n{refusal.strip()}\n\nMend the cases in "
+        f"{', '.join(cases_scope)} so it passes, reading the source lines again with "
+        "`beagle refs show` where a case needs them; write nowhere else. Run the dry "
+        "run again yourself, then end with a report naming the case files and the cites."
+    )
 
 
 def make_step_tool() -> Any:

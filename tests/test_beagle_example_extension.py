@@ -19871,22 +19871,22 @@ async def test_pursuit_step_spec_tied_writes_cases_then_opens_with_cites_and_cas
         "--cites REF:ANCHOR ... "
         "--cases FILE ... --dry-run"
     ) in cases["stdin"]
-    assert _pursuit_calls(fake_beagle, "open") == [
-        [
-            "T0002",
-            "--criteria",
-            "parse reads what the spec says",
-            "--done-when",
-            "python3 -m pytest -q tests/test_parse.py",
-            "--scope",
-            "parser.py",
-            "--cites",
-            "spec:2#ff4",
-            "spec:3#ab0-4#c01",
-            "--cases",
-            "tests/test_parse.py",
-        ]
+    opened = [
+        "T0002",
+        "--criteria",
+        "parse reads what the spec says",
+        "--done-when",
+        "python3 -m pytest -q tests/test_parse.py",
+        "--scope",
+        "parser.py",
+        "--cites",
+        "spec:2#ff4",
+        "spec:3#ab0-4#c01",
+        "--cases",
+        "tests/test_parse.py",
     ]
+    # The host's dry run of the open, then the open.
+    assert _pursuit_calls(fake_beagle, "open") == [[*opened, "--dry-run"], opened]
     [commit] = [c for c in _pursuit_calls(fake_beagle, "commit") if "tests/test_parse.py" in c]
     assert commit[:2] == ["T0002", "tests/test_parse.py"]
     assert commit[commit.index("--subject") + 1] == "T0002: cases from spec"
@@ -19918,7 +19918,7 @@ async def test_pursuit_step_spec_tied_scope_of_tests_only_gains_the_code_its_cas
     cases, code = _runs(fake_tau)
     assert cases["role"] == "cases" and code["role"] == "executor"
     assert "parser.py" in code["scope"] and "parser/" in code["scope"]
-    [opened] = _pursuit_calls(fake_beagle, "open")
+    [_dry_run, opened] = _pursuit_calls(fake_beagle, "open")
     scoped = opened[opened.index("--scope") + 1 : opened.index("--cites")]
     assert scoped == ["tests/test_parse.py", "parser.py", "parser/"]
     assert "data test" not in result.text
@@ -19951,7 +19951,7 @@ async def test_pursuit_step_reanchors_a_cite_to_the_line_it_names(
 
     shows = [c["argv"] for c in _calls(fake_beagle) if c["argv"][:2] == ["refs", "show"]]
     assert ["refs", "show", "spec", "--from", "2", "--to", "2"] in shows
-    [opened] = _pursuit_calls(fake_beagle, "open")
+    [_dry_run, opened] = _pursuit_calls(fake_beagle, "open")
     assert "spec:2#ff4" in opened and "spec:2#0b7" not in opened
     assert "cite=spec:2#ff4" in (project / "tests/test_parse.py").read_text()
     assert "spec:2#0b7" in result.text and "spec:2#ff4" in result.text
@@ -20011,7 +20011,7 @@ async def test_pursuit_step_cases_worker_scope_is_the_tests_the_check_runs(
 
     [cases] = _runs(fake_tau)
     assert cases["scope"] == "tests/test_parse.py"
-    [opened] = _pursuit_calls(fake_beagle, "open")
+    [_dry_run, opened] = _pursuit_calls(fake_beagle, "open")
     assert opened[opened.index("--cases") + 1 :] == ["tests/test_parse.py"]
     assert module._cases_scope("python3 -m pytest -q", project) == []
 
@@ -20220,8 +20220,8 @@ async def test_pursuit_step_hands_a_refused_cases_dry_run_back_to_the_same_worke
     worker = first["argv"][first["argv"].index("--session-id") + 1]
     assert mend["argv"][mend["argv"].index("--session") + 1] == worker
     assert "op=parse has no invalid case" in mend["stdin"]
-    dry, opened = _pursuit_calls(fake_beagle, "open")[:2]
-    assert "--dry-run" in dry and "--dry-run" not in opened
+    opens = _pursuit_calls(fake_beagle, "open")
+    assert ["--dry-run" in call for call in opens] == [True, True, False]
     assert "not opened" not in result.text
 
 
