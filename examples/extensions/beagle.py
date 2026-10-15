@@ -3039,14 +3039,15 @@ def _reference_size(path: Path) -> str:
     return f" — {count} lines, {reads} {noun} at {WINDOW_LINES} lines per read"
 
 
-def _turn_cap_note() -> str:
-    """The worker's tool-call cap, as pursuit_step's brief states it (R21-R25)."""
+def _turn_cap_note(work_note: str | None = None) -> str:
+    """The worker's tool-call cap, as pursuit_step's brief states it (R21-R25),
+    then `work_note` (WORK_IT_OUT_NOTE unless given)."""
     cap = _worker_max_turns()
     return (
         f"You have {cap} tool calls in all. Write the files by about call {cap // 2}, "
         "then use the rest to run the check and fix them. A bash command is stopped "
         f"after {_worker_bash_timeout():g} s unless the call passes a longer `timeout`. "
-        + WORK_IT_OUT_NOTE
+        + (WORK_IT_OUT_NOTE if work_note is None else work_note)
     )
 
 
@@ -3057,6 +3058,15 @@ WORK_IT_OUT_NOTE = (
     "Work out arithmetic, bit layouts and expected outputs by running them "
     "(`python3 -c`), not in your reasoning: a long turn of reasoning is cut at the "
     "output limit, costs minutes, and is no surer than the run."
+)
+#: The cases worker's form of it. Run R104: told both to work expected outputs
+#: out by running them and to assert no output it works out (CASES_VALUES_NOTE),
+#: a cases worker spent a 241 s turn weighing the two.
+CASES_WORK_IT_OUT_NOTE = (
+    "Check arithmetic and bit layouts by running them (`python3 -c`), not in your "
+    "reasoning: a long turn of reasoning is cut, costs minutes, and is no surer "
+    "than the run. A run only checks a case; its expected values still come from "
+    "the cited lines."
 )
 
 
@@ -11186,7 +11196,7 @@ def _cases_brief(
         + NO_BEAGLE_NOTE
         + " You may also run that `beagle pursuit open ... --dry-run`."
         + "\n\n"
-        + _turn_cap_note()
+        + _turn_cap_note(CASES_WORK_IT_OUT_NOTE)
     )
 
 

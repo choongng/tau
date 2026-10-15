@@ -19724,6 +19724,10 @@ async def test_pursuit_step_spec_tied_writes_cases_then_opens_with_cites_and_cas
     # Run S04: a 16k-token turn of bit arithmetic by hand; a stub hid the code.
     assert "by running them" in cases["stdin"] and "by running them" in code["stdin"]
     assert "do not stub it" in cases["stdin"]
+    # Run R104: the cases brief said both "work out expected outputs by running
+    # them" and "not an output you work out"; a 241 s turn weighed the two.
+    assert "expected outputs" not in cases["stdin"] and "expected outputs" in code["stdin"]
+    assert "expected values still come from the cited lines" in cases["stdin"]
     assert (
         "beagle pursuit open T0002 --criteria 'parse reads what the spec says' "
         "--done-when 'python3 -m pytest -q tests/test_parse.py' --scope parser.py "
