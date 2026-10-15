@@ -6904,6 +6904,14 @@ _READ_DESIGN_WORDS = frozenset(
         "notes",
         "design",
         "choose",
+        # R126 (g26 itc): 'Examine practical implementation patterns from <url>'
+        # was kept as T0002, a study task, and took 22 of the 30 minutes.
+        "examine",
+        "inspect",
+        "survey",
+        "familiarize",
+        "familiarise",
+        "skim",
     }
 )
 #: Words naming something such a milestone would deliver besides reading.
