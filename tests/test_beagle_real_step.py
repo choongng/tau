@@ -256,6 +256,25 @@ async def test_real_spec_tied_step_takes_a_case_line_by_its_test_name_with_words
     assert show(real_beagle, add)["status"] == "done", result.text
 
 
+async def test_real_spec_tied_step_takes_the_source_words_a_report_quotes_beside_the_case(
+    tmp_path: Path, real_beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Run R110 (q35 itc): two code workers corrected cases against the paper, and
+    # each quoted it in backticks on the line naming the test (`split(0) = (0, 0)`),
+    # but put the case's own docstring in its CASE line. The tests were put back
+    # twice, and the run ended at the cap with 22 of 24 cases green.
+    report = (
+        "- `test_add_sum` expected 6; the spec says `add(a,b) returns the sum of a and b`.\n"
+        'CASE add-sum: "The case expects add(2, 3) to be 6."'
+    )
+    add, cases, result = await _spec_tied_step_with_a_wrong_case(
+        tmp_path, real_beagle, monkeypatch, report
+    )
+    assert "== 5" in cases
+    assert show(real_beagle, add)["status"] == "done", result.text
+    assert '"add(a,b) returns the sum of a and b"' in result.text, result.text
+
+
 async def test_real_spec_tied_step_names_cases_whose_markers_have_no_name(
     tmp_path: Path, real_beagle: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

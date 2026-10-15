@@ -20183,6 +20183,32 @@ def test_case_lines_match_the_test_name_and_keep_only_the_quoted_words() -> None
     assert quotes[key("zero-one-byte")] == "0 is one byte"
 
 
+def test_a_gap_case_is_refuted_by_source_words_anywhere_in_references(tmp_path: Path) -> None:
+    # Run R110: `kind=gap` cases assumed fork and join of a null id are refused;
+    # the paper defines split(0) = (0, 0) and sum(0, i) = i, twelve lines below
+    # the join case's cite. A gap case says the source is silent, so source words
+    # anywhere refute it; a case of any other kind keeps to its cited paragraph.
+    module = _module()
+    (tmp_path / "references").mkdir()
+    lines = ["Join."] + [""] * 3 + ["join((i1 , e1 ), (i2 , e2 )) = (sum(i1 , i2 ), ...)"]
+    lines += [""] * 6 + ["such that:", "", "      sum(0, i) = i,"]
+    (tmp_path / "references" / "itc.txt").write_text("\n".join(lines) + "\n")
+    report = (
+        "- `test_join_null_id_refused` → `test_join_null_id_absorbs`: `sum(0, i) = i` "
+        "is defined, so join with a null id gives the other stamp.\n"
+        "- `test_join_max`: `join((i1, e1), (i2, e2))` is as cited.\n"
+        'CASE join-null-id: "The source says nothing of joining with null ids."\n'
+    )
+    held = module._case_source_words
+    names = ["test_join_null_id_refused"]
+    assert held(report, "join-null-id", names, "itc:5#abc", "gap", tmp_path) == "sum(0, i) = i"
+    assert held(report, "join-null-id", names, "itc:5#abc", "example", tmp_path) == ""
+    assert (
+        held(report, "join-max", ["test_join_max"], "itc:5#abc", "example", tmp_path)
+        == "join((i1, e1), (i2, e2))"
+    )
+
+
 def test_cited_text_holds_the_sentence_a_cited_line_ends(tmp_path: Path) -> None:
     # Run S06: the cite named line 35, `0x40 0x3F.`, the end of a sentence begun on
     # line 33, and the worker's quote of that sentence was refused.
