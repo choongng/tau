@@ -11517,26 +11517,47 @@ def _reanchor_cites(root: Path, files: list[str], cites: list[str]) -> dict[str,
     numbers; `open` refused 146#0b7 as line 136's anchor, and three cases
     workers in a row left it so. A worker points at a line; a short anchor
     that fits another line is chance, so the line decides.
+
+    Unless that line, with that anchor, is in another reference: R130 (lfm24
+    itc) cited itc2008:48#015, the line `refs find` had shown it in
+    interval-tree-clocks, and by the line alone it became the paper's blank
+    line 48. A line and its anchor together name that other reference.
     """
     fixed: dict[str, str] = {}
     known: dict[tuple[str, int], str | None] = {}
+
+    def anchor_of(name: str, number: int) -> str | None:
+        if (name, number) not in known:
+            known[(name, number)] = _line_anchor(name, number, root)
+        return known[(name, number)]
+
+    others = sorted(
+        {
+            path.stem
+            for path in (root / REFERENCES_DIR).glob("*")
+            if path.is_file() and path.stem != "index"
+        }
+    )
     for cite in cites:
         name, sep, anchors = cite.partition(":")
         if not sep:
             continue
         parts = re.findall(r"(\d+)#([0-9a-f]+)", anchors)
-        if not parts:
+        wrong = [(n, a) for n, a in parts if anchor_of(name, int(n)) not in (None, a)]
+        if not wrong:
+            continue
+        holders = [
+            other
+            for other in others
+            if other != name and all(anchor_of(other, int(n)) == a for n, a in parts)
+        ]
+        if len(holders) == 1:
+            fixed[cite] = f"{holders[0]}:{anchors}"
             continue
         new = anchors
-        for number, anchor in parts:
-            key = (name, int(number))
-            if key not in known:
-                known[key] = _line_anchor(name, key[1], root)
-            right = known[key]
-            if right is not None and right != anchor:
-                new = re.sub(rf"\b{number}#{anchor}\b", f"{number}#{right}", new)
-        if new != anchors:
-            fixed[cite] = f"{name}:{new}"
+        for number, anchor in wrong:
+            new = re.sub(rf"\b{number}#{anchor}\b", f"{number}#{anchor_of(name, int(number))}", new)
+        fixed[cite] = f"{name}:{new}"
     if fixed:
         for rel in files:
             path = root / rel
@@ -11929,7 +11950,12 @@ async def _write_cases(
             "names the test file the cases go in."
         )
     note = "".join(
-        f"Re-anchored the cite {old} to {new}: the anchor of the line it names.\n"
+        (
+            f"Re-anchored the cite {old} to {new}: the anchor of the line it names.\n"
+            if old.partition(":")[0] == new.partition(":")[0]
+            else f"Moved the cite {old} to {new}: that line, with that anchor, is in "
+            f"{new.partition(':')[0]}.\n"
+        )
         for old, new in reanchored.items()
     )
     return files, cites, spent, note

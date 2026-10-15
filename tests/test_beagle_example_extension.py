@@ -20493,6 +20493,40 @@ async def test_pursuit_step_reanchors_a_cite_to_the_line_it_names(
 
 
 @pytest.mark.anyio
+async def test_pursuit_step_moves_a_cite_to_the_reference_whose_line_it_names(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # R130 (lfm24 itc): the worker cited itc2008:48#015, the line `refs find` had
+    # shown it in the other reference, interval-tree-clocks:48#015 ("event:
+    # increments the counter"). Re-anchored by line it became itc2008:48#e3b, a
+    # blank line of the paper; each mend put #015 back, and 30 min went there.
+    project = _pursuit_project(tmp_path)
+    (project / "references").mkdir()
+    (project / "references" / "spec.txt").write_text("spec\n")
+    (project / "references" / "notes.md").write_text("notes\n")
+    monkeypatch.chdir(project)
+    crossed = SPEC_CASES.replace("spec:2#ff4", "spec:2#0b7")
+    monkeypatch.setenv("FAKE_TAU_CASES_WRITES", json.dumps({"tests/test_parse.py": crossed}))
+    _source_task(fake_beagle)
+    (fake_beagle / "show-spec.out").write_text("2#ff4| parse reads an int\n")
+    (fake_beagle / "show-notes.out").write_text("2#0b7| parse a number\n")
+    runtime, _ = _bound(tmp_path)
+    step = _tool(runtime, "pursuit_step")
+
+    result = await step.execute("c1", SPEC_STEP)
+
+    [_dry_run, opened] = _pursuit_calls(fake_beagle, "open")
+    assert "notes:2#0b7" in opened and "spec:2#ff4" not in opened
+    assert "cite=notes:2#0b7" in (project / "tests/test_parse.py").read_text()
+    assert "spec:2#0b7" in result.text and "notes:2#0b7" in result.text
+    assert "closed done" in result.text
+
+
+@pytest.mark.anyio
 async def test_pursuit_step_no_source_sends_no_cases_worker(
     tmp_path: Path,
     beagle: Path,
