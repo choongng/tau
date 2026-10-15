@@ -4461,6 +4461,34 @@ def test_a_milestone_source_that_names_no_reference_joins_its_intent(tmp_path: P
     assert module._task_source({"intent": kept.split("::", 1)[1]}) == "semver.org"
 
 
+def test_founding_folds_examine_and_understand_milestones_into_the_work() -> None:
+    # R126 (g26 itc, 9/42): 'Understand the ITC mathematical model ... from <paper>' was
+    # folded into 'Examine practical implementation patterns from <walkthrough>', which
+    # was kept: 'examine' was not a reading word. It became T0002, a "study" task whose
+    # worker was killed at its 17 min wall; the implementation never opened.
+    module = _module()
+    parts = module._milestone_parts(
+        [
+            {
+                "part": "Understand the ITC mathematical model and operations from the paper",
+                "source": "https://gsd.di.uminho.pt/members/cbm/ps/itc2008.pdf",
+            },
+            {
+                "part": "Examine practical implementation patterns from the walkthrough",
+                "source": "https://ferd.ca/interval-tree-clocks.html",
+            },
+            {"part": "Implement core ITC data structure and operations in Python"},
+        ]
+    )
+    kept, notes = module._repair_milestones(parts)
+    assert [part.split("::")[0] for part in kept] == [
+        "Implement core ITC data structure and operations in Python"
+    ]
+    for title in ("Inspect the reference encoder", "Survey existing libraries"):
+        assert module._design_only_milestone(title), title
+    assert not module._design_only_milestone("Examine and fix the decoder")
+
+
 def test_founding_folds_an_environment_milestone_with_no_source_into_the_first_work() -> None:
     # R105 (g26, bare-goal semver): 'Environment setup :: uv, ruff, pytest' opened as
     # T0002; no check of it could be shown to refuse, and the driver spent 13 min
