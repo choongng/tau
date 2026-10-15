@@ -19965,3 +19965,31 @@ async def test_pursuit_found_milestone_source_is_kept_like_a_plan_part(
     assert _milestone_splits(fake_beagle) == [
         ["T0001", "Parser::Source: spec", "CLI::wires it up", "--ordered"]
     ]
+
+
+def test_case_lines_match_the_test_name_and_keep_only_the_quoted_words() -> None:
+    # Run S06: the code worker wrote `CASE test_sixty_three_two_byte: "…"` for the
+    # case `sixty-three-two-byte`, then quoted the words with its reason after them.
+    # Neither matched, and one wrong case kept a task whose code passed open.
+    module = _module()
+    report = (
+        'CASE test_sixty_three_two_byte: "63 is written in the two-byte form" '
+        "— but encode() appends the end marker\n"
+        "CASE zero-one-byte: 0 is one byte\n"
+    )
+    quotes = module._case_quotes(report)
+    key = module._case_key
+    assert quotes[key("sixty-three-two-byte")] == "63 is written in the two-byte form"
+    assert quotes[key("zero-one-byte")] == "0 is one byte"
+
+
+def test_cited_text_holds_the_sentence_a_cited_line_ends(tmp_path: Path) -> None:
+    # Run S06: the cite named line 35, `0x40 0x3F.`, the end of a sentence begun on
+    # line 33, and the worker's quote of that sentence was refused.
+    module = _module()
+    (tmp_path / "references").mkdir()
+    (tmp_path / "references" / "wf.txt").write_text(
+        "Forms.\n\nThe one-byte form never\nholds 63: 63 is written as\n0x40 0x3F.\n\nEnd.\n"
+    )
+    text = module._squeezed(module._cited_text("wf:5#abc", tmp_path))
+    assert text == "the one-byte form never holds 63: 63 is written as 0x40 0x3f."

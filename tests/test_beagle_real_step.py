@@ -242,6 +242,20 @@ async def test_real_spec_tied_step_puts_back_a_case_changed_without_the_source_w
     )
 
 
+async def test_real_spec_tied_step_takes_a_case_line_by_its_test_name_with_words_after_the_quote(
+    tmp_path: Path, real_beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Run S06: `CASE test_<name>: "<words>" — <why>` from q35, for case <name>.
+    add, cases, result = await _spec_tied_step_with_a_wrong_case(
+        tmp_path,
+        real_beagle,
+        monkeypatch,
+        'CASE test_add_sum: "returns the sum of a and b" \u2014 the case expected 6',
+    )
+    assert "== 5" in cases
+    assert show(real_beagle, add)["status"] == "done", result.text
+
+
 async def test_real_spec_tied_step_names_cases_whose_markers_have_no_name(
     tmp_path: Path, real_beagle: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
