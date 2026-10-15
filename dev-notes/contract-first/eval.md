@@ -37,6 +37,7 @@ branch and sha. Grades come from `grade_<task>.py` over `runs/RNN/adapter.py`;
 | R100 | q35 | wrenfold | beagle 0.48.0 08e642c; tau ecb438ea (T0609) | 54/54 on the working tree, stopped at 35.6 min when runs went to a 30 min cap; nothing committed, no task done. The code was green at 14.6 min (reconstructed from the worker session) | S02 0/54; R98 54/54 in 49.9 min; B06 plain 54/54 in 9.1 min |
 | S03 | q35 | wrenfold (smoke, 30 min cap) | beagle 0.48.0 08e642c; tau 3cf73fa3 (fix 1, T0611: cases quote) | 0/54: capped at 30 min with no task opened and no code; both T0002 cases workers wrote sound cases under markers beagle could not read (cite where the name goes; then `cite=` with no name) | R100 54/54 green at 14.6 min; B06 plain 54/54 in 9.1 min |
 | S04 | q35 | wrenfold (smoke, 30 min cap) | beagle 0.48.0 08e642c; tau 602750d9 (T0611-T0614: cases quote, case-correction route, marker naming) | 45/54 at the cap, first at 23 min; T0002 opened tied at 12.9 min (markers right first try), code worker still fixing 63 and the end-marker refusal at the cap | S03 0/54; R100 green at 14.6 min; B06 plain 9.1 min |
+| S05 | q35 | wrenfold (smoke, 30 min cap) | beagle 0.48.0 08e642c; tau 5cd51a62 (T0616: work arithmetic out by running it; cases don't stub the code) | 0/54 at the cap: founding made 'Project scaffolding' a sourced milestone; its cases (cited to the title line) opened at 19.6 min, closed done at 25.5 min; the encoder never opened | S04 45/54; B06 plain 9.1 min |
 
 ## B06 — the invented spec was not hard
 
@@ -891,3 +892,25 @@ What it shows:
 
 Fix before S05: T0616 (both worker briefs: work arithmetic and expected outputs out by running them;
 the cases brief: the import failure is expected, do not stub the code).
+
+## S05 — q35 wrenfold smoke on T0616: a sourced scaffolding milestone eats the run
+
+Capped at 30 min, 0/54: `wrenfold/` holds only `__init__.py`. The founding (7.6 min) made four
+milestones: Project scaffolding, Encoder and Decoder, each with the spec as its source, then Tests.
+T0609 refused the scaffolding step's import-only check twice, so the driver named
+`tests/test_scaffold.py`. A cases worker spent 10.8 min looking in the spec for pyproject.toml, uv
+and ruff, then tied "the module exists" to the spec's title line and "it is a package" to its scope
+sentence. Beagle accepted both: an anchor is checked for being valid, not for bearing on the case.
+T0002 closed done at 25.5 min, and the encoder never opened.
+
+What it shows:
+
+1. **A layout-only part has nothing to cite and nothing but an import to check.** S04's founding
+   had no such part. Its code worker made the package within the encoder task.
+2. **No length stop in either worker** (largest turns 9.8k and 2.6k tokens), against two 16k stops
+   in S04. T0616's note is the only change, but these tasks were trivial, so this is weak evidence.
+3. **No stub**: the scaffolding cases import `wrenfold` plainly.
+
+Fix before S06: T0617. Founding folds a layout-only milestone into the next part's intent, ahead
+of that part's `Source:`. The design fold had the same latent bug of writing after the source. The
+setup refusal now says to name the package layout in the first part's intent.
