@@ -2933,6 +2933,10 @@ def _references_for(root: Path, prompt: str) -> dict[str, Any]:
 
 #: About how much of each reference the found-first steer shows the driver.
 REFERENCE_EXTRACT_CHARS = 1500
+#: A reference up to this long the steer shows whole. Run R120 (g26 wrenfold):
+#: shown 1500 characters of a 2586-character spec, the driver founded without
+#: `count`, which only the cut part (section 5) names.
+REFERENCE_WHOLE_CHARS = 6000
 _ABSTRACT = re.compile(r"(?im)^\s*abstract\b[\s.:\-\u2014]*")
 
 
@@ -2967,7 +2971,8 @@ def _reference_extract(text: str) -> str:
 
 
 def _references_note(index: Mapping[str, Any], root: Path) -> str:
-    """The found-first steer's part on the request's references: an extract each."""
+    """The found-first steer's part on the request's references: each whole when
+    short, else an extract."""
     fetched, failed = index.get("fetched") or {}, index.get("failed") or {}
     if not fetched and not failed:
         return ""
@@ -2978,10 +2983,12 @@ def _references_note(index: Mapping[str, Any], root: Path) -> str:
         except OSError as exc:
             parts.append(f"Could not read {REFERENCES_DIR}/{name} (from {url}): {exc}")
             continue
-        parts.append(
-            f"From {url} ({REFERENCES_DIR}/{name}), its opening:\n<<<\n"
-            f"{_reference_extract(text)}\n>>>"
-        )
+        if len(text) <= REFERENCE_WHOLE_CHARS:
+            shown = f"the whole of it:\n<<<\n{text.strip()}\n>>>"
+        else:
+            lines = len(text.splitlines())
+            shown = f"its opening, of {lines} lines:\n<<<\n{_reference_extract(text)}\n>>>"
+        parts.append(f"From {url} ({REFERENCES_DIR}/{name}), {shown}")
     parts += [f"Could not fetch {url}: {why}" for url, why in failed.items()]
     return (
         "The references in the request, fetched for you:\n\n"
