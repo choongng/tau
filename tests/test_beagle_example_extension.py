@@ -3131,14 +3131,18 @@ async def test_pursuit_step_warns_a_fresh_worker_not_to_rewrite_a_check_that_alr
     # the passing module and regressed it to 27/76. _WITNESS_PENDING carries the
     # "it already passes; add only the WITNESS, do not rewrite it" instruction to
     # that next worker.
-    module = _module()
-    module._WITNESS_PENDING.clear()
     monkeypatch.chdir(_git_project(tmp_path, monkeypatch))
     monkeypatch.setenv("FAKE_TAU_REPORT", WITNESSED_REPORT)
     _ready_task(fake_beagle)
     (fake_beagle / "prove.out").write_text("T0002: PROVEN — refuses with done.txt gone\n")
-    module._WITNESS_PENDING.add((str(_pursuit_project(tmp_path)), "T0002"))
     runtime, _ = _bound(tmp_path)
+    # The tool reads the runtime's loaded module, not a fresh _module(); seed and
+    # read that instance. Key off the root the step derives so a resolved-symlink
+    # tmp path does not make the keys differ.
+    module = _loaded_module()
+    module._WITNESS_PENDING.clear()
+    key = (str(module._project_root()[0]), "T0002")
+    module._WITNESS_PENDING.add(key)
 
     await _tool(runtime, "pursuit_step").execute(
         "c1",
@@ -3153,7 +3157,7 @@ async def test_pursuit_step_warns_a_fresh_worker_not_to_rewrite_a_check_that_alr
     [run] = _runs(fake_tau)
     assert "already" in run["stdin"] and "do not rewrite" in run["stdin"].lower()
     assert module.WITNESS_PENDING_NOTE in run["stdin"]
-    assert (str(_pursuit_project(tmp_path)), "T0002") not in module._WITNESS_PENDING
+    assert key not in module._WITNESS_PENDING
 
 
 @pytest.mark.anyio

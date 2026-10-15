@@ -7410,6 +7410,19 @@ WITNESS_NOTE = (
     "REPLACEMENT:\n<that text with the defect>\n"
     "END WITNESS"
 )
+
+#: Briefed to a worker on a task whose check an earlier step already made pass,
+#: when only its WITNESS is still missing. R129 (g26 semver): the next worker
+#: rewrote the passing module and regressed it. It must read, not rewrite.
+WITNESS_PENDING_NOTE = (
+    "An earlier sub-agent already made this task's check pass; its implementation "
+    "is on disk and working. The only thing left is the WITNESS. Do NOT rewrite, "
+    "refactor or otherwise change the implementation — leave it exactly as it is. "
+    "Read it, then end your report with a WITNESS block below, naming one real "
+    "defect (a NEEDLE that occurs there exactly once) in the module the check's "
+    "test imports. If no test the check runs would catch that defect yet, add that "
+    "one test case, and change nothing else."
+)
 ON_DISK_WITNESS_NOTE = (
     "The check passes already on the uncommitted work; do not change the "
     "implementation. Add or name a mutation that shows the check can refuse: a line "
@@ -9196,6 +9209,14 @@ def _close_infeasible(
 #: scope it is sent with: run R04's driver got past a (check, scope) key by
 #: changing the scope. A new route or a plan of the task clears it.
 _UNPROVEN: set[tuple[str, str]] = set()
+
+#: Tasks whose check passed in an earlier step but whose witness was not yet
+#: accepted (ask_module), so the step ended before it could be witnessed in the
+#: same worker. R129 (g26 semver): such a task's next step spawned a fresh
+#: worker that rewrote the passing implementation and regressed it from 75/76 to
+#: 27/76. The next worker on it is told the implementation passes and to add
+#: only the WITNESS, not to rewrite it; the note is consumed when briefed.
+_WITNESS_PENDING: set[tuple[str, str]] = set()
 
 #: The exit status of each open task's check at its last run in a step, by
 #: (project root, task): a split commits the task's work when it was 0.
@@ -11019,6 +11040,7 @@ def _forget_task(root: Path, task: str) -> None:
     """Drop what the step tool remembers of `task`: closed, re-routed or planned."""
     key = (str(root), task)
     _UNPROVEN.discard(key)
+    _WITNESS_PENDING.discard(key)
     _LAST_CHECK_EXIT.pop(key, None)
     _LAST_CHECK_FAILURE.pop(key, None)
     _NOT_DONE.pop(key, None)
@@ -12739,6 +12761,7 @@ def make_step_tool() -> Any:
                 # already passing. `beagle pursuit amend` takes no --scope, so the
                 # record keeps its scope and this step runs on the call's.
                 _UNPROVEN.discard((str(root), task))
+                _WITNESS_PENDING.discard((str(root), task))
                 _LAST_CHECK_EXIT.pop((str(root), task), None)
                 _LAST_CHECK_FAILURE.pop((str(root), task), None)
                 # q35 R57: the old check's close demand is not the new check's.
@@ -12954,6 +12977,11 @@ def make_step_tool() -> Any:
             # Run R28: a fix task's check ran a test importing code, and the note
             # told W3 it imported none.
             brief += "\n\n" + _known_answers_note(check, scope, root)
+        if (str(root), task) in _WITNESS_PENDING:
+            # R129 (g26 semver): an earlier step made the check pass but ended
+            # before the witness was accepted; this worker adds only the witness.
+            _WITNESS_PENDING.discard((str(root), task))
+            brief += "\n\n" + WITNESS_PENDING_NOTE
         asked_scope = _strings(arguments.get("scope"))
         kept = _strings(record.get("scope"))
         if (
@@ -13280,6 +13308,10 @@ def make_step_tool() -> Any:
                 if proof.ask_module
                 else "no defect could be put back to show the check can fail"
             )
+            if proof.ask_module:
+                # R129: the check passes and a witness is obtainable in the
+                # module; the next worker adds only that, leaving the work alone.
+                _WITNESS_PENDING.add((str(root), task))
             return _not_done(
                 root,
                 task,
