@@ -19953,6 +19953,10 @@ async def test_pursuit_step_spec_tied_writes_cases_then_opens_with_cites_and_cas
     # Run S04: a 16k-token turn of bit arithmetic by hand; a stub hid the code.
     assert "by running them" in cases["stdin"] and "by running them" in code["stdin"]
     assert "do not stub it" in cases["stdin"]
+    # Run R119: both cases workers wrote their own encoder to check the source's
+    # table, chased where it disagreed, and left no test in 24 minutes.
+    assert "do not write the code, or a version of it" in cases["stdin"]
+    assert "write it out from the pattern it shows" in cases["stdin"]
     # Run R104: the cases brief said both "work out expected outputs by running
     # them" and "not an output you work out"; a 241 s turn weighed the two.
     assert "expected outputs" not in cases["stdin"] and "expected outputs" in code["stdin"]
