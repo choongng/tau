@@ -63,6 +63,7 @@ branch and sha. Grades come from `grade_<task>.py` over `runs/RNN/adapter.py`;
 | R125 | q35 | semver (bare goal, round 22, 30 min cap) | beagle 0.48.0 08e642c; tau 5b8020f0 (T0642) | **75/76** at 27 min (45/76 at 12); T0002 model 1.5 min, T0003 parse 15.4 min (spec-tied: cases 6, code 5.4 + 3.8 correcting two cases), T0004 compare 7.4 min (cases 5.4); then T0005 extras at the cap; misses only `1.2.3\n` (`$`); the spec was fetched as three identical files, one per `#fragment` | B07 plain q35 75/76 in 8.1 min |
 | R126 | g26 | itc (round 23, 30 min cap) | beagle 0.48.0 08e642c; tau 78c9b702 (T0643) | **9/42**; founding kept 'Examine practical implementation patterns from <ferd.ca>' (with 'Understand ... from <paper>' folded in) as T0002, a study task (`tests/test_itc_study.py`); its worker wrote cases and an untracked itc.py (bitmask ids, flat events, no leq) and was killed at its 17 min wall; the second was running at the cap | — |
 | R127 | lfm24 | cobs (round 24, 30 min cap) | beagle 0.48.0 08e642c; tau 577f0b78 (T0644) | **0/44**, exit 0 at 12 min; founded, then three driver turns in a row ran to the output limit working out COBS itself; tau nudged two, the stop gate skipped the third, and the run ended with no pursuit_step | — |
+| R128 | q35 | wrenfold (round 25, 30 min cap) | beagle 0.48.0 08e642c; tau 7627899e (T0645) | **48/54**, capped; encoder (T0002) and decoder (T0003) closed, count's cases worker running at the cap; cases workers 7.6, 6.1, 7+ min against ~3 per code worker | — |
 
 ## B06 — the invented spec was not hard
 
@@ -1598,3 +1599,27 @@ Fix before round 25: **T0645 (fix 32).** The stop gate counts driver cut-offs in
 tau's session does (time cuts get `MAX_TIME_CUT_CONTINUATIONS`, others
 `MAX_OUTPUT_LIMIT_CONTINUATIONS`) and treats the one past tau's nudges as a stop: it gets the
 gate's follow-up, within the gate's two a run. 'internalize' as a reading word is left for now.
+
+## R128 — q35 wrenfold, round 25: cases writing is the clock (48/54)
+
+Founded in 1.5 min with three milestones (encoder, decoder, count), each spec-tied to
+wrenfold-r3. Each took a cases worker and then a code worker:
+
+| task | cases | code |
+|---|---|---|
+| T0002 encoder | 10:23–10:30 (7.6 min) | 2.8 min |
+| T0003 decoder | 10:34–10:40 (6.1 min) | 3.5 min |
+| T0004 count | 10:44–cap (7+ min; a cite-tie refusal and a loop cut) | — |
+
+Each cases worker spent about a minute on fast `refs find/show` lookups, then one or two
+turns of 86–239 s reasoning. The 239 s turn (42k chars) had the whole test file drafted by
+about 8k chars and spent the rest re-drafting it ("OK, let me write the test file now.
+Actually, one more thing…"). Since 10-14, 50 cases-worker turns reasoned 90 s or more
+(8,625 s in all); where a draft shows, it is usually in the first quarter. R125 had the
+same cost.
+
+Replayed with the 239 s turn cut at 120 s and tau's time-cut nudge, q35 wrote the full
+15-case file in 4 of 4 samples within 17 s; cut at 60 s, 2 of 3; at 30 s it ran checks.
+
+Fix before round 26: **T0646 (fix 33).** Cases workers get `CASES_REASONING_SECONDS` =
+120 s per turn; code workers keep 240.

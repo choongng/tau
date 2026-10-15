@@ -47,7 +47,7 @@ Watch on lfm24: llama.cpp #30490. After about 8 rejected tool calls in a row it 
 | 22 | R125 | q35 | semver | 75/76 at 27 min (plain 8.1; cases 5–6 min per spec-tied task; one page fetched per fragment) | T0643 |
 | 23 | R126 | g26 | itc | 9/42 ('Examine ... patterns' kept as a study T0002, 22 min; implementation never opened) | T0644 |
 | 24 | R127 | lfm24 | cobs | 0/44 at 12 min (three driver cut-offs in a row after founding; tau's nudges ran out and the run ended) | T0645 |
-| 25 | R128 | q35 | wrenfold | | |
+| 25 | R128 | q35 | wrenfold | 48/54 capped (encoder, decoder closed; cases workers ~21 of 30 min) | T0646 |
 | 26 | R129 | g26 | semver | | |
 | 27 | R130 | lfm24 | itc | | |
 | 28 | R131 | q35 | cobs | | |
