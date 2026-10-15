@@ -3038,8 +3038,19 @@ def _turn_cap_note() -> str:
     return (
         f"You have {cap} tool calls in all. Write the files by about call {cap // 2}, "
         "then use the rest to run the check and fix them. A bash command is stopped "
-        f"after {_worker_bash_timeout():g} s unless the call passes a longer `timeout`."
+        f"after {_worker_bash_timeout():g} s unless the call passes a longer `timeout`. "
+        + WORK_IT_OUT_NOTE
     )
+
+
+#: Run S04: each q35 worker's longest turn was 16k tokens of reasoning cut at the
+#: output limit, about 8 min each; the code worker's was bit layouts by hand
+#: ("15 zeros + 23 bits = 38"), wrong, then checked by one `python3 -c` in seconds.
+WORK_IT_OUT_NOTE = (
+    "Work out arithmetic, bit layouts and expected outputs by running them "
+    "(`python3 -c`), not in your reasoning: a long turn of reasoning is cut at the "
+    "output limit, costs minutes, and is no surer than the run."
+)
 
 
 def _git_identity(root: Path) -> bool:
@@ -11107,7 +11118,9 @@ def _cases_brief(
         + "\n\n"
         "You are done when this passes, with your cites and case files added:\n"
         f"  {dry_run} --cites REF:ANCHOR ... --cases FILE ... --dry-run\n"
-        "It passes while the tests fail: the code is not written yet. Its --scope is "
+        "It passes while the tests fail: the code is not written yet, so the case file "
+        "fails to import it, and that is the failure expected. Import the code as the "
+        "check will and do not stub it: a stub hides the code from the tests. Its --scope is "
         f"the code's, for the later sub-agent; you write only in {', '.join(cases_scope)}. "
         "End with a report naming the case files and the cites.\n\n"
         + NO_BEAGLE_NOTE
