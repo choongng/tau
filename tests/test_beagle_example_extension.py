@@ -14924,14 +14924,45 @@ async def test_step_on_waiting_task_names_what_it_waits_on(
     runtime, _ = _bound(tmp_path)
     step = _tool(runtime, "pursuit_step")
 
-    waiting = await step.execute("c1", R16_T0011_STEP)
     container = await step.execute("c2", {**R16_T0011_STEP, "task": "T0006"})
+    waits = _module()._not_workable_text("T0011", tree, ["T0010"], None)
 
-    assert "T0011 is not a task to work now: it waits on T0010 (open)" in waiting.text
-    assert 'work T0010 first: pursuit_step task="T0010"' in waiting.text
+    assert "T0011 is not a task to work now: it waits on T0010 (open)" in waits
+    assert 'work T0010 first: pursuit_step task="T0010"' in waits
     assert "T0006 is not a task to work now: it is a container of T0010, T0011" in (container.text)
-    for result in (waiting, container):
-        assert "or it waits" not in result.text
+    assert "or it waits" not in waits + container.text
+    assert _pursuit_calls(fake_beagle, "open") == []
+
+
+@pytest.mark.anyio
+async def test_step_on_a_task_waiting_on_a_workable_one_steps_that_one(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # R104-R131: "work T0010 first" cost a call each time; the step makes it.
+    monkeypatch.chdir(_pursuit_project(tmp_path))
+    ready = {"open": [], "ready": [{"id": "T0010", "title": "Known answers"}]}
+    (fake_beagle / "next.out").write_text(json.dumps(ready))
+    tree = [
+        {"id": "T0010", "parent": "", "status": "pending", "title": "Known answers"},
+        {"id": "T0011", "parent": "", "status": "pending", "waiting_on": ["T0010"]},
+    ]
+    (fake_beagle / "tree.out").write_text(json.dumps({"nodes": tree}))
+    record = {"id": "T0010", "title": "Known answers", "intent": "x", "status": "pending"}
+    (fake_beagle / "show.out").write_text(json.dumps(record))
+    runtime, _ = _bound(tmp_path)
+
+    result = await _tool(runtime, "pursuit_step").execute("c1", R16_T0011_STEP)
+
+    assert result.text.startswith(
+        "T0011 waits on T0010, which is workable now, so this step ran T0010 in its place; "
+        "the criteria, done_when and scope sent were T0011's and were not used. Step T0011 once "
+        "T0010 is closed."
+    )
+    assert "Next task: T0010 — Known answers" in result.text
     assert _pursuit_calls(fake_beagle, "open") == []
 
 

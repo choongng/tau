@@ -11400,6 +11400,30 @@ def _check_runs_own_file(
     return ""
 
 
+def _waited_workable(task: str, nodes: list[dict[str, Any]], workable: list[str]) -> str:
+    """The first of `workable` that `task` waits on, or ""."""
+    named = [w[2] for w in _hard_waits(nodes).get(task, [])]
+    return next((t for t in named if t in workable), "")
+
+
+def _steps_in_place_of(
+    task: str, nodes: list[dict[str, Any]], workable: list[str], root: Path
+) -> str:
+    """The workable task a step on waiting `task` runs instead, or "".
+
+    R104-R131: drivers stepped a task that waited on a workable one, were told
+    to work that one first, and spent a call doing so each time. The host knows
+    the call, so it makes it, unless the waited-on task needs a change of its
+    own first (its check runs `task`'s file, or it is at the escalation count).
+    """
+    first = _waited_workable(task, nodes, workable)
+    if not first or _check_runs_own_file(task, first, nodes, root):
+        return ""
+    if _NOT_DONE.get((str(root), first), 0) >= ESCALATE_AFTER:
+        return ""
+    return first
+
+
 def _not_workable(
     task: str, nodes: list[dict[str, Any]], workable: list[str], root: Path | None = None
 ) -> str:
@@ -12229,9 +12253,24 @@ def make_step_tool() -> Any:
                     f"{task} was superseded by {heir}, which took its work on, and {heir} "
                     f"is not ready either. {nothing_ready}"
                 )
-            if open_ids or ready_ids:
+            first = _steps_in_place_of(task, nodes, open_ids + ready_ids, root)
+            if first:
+                demand = _NOT_DONE_DEMAND.get((str(root), first), "")
+                sent = [k for k in ("criteria", "done_when", "scope") if arguments.get(k)]
+                words = " and ".join([", ".join(sent[:-1]), sent[-1]] if sent[1:] else sent)
+                kept_lead.append(
+                    f"{task} waits on {first}, which is workable now, so this step ran "
+                    f"{first} in its place"
+                    + (f"; the {words} sent were {task}'s and were not used" if sent else "")
+                    + f". Step {task} once {first} is closed.\n\n"
+                )
+                arguments = {"task": first, **({"notes": demand} if demand else {})}
+                task = first
+                stepped[:] = [task]
+            elif open_ids or ready_ids:
                 return _step_result(_not_workable(task, nodes, open_ids + ready_ids, root))
-            return _step_result(f"{task} is not a task to work now. {nothing_ready}")
+            else:
+                return _step_result(f"{task} is not a task to work now. {nothing_ready}")
 
         rc, out = _pursuit(["show", task], root)
         record = _json_reply(out) if rc == 0 else None
