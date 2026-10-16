@@ -12538,9 +12538,18 @@ def make_step_tool() -> Any:
                         f"route does not change what the work is for: {carried!r}\n\n"
                     )
                 criteria = carried
-            if done_when and not criteria:
+            recorded = " ".join(str(record.get("intent") or title).split())
+            if done_when and not criteria and recorded:
                 # Run R14 sent task and done_when without criteria three times and
-                # got the next-task prompt back with no word of what was missing.
+                # got the next-task prompt back with no word of what was missing;
+                # R104-R131 were refused for it five times. The task's recorded
+                # intent says what it is for: it stands as the criteria.
+                criteria = recorded
+                route += (
+                    f"No criteria were sent, so {task}'s recorded intent stands as them: "
+                    f"{criteria!r}. Send criteria with the call to say it otherwise.\n\n"
+                )
+            elif done_when and not criteria:
                 return _step_result(
                     f"pursuit_step: {task} not opened — criteria is missing: say what will "
                     "be true when it is done, and call pursuit_step again with task, "

@@ -7679,10 +7679,15 @@ async def test_done_by_closes_a_pending_milestone(
 
 
 @pytest.mark.anyio
-async def test_step_with_done_when_but_no_criteria_says_criteria_is_missing(
-    tmp_path: Path, beagle: Path, fake_beagle: Path, monkeypatch: pytest.MonkeyPatch
+async def test_step_with_done_when_but_no_criteria_takes_the_recorded_intent(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # R14 E47-E53: task+done_when without criteria re-printed the next-task prompt.
+    # R14 E47-E53: task+done_when without criteria re-printed the next-task prompt;
+    # R104-R131 refused it five times. The recorded intent stands as the criteria.
     monkeypatch.chdir(_pursuit_project(tmp_path))
     _ready_task(fake_beagle)
     runtime, _ = _bound(tmp_path)
@@ -7691,11 +7696,13 @@ async def test_step_with_done_when_but_no_criteria_says_criteria_is_missing(
         "c1", {"task": "T0002", "done_when": "grep -q done done.txt"}
     )
 
-    assert "T0002 not opened — criteria is missing: say what will be true when it is done" in (
-        result.text
+    [opened] = _pursuit_calls(fake_beagle, "open")
+    assert opened[opened.index("--criteria") + 1] == "reads input"
+    assert result.text.startswith(
+        "No criteria were sent, so T0002's recorded intent stands as them: 'reads input'. "
+        "Send criteria with the call to say it otherwise."
     )
-    assert "Next task" not in result.text
-    assert _pursuit_calls(fake_beagle, "open") == []
+    assert "closed done" in result.text
 
 
 STALLED_TREE = [
