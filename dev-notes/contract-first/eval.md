@@ -1751,30 +1751,29 @@ Tied to the grade:
   `decode` at 13.3 and 13.9 min dropped the end-marker check. Decode is T0003's work, so no T0002
   case covered it and nothing caught the regression. This is the third run that ended on a worse
   tree than it reached (after R129 and R131).
-- **Why nothing closed, (a): case `sixty-three` (`kind=example`, cite 35) asserted
-  `encode([63]) == 40 3F`.** Those are line 35's bytes, but they are one integer's form. Line 41
-  says a sequence is "followed by one end marker", so `encode` returns `40 3F 3F`. The
-  copy-the-output rule (`CASES_VALUES_NOTE`) was followed: the line gave bytes, and they were copied
-  as the operation's whole output. The code worker found the failure at 14.4 min. Its next reply ran
-  6.4 min to the output limit. It then edited the pinned case and ran out of turns. Its
-  `CASE <id>: "<words>"` route required words from line 35, and line 35 holds none about the end
-  marker; those words are on line 41. This is the same dead end as R131, where the words that
-  dispute the case are not on its cited line.
+- **Case `sixty-three` was wrong, and the route to correct it worked.** The case (`kind=example`,
+  cite 35) asserted `encode([63]) == 40 3F`. Those are line 35's bytes, but they are one integer's
+  form, and line 41 adds the end marker, so `encode` returns `40 3F 3F`. The code worker found the
+  failure at 14.4 min and spent a 6.4-min reply that ran to the output limit. It then edited the
+  case and quoted line 35's words beside the test's name. `_settle_case_edits` accepted the quote
+  and `pursuit amend` re-pinned the edited file (the pinned sha is the edited file's). An earlier
+  draft of this note said the route had no words on the cite. That was wrong: the matcher is
+  lenient, since the quoted words support the old value as much as the new one. The cost was the
+  worker's time, not the route.
 - **Why nothing closed, (b): the driver's `done_when` was `pytest tests/test_encoding.py`.** Bare
   `pytest` does not put the project root on `sys.path`, so collection failed with an import error
   until a `pyproject.toml` set `pythonpath`. The code workers had tested with `python3 -m pytest`,
   which passed. The second worker found this at 25.5 min and fixed it at 27.1, inside its 277 s
   wall. The driver's re-step switched to `python3 -m pytest`.
 
-Fix candidates, held until the baseline queue (B08–B15) finishes:
+What decided the run was the clock: the code worker's 6.4-min reply and its 60 turns, then a
+second worker with 277 s to fix the import path. No sound one-run fix:
 
-- **The `CASE` route quotes any source line by its number:** `CASE <id>: <line> "<words>"`, checked
-  against that line. It would have given R132's worker a way through with line 41. It would not
-  have helped R131, where no line holds the value. Its risk is that a code worker could quote
-  something unrelated to excuse a case.
-- **Rejected: a prose note that a cited piece is not the whole output.** R131 showed that prose
-  alone does not hold this.
+- **Don't apply: the `CASE` route quoting any source line by number.** R132's edit already went
+  through, and in R131 no line holds the right value. No run yet needs it.
 - **The bare `pytest` check** is Python-specific, and so is the obvious fix (prefer `python3 -m`).
-  The general form is to run the check once the code worker reports its own tests passing, and on
-  "collection or import error" tell the driver that the command, not the code, fails. That belongs
-  to the language-neutral repair work, not a one-run patch.
+  The host's retry brief already said the check fails at collection and to fix the work, and the
+  worker did, in scope. Only the remaining wall was short. Leave this to the language-neutral
+  repair work (refusals that tell the model its next step).
+- **The decode regression** was outside T0002's check, so no keep-the-best-tree mechanism keyed to
+  the task's check could have seen it.
