@@ -12250,6 +12250,154 @@ async def _keep_best_attempt(
     )
 
 
+#: Options that run fewer cases than the check, or stop at the first failure: a
+#: worker's run with one counts less than the check would, so it is no attempt.
+_NARROWING_OPTIONS = (
+    *("-x", "--exitfirst", "--lf", "--last-failed", "--sw", "--stepwise", "--maxfail"),
+    *("-k", "--deselect", "--ignore", "-t", "--testNamePattern", "--bail"),
+    *("--onlyFailures", "--skip", "--exact", "--filter", "-run"),
+)
+#: A worker's run of its check whose exit or output may not be the check's (piped
+#: to `tail`, after `;`) is run again as the host runs it, when the worker's run
+#: took no longer than this many seconds; the re-run gets twice that.
+WORKER_CHECK_RERUN_SECONDS = 120.0
+
+
+def _narrows(arg: str) -> bool:
+    """Whether a command-line option is one of `_NARROWING_OPTIONS` (`-xq` and
+    `-kzero` included)."""
+    short = arg[1:] if arg.startswith("-") and not arg.startswith("--") else ""
+    if short.isalpha() and ("x" in short or short[:1] in ("k", "t")):
+        return True
+    return any(arg == option or arg.startswith(option + "=") for option in _NARROWING_OPTIONS)
+
+
+def _program_base(word: str) -> str:
+    """A program's name without its directory and version: `.venv/bin/python3` is `python`."""
+    return re.sub(r"[\d.]+$", "", Path(word).name)
+
+
+def _runs_whole_check(argv: list[str], check: list[str]) -> bool:
+    """Whether one simple command runs all of `check`: the same program, the check's
+    words in order, and nothing more but options that do not narrow the run."""
+    argv = _past_runner(_unwrapped(argv))
+    if not argv or not check or _program_base(argv[0]) != _program_base(check[0]):
+        return False
+
+    def word(arg: str) -> str:
+        return arg if arg.startswith("-") else os.path.normpath(arg)
+
+    wanted = [word(arg) for arg in check[1:]]
+    at = 0
+    for arg in argv[1:]:
+        if at < len(wanted) and word(arg) == wanted[at]:
+            at += 1
+        elif not arg.startswith("-") or _narrows(arg):
+            return False
+    return at == len(wanted)
+
+
+def _command_segments(command: str) -> list[tuple[list[str], str]] | None:
+    """A bash command's simple commands, redirections dropped, each with the
+    operator after it ("" for the last); None when it will not parse."""
+    tokens = _shell_tokens(command)
+    if tokens is None:
+        return None
+    segments: list[tuple[list[str], str]] = []
+    current: list[str] = []
+    skip = False
+    for token in tokens:
+        if skip:
+            skip = False
+        elif _is_operator(token) and ("<" in token or ">" in token):
+            if current and current[-1].isdigit():
+                current.pop()  # the fd of `2>&1`
+            skip = True  # and its target
+        elif _is_operator(token):
+            segments.append((current, token))
+            current = []
+        else:
+            current.append(token)
+    segments.append((current, ""))
+    while len(segments) > 1 and not segments[-1][0]:
+        segments.pop()
+        segments[-1] = (segments[-1][0], "")
+    return segments
+
+
+def _check_run_kind(command: str, check: str) -> str | None:
+    """How a worker's bash `command` runs its task's `check`: "exit" when it runs the
+    whole check and the command's exit is the check's (nothing after it but `&&`),
+    "rerun" when it runs the whole check but its exit or output may not be the
+    check's (`| tail`, `|| true`, `; echo`), None when it does not run the whole
+    check (`-x`, `-k`, one test, another path)."""
+    try:
+        wanted = _past_runner(_unwrapped(shlex.split(check)))
+    except ValueError:
+        return None
+    if wanted and Path(wanted[0]).name in _SHELLS and "-c" in wanted[1:]:
+        script_at = wanted.index("-c") + 1
+        script = wanted[script_at] if script_at < len(wanted) else ""
+        said = _squeezed_line(command)
+        return "exit" if said in (_squeezed_line(script), _squeezed_line(check)) else None
+    segments = _command_segments(command)
+    for at, (argv, _op) in enumerate(segments or []):
+        if not _runs_whole_check(argv, wanted):
+            continue
+        after = [op for _, op in segments[at:]] if segments else []
+        return "exit" if all(op in ("&&", "") for op in after) else "rerun"
+    return None
+
+
+def make_attempt_keeper() -> Any:
+    """Build the worker's `tool_result` hook that keeps each run of its task's check
+    as an attempt, and tells it when its tree ranks below the task's best.
+
+    R131 (q35 cobs): W3 ran T0002's check at 19 of 21 cases, rewrote encode(), and
+    ran it at 4 of 21, and nothing said what the earlier run had passed. A run whose
+    exit or output may not be the check's is run again as the host runs it; a run
+    narrowed to fewer cases keeps nothing. Text is added to the tool's result only.
+    """
+
+    async def keep(event: Any, context: ExtensionContext) -> ToolResultHookResult | None:
+        try:
+            if event.tool_name != "bash":
+                return None
+            sent = _worker_scope()
+            goal = _find_goal(Path(context.cwd))
+            if sent is None or goal is None or not _ATTEMPT_TASK.fullmatch(sent[0]):
+                return None
+            task, scope = sent
+            check = _task_check(goal, task)
+            kind = _check_run_kind(str(event.arguments.get("command") or ""), check)
+            if not check or kind is None:
+                return None
+            root = goal.parent.parent
+            details = event.result.details or {}
+            rc = details.get("exit_code")
+            if details.get("timed_out") or details.get("cancelled"):
+                return None
+            if kind == "exit" and isinstance(rc, int):
+                verdict = (rc, event.result.text)
+            else:
+                seconds = details.get("duration_seconds")
+                if not isinstance(seconds, int | float) or seconds > WORKER_CHECK_RERUN_SECONDS:
+                    return None
+                verdict = await _run_check(check, root, 2 * WORKER_CHECK_RERUN_SECONDS)
+            cases = _strings(_task_record(goal, task).get("cases"))
+            kept = await asyncio.to_thread(
+                _record_attempt, root, task, scope, cases, check, verdict, "worker"
+            )
+            note = await asyncio.to_thread(_below_best_note, root, task, scope, kept)
+            if not note:
+                return None
+            return ToolResultHookResult(content=f"{event.result.text}\n\n{note}")
+        except Exception:  # noqa: BLE001 - fail open; a note must not break the tool
+            return None
+
+    return keep
+
+
 async def _write_cases(
     task: str,
     title: str,
@@ -17749,6 +17897,7 @@ def setup(tau: ExtensionAPI) -> None:
     tau.on("tool_call", make_bash_hooks())
     if _is_worker():
         tau.on("tool_call", make_worker_scope_guard())
+        tau.on("tool_result", make_attempt_keeper())
     else:
         tau.on("tool_call", make_scope_guard())
         tau.on("tool_result", make_stopped_worker_note())

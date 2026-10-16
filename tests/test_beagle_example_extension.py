@@ -21240,3 +21240,120 @@ async def test_pursuit_step_first_worker_hears_of_a_better_attempt_left_behind(
     # The worker changed nothing, so the step ends at 0 of 3, below attempt 1.
     assert "so T0002's files are put back as attempt 1 left them" in result.text
     assert impl.read_text() == "single_zero two_zeros\n"
+
+
+def test_a_worker_command_runs_the_check_only_when_it_runs_all_of_it() -> None:
+    kind = _module()._check_run_kind
+    check = "python3 -m pytest -q tests/test_encode.py"
+    for command in (
+        check,
+        ".venv/bin/python -m pytest -q tests/test_encode.py -v",
+        "cd /p && timeout 60 python3 -m pytest -q ./tests/test_encode.py 2>&1",
+        "uv run python -m pytest -q tests/test_encode.py && echo ok",
+        "python3 -m pytest -q tests/test_encode.py --tb=short > out.log 2>&1",
+    ):
+        assert kind(command, check) == "exit", command
+    # Its exit is not the check's, or its output may be cut: the hook runs the check.
+    for command in (
+        "python3 -m pytest -q tests/test_encode.py 2>&1 | tail -30",
+        "python3 -m pytest -q tests/test_encode.py || true",
+        "python3 -m pytest -q tests/test_encode.py; echo done",
+    ):
+        assert kind(command, check) == "rerun", command
+    # Fewer cases than the check runs, or not the check at all.
+    for command in (
+        "python3 -m pytest -q tests/test_encode.py -x",
+        "python3 -m pytest -q tests/test_encode.py -k zero",
+        "python3 -m pytest -q tests/test_encode.py --lf",
+        "python3 -m pytest -q tests/test_encode.py::test_single_zero",
+        "python3 -m pytest tests/test_encode.py",
+        "python3 -m pytest -q tests/",
+        "pytest -q tests/test_encode.py",
+        "cat tests/test_encode.py",
+        "echo 'python3 -m pytest -q tests/test_encode.py'",
+    ):
+        assert kind(command, check) is None, command
+    assert kind("cargo test -- --nocapture", "cargo test") == "exit"
+    assert kind("cargo test single_zero", "cargo test") is None
+    assert kind("npx jest --bail", "npx jest") is None
+    assert kind("make test", "bash -c 'make test'") == "exit"
+    assert kind("make test", "make check") is None
+
+
+def _attempt_worker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> tuple[ExtensionRuntime, Path]:
+    """A worker on T0003 of a committed project, its check the attempt check script."""
+    project = _committed_project(tmp_path, monkeypatch)
+    (project / "check.py").write_text(ATTEMPT_CHECK_SCRIPT)
+    _git(project, "add", "check.py")
+    _git(project, "commit", "-q", "-m", "check")
+    (project / ".beagle" / "tree").mkdir()
+    (project / ".beagle" / "tree" / "T0003.md").write_text(
+        '+++\nid = "T0003"\ndone_when = "python3 check.py"\nscope = ["cobs/"]\n'
+        'cases = ["tests/test_encode.py"]\n+++\n'
+    )
+    monkeypatch.chdir(project)
+    monkeypatch.setenv("BEAGLE_TAU_WORKER", "1")
+    monkeypatch.setenv("BEAGLE_TAU_WORKER_TASK", "T0003")
+    monkeypatch.setenv("BEAGLE_TAU_WORKER_SCOPE", "cobs/")
+    runtime, _ = _bound(tmp_path)
+    return runtime, project
+
+
+def _running_bash(runtime: ExtensionRuntime, project: Path) -> Any:
+    """A bash tool that runs its command, behind the runtime's hooks."""
+
+    async def run(_id: str, arguments: Any, *_: Any) -> AgentToolResult:
+        proc = subprocess.run(
+            ["bash", "-c", arguments["command"]], cwd=project, capture_output=True, text=True
+        )
+        text = proc.stdout + proc.stderr
+        if proc.returncode:
+            text += f"\n\nCommand exited with code {proc.returncode}"
+        details = {"exit_code": proc.returncode, "duration_seconds": 0.1}
+        return AgentToolResult(content=[TextContent(text=text)], details=details)
+
+    tool = AgentTool(name="bash", label="bash", description="", parameters={}, execute_fn=run)
+    [wrapped] = [t for t in runtime.compose_tools([tool]) if t.name == "bash"]
+    return wrapped
+
+
+@pytest.mark.anyio
+async def test_a_worker_running_its_check_keeps_an_attempt_and_hears_when_it_is_below_the_best(
+    tmp_path: Path, beagle: Path, fake_beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # R131 (q35 cobs): W3 ran the check at 19 of 21, rewrote encode(), and ran it
+    # at 4 of 21 with nothing saying what the earlier run had passed.
+    runtime, project = _attempt_worker(tmp_path, monkeypatch)
+    module = _loaded_module()
+    bash = _running_bash(runtime, project)
+    impl = project / "cobs" / "impl.txt"
+    status = _git(project, "status", "--porcelain")
+
+    impl.write_text("single_zero two_zeros\n")
+    first = await bash.execute("c1", {"command": "python3 check.py"})
+    impl.write_text("\n")
+    probe = await bash.execute("c2", {"command": "python3 check.py -x"})
+    second = await bash.execute("c3", {"command": "python3 check.py 2>&1 | tail -1"})
+
+    best = "refs/tau/attempts/T0003/1"
+    assert "refs/tau" not in first.text and "refs/tau" not in probe.text
+    assert second.text.startswith("FAILED tests/test_encode.py::test_window_limit")
+    assert second.text.endswith(
+        f"\n\nT0003: attempt 1 (`{best}`) passed 2 of 3 cases; this tree passes 0. "
+        f"`git diff {best} -- cobs/` shows what changed since. Keep what helped and put "
+        f"back what broke; `git checkout {best} -- <path>` puts one file back."
+    )
+    # The piped run was run again whole, as the host runs it.
+    attempts = module._attempts(project, "T0003")
+    assert [(a.n, a.exit, a.figure, a.by) for a in attempts] == [
+        (1, 1, 2, "worker"), (2, 1, 0, "worker")
+    ]  # fmt: skip
+    assert _git(project, "show", f"{best}:cobs/impl.txt") == "single_zero two_zeros\n"
+    assert _git(project, "status", "--porcelain") == status + "?? cobs/impl.txt\n"
+    assert _git(project, "diff", "--cached") == ""
+    # Taking one file back is a checkout the worker's guards let through.
+    back = await bash.execute("c4", {"command": f"git checkout {best} -- cobs/impl.txt"})
+    assert "refus" not in back.text.casefold(), back.text
+    assert impl.read_text() == "single_zero two_zeros\n"
