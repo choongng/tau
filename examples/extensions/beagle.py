@@ -143,7 +143,7 @@ import tempfile
 import time
 import tomllib
 import uuid
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -1751,6 +1751,8 @@ class _WorkerRun:
     killed_at: str | None = None
     #: The command of the tool call its last assistant message made, if any.
     pending_command: str = ""
+    #: The paths outside its scope it was refused, for the driver's next call.
+    refused_writes: tuple[str, ...] = ()
 
     @property
     def unreported(self) -> bool:
@@ -1881,6 +1883,8 @@ NO_CALL_CUT = (
 _THINKING_OFF_NEXT: dict[str, str] = {}
 #: How tau words the tool result of a call an extension blocked.
 _BLOCKED = "Tool call blocked: "
+#: The scope guard's refusal of a write outside the task's scope, up to the path.
+_OUTSIDE_SCOPE = re.compile(r"Tool call blocked: refusing to write (\S.*?): it is outside ")
 #: The countdown sentence tau appends to each refusal's problem.
 _REFUSAL_COUNTDOWN = re.compile(r"\s*\d+ more refused calls? in a row stop the run\.\s*$")
 
@@ -1917,6 +1921,8 @@ class _WorkerEvents:
     refusal: str | None = None
     #: Whether tau's breaker stopped the run after refused calls in a row.
     stopped: bool = False
+    #: The project paths the scope guard refused to write, in the order first refused.
+    refused_writes: list[str] = field(default_factory=list)
     #: How many assistant turns in a row, up to the last, ended at the output-token
     #: limit. Audit 7: a count over the whole run blamed the limit for a wall a
     #: worker hit long after its last cut-off turn. Run R27: a turn whose call was
@@ -2042,6 +2048,9 @@ class _WorkerEvents:
         else:
             return
         text = text.strip()
+        outside = _OUTSIDE_SCOPE.match(text)
+        if outside is not None and outside.group(1) not in self.refused_writes:
+            self.refused_writes.append(outside.group(1))
         if text.removeprefix(_BLOCKED).startswith(CUT_OFF_REFUSAL):
             if self._turn_cut:
                 self.cut_fills[-1:] = [CUT_CALL]
@@ -2422,6 +2431,7 @@ async def _run_worker(
                 transcript=transcript,
                 stop_reason="length",
                 last_words=events.report,
+                refused_writes=tuple(events.refused_writes),
             )
         if signal is not None and signal.is_cancelled():
             problem = "cancelled; the worker was killed and its partial work is in the tree."
@@ -2448,6 +2458,7 @@ async def _run_worker(
             problem=problem,
             transcript=transcript,
             said_last=events.last_said() if walled else ("", ""),
+            refused_writes=tuple(events.refused_writes),
         )
 
     stderr = talk.result()
@@ -2472,6 +2483,7 @@ async def _run_worker(
         last_words=events.report,
         killed_at=limit if note else None,
         pending_command=events.pending_command,
+        refused_writes=tuple(events.refused_writes),
     )
 
 
@@ -2578,7 +2590,6 @@ def make_dispatch() -> Any:
         signal: ToolCancellationToken | None = None,
         on_update: ToolUpdateCallback | None = None,
     ) -> AgentToolResult:
-        del tool_call_id, on_update
         brief = arguments.get("brief")
         if not isinstance(brief, str) or not brief.strip():
             return _make_dispatch_result(
@@ -2593,6 +2604,22 @@ def make_dispatch() -> Any:
             else _SEEN_CWD or Path.cwd()
         )
         refusal = _founded_dispatch_refusal(cwd)
+        goal = _find_goal(cwd) if refusal is not None else None
+        task = _offered_task(goal.parent.parent) if goal is not None else ""
+        if task:
+            # R104-R131: three founded drivers dispatched the offered task and
+            # never recovered from the refusal. The step is the call they meant;
+            # the brief goes to it as notes.
+            notes = brief.strip()
+            stepped = await make_step_tool()(
+                tool_call_id, {"task": task, "notes": notes}, signal, on_update
+            )
+            text = "".join(getattr(c, "text", "") for c in stepped.content)
+            return _make_dispatch_result(
+                f"pursuit_dispatch ran as pursuit_step task={json.dumps(task)}, with the "
+                "brief as its notes: in a founded pursuit a dispatch opens and closes no "
+                "task, and pursuit_step does. Call pursuit_step from here on.\n\n" + text
+            )
         if refusal is not None:
             return _make_dispatch_result(refusal)
 
@@ -2709,6 +2736,9 @@ LOCKS_NOTE = "locks are not taken here: nothing is locked, and a later task may 
 DEFAULT_CHECK_TIMEOUT = 600.0
 
 _TASK_ID = re.compile(r"\bT\d{4,}\b")
+#: beagle's refusal to spawn from an open task with no commit of its own: the
+#: route is its check alone, which `amend` changes in place.
+_NO_OWN_COMMIT = re.compile(r"has no commit of its own since it opened")
 #: beagle's refusal to open a task ranked below a ready one, up to its remedy.
 _RANKED_BELOW = re.compile(
     r"ranks below (.+?)(?: \(`pursuit next` lists them\))?\. If this one should go first", re.S
@@ -3136,8 +3166,8 @@ def _turn_cap_note(work_note: str | None = None) -> str:
 #: ("15 zeros + 23 bits = 38"), wrong, then checked by one `python3 -c` in seconds.
 WORK_IT_OUT_NOTE = (
     "Work out arithmetic, bit layouts and expected outputs by running them "
-    "(`python3 -c`), not in your reasoning: a long turn of reasoning is cut at the "
-    "output limit, costs minutes, and is no surer than the run."
+    "(a one-line script or shell command), not in your reasoning: a long turn of "
+    "reasoning is cut at the output limit, costs minutes, and is no surer than the run."
 )
 #: The cases worker's form of it. Run R104: told both to work expected outputs
 #: out by running them and to assert no output it works out (CASES_VALUES_NOTE),
@@ -3145,7 +3175,8 @@ WORK_IT_OUT_NOTE = (
 #: cases workers wrote their own encoder to check the source's table, chased
 #: where it disagreed (the rows shortened with `...`), and wrote no test in 24 min.
 CASES_WORK_IT_OUT_NOTE = (
-    "Check arithmetic and bit layouts by running them (`python3 -c`), not in your "
+    "Check arithmetic and bit layouts by running them (a one-line script or shell "
+    "command), not in your "
     "reasoning: a long turn of reasoning is cut, costs minutes, and is no surer "
     "than the run. A run only checks a case; its expected values still come from "
     "the cited lines. The cited lines are right: do not write the code, or a "
@@ -3379,6 +3410,34 @@ def _relay_next(out: str, fallback: str) -> tuple[str, str]:
     if not move:
         return out, fallback
     return _NEXT_LINE.sub("", out).strip(), _tau_next(move)
+
+
+def _relayed(head: str, out: str, then: str) -> str:
+    """`head`, beagle's reply `out`, and the tau call to make next: the move its
+    `next:` line names, where a tool makes it, else `then`.
+
+    R104-R131: 24 refusals relayed beagle's text as it was, written for beagle's
+    own users; the driver was left with `pursuit <verb>` lines no tool runs, and
+    no call. A move no tool makes stays in the text, and `then` still ends it.
+    """
+    move = _beagle_next(out)
+    mapped = _tau_next(move) if move else ""
+    if mapped and not mapped.startswith("Next, as beagle says"):
+        out, then = _NEXT_LINE.sub("", out), mapped
+    return f"{head}\n{out.strip()}\n\n{then}"
+
+
+def _cannot_read(task: str, rc: int, out: str, root: Path) -> str:
+    """The step's reply when `beagle pursuit show` cannot read `task`: beagle's
+    words, and the ids in the tree to name one by."""
+    listed = _task_ids_listed(_tree_nodes(root))
+    return _relayed(
+        f"pursuit_step: cannot read {task} (exit {rc}):",
+        out,
+        (f"The tasks: {listed}. " if listed else "")
+        + "Next: call pursuit_step with task set to one of their ids, or with no arguments "
+        "for the next task.",
+    )
 
 
 def _strings(value: Any) -> list[str]:
@@ -4351,8 +4410,13 @@ def make_found_tool(
             # Unwritten, so a corrected call founds afresh.
             goal.unlink(missing_ok=True)
             return _step_result(
-                f"pursuit_found: nothing founded; `beagle pursuit add --root-task` "
-                f"failed (exit {rc}):\n{out}"
+                _relayed(
+                    f"pursuit_found: nothing founded; `beagle pursuit add --root-task` "
+                    f"failed (exit {rc}):",
+                    out,
+                    "Nothing was written. Next: call pursuit_found again with the goal "
+                    "corrected as beagle says.",
+                )
             )
         root_task = found.group(0)
         references = await asyncio.to_thread(_references_for, root, _LAST_PROMPT)
@@ -4369,9 +4433,14 @@ def make_found_tool(
             rc, out = _pursuit(split, root)
         if rc != 0:
             return _step_result(
-                f"pursuit_found: founded {goal} with root task {root_task}, but the "
-                f"milestone split failed (exit {rc}):\n{out}\n\nAdd them with pursuit_plan."
-                f"\n\n{_goal_text(goal) or ''}"
+                _relayed(
+                    f"pursuit_found: founded {goal} with root task {root_task}, but the "
+                    f"milestone split failed (exit {rc}):",
+                    out,
+                    f'Next: add the milestones with pursuit_plan, task="{root_task}" and '
+                    "the milestones as its parts.",
+                )
+                + f"\n\n{_goal_text(goal) or ''}"
             )
         notes = []
         if initialized:
@@ -4725,6 +4794,40 @@ def _steer_resemblance(out: str, root: Path) -> str:
     return _RESEMBLANCE_ROUTE.sub(route, out)
 
 
+def _task_named(named: str, nodes: list[dict[str, Any]], goal: Path) -> str | None:
+    """The id of the task `named` names by title, or the root for the goal's statement.
+
+    None when no live task, or more than one, carries that title. Runs R104-R131
+    sent pursuit_plan the goal statement or a task's title as `task` seven
+    times; beagle answered "no task '<title>' in the tree" and the driver lost
+    the plan.
+    """
+    live = [n for n in nodes if n.get("status") not in ("abandoned", "superseded")]
+    ids = {str(n.get("id")) for n in live}
+    cited = [t for t in dict.fromkeys(_TASK_ID.findall(named)) if t in ids]
+    if len(cited) == 1:
+        return cited[0]
+    folded = _fold(named.strip().strip("\"'`"))
+    try:
+        statement = str(tomllib.loads(goal.read_text(encoding="utf-8"))["goal"]["statement"])
+    except (OSError, tomllib.TOMLDecodeError, KeyError, TypeError, ValueError):
+        statement = ""
+    roots = [str(n.get("id")) for n in live if not n.get("parent")]
+    goal_named = statement.strip() and folded in (_fold(statement), _fold(_task_title(statement)))
+    if goal_named and len(roots) == 1:
+        return roots[0]
+    titled = [str(n.get("id")) for n in live if _fold(str(n.get("title") or "")) == folded]
+    return titled[0] if len(titled) == 1 else None
+
+
+def _task_ids_listed(nodes: list[dict[str, Any]], limit: int = 12) -> str:
+    """The live tasks as `T0001 "title"`, for a call that named none of them."""
+    live = [n for n in nodes if n.get("status") not in ("abandoned", "superseded", "done")]
+    shown = [f'{n.get("id")} "{n.get("title") or ""}"' for n in live[:limit]]
+    more = f", and {len(live) - limit} more" if len(live) > limit else ""
+    return ", ".join(shown) + more
+
+
 def make_plan_tool() -> Any:
     """Build `pursuit_plan`: split a task into steps, or add steps to a container."""
 
@@ -4743,9 +4846,29 @@ def make_plan_tool() -> Any:
         parts = _milestone_parts(arguments.get("parts"), root, source_notes)
         if not task or not parts:
             return _step_result("pursuit_plan: 'task' and 'parts' are both required.")
+        took: list[str] = []
+        if not _TASK_ID.fullmatch(task):
+            nodes = _tree_nodes(root)
+            named = _task_named(task, nodes, goal) if nodes else None
+            if named is None and nodes:
+                return _step_result(
+                    f"pursuit_plan: nothing added — no task is titled {task!r}: `task` "
+                    f"takes a task's id. The tasks: {_task_ids_listed(nodes)}. Call "
+                    "pursuit_plan again with task set to the id these parts go under."
+                )
+            if named is not None:
+                took.append(
+                    f"Took {task!r} as {named}, the task it names; name a task by "
+                    f'its id, as task="{named}".\n\n'
+                )
+                task = named
+
+        def result(text: str) -> AgentToolResult:
+            return _step_result("".join(took) + text)
+
         parts, split_notes = _split_part_lines(parts)
         if not parts:
-            return _step_result(f"pursuit_plan: nothing added — {split_notes[0]}")
+            return result(f"pursuit_plan: nothing added — {split_notes[0]}")
         split_notes += source_notes
         cut = [part for part in parts if _fit_part(part) != part]
         parts = [_fit_part(part) for part in parts]
@@ -4756,10 +4879,10 @@ def make_plan_tool() -> Any:
             )
         setup = _setup_milestone(parts)
         if setup is not None:
-            return _step_result(f"pursuit_plan: nothing added — {setup}")
+            return result(f"pursuit_plan: nothing added — {setup}")
         rerun = _rerun_only_part(parts)
         if rerun is not None:
-            return _step_result(f"pursuit_plan: nothing added — {rerun}")
+            return result(f"pursuit_plan: nothing added — {rerun}")
         ordered = arguments.get("ordered", True) is not False
         # Run R25 sent 'T0007::…' to `split` raw, and beagle titled the task
         # 'T0007': every part goes on as the title `_split_part` repairs.
@@ -4770,7 +4893,7 @@ def make_plan_tool() -> Any:
         ]
         if unlabeled:
             why = _bare_label_refusal(task, parts, unlabeled, _tree_nodes(root))
-            return _step_result(f"pursuit_plan: nothing added — {why}")
+            return result(f"pursuit_plan: nothing added — {why}")
         for part in parts:
             label = part.partition("::")[0].strip()
             if _BARE_LABEL.fullmatch(label):
@@ -4783,7 +4906,7 @@ def make_plan_tool() -> Any:
         ]
         reading = _reading_only_part(parts)
         if reading is not None:
-            return _step_result(f"pursuit_plan: nothing added — {reading}")
+            return result(f"pursuit_plan: nothing added — {reading}")
         # A small model re-sends the plan it already made; beagle adds every
         # part again, and the copies are then worked twice.
         existing = _children(task, root)
@@ -4794,13 +4917,13 @@ def make_plan_tool() -> Any:
         ]
         parts = [part for part in parts if _part_title(part).lower() not in existing]
         if not parts:
-            return _step_result(
+            return result(
                 f"pursuit_plan: nothing added — {task} already has {', '.join(repeated)}. "
                 "Work them with pursuit_step; call it with no arguments for the next ready one."
             )
         clash = _live_title_clash(task, parts, _tree_nodes(root))
         if clash is not None:
-            return _step_result(f"pursuit_plan: nothing added — {clash}")
+            return result(f"pursuit_plan: nothing added — {clash}")
         one_step = (
             f"pursuit_plan: nothing added — {task} is already one step, so one "
             "part does not break it down: a plan needs two or more parts, which "
@@ -4811,7 +4934,7 @@ def make_plan_tool() -> Any:
         # still takes one more child; a leaf with one part is already a single
         # step. Run R15's beagle refused the part's title before it got there.
         if len(parts) == 1 and _is_leaf(task, _tree_nodes(root)):
-            return _step_result(one_step)
+            return result(one_step)
         # Read before the split, which leaves the task a container.
         scope, uncommitted = _uncommitted_in_scope(root, task)
         uncommitted_note = _uncommitted_note(task, uncommitted) if uncommitted else ""
@@ -4820,7 +4943,7 @@ def make_plan_tool() -> Any:
             # beagle says "a pending leaf" or, for one being worked, "a open
             # leaf": run R06's plan of one part on open T0002 came back raw.
             if rc != 0 and "leaf with work of its own" in out:
-                return _step_result(one_step)
+                return result(one_step)
         else:
             if uncommitted:
                 uncommitted_note = _commit_before_split(root, task, scope, uncommitted)
@@ -4828,10 +4951,15 @@ def make_plan_tool() -> Any:
             if rc != 0 and "already has children" in out:
                 rc, out = _add_children(task, parts, root)
         if rc != 0:
-            refused = f"pursuit_plan: beagle refused (exit {rc}):\n{out}"
+            refused = _relayed(
+                f"pursuit_plan: beagle refused (exit {rc}):",
+                out,
+                f'Nothing was added. Next: call pursuit_plan again with task="{task}" and '
+                "the parts corrected as beagle says.",
+            )
             if uncommitted_note:
                 refused += f"\n\n{uncommitted_note}"
-            return _step_result(refused)
+            return result(refused)
         _forget_task(root, task)
         notes = "".join(f"{note}\n\n" for note in split_notes)
         if uncommitted_note:
@@ -4841,7 +4969,7 @@ def make_plan_tool() -> Any:
         if "--outcome abandoned" in out:
             notes += f"{ABANDON_HINT}\n\n"
         shown = _steer_resemblance(out, root)
-        return _step_result(f"{shown}\n\n{_tree(root)}\n\n{notes}Next: pursuit_step.")
+        return result(f"{shown}\n\n{_tree(root)}\n\n{notes}Next: pursuit_step.")
 
     return execute
 
@@ -4983,19 +5111,20 @@ def _check_problem(command: str) -> str | None:
         return None  # beagle says why it will not split
     if not words:
         return None
-    one_command = _ONE_COMMAND
     if _bash_find(command, lambda argv: "beagle" if _named(argv, "beagle") else None):
         # The close runs the check, so a check that runs beagle can only ever
         # answer how it was called, never whether the work is done.
         return (
             f"done_when runs beagle itself, which cannot say whether the work is done. "
-            f"{one_command}; pursuit_step does the close. Call pursuit_step again with that."
+            f"{_one_command()}; pursuit_step does the close. Call pursuit_step again with "
+            "that."
         )
     if any(".beagle" in word for word in words):
         return (
             "done_when reads .beagle/, beagle's record of the pursuit, which says what was "
             "written about the work, not what was built: a grep of a task's notes passes "
-            f"as soon as the notes say so. {one_command}. A file the task writes goes in the "
+            f"as soon as the notes say so. {_one_command()}. A file the task writes goes in "
+            "the "
             "project, not in .beagle/: a note or summary in docs/, checked with `grep -q "
             "'<a phrase it must contain>' docs/<name>.md`. Call pursuit_step again with that."
         )
@@ -5003,9 +5132,9 @@ def _check_problem(command: str) -> str | None:
     if operators:
         return (
             f"done_when has a bare {operators[0]!r}, but it runs without a shell, so "
-            f"{operators[0]!r} reaches {words[0]!r} as an argument. {one_command}; for "
-            "more than one thing, name a new test file (e.g. tests/test_<name>.py) in "
-            "scope and say in notes what it must check; the sub-agent writes it, not you. "
+            f"{operators[0]!r} reaches {words[0]!r} as an argument. {_one_command()}; for "
+            "more than one thing, name a new test file in scope and say in notes what it "
+            "must check; the sub-agent writes it, not you. "
             "Call pursuit_step again with it."
         )
     program = Path(words[0]).name
@@ -5025,14 +5154,14 @@ def _check_problem(command: str) -> str | None:
         # design's content was never judged.
         return (
             f"done_when `{command}` only tests that a file exists, so it passes whatever "
-            f"the file says. {one_command}; for a document, `grep -q '<a term the "
+            f"the file says. {_one_command()}; for a document, `grep -q '<a term the "
             "reference uses>' <doc>`, so the check reads what it must hold. Call "
             "pursuit_step again with that."
         )
     if program in _SHOWS_A_FILE or (program.startswith("python") and "json.tool" in words[1:3]):
         return (
             f"done_when `{command}` passes as soon as the file is there, whatever it says. "
-            f"{one_command}, testing what the file must hold; for a document, `grep -q "
+            f"{_one_command()}, testing what the file must hold; for a document, `grep -q "
             "'<a phrase it must contain>' <path>`. Call pursuit_step again with that."
         )
     python = _past_runner(words)
@@ -5043,7 +5172,7 @@ def _check_problem(command: str) -> str | None:
         # validate_fork_seed; print('OK')"`, which passes once the name exists.
         return (
             f"done_when `{command}` only imports and prints, so it passes as soon as the "
-            f"file is there, whatever it says. {one_command}, testing what the code must "
+            f"file is there, whatever it says. {_one_command()}, testing what the code must "
             "do. Call pursuit_step again with that."
         )
     if python and _judges_nothing(python[1:]):
@@ -5052,7 +5181,7 @@ def _check_problem(command: str) -> str | None:
         return (
             f"done_when `{command}` only constructs and calls, with no assert, so it "
             "passes on any code that does not crash, whatever it returns. "
-            f"{one_command}, asserting the values the reference gives. Call pursuit_step "
+            f"{_one_command()}, asserting the values the reference gives. Call pursuit_step "
             "again with that."
         )
     if _key_only_json_check(command):
@@ -5061,7 +5190,7 @@ def _check_problem(command: str) -> str | None:
         return (
             f"done_when `{command}` loads JSON and only asserts that keys are there, but a "
             "key check passes on any content; bind a test that compares values to the "
-            "reference. " + one_command + ", asserting the values the reference gives. "
+            "reference. " + _one_command() + ", asserting the values the reference gives. "
             "Call pursuit_step again with that."
         )
     found = [w for w in words[1:] if w.lower() in _PROSE_WORDS]
@@ -5070,22 +5199,80 @@ def _check_problem(command: str) -> str | None:
     return (
         f"done_when reads as a sentence (bare {', '.join(repr(w) for w in found[:3])}), not "
         "a command. It is split into words and run as-is, so it must be ONE command "
-        "that exits 0 exactly when the task is done, such as `python3 -m pytest -q "
-        "tests/test_greet.py`. Put what the test must assert in criteria and notes, "
-        "and call pursuit_step again."
+        "that exits 0 exactly when the task is done: "
+        + _test_command("the one test file the task's test goes in")
+        + ". Put what the test must assert in criteria and notes, and call pursuit_step "
+        "again."
     )
 
 
-_ONE_COMMAND = (
-    "It must be ONE command over the project that exits 0 exactly when the task is "
-    "done, such as `python3 -m pytest -q tests/test_greet.py`"
-)
+#: The longest check shown as an example: past it the form is lost in the detail.
+EXAMPLE_CHECK_CHARS = 100
+
+
+def _pursuit_root() -> Path | None:
+    """The root of the pursuit this session works in, or None."""
+    goal = _find_goal(_SEEN_CWD or Path.cwd())
+    return goal.parent.parent if goal is not None else None
+
+
+def _example_check(root: Path | None = None) -> str:
+    """A check already bound in this project that runs a test, to show as the form
+    one takes; or "" when there is none.
+
+    An earlier task's done_when (a done task's first), else a command in
+    .beagle/gates.toml. Owner, 2026-10-15: refusals are language- and
+    task-neutral, and an example comes from the project itself: every refusal
+    said `python3 -m pytest -q tests/test_greet.py`, to a Go or Rust project too.
+    """
+    root = root if root is not None else _pursuit_root()
+    if root is None:
+        return ""
+    nodes = sorted(_tree_nodes(root), key=lambda n: n.get("status") != "done")
+    for node in nodes:
+        check = " ".join(str(node.get("done_when") or "").split())
+        try:
+            words = shlex.split(check)
+        except ValueError:
+            continue
+        runs_test = any(
+            _is_test_path(word.split("::")[0]) or word.rstrip("/") in _TEST_DIRS
+            for word in words[1:]
+        )
+        if check and len(check) <= EXAMPLE_CHECK_CHARS and runs_test:
+            return check
+    try:
+        gates = tomllib.loads((root / ".beagle" / "gates.toml").read_text())
+    except (OSError, tomllib.TOMLDecodeError):
+        return ""
+    for gate in gates.get("gate") or []:
+        command = " ".join(str(gate.get("command") or "").split()) if isinstance(gate, dict) else ""
+        if command and len(command) <= EXAMPLE_CHECK_CHARS:
+            return command
+    return ""
+
+
+def _test_command(narrowed: str, root: Path | None = None) -> str:
+    """The check a refusal asks for, in words: the project's own test command
+    narrowed to `narrowed`, with a check already bound here as its form."""
+    example = _example_check(root)
+    return f"the project's own test command, narrowed to {narrowed}" + (
+        f", in the form of a check this project already binds: `{example}`" if example else ""
+    )
+
+
+def _one_command(root: Path | None = None) -> str:
+    """What a check must be, for a refusal of one that is not."""
+    return (
+        "It must be ONE command over the project that exits 0 exactly when the task is "
+        "done: " + _test_command("the one test file the task's test goes in", root)
+    )
 
 
 def _always_passes(command: str) -> str:
     return (
         f"done_when `{command}` exits 0 whatever the work does, so it cannot judge it. "
-        f"{_ONE_COMMAND}. {ABANDON_HINT}"
+        f"{_one_command()}. {ABANDON_HINT}"
     )
 
 
@@ -5493,6 +5680,18 @@ def _no_scope_problem(scope: list[str], root: Path) -> str | None:
         "no scope given, so its sub-agent would write anywhere. Pass scope=[...] "
         "naming the paths this task writes, and call pursuit_step again."
     )
+
+
+def _derived_scope(check: str, record: Mapping[str, Any], root: Path) -> list[str]:
+    """The scope a task called with none takes: the files its check runs, the
+    scope on its record, and its predecessor's scope, in that order."""
+    found = [
+        *_check_run_files(check, root),
+        *_strings(record.get("scope")),
+        *_predecessor_scope(dict(record), root),
+    ]
+    found = [rel.removeprefix("./") for rel in found]
+    return list(dict.fromkeys(rel for rel in found if rel and not _scratch_like(Path(rel))))
 
 
 def _data_task(scope: list[str], goal: Path, check: str) -> bool:
@@ -6128,7 +6327,7 @@ def _pytest_node_import_only_problem(command: str, scope: list[str], root: Path)
                 continue
             return (
                 f"done_when `{command}` runs {part}, which uses nothing from {source}: it "
-                f"passes once the import does, whatever {source} does. {_ONE_COMMAND}, "
+                f"passes once the import does, whatever {source} does. {_one_command(root)}, "
                 f"running a test that calls {source}'s code and asserts what it returns. "
                 "Call pursuit_step again with that."
             )
@@ -7524,12 +7723,21 @@ def _in_tests_dir(rel: str) -> bool:
     return bool({"test", "tests"} & set(Path(rel).parts[:-1]))
 
 
+#: Directories whose files are tests, in the languages' own layouts.
+_TEST_DIRS = frozenset({"test", "tests", "spec", "__tests__"})
+#: Suffixes of a JVM or .NET test class's file: FooTest.java, BarTests.kt.
+_CLASS_TEST_SUFFIXES = (".java", ".kt", ".kts", ".scala", ".groovy", ".cs")
+
+
 def _is_test_path(rel: str) -> bool:
     """Whether `rel` is a test: a test_*.py, *_test.py or conftest.py anywhere, a
-    package's __init__.py under a tests dir, or any non-.py file under one.
+    package's __init__.py under a tests dir, or any non-.py file under one; in
+    other languages a *_test.go, *.test.ts or *.spec.js, a FooTest.java, or any
+    file under test/, tests/, spec/ or __tests__/.
 
     Run R24: tests/interval_tree_clocks.py, the module a test imported, counted as
-    a test for prove and as misplaced implementation at the close.
+    a test for prove and as misplaced implementation at the close. Owner,
+    2026-10-15: the host's judgements hold in every language, not Python's only.
     """
     parts = Path(rel).parts
     name = parts[-1] if parts else rel
@@ -7537,7 +7745,14 @@ def _is_test_path(rel: str) -> bool:
         return True
     if name.endswith(".py"):
         return name == "__init__.py" and _in_tests_dir(rel)
-    return _in_tests_dir(rel)
+    stem, dot, suffix = name.partition(".")
+    if dot and (
+        stem.endswith(("_test", "_spec"))
+        or re.search(r"\.(test|spec)\.", f".{suffix}") is not None
+        or (name.endswith(_CLASS_TEST_SUFFIXES) and stem.endswith(("Test", "Tests")))
+    ):
+        return True
+    return bool(_TEST_DIRS & set(parts[:-1]))
 
 
 def _module_beside_tests(rel: str) -> bool:
@@ -9099,9 +9314,10 @@ async def _audit(
     """
     rc, brief = _pursuit(["audit"], root)
     if rc != 0:
-        return (
-            f"pursuit_step: an audit is due, but `beagle pursuit audit` failed (exit {rc}):"
-            f"\n{brief}"
+        return _relayed(
+            f"pursuit_step: an audit is due, but `beagle pursuit audit` failed (exit {rc}):",
+            brief,
+            "Next: call pursuit_step with no arguments; it sends the audit again.",
         )
     brief = brief.split("\nFor the driver:")[0].rstrip()
     if on_update is not None:
@@ -9133,9 +9349,12 @@ async def _audit(
         root,
     )
     if rc != 0:
-        return (
+        return _relayed(
             f"pursuit_step: an audit is due; its sub-agent reported, but `beagle pursuit "
-            f"audit --record` refused (exit {rc}):\n{kept}\n\nReport:\n{run.shown_report}"
+            f"audit --record` refused (exit {rc}):",
+            kept,
+            f"Report:\n{run.shown_report}\n\nNext: call pursuit_step with no arguments; "
+            "it sends the audit again.",
         )
     then = (
         "Each defect becomes work before more is opened: for each task the report finds "
@@ -9156,9 +9375,11 @@ def _abandon(task: str, why: str, root: Path, goal: Path) -> str:
     argv = ["close", task, "--outcome", "abandoned", "--reason", why[:500]]
     rc, out = _pursuit(argv, root)
     if rc != 0:
-        return (
-            f"pursuit_step: `beagle pursuit close {task} --outcome abandoned` refused "
-            f"(exit {rc}):\n{out}"
+        return _relayed(
+            f"pursuit_step: `beagle pursuit close {task} --outcome abandoned` refused (exit {rc}):",
+            out,
+            f"{task} is not closed. Next: call pursuit_step with no arguments for the next "
+            "task, or abandon it again with the reason corrected as beagle says.",
         )
     _forget_task(root, task)
     released = _release_waiters(task, why, root)
@@ -9238,9 +9459,12 @@ def _close_infeasible(
     ]  # fmt: skip
     rc, out = _pursuit(argv, root)
     if rc != 0:
-        return (
+        return _relayed(
             f"pursuit_step: `beagle pursuit close {task} --outcome infeasible` refused "
-            f"(exit {rc}):\n{out}"
+            f"(exit {rc}):",
+            out,
+            f"{task} is not closed. Next: call pursuit_step with no arguments for the next "
+            "task, or close it infeasible again with the evidence corrected as beagle says.",
         )
     _forget_task(root, task)
     parent = str(node.get("parent") or "")
@@ -9459,7 +9683,7 @@ def _already_passes(
     text = (
         f"`{check}` already passes, before any work, so it cannot tell this task's work "
         "from none. Bind a check that fails now: name a new test file for what this task "
-        "adds, e.g. `python3 -m pytest -q tests/test_<this task>.py`, put it in scope, and "
+        f"adds, run by {_test_command('that file')}; put it in scope, and "
         "say in the notes what it should test. It fails until the sub-agent writes it; do "
         "not write it yourself. If the work is there already, bind the goal criterion's "
         "test, which imports and runs the code."
@@ -10038,7 +10262,7 @@ async def _done_by(
     rc, out = _pursuit(["show", task], root)
     record = _json_reply(out) if rc == 0 else None
     if not isinstance(record, dict):
-        return f"pursuit_step: cannot read {task} (exit {rc}):\n{out}"
+        return _cannot_read(task, rc, out, root)
     given = str(arguments.get("done_when") or "").strip()
     check = given or str(record.get("done_when") or "").strip()
     title = str(record.get("title") or "")
@@ -10125,9 +10349,12 @@ async def _done_by(
         argv += ["--confirms", done]
     rc, opened = _pursuit(argv, root, timeout=DEFAULT_CHECK_TIMEOUT + 60)
     if rc != 0:
-        refused, then = _relay_next(opened, "")
-        return f"pursuit_step: `beagle pursuit open` refused (exit {rc}):\n{refused}" + (
-            f"\n\n{then}" if then else ""
+        return _relayed(
+            f"pursuit_step: `beagle pursuit open` refused (exit {rc}):",
+            opened,
+            f'{task} is not closed. Next: call pursuit_step task="{task}" with '
+            f'abandon="done by {done}" again once what beagle names is corrected, or work '
+            f'it with pursuit_step task="{task}".',
         )
     if witness:
         argv = ["prove", task, *(a for rel in witness for a in ("--absent", rel))]
@@ -11012,7 +11239,7 @@ def _check_run_files(check: str, root: Path) -> list[str]:
         rel = part.split("::")[0].rstrip("/")
         path = Path(rel)
         if (
-            rel.endswith(".py")
+            (rel.endswith(".py") or ("." in path.name and _is_test_path(rel)))
             and not path.is_absolute()
             and ".." not in path.parts
             and rel not in found
@@ -11314,6 +11541,30 @@ def _check_runs_own_file(
                 f"scope={json.dumps([*scope, rel])}."
             )
     return ""
+
+
+def _waited_workable(task: str, nodes: list[dict[str, Any]], workable: list[str]) -> str:
+    """The first of `workable` that `task` waits on, or ""."""
+    named = [w[2] for w in _hard_waits(nodes).get(task, [])]
+    return next((t for t in named if t in workable), "")
+
+
+def _steps_in_place_of(
+    task: str, nodes: list[dict[str, Any]], workable: list[str], root: Path
+) -> str:
+    """The workable task a step on waiting `task` runs instead, or "".
+
+    R104-R131: drivers stepped a task that waited on a workable one, were told
+    to work that one first, and spent a call doing so each time. The host knows
+    the call, so it makes it, unless the waited-on task needs a change of its
+    own first (its check runs `task`'s file, or it is at the escalation count).
+    """
+    first = _waited_workable(task, nodes, workable)
+    if not first or _check_runs_own_file(task, first, nodes, root):
+        return ""
+    if _NOT_DONE.get((str(root), first), 0) >= ESCALATE_AFTER:
+        return ""
+    return first
 
 
 def _not_workable(
@@ -11860,8 +12111,8 @@ async def _write_cases(
             f"pursuit_step: {task} not opened — its source is {source}, so its check "
             f"runs the cases a sub-agent writes from that, and done_when names no test "
             f"file: `{done_when}`\n\nMake done_when the project's test command over the "
-            "file the cases go in, e.g. `python3 -m pytest -q tests/test_<part>.py`, with "
-            "no expected values in it: the cases read them from the source. Call "
+            + _test_command("the one test file the cases go in", root)
+            + ", with no expected values in it: the cases read them from the source. Call "
             f'pursuit_step with task="{task}" again.'
         )
     bad_thinking = _bad_thinking(arguments.get("thinking"))
@@ -11897,25 +12148,32 @@ async def _write_cases(
     # R114 (g26) and R115 (lfm24): workers ended without the dry run their brief
     # names, and the open refused them 5-12 min in; the next call's worker read
     # the source again. The host runs it, and the same session mends the cases.
+    # A worker that left no marked test is resumed the same way, with the
+    # marker's form (R104-R131: refused, the next call's worker read the
+    # source again from the start).
     for mends in range(CASES_DRY_RUN_MENDS + 1):
         if not files:
-            break
-        moved = _reanchor_cites(root, files, cites)
-        reanchored.update(moved)
-        cites = [moved.get(cite, cite) for cite in cites]
-        refused = _cases_dry_run_refusal(task, criteria, done_when, scope, files, cites, root)
-        if refused is None:
-            break
-        if mends == CASES_DRY_RUN_MENDS or run.transcript is None:
-            rc, said_open = refused
-            relayed, then = _relay_next(said_open, "")
-            return (
-                f"pursuit_step: `beagle pursuit open` refused (exit {rc}):\n{relayed}\n\n"
-                f"{task} is not opened. The cases written from {source} stay in "
-                f"{', '.join(files)}; the next pursuit_step for {task} has them corrected."
-                + (f"\n\n{then}" if then else "")
-            )
-        brief = _cases_mend_brief(refused[1], cases_scope)
+            if mends == CASES_DRY_RUN_MENDS or run.transcript is None:
+                break
+            brief = _cases_marker_mend_brief(cases_scope, source)
+        else:
+            moved = _reanchor_cites(root, files, cites)
+            reanchored.update(moved)
+            cites = [moved.get(cite, cite) for cite in cites]
+            refused = _cases_dry_run_refusal(task, criteria, done_when, scope, files, cites, root)
+            if refused is None:
+                break
+            if mends == CASES_DRY_RUN_MENDS or run.transcript is None:
+                rc, said_open = refused
+                return _relayed(
+                    f"pursuit_step: `beagle pursuit open` refused (exit {rc}):",
+                    said_open,
+                    f"{task} is not opened. The cases written from {source} stay in "
+                    f"{', '.join(files)}; the next pursuit_step for {task} has them corrected."
+                    f'\n\nNext: call pursuit_step task="{task}" again; its cases worker '
+                    "gets beagle's words.",
+                )
+            brief = _cases_mend_brief(refused[1], cases_scope)
         wall = min(timeout, CASES_MEND_SECONDS)
         run = await _run_worker(
             brief,
@@ -11931,11 +12189,11 @@ async def _write_cases(
             resume=run.transcript.stem,
         )
         spent = max(spent or 0, run.spent or 0) or None
+        said = f"\n\nIts report:\n{_capped_report(run)}" if run.report else ""
         if run.problem is not None:
-            said = f"\n\nIts report:\n{_capped_report(run)}" if run.report else ""
             return (
                 f"pursuit_step: {task} not opened — the sub-agent mending its cases from "
-                f"{source} after beagle refused them did not finish: {run.problem}{said}"
+                f"{source} did not finish: {run.problem}{said}"
                 f'\n\nCall pursuit_step with task="{task}" again to have them written.'
             )
         _repair_case_markers(root, cases_scope)
@@ -11995,6 +12253,18 @@ def _cases_mend_brief(refusal: str, cases_scope: list[str]) -> str:
         f"{', '.join(cases_scope)} so it passes, reading the source lines again with "
         "`beagle refs show` where a case needs them; write nowhere else. Run the dry "
         "run again yourself, then end with a report naming the case files and the cites."
+    )
+
+
+def _cases_marker_mend_brief(cases_scope: list[str], source: str) -> str:
+    """The next prompt of a cases worker that ended with no marked test."""
+    return (
+        f"You ended, and the host found no test in {', '.join(cases_scope)} with a "
+        "`beagle-case:` marker above it, so nothing ties the task to its source. "
+        + CASES_MARKER_NOTE.format(ref=Path(source).stem)
+        + f" Put the marker above each case you wrote; if you wrote none, write them now "
+        f"from {source}. Write nowhere else, then end with a report naming the case files "
+        "and the cites."
     )
 
 
@@ -12145,14 +12415,29 @@ def make_step_tool() -> Any:
                     f"{task} was superseded by {heir}, which took its work on, and {heir} "
                     f"is not ready either. {nothing_ready}"
                 )
-            if open_ids or ready_ids:
+            first = _steps_in_place_of(task, nodes, open_ids + ready_ids, root)
+            if first:
+                demand = _NOT_DONE_DEMAND.get((str(root), first), "")
+                sent = [k for k in ("criteria", "done_when", "scope") if arguments.get(k)]
+                words = " and ".join([", ".join(sent[:-1]), sent[-1]] if sent[1:] else sent)
+                kept_lead.append(
+                    f"{task} waits on {first}, which is workable now, so this step ran "
+                    f"{first} in its place"
+                    + (f"; the {words} sent were {task}'s and were not used" if sent else "")
+                    + f". Step {task} once {first} is closed.\n\n"
+                )
+                arguments = {"task": first, **({"notes": demand} if demand else {})}
+                task = first
+                stepped[:] = [task]
+            elif open_ids or ready_ids:
                 return _step_result(_not_workable(task, nodes, open_ids + ready_ids, root))
-            return _step_result(f"{task} is not a task to work now. {nothing_ready}")
+            else:
+                return _step_result(f"{task} is not a task to work now. {nothing_ready}")
 
         rc, out = _pursuit(["show", task], root)
         record = _json_reply(out) if rc == 0 else None
         if not isinstance(record, dict):
-            return _step_result(f"pursuit_step: cannot read {task} (exit {rc}):\n{out}")
+            return _step_result(_cannot_read(task, rc, out, root))
         title = str(record.get("title") or "")
         if _setup_milestone([title]) is not None:
             lead[:] = [_setup_lead(task)]
@@ -12372,9 +12657,25 @@ def make_step_tool() -> Any:
                         + _already_passes(new_check, task, _tree_nodes(root))
                     )
                 successor, spawned = _spawn(task, record, notes, done_when, root)
-                if successor is None:
+                unworked = successor is None and _NO_OWN_COMMIT.search(spawned) is not None
+                if (
+                    unworked
+                    and status == "open"
+                    and done_when
+                    and " ".join(done_when.split()) != " ".join(old_check.split())
+                ):
+                    # R104-R131: six spawns refused because the open task had no
+                    # commit of its own, so only its check was at fault; beagle's
+                    # remedy, `amend`, is what this call already carries.
+                    route += taken + (
+                        f"{task} has no work committed since it opened, so beagle keeps "
+                        "it and changes only its check: the new done_when is amended "
+                        f"onto {task} in place, with no new route.\n\n"
+                    )
+                elif successor is None:
                     return _step_result(
-                        f"pursuit_step: `beagle pursuit spawn {task}` refused:\n{spawned}\n\n"
+                        f"pursuit_step: `beagle pursuit spawn {task}` refused:\n"
+                        f"{_NEXT_LINE.sub('', spawned).strip()}\n\n"
                         + (
                             _spawn_limit_offer(
                                 task,
@@ -12387,27 +12688,35 @@ def make_step_tool() -> Any:
                             if _at_spawn_limit(task, nodes)
                             else _pending_route_said(task, done_when, scope, criteria)
                             if status == "pending"
+                            else (
+                                f"{task} has no work committed since it opened, so a new "
+                                "route can change only its check: call pursuit_step "
+                                f'task="{task}" with a done_when other than `{old_check}`, '
+                                "and no new_route."
+                            )
+                            if unworked
                             else "Say more specifically in notes how this route differs."
                         )
                     )
-                route = f"{taken}{spawned}\n\n"
-                spawns[:] = [(task, successor, spawned)]
-                if same_route:
-                    _carry_not_done(root, task, successor)
-                # q35 R51: W5's last words were kept for T0003's next brief, and the
-                # new route to T0007 dropped them; the successor's first brief has them.
-                kept_progress = _KILLED_PROGRESS.pop((str(_resolved(root)), task), None)
-                if kept_progress:
-                    _KILLED_PROGRESS[(str(_resolved(root)), successor)] = kept_progress
-                _forget_task(root, task)
-                task = successor
-                criteria = old_criteria or criteria
-                done_when = done_when or old_check
-                scope = scope or _strings(record.get("scope"))
-                rc, out = _pursuit(["show", task], root)
-                record = _json_reply(out) if rc == 0 else None
-                if not isinstance(record, dict):
-                    return _step_result(f"pursuit_step: cannot read {task} (exit {rc}):\n{out}")
+                else:
+                    route = f"{taken}{spawned}\n\n"
+                    spawns[:] = [(task, successor, spawned)]
+                    if same_route:
+                        _carry_not_done(root, task, successor)
+                    # q35 R51: W5's last words were kept for T0003's next brief, and the
+                    # new route to T0007 dropped them; the successor's first brief has them.
+                    kept_progress = _KILLED_PROGRESS.pop((str(_resolved(root)), task), None)
+                    if kept_progress:
+                        _KILLED_PROGRESS[(str(_resolved(root)), successor)] = kept_progress
+                    _forget_task(root, task)
+                    task = successor
+                    criteria = old_criteria or criteria
+                    done_when = done_when or old_check
+                    scope = scope or _strings(record.get("scope"))
+                    rc, out = _pursuit(["show", task], root)
+                    record = _json_reply(out) if rc == 0 else None
+                    if not isinstance(record, dict):
+                        return _step_result(_cannot_read(task, rc, out, root))
         tried = _NOT_DONE.get((str(root), task), 0)
         if (
             not route
@@ -12446,9 +12755,18 @@ def make_step_tool() -> Any:
                         f"route does not change what the work is for: {carried!r}\n\n"
                     )
                 criteria = carried
-            if done_when and not criteria:
+            recorded = " ".join(str(record.get("intent") or title).split())
+            if done_when and not criteria and recorded:
                 # Run R14 sent task and done_when without criteria three times and
-                # got the next-task prompt back with no word of what was missing.
+                # got the next-task prompt back with no word of what was missing;
+                # R104-R131 were refused for it five times. The task's recorded
+                # intent says what it is for: it stands as the criteria.
+                criteria = recorded
+                route += (
+                    f"No criteria were sent, so {task}'s recorded intent stands as them: "
+                    f"{criteria!r}. Send criteria with the call to say it otherwise.\n\n"
+                )
+            elif done_when and not criteria:
                 return _step_result(
                     f"pursuit_step: {task} not opened — criteria is missing: say what will "
                     "be true when it is done, and call pursuit_step again with task, "
@@ -12467,9 +12785,10 @@ def make_step_tool() -> Any:
                         if carried
                         else "  criteria: what will be true when it is done\n"
                     )
-                    + "  done_when: ONE command that exits 0 only then, e.g. `python3 -m "
-                    "pytest -q tests/test_x.py`. It is split into words and run without a "
-                    "shell: no prose, no &&, |, > or $(...). It should fail now.\n"
+                    + "  done_when: ONE command that exits 0 only then: "
+                    + _test_command("the one test file the task's test goes in", root)
+                    + ". It is split into words and run without a shell: no prose, no &&, "
+                    "|, > or $(...). It should fail now.\n"
                     "  scope: the paths it will touch\n"
                     "  notes: where to start, what to leave alone\n"
                     "A sub-agent does the work and the check decides. If you cannot write "
@@ -12487,6 +12806,17 @@ def make_step_tool() -> Any:
                 return _step_result(f"pursuit_step: {task} not opened — {prose}")
             route += _bound_note(done_when, chained)
             done_when = chained
+            if not scope and _no_scope_problem(scope, root) is not None:
+                # R104-R131: "no scope given" five times, for checks that named
+                # the files the task writes. The host knows them; it says so.
+                derived = _derived_scope(done_when, record, root)
+                if derived:
+                    scope = derived
+                    route += (
+                        f"No scope was sent, so {task}'s scope is the files its check runs, "
+                        f"its recorded scope and its predecessor's: {json.dumps(scope)}. Send "
+                        "scope to set it otherwise.\n\n"
+                    )
             # R112 (lfm24) and R114 (g26): a call with no scope, and one scoped
             # into references/, each ran a cases worker for 5-6 min and was
             # refused only then; a scope judged on its own costs the driver seconds.
@@ -12690,17 +13020,20 @@ def make_step_tool() -> Any:
                     f'Send {first.group()} first, with pursuit_step task="{first.group()}".'
                 )
             if rc != 0:
-                refused, then = _relay_next(opened, "")
                 return _step_result(
-                    f"pursuit_step: `beagle pursuit open` refused (exit {rc}):\n{refused}"
-                    + (
-                        f"\n\n{task} is not opened. The cases written from {source} stay "
-                        f"in {', '.join(case_files)}; the next pursuit_step for {task} has "
-                        "them corrected."
-                        if case_files
-                        else ""
+                    _relayed(
+                        f"pursuit_step: `beagle pursuit open` refused (exit {rc}):",
+                        opened,
+                        (
+                            f"{task} is not opened. The cases written from {source} stay "
+                            f"in {', '.join(case_files)}; the next pursuit_step for {task} "
+                            "has them corrected.\n\n"
+                            if case_files
+                            else f"{task} is not opened. "
+                        )
+                        + f'Next: call pursuit_step task="{task}" again with what beagle '
+                        "names corrected.",
                     )
-                    + (f"\n\n{then}" if then else "")
                 )
             if case_files:
                 # beagle pins the cases by hash at the open; commit them as the
@@ -12832,8 +13165,14 @@ def make_step_tool() -> Any:
                 rc, amended = _pursuit(argv, root)
                 if rc != 0:
                     return _step_result(
-                        f"pursuit_step: `beagle pursuit amend` refused the new check (exit {rc}):"
-                        f"\n{amended}"
+                        _relayed(
+                            f"pursuit_step: `beagle pursuit amend` refused the new check "
+                            f"(exit {rc}):",
+                            amended,
+                            f"The old check `{bound_check}` stays bound to {task}. Next: call "
+                            f'pursuit_step task="{task}" with a done_when corrected as beagle '
+                            "says, or with no done_when to run the bound one.",
+                        )
                     )
                 opened = amended
                 record = {**record, "done_when": done_when}
@@ -12928,7 +13267,13 @@ def make_step_tool() -> Any:
         else:
             rc, brief = _pursuit(["brief", task], root)
             if rc != 0:
-                return _step_result(f"pursuit_step: `beagle pursuit brief {task}` failed:\n{brief}")
+                return _step_result(
+                    _relayed(
+                        f"pursuit_step: `beagle pursuit brief {task}` failed:",
+                        brief,
+                        "Next: call pursuit_step with no arguments for the next task.",
+                    )
+                )
             brief = _without_beagle_habits(
                 _without_commit_steps(brief),
                 _command_bound(_memory_max(), _worker_timeout(arguments.get("timeout"))[0]),
@@ -13034,8 +13379,8 @@ def make_step_tool() -> Any:
             else:
                 how = (
                     "The new route's done_when imports the code this task tests and runs "
-                    "it (e.g. `python3 -m pytest -q tests/test_<this task>.py`, a test "
-                    "that imports the module), with that code's source file in scope"
+                    f"it ({_test_command('a test that imports that code', root)}), with "
+                    "that code's source file in scope"
                 )
             return _not_done(
                 root,
@@ -13105,6 +13450,7 @@ def make_step_tool() -> Any:
         _KILLED_PROGRESS.pop(progress_key, None)
         unreported: list[tuple[int, _WorkerRun, list[str]]] = []
         reported: tuple[int, str] | None = None
+        refused_out: list[str] = []
         # Run R39: one step is bounded by one budget, not a full timeout per attempt.
         step_budget = timeout * STEP_BUDGET_FACTOR
         budget_spent = ""
@@ -13144,6 +13490,8 @@ def make_step_tool() -> Any:
             )
             resume = ""
             worker_ran = True
+            refused_out += [rel for rel in run.refused_writes if rel not in refused_out]
+            widen = _refused_writes_note(task, refused_out, scope)
             if run.spent is not None:
                 spent = (spent or 0) + run.spent
             if run.problem is not None:
@@ -13156,6 +13504,7 @@ def make_step_tool() -> Any:
                     + _killed_attempt_context(
                         run, shown, verdict, check, root, scope, ended == "reported back"
                     )
+                    + (f"{widen}\n\n" if widen else "")
                     + f'Call pursuit_step with task="{task}" to send it again.',
                 )
             if run.unreported:
@@ -13180,6 +13529,8 @@ def make_step_tool() -> Any:
             settled = _settle_case_edits(task, report, root)
             if settled:
                 shown = f"{shown}\n\n{settled}"
+            if widen:
+                shown = f"{shown}\n\n{widen}"
             if not check:
                 verdict = (0, "")
                 break
@@ -13376,10 +13727,11 @@ def make_step_tool() -> Any:
                 )
             )
             fresh_check = (
-                "a done_when that runs a new test file, e.g. `python3 -m pytest -q "
-                f"tests/test_<this task>.py`, in scope: `{check}` passes on the committed "
+                "a done_when that runs a new test file in scope, "
+                f"{_test_command('that file', root)}: `{check}` passes on the committed "
                 "files too, so a route on it is refused as already passing. "
             )
+            behaviour_check = _test_command("a test of this task's behaviour", root)
             why = (
                 "the check passes even with a defect put back into the work, so it does "
                 "not test what this task built"
@@ -13418,9 +13770,9 @@ def make_step_tool() -> Any:
                     "WITNESS in the module the test imports, named above."
                     if proof.ask_module
                     else f'Next: pursuit_step with task="{task}" and a done_when that runs '
-                    "a test of the behaviour itself, e.g. `python3 -m pytest -q "
-                    "tests/test_<this task>.py`, with notes saying what that test must "
-                    "check. A bare import or file-exists check cannot be shown to refuse."
+                    f"a test of the behaviour itself, {behaviour_check}, with notes saying "
+                    "what that test must check. A bare import or file-exists check cannot be "
+                    "shown to refuse."
                     if proof.weak
                     else f"Next: {_spawn_limit_offer(task, check, scope, fresh)}"
                     if _at_spawn_limit(task, fresh := _tree_nodes(root))
@@ -13433,10 +13785,9 @@ def make_step_tool() -> Any:
                         if tests_only and missing_data
                         else f"a done_when that runs that file's test. {proof_note}"
                         if tests_only
-                        else "a done_when that runs a test of the behaviour itself, e.g. "
-                        "`python3 -m pytest -q tests/test_<this task>.py`. The test must "
-                        "import the code this task tests, and that code's source file "
-                        "must be in scope."
+                        else "a done_when that runs a test of the behaviour itself, "
+                        f"{behaviour_check}. The test must import the code this task "
+                        "tests, and that code's source file must be in scope."
                     )
                     + " Another step on this task without a new route runs no sub-agent."
                 ),
@@ -13704,8 +14055,8 @@ def make_driver_edit_guard() -> Any:
                 f"refusing to {what} from the driving session: in a pursuit the work, and "
                 f"its commits, are done by sub-agents. {call}; a sub-agent does it and the "
                 "task's check decides. For work no task covers (a failing gate, a lint fix), "
-                "add a task with pursuit_plan. Reading and running (tests, `ruff check` "
-                "without `--fix`, `git status`) is fine."
+                "add a task with pursuit_plan. Reading and running (tests, a linter without "
+                "its fix flag, `git status`) is fine."
             ),
         )
 
@@ -14402,6 +14753,44 @@ def _scratch_like(rel: Path) -> bool:
     return bool(_SCRATCH_WORDS & set(re.split(r"[^a-z0-9]+", rel.stem.lower())))
 
 
+#: Words in a refused file's name that say it is the worker's report, written to disk.
+_REPORT_WORDS = frozenset({"report", "analysis", "summary", "findings"})
+
+
+def _report_like(rel: Path) -> bool:
+    """Whether a refused path is a report written as a file (docs/report.md, REPORT.md).
+
+    R104-R131: about 15% of the out-of-scope writes refused were report files;
+    the worker's report is its final message, which the driver reads.
+    """
+    if rel.suffix.lower() not in {".md", ".txt", ".rst", ""}:
+        return False
+    return bool(_REPORT_WORDS & set(re.split(r"[^a-z0-9]+", rel.stem.lower())))
+
+
+def _refused_writes_note(task: str, refused: Iterable[str], scope: list[str]) -> str:
+    """For the driver: the paths a worker on `task` was refused outside its scope,
+    and the call that widens the scope to them; "" when none is work.
+
+    R104-R131: 44 refused out-of-scope writes ended with the worker reporting the
+    path, or not, and nothing carried the path to the driver's next call.
+    """
+    paths = [
+        rel
+        for rel in dict.fromkeys(refused)
+        if not _scratch_like(Path(rel)) and not _report_like(Path(rel))
+    ]
+    if not paths:
+        return ""
+    widened = list(dict.fromkeys([*scope, *paths]))
+    return (
+        f"The sub-agent was refused writes outside {task}'s scope: {', '.join(paths)}. "
+        f"If {task}'s work needs them, widen its scope on the next call: pursuit_step "
+        f'task="{task}", scope={json.dumps(widened)}. If another task owns them, leave '
+        "them to it."
+    )
+
+
 def _task_record(goal: Path, task: str) -> dict[str, Any]:
     """The task's record in the pursuit's tree, or {}."""
     try:
@@ -14681,7 +15070,8 @@ def _reread_refusal(
             f"refusing to read {path} again: this is read {seen} of a {count}-line file "
             f"{paging}, and "
             f"{calls - 1} of {cap} calls are used with nothing written. Query it instead, "
-            "e.g. `python3 -c` over the file for the case or line you need, and write "
+            "e.g. a grep or a one-line script over the file for the case or line you need, "
+            "and write "
             f"{', '.join(scope)} now."
         )
     # No scope names references/ (`_scope_problem`), so its reads land here.
@@ -14878,12 +15268,11 @@ def make_worker_scope_guard() -> Any:
         rel = target.relative_to(root) if target != root else target
         if in_store:
             return ToolCallHookResult(block=True, reason=_store_write_refusal(rel, root, log))
+        # Run R09: refused src/, W4 wrote the library to tests/itc/ instead. Said of
+        # any refused path now, in any language: the move is the same mistake.
         source = (
-            # Run R09: refused src/, W4 wrote the library to tests/itc/ instead.
-            " The implementation does not go under tests/ either: it is a later "
-            "task's work, so report it instead."
-            if rel.suffix == ".py" and not _is_test_path(rel.as_posix())
-            else ""
+            f" Do not write it to another path in the scope instead: {rel} is a later "
+            "task's work, so report it."
         )
         scopes = ", ".join(scope)
         refusals[rel] = refusals.get(rel, 0) + 1
@@ -14896,6 +15285,15 @@ def make_worker_scope_guard() -> Any:
             if times > 1
             else ""
         )
+        if _report_like(rel):
+            # R104-R131: about 15% of these refusals were report files.
+            return ToolCallHookResult(
+                block=True,
+                reason=(
+                    f"refusing to write {rel}: it is outside {task}'s scope ({scopes}). "
+                    "Your report is your final message, not a file: end the turn with it."
+                ),
+            )
         if _scratch_like(rel):
             if again:
                 return ToolCallHookResult(
@@ -15636,7 +16034,14 @@ def make_bash_hooks() -> Any:
             return None
         if not reasons:
             return None
-        return ToolCallHookResult(block=True, reason="\n\n".join(reasons))
+        # R104-R131: the hook's words were beagle's, for Claude Code users, and
+        # ended on no call.
+        return ToolCallHookResult(
+            block=True,
+            reason="\n\n".join(reasons)
+            + "\n\nNothing was committed. Run the commit again with what this names "
+            "corrected.",
+        )
 
     return bash_hooks
 

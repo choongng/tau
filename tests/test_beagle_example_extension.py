@@ -771,7 +771,10 @@ async def test_commit_claims_block_stops_the_bash_call(
     committed = await bash.execute("c1", {"command": "git commit -m wip"})
 
     assert ls.text == "ran"
-    assert committed.text == "Tool call blocked: beagle commit-claims: no Claims block"
+    assert committed.text == (
+        "Tool call blocked: beagle commit-claims: no Claims block\n\nNothing was committed. "
+        "Run the commit again with what this names corrected."
+    )
     [call] = [c for c in _calls(fake_beagle) if "commit-claims" in c["argv"]]
     assert call["argv"] == ["hook", "commit-claims"]
     assert Path(call["cwd"]) == project
@@ -997,7 +1000,9 @@ async def test_installed_commit_trailer_joins_commit_claims(
     committed = await bash.execute("c1", {"command": "git commit -m wip"})
 
     assert ls.text == "ran"
-    assert committed.text == "Tool call blocked: beagle commit-trailer: forbidden Co-Authored-By"
+    assert committed.text.startswith(
+        "Tool call blocked: beagle commit-trailer: forbidden Co-Authored-By\n\nNothing was"
+    )
     calls = _calls(fake_beagle)
     assert [c["argv"] for c in calls] == [["hook", "commit-claims"], ["hook", "commit-trailer"]]
     assert all(Path(c["cwd"]) == project for c in calls)
@@ -1498,6 +1503,13 @@ if tamper:
 mends = os.environ.get("FAKE_TAU_RESUMED_MENDS")
 if mends and "--session" in sys.argv:  # a resumed worker clears what refused its cases
     Path(mends).unlink(missing_ok=True)
+if "--session" in sys.argv:  # what a resumed worker writes
+    for rel, text in json.loads(os.environ.get("FAKE_TAU_RESUMED_WRITES") or "{}").items():
+        Path(rel).write_text(text)
+for rel in json.loads(os.environ.get("FAKE_TAU_REFUSED_WRITES") or "[]"):  # the scope guard's
+    refused = f"Tool call blocked: refusing to write {rel}: it is outside T0002's scope (x)."
+    result = {"role": "toolResult", "content": [{"type": "text", "text": refused}]}
+    print(json.dumps({"type": "message_end", "message": result}), flush=True)
 reports = json.loads(os.environ.get("FAKE_TAU_REPORTS") or "[]")  # one per run, in order
 message = {
     "role": "assistant",
@@ -3784,6 +3796,66 @@ async def test_pursuit_step_amends_an_open_task_whose_check_cannot_judge(
     assert "closed done" in result.text
 
 
+_NO_OWN_COMMIT_SPAWN = (
+    "T0002 has no commit of its own since it opened, so the defect is the check's "
+    "alone. Fix it in place: `pursuit amend T0002 --done-when <check>`\n"
+)
+
+
+@pytest.mark.anyio
+async def test_new_route_on_an_unworked_open_task_amends_its_check_in_place(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # R104-R131: six spawns refused as "no commit of its own since it opened";
+    # the call already carried the new done_when that `amend` takes.
+    monkeypatch.chdir(_pursuit_project(tmp_path))
+    monkeypatch.setenv("FAKE_TAU_SUCCEEDS_ON", "1")
+    _open_task_in_scope(fake_beagle, ["done.txt"], "grep -q done old.txt")
+    (fake_beagle / "spawn.out").write_text(_NO_OWN_COMMIT_SPAWN)
+    (fake_beagle / "spawn.rc").write_text("1")
+    runtime, _ = _bound(tmp_path)
+    call = {"task": "T0002", "new_route": True, "notes": "check the file it writes"}
+
+    result = await _tool(runtime, "pursuit_step").execute(
+        "c1", {**call, "done_when": "grep -q done done.txt"}
+    )
+
+    [amend] = _pursuit_calls(fake_beagle, "amend")
+    assert amend[:3] == ["T0002", "--done-when", "grep -q done done.txt"]
+    assert _pursuit_calls(fake_beagle, "open") == []
+    assert "amended onto T0002 in place, with no new route" in result.text
+    assert "closed done" in result.text
+
+
+@pytest.mark.anyio
+async def test_new_route_on_an_unworked_open_task_with_its_own_check_says_change_it(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.chdir(_pursuit_project(tmp_path))
+    _open_task_in_scope(fake_beagle, ["done.txt"], "grep -q done done.txt")
+    (fake_beagle / "spawn.out").write_text(_NO_OWN_COMMIT_SPAWN)
+    (fake_beagle / "spawn.rc").write_text("1")
+    runtime, _ = _bound(tmp_path)
+
+    result = await _tool(runtime, "pursuit_step").execute(
+        "c1", {"task": "T0002", "new_route": True, "notes": "smaller steps"}
+    )
+
+    assert _pursuit_calls(fake_beagle, "amend") == [] and _runs(fake_tau) == []
+    assert result.text.endswith(
+        'call pursuit_step task="T0002" with a done_when other than '
+        "`grep -q done done.txt`, and no new_route."
+    )
+
+
 @pytest.mark.anyio
 async def test_step_refuses_a_check_that_exits_with_a_git_usage_error(
     tmp_path: Path,
@@ -4200,7 +4272,68 @@ def test_operator_refusal_says_the_worker_writes_the_test() -> None:
     found = _module()._check_problem("python3 -m pytest -q tests/ | tail -1")
 
     assert "bare '|'" in found and "the sub-agent writes it" in found
-    assert "tests/test_<name>.py" in found
+    assert "the project's own test command, narrowed to the one test file" in found
+    assert "tests/test_<name>.py" not in found and "python3 -m pytest" not in found.split("|")[1]
+
+
+def test_example_check_comes_from_the_project(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Owner 2026-10-15: every refusal said `python3 -m pytest -q tests/test_greet.py`,
+    # to a Go or Rust project too; the example is a check the project binds.
+    module = _module()
+    nodes = [
+        {"id": "T0003", "status": "open", "done_when": "cargo test --test parse"},
+        {"id": "T0002", "status": "done", "done_when": "go test ./pkg/x_test.go"},
+        {"id": "T0001", "status": "done", "done_when": "true"},
+    ]
+    monkeypatch.setattr(module, "_tree_nodes", lambda root: nodes)
+    assert module._example_check(tmp_path) == "go test ./pkg/x_test.go"
+    assert "in the form of a check this project already binds: `go test ./pkg/x_test.go`" in (
+        module._test_command("that file", tmp_path)
+    )
+
+    monkeypatch.setattr(module, "_tree_nodes", lambda root: [])
+    (tmp_path / ".beagle").mkdir()
+    (tmp_path / ".beagle" / "gates.toml").write_text(
+        '[[gate]]\nname = "tests"\ncommand = "npm test"\n'
+    )
+    assert module._example_check(tmp_path) == "npm test"
+
+    (tmp_path / ".beagle" / "gates.toml").unlink()
+    assert module._example_check(tmp_path) == ""
+    assert module._test_command("that file", tmp_path) == (
+        "the project's own test command, narrowed to that file"
+    )
+
+
+@pytest.mark.parametrize(
+    ("rel", "is_test"),
+    [
+        ("tests/test_a.py", True),
+        ("pkg/a_test.py", True),
+        ("conftest.py", True),
+        ("tests/__init__.py", True),
+        ("tests/helpers.py", False),
+        ("src/a.py", False),
+        ("tests/data/case.json", True),
+        ("pkg/parse_test.go", True),
+        ("pkg/parse.go", False),
+        ("src/parse.test.ts", True),
+        ("src/parse.spec.js", True),
+        ("src/parse.ts", False),
+        ("src/__tests__/parse.ts", True),
+        ("spec/parse_spec.rb", True),
+        ("test/parse.js", True),
+        ("src/test/java/x/ParserTest.java", True),
+        ("src/main/java/x/Parser.java", False),
+        ("app/src/ParserTests.kt", True),
+        ("rust/tests/parse.rs", True),
+        ("rust/src/lib.rs", False),
+    ],
+)
+def test_is_test_path_knows_each_languages_tests(rel: str, is_test: bool) -> None:
+    assert _module()._is_test_path(rel) is is_test
 
 
 @pytest.mark.anyio
@@ -6308,7 +6441,7 @@ async def test_a_long_goal_statement_is_cut_to_a_root_task_title(
 
 
 @pytest.mark.anyio
-async def test_founded_driver_dispatch_refused(
+async def test_founded_driver_dispatch_runs_as_a_step_on_the_offered_task(
     tmp_path: Path,
     beagle: Path,
     fake_beagle: Path,
@@ -6316,9 +6449,12 @@ async def test_founded_driver_dispatch_refused(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     # R01: founded, the 9B driver dispatched twice instead of stepping, and
-    # neither dispatch opened or closed a task.
+    # neither dispatch opened or closed a task. R104-R131: three such refusals
+    # were never recovered from; the step runs in the dispatch's place.
     monkeypatch.chdir(_pursuit_project(tmp_path))
     (fake_beagle / "next.out").write_text(json.dumps({"open": [], "ready": ["T0003"]}))
+    record = {"id": "T0003", "title": "Clock", "intent": "stamps fork", "status": "pending"}
+    (fake_beagle / "show.out").write_text(json.dumps(record))
     runtime, _ = _bound(tmp_path)
 
     result = await _tool(runtime, "pursuit_dispatch").execute(
@@ -6326,8 +6462,29 @@ async def test_founded_driver_dispatch_refused(
     )
 
     assert _runs(fake_tau) == []
+    assert result.text.startswith(
+        'pursuit_dispatch ran as pursuit_step task="T0003", with the brief as its notes'
+    )
+    assert "Next task: T0003 — Clock" in result.text
+
+
+@pytest.mark.anyio
+async def test_founded_driver_dispatch_with_nothing_offered_is_refused(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.chdir(_pursuit_project(tmp_path))
+    (fake_beagle / "next.out").write_text(json.dumps({"open": [], "ready": []}))
+    runtime, _ = _bound(tmp_path)
+
+    result = await _tool(runtime, "pursuit_dispatch").execute("c1", {"brief": "Implement it"})
+
+    assert _runs(fake_tau) == []
     assert "refused, nothing was spawned" in result.text
-    assert "pursuit_step with task=T0003" in result.text
+    assert "Call pursuit_step with no arguments" in result.text
 
 
 @pytest.mark.anyio
@@ -6366,7 +6523,7 @@ async def test_dispatch_text_in_a_founded_session_names_no_guard_refused_bash_co
     refused = await dispatch.execute("c1", {"brief": "Implement it"})
     # A worker sent to an unfounded cwd from a founded session still reports.
     reported = await dispatch.execute("c2", {"brief": "Implement it", "cwd": str(elsewhere)})
-    assert "refused, nothing was spawned" in refused.text
+    assert "pursuit_dispatch ran as pursuit_step" in refused.text
     assert "[pursuit_dispatch] step-executor" in reported.text
 
     texts = [refused.text, reported.text]
@@ -7054,6 +7211,36 @@ def _r25_nodes() -> list[dict[str, Any]]:
 
 
 @pytest.mark.anyio
+async def test_plan_takes_a_title_or_the_goal_statement_as_its_task_id(
+    tmp_path: Path, beagle: Path, fake_beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # R104-R131: seven "no task '<title>' in the tree" relays from pursuit_plan.
+    monkeypatch.chdir(_pursuit_project(tmp_path))
+    (fake_beagle / "tree.out").write_text(json.dumps({"nodes": _r25_nodes()}))
+    runtime, _ = _bound(tmp_path)
+    plan = _tool(runtime, "pursuit_plan")
+
+    by_title = await plan.execute(
+        "c1", {"task": "known  answers", "parts": ["Cases::write", "Docs::write"]}
+    )
+    by_goal = await plan.execute(
+        "c2", {"task": "Ship it", "parts": ["Command line::add a CLI entry point"]}
+    )
+    unknown = await plan.execute("c3", {"task": "Port it", "parts": ["A::a", "B::b"]})
+
+    assert [call[0] for call in _pursuit_calls(fake_beagle, "split")] == ["T0006"]
+    assert by_title.text.startswith("Took 'known  answers' as T0006, the task it names")
+    assert 'task="T0006"' in by_title.text
+    assert [call[call.index("--parent") + 1] for call in _pursuit_calls(fake_beagle, "add")] == [
+        "T0001"
+    ]
+    assert by_goal.text.startswith("Took 'Ship it' as T0001")
+    assert unknown.text.startswith("pursuit_plan: nothing added — no task is titled 'Port it'")
+    assert 'T0006 "Known answers"' in unknown.text
+    assert len(_pursuit_calls(fake_beagle, "split")) == 1
+
+
+@pytest.mark.anyio
 async def test_plan_split_repairs_bare_label_titles(
     tmp_path: Path, beagle: Path, fake_beagle: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -7585,10 +7772,15 @@ async def test_done_by_closes_a_pending_milestone(
 
 
 @pytest.mark.anyio
-async def test_step_with_done_when_but_no_criteria_says_criteria_is_missing(
-    tmp_path: Path, beagle: Path, fake_beagle: Path, monkeypatch: pytest.MonkeyPatch
+async def test_step_with_done_when_but_no_criteria_takes_the_recorded_intent(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # R14 E47-E53: task+done_when without criteria re-printed the next-task prompt.
+    # R14 E47-E53: task+done_when without criteria re-printed the next-task prompt;
+    # R104-R131 refused it five times. The recorded intent stands as the criteria.
     monkeypatch.chdir(_pursuit_project(tmp_path))
     _ready_task(fake_beagle)
     runtime, _ = _bound(tmp_path)
@@ -7597,11 +7789,13 @@ async def test_step_with_done_when_but_no_criteria_says_criteria_is_missing(
         "c1", {"task": "T0002", "done_when": "grep -q done done.txt"}
     )
 
-    assert "T0002 not opened — criteria is missing: say what will be true when it is done" in (
-        result.text
+    [opened] = _pursuit_calls(fake_beagle, "open")
+    assert opened[opened.index("--criteria") + 1] == "reads input"
+    assert result.text.startswith(
+        "No criteria were sent, so T0002's recorded intent stands as them: 'reads input'. "
+        "Send criteria with the call to say it otherwise."
     )
-    assert "Next task" not in result.text
-    assert _pursuit_calls(fake_beagle, "open") == []
+    assert "closed done" in result.text
 
 
 STALLED_TREE = [
@@ -8566,7 +8760,7 @@ async def test_worker_of_a_known_answers_task_is_refused_a_write_to_source(
         result = await _tool_with_hooks(runtime, tool).execute("c1", arguments)
 
         assert "refusing to write itc/itc.py: it is outside T0003's scope" in result.text
-        assert "The implementation does not go under tests/ either" in result.text
+        assert "Do not write it to another path in the scope instead" in result.text
 
     data = {"path": "tests/cases.json", "content": "[]"}
     assert (await _tool_with_hooks(runtime, "write").execute("c2", data)).text == "ran"
@@ -9283,6 +9477,95 @@ def _cut_off_events() -> tuple[bytes, bytes, bytes]:
     cut = end({"role": "toolResult", "content": [{"type": "text", "text": refused}]})
     ran = end({"role": "toolResult", "content": [{"type": "text", "text": "ok"}]})
     return call, cut, ran
+
+
+def test_relayed_beagle_refusal_ends_with_a_tau_call() -> None:
+    # R104-R131: 24 relays of beagle's text ended on `pursuit <verb>` lines.
+    relayed = _module()._relayed
+    then = "Next: call pursuit_step with no arguments for the next task."
+
+    mapped = relayed("pursuit_step: refused:", "no.\nnext: beagle pursuit open T0004\n", then)
+    unmapped = relayed("pursuit_step: refused:", "no.\nnext: beagle pursuit amend T0004", then)
+    bare = relayed("pursuit_step: refused:", "no such task\n", then)
+
+    assert (
+        mapped
+        == 'pursuit_step: refused:\nno.\n\nNext: pursuit_step with task="T0004", which opens it.'
+    )
+    assert unmapped.endswith("next: beagle pursuit amend T0004\n\n" + then)
+    assert bare == f"pursuit_step: refused:\nno such task\n\n{then}"
+
+
+@pytest.mark.anyio
+async def test_plan_refusal_ends_with_the_corrected_plan_call(
+    tmp_path: Path, beagle: Path, fake_beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(_pursuit_project(tmp_path))
+    (fake_beagle / "split.rc").write_text("2")
+    (fake_beagle / "split.out").write_text("beagle: a part title is empty\n")
+    (fake_beagle / "add.rc").write_text("2")
+    (fake_beagle / "add.out").write_text("beagle: a part title is empty\n")
+    runtime, _ = _bound(tmp_path)
+
+    result = await _tool(runtime, "pursuit_plan").execute(
+        "c1", {"task": "T0001", "parts": ["Parser::reads input", "Printer::writes output"]}
+    )
+
+    assert "pursuit_plan: beagle refused (exit 2):\nbeagle: a part title is empty" in result.text
+    assert result.text.rstrip().endswith(
+        'Next: call pursuit_plan again with task="T0001" and the parts corrected as beagle says.'
+    )
+
+
+def test_worker_events_keep_the_paths_refused_outside_the_scope() -> None:
+    def refused(text: str) -> bytes:
+        result = {"role": "toolResult", "content": [{"type": "text", "text": text}]}
+        return json.dumps({"type": "message_end", "message": result}).encode()
+
+    events = _module()._WorkerEvents()
+    for rel in ("cmd/main.go", "go.mod", "cmd/main.go"):
+        events.feed(refused(f"Tool call blocked: refusing to write {rel}: it is outside T0004's"))
+    events.feed(refused("Tool call blocked: refusing to write .git/beagle/x: beagle's store"))
+
+    assert events.refused_writes == ["cmd/main.go", "go.mod"]
+
+
+def test_refused_writes_note_offers_the_widened_scope_and_skips_reports() -> None:
+    note = _module()._refused_writes_note(
+        "T0004", ["cmd/main.go", "REPORT.md", "scratch.log", "go.mod"], ["cmd/main_test.go"]
+    )
+
+    assert note == (
+        "The sub-agent was refused writes outside T0004's scope: cmd/main.go, go.mod. If "
+        "T0004's work needs them, widen its scope on the next call: pursuit_step "
+        'task="T0004", scope=["cmd/main_test.go", "cmd/main.go", "go.mod"]. If another '
+        "task owns them, leave them to it."
+    )
+    assert _module()._refused_writes_note("T0004", ["docs/report.md"], []) == ""
+
+
+@pytest.mark.anyio
+async def test_step_result_names_the_writes_refused_outside_the_scope(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # R104-R131: 44 refused out-of-scope writes, and no path reached the driver.
+    monkeypatch.chdir(_pursuit_project(tmp_path))
+    monkeypatch.setenv("FAKE_TAU_SUCCEEDS_ON", "99")
+    monkeypatch.setenv("FAKE_TAU_REFUSED_WRITES", json.dumps(["lib/core.rs"]))
+    _open_task_in_scope(fake_beagle, ["done.txt"], "grep -q done done.txt")
+    runtime, _ = _bound(tmp_path)
+
+    result = await _tool(runtime, "pursuit_step").execute("c1", {"task": "T0002", "attempts": 1})
+
+    assert (
+        "The sub-agent was refused writes outside T0002's scope: lib/core.rs. If T0002's "
+        'work needs them, widen its scope on the next call: pursuit_step task="T0002", '
+        'scope=["done.txt", "lib/core.rs"].'
+    ) in result.text
 
 
 def test_worker_events_counts_truncated_refusal_as_length_stop() -> None:
@@ -11724,19 +12007,28 @@ async def test_prove_refused_step_names_implementation_written_under_tests(
 
 
 @pytest.mark.anyio
-async def test_worker_scope_refusal_of_source_says_not_under_tests_either(
+async def test_worker_scope_refusal_says_not_to_move_the_file_into_scope(
     tmp_path: Path, beagle: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    # R09's "not under tests/ either" held for .py only; the move is the same
+    # mistake in any language (owner, 2026-10-15).
     runtime = _scoped_worker(tmp_path, monkeypatch, scope="tests/")
     write = _tool_with_hooks(runtime, "write")
 
     source = await write.execute("c1", {"path": "src/x.py", "content": "class X: ...\n"})
-    doc = await write.execute("c2", {"path": "docs/x.md", "content": "x\n"})
+    go = await write.execute("c2", {"path": "pkg/x.go", "content": "package pkg\n"})
+    report = await write.execute("c3", {"path": "docs/REPORT.md", "content": "x\n"})
 
-    either = "The implementation does not go under tests/ either: it is a later task's work"
     assert "refusing to write src/x.py: it is outside T0003's scope (tests/)" in source.text
-    assert either in source.text
-    assert "refusing to write docs/x.md" in doc.text and either not in doc.text
+    assert source.text.endswith(
+        "Do not write it to another path in the scope instead: src/x.py is a later "
+        "task's work, so report it."
+    )
+    assert "pkg/x.go is a later task's work" in go.text
+    assert "tests/" not in go.text.split("(tests/)", 1)[1]
+    assert report.text.endswith(
+        "Your report is your final message, not a file: end the turn with it."
+    )
 
 
 @pytest.mark.anyio
@@ -11782,7 +12074,7 @@ async def test_scope_refusal_of_a_path_refused_before_counts_and_sends_to_report
         "again, 2 times now. No write outside the scope will be taken: write only under "
         "tests/, or end the turn now with your report naming itc/core.py as needed."
     ) in second.text
-    assert "The implementation does not go under tests/ either" in second.text
+    assert "Do not write it to another path in the scope instead" in second.text
     assert "is lost when the step ends" not in second.text
     assert "refused again, 3 times now" in third.text
     assert not (tmp_path / "itc" / "core.py").exists()
@@ -11807,8 +12099,8 @@ async def test_scope_refusal_first_time_is_unchanged(
     assert code.text.endswith(
         "refusing to write itc/core.py: it is outside T0003's scope (tests/). Work written "
         "outside T0003's scope is not its work and is lost when the step ends: do what the "
-        "scope holds, and report that itc/core.py is needed. The implementation does not go "
-        "under tests/ either: it is a later task's work, so report it instead."
+        "scope holds, and report that itc/core.py is needed. Do not write it to another path "
+        "in the scope instead: itc/core.py is a later task's work, so report it."
     )
     assert log.text.endswith(
         "refusing to write run.log: it is outside T0003's scope (tests/); name it in your "
@@ -11935,7 +12227,7 @@ async def test_no_write_guard_counts_in_scope_paging(
     assert again.text != "ran"
     assert "this is read 2 of a 1-line file that one pass reads in 1" in again.text
     assert "11 of 20 calls are used with nothing written" in again.text
-    assert "`python3 -c` over the file" in again.text and "write tests/ now" in again.text
+    assert "a one-line script over the file" in again.text and "write tests/ now" in again.text
     assert wrote.text == "ran" and after.text == "ran"
 
     refusal = _module()._reread_refusal(
@@ -12222,10 +12514,10 @@ async def test_scratch_script_refusal_does_not_mention_the_implementation(
 
         assert f"refusing to write {name}: it is outside T0003's scope" in result.text
         assert "Scratch files go in /tmp." in result.text
-        assert "implementation" not in result.text and "tests/ either" not in result.text
+        assert "another path in the scope" not in result.text
 
     code = await write.execute("c2", {"path": "itc/core.py", "content": "class Stamp: ...\n"})
-    assert "The implementation does not go under tests/ either" in code.text
+    assert "Do not write it to another path in the scope instead" in code.text
 
 
 @pytest.mark.anyio
@@ -14739,14 +15031,45 @@ async def test_step_on_waiting_task_names_what_it_waits_on(
     runtime, _ = _bound(tmp_path)
     step = _tool(runtime, "pursuit_step")
 
-    waiting = await step.execute("c1", R16_T0011_STEP)
     container = await step.execute("c2", {**R16_T0011_STEP, "task": "T0006"})
+    waits = _module()._not_workable_text("T0011", tree, ["T0010"], None)
 
-    assert "T0011 is not a task to work now: it waits on T0010 (open)" in waiting.text
-    assert 'work T0010 first: pursuit_step task="T0010"' in waiting.text
+    assert "T0011 is not a task to work now: it waits on T0010 (open)" in waits
+    assert 'work T0010 first: pursuit_step task="T0010"' in waits
     assert "T0006 is not a task to work now: it is a container of T0010, T0011" in (container.text)
-    for result in (waiting, container):
-        assert "or it waits" not in result.text
+    assert "or it waits" not in waits + container.text
+    assert _pursuit_calls(fake_beagle, "open") == []
+
+
+@pytest.mark.anyio
+async def test_step_on_a_task_waiting_on_a_workable_one_steps_that_one(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # R104-R131: "work T0010 first" cost a call each time; the step makes it.
+    monkeypatch.chdir(_pursuit_project(tmp_path))
+    ready = {"open": [], "ready": [{"id": "T0010", "title": "Known answers"}]}
+    (fake_beagle / "next.out").write_text(json.dumps(ready))
+    tree = [
+        {"id": "T0010", "parent": "", "status": "pending", "title": "Known answers"},
+        {"id": "T0011", "parent": "", "status": "pending", "waiting_on": ["T0010"]},
+    ]
+    (fake_beagle / "tree.out").write_text(json.dumps({"nodes": tree}))
+    record = {"id": "T0010", "title": "Known answers", "intent": "x", "status": "pending"}
+    (fake_beagle / "show.out").write_text(json.dumps(record))
+    runtime, _ = _bound(tmp_path)
+
+    result = await _tool(runtime, "pursuit_step").execute("c1", R16_T0011_STEP)
+
+    assert result.text.startswith(
+        "T0011 waits on T0010, which is workable now, so this step ran T0010 in its place; "
+        "the criteria, done_when and scope sent were T0011's and were not used. Step T0011 once "
+        "T0010 is closed."
+    )
+    assert "Next task: T0010 — Known answers" in result.text
     assert _pursuit_calls(fake_beagle, "open") == []
 
 
@@ -20647,12 +20970,43 @@ async def test_pursuit_step_spec_tied_cases_fail_without_a_marker_and_nothing_op
 
     assert "T0002 not opened" in result.text and "`beagle-case:` marker" in result.text
     assert "the spec has no parse section" in result.text
-    assert [run["role"] for run in _runs(fake_tau)] == ["cases"]
+    # The worker was resumed twice with the marker's form, then it was refused.
+    first, *mends = _runs(fake_tau)
+    assert [run["role"] for run in mends] == ["cases"] * 2
+    worker = first["argv"][first["argv"].index("--session-id") + 1]
+    assert all(run["argv"][run["argv"].index("--session") + 1] == worker for run in mends)
+    assert (
+        "found no test in tests/test_parse.py with a `beagle-case:` marker" in (mends[0]["stdin"])
+    )
     assert _pursuit_calls(fake_beagle, "open") == []
 
 
 @pytest.mark.anyio
-async def test_pursuit_step_spec_tied_with_no_scope_is_refused_before_its_cases_worker(
+async def test_pursuit_step_resumes_a_cases_worker_that_left_no_marker(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # R104-R131: refused "no beagle-case marker", the next call's worker read
+    # the source again; the same session adds the markers instead.
+    monkeypatch.chdir(_pursuit_project(tmp_path))
+    monkeypatch.setenv("FAKE_TAU_CASES_WRITES", json.dumps({"tests/test_parse.py": "x = 1\n"}))
+    monkeypatch.setenv("FAKE_TAU_RESUMED_WRITES", json.dumps({"tests/test_parse.py": SPEC_CASES}))
+    _source_task(fake_beagle)
+    runtime, _ = _bound(tmp_path)
+
+    result = await _tool(runtime, "pursuit_step").execute("c1", SPEC_STEP)
+
+    first, mend, *_ = _runs(fake_tau)
+    assert first["role"] == mend["role"] == "cases" and "--session" in mend["argv"]
+    assert "not opened" not in result.text
+    assert "--dry-run" not in _pursuit_calls(fake_beagle, "open")[-1]
+
+
+@pytest.mark.anyio
+async def test_pursuit_step_spec_tied_with_no_scope_takes_its_checks_files(
     tmp_path: Path,
     beagle: Path,
     fake_beagle: Path,
@@ -20661,6 +21015,7 @@ async def test_pursuit_step_spec_tied_with_no_scope_is_refused_before_its_cases_
 ) -> None:
     # R112 (lfm24, wrenfold): T0002's call with no scope ran a cases worker for
     # 6 min, then was refused "no scope given"; the next call ran another.
+    # R104-R131: refused five times for checks that named the files.
     project = _pursuit_project(tmp_path)
     (project / "references").mkdir(exist_ok=True)
     monkeypatch.chdir(project)
@@ -20671,9 +21026,27 @@ async def test_pursuit_step_spec_tied_with_no_scope_is_refused_before_its_cases_
 
     result = await _tool(runtime, "pursuit_step").execute("c1", call)
 
-    assert "T0002 not opened — no scope given" in result.text
-    assert _runs(fake_tau) == []
-    assert _pursuit_calls(fake_beagle, "open") == []
+    assert result.text.startswith(
+        "No scope was sent, so T0002's scope is the files its check runs, its recorded "
+        'scope and its predecessor\'s: ["tests/test_parse.py"]. Send scope to set it otherwise.'
+    )
+    assert "no scope given" not in result.text
+    assert _runs(fake_tau)[0]["scope"].splitlines() == ["tests/test_parse.py"]
+
+
+def test_derived_scope_joins_check_record_and_predecessor(
+    tmp_path: Path, beagle: Path, fake_beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project = _pursuit_project(tmp_path)
+    monkeypatch.chdir(project)
+    (fake_beagle / "show-T0009.out").write_text(json.dumps({"id": "T0009", "scope": ["lib/"]}))
+    record = {"scope": ["cmd/main.go", "tmp/probe.log"], "sibling_of": "T0009"}
+
+    (project / "x_test.go").write_text("package x\n")
+
+    derived = _module()._derived_scope("go test ./x_test.go", record, project)
+
+    assert derived == ["x_test.go", "cmd/main.go", "lib/"]
 
 
 @pytest.mark.anyio
