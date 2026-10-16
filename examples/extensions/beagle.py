@@ -2709,6 +2709,9 @@ LOCKS_NOTE = "locks are not taken here: nothing is locked, and a later task may 
 DEFAULT_CHECK_TIMEOUT = 600.0
 
 _TASK_ID = re.compile(r"\bT\d{4,}\b")
+#: beagle's refusal to spawn from an open task with no commit of its own: the
+#: route is its check alone, which `amend` changes in place.
+_NO_OWN_COMMIT = re.compile(r"has no commit of its own since it opened")
 #: beagle's refusal to open a task ranked below a ready one, up to its remedy.
 _RANKED_BELOW = re.compile(
     r"ranks below (.+?)(?: \(`pursuit next` lists them\))?\. If this one should go first", re.S
@@ -12426,7 +12429,22 @@ def make_step_tool() -> Any:
                         + _already_passes(new_check, task, _tree_nodes(root))
                     )
                 successor, spawned = _spawn(task, record, notes, done_when, root)
-                if successor is None:
+                unworked = successor is None and _NO_OWN_COMMIT.search(spawned) is not None
+                if (
+                    unworked
+                    and status == "open"
+                    and done_when
+                    and " ".join(done_when.split()) != " ".join(old_check.split())
+                ):
+                    # R104-R131: six spawns refused because the open task had no
+                    # commit of its own, so only its check was at fault; beagle's
+                    # remedy, `amend`, is what this call already carries.
+                    route += taken + (
+                        f"{task} has no work committed since it opened, so beagle keeps "
+                        "it and changes only its check: the new done_when is amended "
+                        f"onto {task} in place, with no new route.\n\n"
+                    )
+                elif successor is None:
                     return _step_result(
                         f"pursuit_step: `beagle pursuit spawn {task}` refused:\n{spawned}\n\n"
                         + (
@@ -12441,27 +12459,35 @@ def make_step_tool() -> Any:
                             if _at_spawn_limit(task, nodes)
                             else _pending_route_said(task, done_when, scope, criteria)
                             if status == "pending"
+                            else (
+                                f"{task} has no work committed since it opened, so a new "
+                                "route can change only its check: call pursuit_step "
+                                f'task="{task}" with a done_when other than `{old_check}`, '
+                                "and no new_route."
+                            )
+                            if unworked
                             else "Say more specifically in notes how this route differs."
                         )
                     )
-                route = f"{taken}{spawned}\n\n"
-                spawns[:] = [(task, successor, spawned)]
-                if same_route:
-                    _carry_not_done(root, task, successor)
-                # q35 R51: W5's last words were kept for T0003's next brief, and the
-                # new route to T0007 dropped them; the successor's first brief has them.
-                kept_progress = _KILLED_PROGRESS.pop((str(_resolved(root)), task), None)
-                if kept_progress:
-                    _KILLED_PROGRESS[(str(_resolved(root)), successor)] = kept_progress
-                _forget_task(root, task)
-                task = successor
-                criteria = old_criteria or criteria
-                done_when = done_when or old_check
-                scope = scope or _strings(record.get("scope"))
-                rc, out = _pursuit(["show", task], root)
-                record = _json_reply(out) if rc == 0 else None
-                if not isinstance(record, dict):
-                    return _step_result(f"pursuit_step: cannot read {task} (exit {rc}):\n{out}")
+                else:
+                    route = f"{taken}{spawned}\n\n"
+                    spawns[:] = [(task, successor, spawned)]
+                    if same_route:
+                        _carry_not_done(root, task, successor)
+                    # q35 R51: W5's last words were kept for T0003's next brief, and the
+                    # new route to T0007 dropped them; the successor's first brief has them.
+                    kept_progress = _KILLED_PROGRESS.pop((str(_resolved(root)), task), None)
+                    if kept_progress:
+                        _KILLED_PROGRESS[(str(_resolved(root)), successor)] = kept_progress
+                    _forget_task(root, task)
+                    task = successor
+                    criteria = old_criteria or criteria
+                    done_when = done_when or old_check
+                    scope = scope or _strings(record.get("scope"))
+                    rc, out = _pursuit(["show", task], root)
+                    record = _json_reply(out) if rc == 0 else None
+                    if not isinstance(record, dict):
+                        return _step_result(f"pursuit_step: cannot read {task} (exit {rc}):\n{out}")
         tried = _NOT_DONE.get((str(root), task), 0)
         if (
             not route

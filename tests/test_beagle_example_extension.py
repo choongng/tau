@@ -3784,6 +3784,66 @@ async def test_pursuit_step_amends_an_open_task_whose_check_cannot_judge(
     assert "closed done" in result.text
 
 
+_NO_OWN_COMMIT_SPAWN = (
+    "T0002 has no commit of its own since it opened, so the defect is the check's "
+    "alone. Fix it in place: `pursuit amend T0002 --done-when <check>`\n"
+)
+
+
+@pytest.mark.anyio
+async def test_new_route_on_an_unworked_open_task_amends_its_check_in_place(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # R104-R131: six spawns refused as "no commit of its own since it opened";
+    # the call already carried the new done_when that `amend` takes.
+    monkeypatch.chdir(_pursuit_project(tmp_path))
+    monkeypatch.setenv("FAKE_TAU_SUCCEEDS_ON", "1")
+    _open_task_in_scope(fake_beagle, ["done.txt"], "grep -q done old.txt")
+    (fake_beagle / "spawn.out").write_text(_NO_OWN_COMMIT_SPAWN)
+    (fake_beagle / "spawn.rc").write_text("1")
+    runtime, _ = _bound(tmp_path)
+    call = {"task": "T0002", "new_route": True, "notes": "check the file it writes"}
+
+    result = await _tool(runtime, "pursuit_step").execute(
+        "c1", {**call, "done_when": "grep -q done done.txt"}
+    )
+
+    [amend] = _pursuit_calls(fake_beagle, "amend")
+    assert amend[:3] == ["T0002", "--done-when", "grep -q done done.txt"]
+    assert _pursuit_calls(fake_beagle, "open") == []
+    assert "amended onto T0002 in place, with no new route" in result.text
+    assert "closed done" in result.text
+
+
+@pytest.mark.anyio
+async def test_new_route_on_an_unworked_open_task_with_its_own_check_says_change_it(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.chdir(_pursuit_project(tmp_path))
+    _open_task_in_scope(fake_beagle, ["done.txt"], "grep -q done done.txt")
+    (fake_beagle / "spawn.out").write_text(_NO_OWN_COMMIT_SPAWN)
+    (fake_beagle / "spawn.rc").write_text("1")
+    runtime, _ = _bound(tmp_path)
+
+    result = await _tool(runtime, "pursuit_step").execute(
+        "c1", {"task": "T0002", "new_route": True, "notes": "smaller steps"}
+    )
+
+    assert _pursuit_calls(fake_beagle, "amend") == [] and _runs(fake_tau) == []
+    assert result.text.endswith(
+        'call pursuit_step task="T0002" with a done_when other than '
+        "`grep -q done done.txt`, and no new_route."
+    )
+
+
 @pytest.mark.anyio
 async def test_step_refuses_a_check_that_exits_with_a_git_usage_error(
     tmp_path: Path,
