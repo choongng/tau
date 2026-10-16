@@ -20902,7 +20902,7 @@ async def test_pursuit_step_resumes_a_cases_worker_that_left_no_marker(
 
 
 @pytest.mark.anyio
-async def test_pursuit_step_spec_tied_with_no_scope_is_refused_before_its_cases_worker(
+async def test_pursuit_step_spec_tied_with_no_scope_takes_its_checks_files(
     tmp_path: Path,
     beagle: Path,
     fake_beagle: Path,
@@ -20911,6 +20911,7 @@ async def test_pursuit_step_spec_tied_with_no_scope_is_refused_before_its_cases_
 ) -> None:
     # R112 (lfm24, wrenfold): T0002's call with no scope ran a cases worker for
     # 6 min, then was refused "no scope given"; the next call ran another.
+    # R104-R131: refused five times for checks that named the files.
     project = _pursuit_project(tmp_path)
     (project / "references").mkdir(exist_ok=True)
     monkeypatch.chdir(project)
@@ -20921,9 +20922,27 @@ async def test_pursuit_step_spec_tied_with_no_scope_is_refused_before_its_cases_
 
     result = await _tool(runtime, "pursuit_step").execute("c1", call)
 
-    assert "T0002 not opened — no scope given" in result.text
-    assert _runs(fake_tau) == []
-    assert _pursuit_calls(fake_beagle, "open") == []
+    assert result.text.startswith(
+        "No scope was sent, so T0002's scope is the files its check runs, its recorded "
+        'scope and its predecessor\'s: ["tests/test_parse.py"]. Send scope to set it otherwise.'
+    )
+    assert "no scope given" not in result.text
+    assert _runs(fake_tau)[0]["scope"].splitlines() == ["tests/test_parse.py"]
+
+
+def test_derived_scope_joins_check_record_and_predecessor(
+    tmp_path: Path, beagle: Path, fake_beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project = _pursuit_project(tmp_path)
+    monkeypatch.chdir(project)
+    (fake_beagle / "show-T0009.out").write_text(json.dumps({"id": "T0009", "scope": ["lib/"]}))
+    record = {"scope": ["cmd/main.go", "tmp/probe.log"], "sibling_of": "T0009"}
+
+    (project / "x_test.go").write_text("package x\n")
+
+    derived = _module()._derived_scope("go test ./x_test.go", record, project)
+
+    assert derived == ["x_test.go", "cmd/main.go", "lib/"]
 
 
 @pytest.mark.anyio

@@ -5579,6 +5579,18 @@ def _no_scope_problem(scope: list[str], root: Path) -> str | None:
     )
 
 
+def _derived_scope(check: str, record: Mapping[str, Any], root: Path) -> list[str]:
+    """The scope a task called with none takes: the files its check runs, the
+    scope on its record, and its predecessor's scope, in that order."""
+    found = [
+        *_check_run_files(check, root),
+        *_strings(record.get("scope")),
+        *_predecessor_scope(dict(record), root),
+    ]
+    found = [rel.removeprefix("./") for rel in found]
+    return list(dict.fromkeys(rel for rel in found if rel and not _scratch_like(Path(rel))))
+
+
 def _data_task(scope: list[str], goal: Path, check: str) -> bool:
     """Whether a task writes known-answer data and its cases test, not the code.
 
@@ -12660,6 +12672,17 @@ def make_step_tool() -> Any:
                 return _step_result(f"pursuit_step: {task} not opened — {prose}")
             route += _bound_note(done_when, chained)
             done_when = chained
+            if not scope and _no_scope_problem(scope, root) is not None:
+                # R104-R131: "no scope given" five times, for checks that named
+                # the files the task writes. The host knows them; it says so.
+                derived = _derived_scope(done_when, record, root)
+                if derived:
+                    scope = derived
+                    route += (
+                        f"No scope was sent, so {task}'s scope is the files its check runs, "
+                        f"its recorded scope and its predecessor's: {json.dumps(scope)}. Send "
+                        "scope to set it otherwise.\n\n"
+                    )
             # R112 (lfm24) and R114 (g26): a call with no scope, and one scoped
             # into references/, each ran a cases worker for 5-6 min and was
             # refused only then; a scope judged on its own costs the driver seconds.
