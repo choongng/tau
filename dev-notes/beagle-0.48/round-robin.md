@@ -90,3 +90,12 @@ broken adapters. None of them read those files, and all three scored 0. No other
 name a harness reference or grader file. The run directory can also reach earlier runs' finished
 trees, such as `~/wrenfold.b06` (54/54) and `~/<task>.rNNN`. Runs need a sandbox that shows them only
 the project, TAU_HOME, tau and beagle (bwrap is installed).
+
+### Calibration (from R133 on)
+
+Score at the cap rewards a run for not checking (upstream-asks 13). Each round from R133 on also
+gets a **calibration** entry: whether the run's own verdict matched the grader. The verdict is
+"done" (its tasks closed on passing checks) or "not done" (work left open). The four outcomes are:
+right and done, wrong but claimed done, right but left open, and wrong and left open. Plain
+baselines have no check, so ending on their own counts as claiming done. On that reading, B04,
+B10, B11, B13, B14 and B15 claimed done while wrong or with no code: 6 of 12.

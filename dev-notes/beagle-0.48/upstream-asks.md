@@ -268,3 +268,77 @@ Ask: a ratchet in beagle, language-neutral because the figures come from the pro
 
 Tau could carry 1–3 for its own step: commit each worker's report as an attempt ref with its
 check result, and name the best ones, with the diff command, in the retry brief, but the ranking and the restore belong in beagle, so every host gets them.
+
+## 13. Pay for knowing, not for structure: a blind, tiered check, with a direct attempt first
+
+Owner, 2026-10-15/16: beagle should be the default "solve this problem" machinery, even on a task
+that lasts an hour, and not just on work that runs for days or weeks. The round robin shows why it
+isn't yet.
+
+**What the rounds and baselines show** (`round-robin.md`, *Plain baselines*). Plain tau (`-p
+--no-extensions`) beats or matches beagle on every model for the bounded tasks, semver and
+wrenfold. It finishes in 4–12 minutes, about when a pursuit writes its first code. Beagle comes out
+ahead only where plain tau built the wrong thing: itc for q35 and g26 (17 and 9 against 0), and cobs
+for g26 (35 against 0). Beagle's cost is fixed and comes before any code:
+
+- founding takes about a minute;
+- the case extraction runs before the code: about 21 of R128's 30 minutes, 5–6 minutes per task
+  in R125, and 6–12.5 minutes per cases worker in R112, R114 and R115;
+- every task goes through open, check and close, and each step is another place a small model
+  can trip. Most rounds that scored 0 never reached code.
+
+**Without an oracle, plain tau does not know when it is wrong either.** All 12 plain baselines
+ended on their own, and 6 of them stopped on a wrong result or no code:
+
+| Run | Model, task | What it stopped on |
+|---|---|---|
+| B04, B10, B14 | q35, g26, lfm24 on itc | interval lists, not ITC (0/42) |
+| B11 | g26 on cobs | no code at all |
+| B15 | lfm24 on cobs | an escape scheme, not COBS (2/44) |
+| B13 | lfm24 on semver | leading zeros, a `v` prefix and whitespace accepted (62/76) |
+
+Plain tau wins on time partly because it never pays to find out whether it is right. The cases
+beagle extracts from the sources stand in for the missing oracle, and they are the one thing plain
+tau cannot give: a "done" that can be believed. So the case extraction is not waste. Its cost just
+needs to come down and move off the path to the first code.
+
+**The model's own tests are no check.** They encode the same understanding as its code, so they
+agree with it. R119's cases workers checked the spec's table with their own encoder, and workers
+in several rounds edited their own case to match their code. A check is a signal only if it is
+built without seeing the code. The order matters less than the blindness.
+
+**Ask:** no small-task mode. Change the default order, which is beagle's own ethos ("detail only
+when you reach it") applied to checks:
+
+1. **A direct attempt first.** The first leaf goes straight at the goal, and the keep-the-best
+   attempt record (ask 12, 0.49.0.dev1) keeps and scores it. The worst case is then plain tau plus
+   a tree, commits, findings and a verdict a person can inspect and steer. On a week-long project
+   the first leaf is also just the shortest line to the goal, so this is not a mode.
+2. **A check built blind, in tiers, cheapest first.** A check builder that does not see the
+   attempt's code writes the check, in tiers. Each tier catches a different share of the plain
+   failures above, and the attempt is judged as each tier lands:
+   - *Coverage*: every operation and term the sources name exists in the code. This catches
+     building the wrong thing: B04, B10 and B14 have no fork, event or join; R120 had no `count`;
+     R122 built "intervals with counters". It is cheap, and it needs no understanding of the
+     algorithm. The founding rubric's MISSING flag is the same test applied to the plan.
+   - *Laws that need no answer*: round-trips, order axioms, idempotence, and laws the source
+     states, such as ITC's join. These are cheap, but they miss a consistently wrong design:
+     B15's escape scheme round-trips.
+   - *Worked examples quoted from the source*: today's cases. They catch the subtle class (B05's
+     255-byte block, B13's leading zeros, semver's `1.2.3\n`). They are the expensive tier and
+     can go wrong in extraction (R132's dropped end marker, R131's limit case, R107's invented
+     empty-input criterion). Spend them where the cheaper tiers cannot settle the work.
+   - *Disagreement*: a second attempt written without seeing the first. It costs an attempt and
+     needs no source at all.
+3. **Structure when the work resists, not up front.** Splitting, spec-tying and per-part cases
+   start on the parts a tier fails, through the route-resists path beagle already has.
+4. **Close on the check, not on a claim.** A leaf closes on a blind check that the attempt passes,
+   so "done" means something even on a one-hour run.
+
+**The measure changes with it.** "Score at the cap" rewards a run for not checking. The round
+robin adds a *calibration* column: did the run's own verdict match the grader? The verdict is a
+closed task with a passing check, or work left open. Plain tau stopped with a wrong result or no
+code in 6 of 12 baselines, and none of those runs shows an independent check it could have
+failed. Beagle's case for being the default at the one-hour scale is a "done" that can be believed,
+at an acceptable cost in time. The test is cheap: q35 and g26 on semver and wrenfold against plain
+tau's 5–12 minutes, with itc and cobs not getting worse.
