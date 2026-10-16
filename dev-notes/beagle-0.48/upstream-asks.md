@@ -222,3 +222,44 @@ a short name for the case, unique in its file"), and the open refusal for a miss
 "no name: the first word after `beagle-case:` is the case's own name, e.g. `zero-is-one-byte`".
 Tau carries it meanwhile as `CASES_MARKER_NOTE` in the cases brief (T0614), and names unnamed
 markers before reading ties (T0613).
+
+## 12. Keep the best attempt: a pursuit should never end on a worse tree than it reached
+
+Three rounds ended on a tree worse than one they had already reached. In each, a worker's later edit
+undid earlier progress, and nothing compared the two trees:
+
+| Run | Grader, best → final | The task's own cases, best → final |
+|---|---|---|
+| R129 (g26 semver) | 75/76 → 27/76 | 8/8 → 4/8: a second worker sent to earn a witness rewrote a passing regex |
+| R131 (q35 cobs) | 8/44 → 3/44 | 19/21 → 4/21: the code worker's last write (writes/w3 → w4, re-run 10-15) |
+| R132 (g26 wrenfold) | 54/54 → 51/54 | 12/12 → 12/12: the regression was in `decode`, which no opened task's check covered |
+
+In R129 and R131 the task's own check would have seen it, but only as a graded figure: the check
+failed at both trees in R131, so exit codes alone cannot rank them. R132's regression was not in
+any check, and no mechanism keyed to checks could have seen it.
+
+Ask: a ratchet in beagle, language-neutral because the figures come from the project's own commands:
+
+1. **Record each attempt.** Every time beagle runs a task's check, and through a `pursuit check
+   <task>` verb that a worker or host can call mid-work, beagle stores:
+   - the tree, as a commit object under `refs/beagle/attempts/<task>/<n>` (`git stash create`
+     plus `update-ref`, so the working tree is untouched);
+   - the check's exit code;
+   - a figure. That is `[report] progress` when the project declares it, or else the number of
+     the task's marked cases that its output does not name as failing. The fallback is a
+     heuristic: most runners print the names of failing tests, and beagle knows each case's
+     name from its marker.
+2. **Rank the attempts.** A passing check beats a failing one; otherwise the higher figure wins.
+3. **Say so when an attempt is worse than the best.** When the latest attempt ranks below the best,
+   the close, `pursuit check`, `next` and `status` all report it, addressed to the model: "T0002's
+   attempt 4 passes 4 of 21 cases; attempt 3 passed 19. Restore it with `beagle pursuit restore
+   T0002 --attempt 3`, and say in the next brief what attempt 4 changed." The restore puts that
+   tree back, limited to the task's scope. A host may do the restore itself after a worker's
+   report.
+4. **Keep closed work closed.** At each close, re-run the checks of the tasks already closed (a
+   regression gate). A close that breaks one is refused, naming the task and the restore. This
+   would have caught R132's `decode` only if T0003 had closed first, so it is about later tasks,
+   not this run.
+
+Tau could carry 1–3 for its own step (snapshot each worker's report and its check result, and
+restore the better one), but the ranking and the restore belong in beagle, so every host gets them.
