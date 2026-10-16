@@ -12084,6 +12084,571 @@ def _settle_case_edits(task: str, report: str, root: Path) -> str:
     )
 
 
+# --------------------------------------------------------------------------- #
+# attempts: each check run of a task kept as a commit, ranked by its figure
+# --------------------------------------------------------------------------- #
+
+#: Where each check run of a task is kept, as a commit of its scope and case
+#: files: `refs/tau/attempts/<task>/<n>`. R129 (g26 semver) went 8/8 → 4/8 of
+#: its cases and R131 (q35 cobs) 19/21 → 4/21, each on a later worker's
+#: rewrite, and nothing held the better tree to compare or go back to.
+ATTEMPT_REFS = "refs/tau/attempts"
+#: The identity attempt commits are made under, so they need no git config.
+ATTEMPT_IDENTITY = {
+    "GIT_AUTHOR_NAME": "tau",
+    "GIT_AUTHOR_EMAIL": "tau@localhost",
+    "GIT_COMMITTER_NAME": "tau",
+    "GIT_COMMITTER_EMAIL": "tau@localhost",
+}
+_ATTEMPT_TASK = re.compile(r"[A-Za-z0-9][\w.-]*")
+_ATTEMPT_TRAILER = re.compile(r"^Tau-Attempt-([\w-]+): ?(.*)$", re.MULTILINE)
+
+#: A word on an output line that says the case it names failed: pytest's
+#: FAILED/ERROR, cargo's `... FAILED` and `panicked`, TAP's `not ok`, and the
+#: crosses jest and mocha print.
+_CASE_FAILED_WORD = re.compile("fail|error|not ok|panicked|[✗×✕✘]", re.I)
+#: The test a `beagle-case:` marker heads: `def`/`fn`/`func`/`function NAME`,
+#: or a `test("…")`/`it("…")` call.
+_CASE_TEST_NAME = re.compile(
+    r"\b(?:def|fn|func|function)\s+([A-Za-z_]\w*)"
+    r"|\b(?:test|it)\s*\(\s*[\"'`]([^\"'`\n]+)[\"'`]"
+)
+
+
+def _marked_cases(root: Path, case_files: list[str]) -> list[tuple[str, str]]:
+    """Each `beagle-case:` marker in `case_files`: its id and the name of the test
+    defined below it ("" when none is found)."""
+    found: list[tuple[str, str]] = []
+    for rel in case_files:
+        try:
+            text = (root / rel).read_text(errors="replace")
+        except OSError:
+            continue
+        for case, (_cite, block) in _case_blocks(text)[1].items():
+            named = _CASE_TEST_NAME.search(block)
+            found.append((case, next((g for g in named.groups() if g), "") if named else ""))
+    return found
+
+
+def _failing_cases(output: str, cases: list[tuple[str, str]]) -> list[str]:
+    """The ids of `cases` that `output` names, by id or test name, on a line with a
+    failure word: `FAILED tests/t.py::test_x`, `test x ... FAILED`, `✕ x`,
+    `not ok 3 - x`."""
+    lines = [
+        re.sub(r"(?<![\w-])test-", "", line.casefold().replace("_", "-"))
+        for line in output.splitlines()
+        if _CASE_FAILED_WORD.search(line)
+    ]
+    failing: list[str] = []
+    for case, name in cases:
+        keys = {_case_key(case), *([_case_key(name)] if name else [])} - {""}
+        patterns = [re.compile(rf"(?<![\w-]){re.escape(key)}(?![\w-])") for key in keys]
+        if any(p.search(line) for p in patterns for line in lines):
+            failing.append(case)
+    return failing
+
+
+def _attempt_figure(rc: int, output: str, cases: list[tuple[str, str]]) -> int:
+    """How far a check run got: on exit 0 every marked case (1 when the task marks
+    none); else the marked cases its output does not name as failing, and 0 when it
+    names none of them failing, since then it did not say which ran.
+
+    Run R131: the check failed at 19/21 and at 4/21, so exit codes alone cannot
+    rank the two trees; the case names in the runner's output can, in any language.
+    """
+    if rc == 0:
+        return len(cases) or 1
+    failing = _failing_cases(output, cases)
+    return len(cases) - len(failing) if failing else 0
+
+
+@dataclass(frozen=True)
+class _Attempt:
+    """One kept check run of a task: its ref, number and what the check said."""
+
+    n: int
+    ref: str
+    exit: int
+    figure: int
+    total: int
+    check: str = ""
+    cases: str = ""
+    by: str = ""
+
+    @property
+    def rank(self) -> tuple[bool, int, int]:
+        """A passing check beats a failing one, then the higher figure; ties go to
+        the latest."""
+        return (self.exit == 0, self.figure, self.n)
+
+
+def _git_out(
+    args: list[str], root: Path, env: Mapping[str, str] | None = None, timeout: float = 30.0
+) -> tuple[int, bytes]:
+    """Run `git args` in `root` for its stdout bytes, failing soft (rc 1 on any error)."""
+    try:
+        proc = subprocess.run(
+            ["git", *args],
+            cwd=root,
+            env=dict(env) if env is not None else None,
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            timeout=timeout,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return 1, b""
+    return proc.returncode, proc.stdout
+
+
+def _squeezed_line(text: str) -> str:
+    return " ".join(text.split())
+
+
+def _cases_digest(root: Path, case_files: list[str]) -> str:
+    """A short hash of the case files' text: figures count only against the same cases."""
+    digest = hashlib.sha256()
+    for rel in sorted(case_files):
+        digest.update(rel.encode() + b"\0")
+        with contextlib.suppress(OSError):
+            digest.update((root / rel).read_bytes())
+    return digest.hexdigest()[:16]
+
+
+def _attempts(root: Path, task: str, check: str = "", cases: str = "") -> list[_Attempt]:
+    """`task`'s kept attempts, oldest first: only those of `check` and of the case
+    files hashed `cases`, when given."""
+    if not _ATTEMPT_TASK.fullmatch(task):
+        return []
+    fmt = "--format=%(refname)%1f%(contents)%1e"
+    rc, out = _git_out(["for-each-ref", fmt, f"{ATTEMPT_REFS}/{task}/"], root)
+    found: list[_Attempt] = []
+    for entry in out.decode(errors="replace").split("\x1e") if rc == 0 else []:
+        ref, _, message = entry.strip().partition("\x1f")
+        fields = dict(_ATTEMPT_TRAILER.findall(message))
+        try:
+            attempt = _Attempt(
+                n=int(ref.rpartition("/")[2]),
+                ref=ref,
+                exit=int(fields["Exit"]),
+                figure=int(fields["Figure"]),
+                total=int(fields.get("Total", "0")),
+                check=fields.get("Check", ""),
+                cases=fields.get("Cases", ""),
+                by=fields.get("By", ""),
+            )
+        except (KeyError, ValueError):
+            continue
+        if check and attempt.check != _squeezed_line(check):
+            continue
+        if cases and attempt.cases != cases:
+            continue
+        found.append(attempt)
+    return sorted(found, key=lambda a: a.n)
+
+
+def _attempt_paths(scope: list[str] | tuple[str, ...], case_files: list[str]) -> list[str]:
+    """The paths an attempt keeps: the task's scope and its case files, each once."""
+    paths: list[str] = []
+    for path in [*scope, *case_files]:
+        if path and not os.path.isabs(path) and path not in paths:
+            paths.append(path)
+    return paths
+
+
+def _record_attempt(
+    root: Path,
+    task: str,
+    scope: list[str] | tuple[str, ...],
+    case_files: list[str],
+    check: str,
+    verdict: tuple[int, str],
+    by: str,
+) -> _Attempt | None:
+    """Keep the tree's `scope` and case files as `task`'s next attempt, with the
+    check's exit and figure as trailers; None when nothing could be kept.
+
+    The commit is built in a scratch index, from HEAD with these paths added, so
+    the work tree and the real index are left as they are: the worker's view of
+    its files does not change, only a ref is added.
+    """
+    paths = _attempt_paths(scope, case_files)
+    if not paths or not check or not _ATTEMPT_TASK.fullmatch(task):
+        return None
+    if _git_out(["rev-parse", "--git-dir"], root)[0] != 0:
+        return None
+    rc, head = _git_out(["rev-parse", "--verify", "-q", "HEAD^{commit}"], root)
+    parent = head.decode().strip() if rc == 0 else ""
+    cases = _marked_cases(root, case_files)
+    figure = _attempt_figure(verdict[0], verdict[1], cases)
+    digest = _cases_digest(root, case_files)
+    with tempfile.TemporaryDirectory(prefix="tau-attempt-") as scratch:
+        env = {**os.environ, **ATTEMPT_IDENTITY, "GIT_INDEX_FILE": str(Path(scratch) / "index")}
+        if parent and _git_out(["read-tree", parent], root, env)[0] != 0:
+            return None
+        for path in paths:
+            # A path neither on disk nor in HEAD has nothing to add; the rest still go.
+            _git_out(["add", "-A", "--", path], root, env, timeout=120.0)
+        rc, tree = _git_out(["write-tree"], root, env)
+        if rc != 0:
+            return None
+        message = (
+            f"tau attempt of {task}: exit {verdict[0]}, figure {figure}\n\n"
+            f"Tau-Attempt-Task: {task}\n"
+            f"Tau-Attempt-Exit: {verdict[0]}\n"
+            f"Tau-Attempt-Figure: {figure}\n"
+            f"Tau-Attempt-Total: {len(cases)}\n"
+            f"Tau-Attempt-Cases: {digest}\n"
+            f"Tau-Attempt-By: {by}\n"
+            f"Tau-Attempt-Check: {_squeezed_line(check)}\n"
+        )
+        argv = ["commit-tree", tree.decode().strip(), *(["-p", parent] if parent else [])]
+        rc, sha = _git_out([*argv, "-m", message], root, env)
+        if rc != 0:
+            return None
+    commit = sha.decode().strip()
+    for _ in range(3):
+        n = max((a.n for a in _attempts(root, task)), default=0) + 1
+        ref = f"{ATTEMPT_REFS}/{task}/{n}"
+        # An empty old value creates the ref only if no one else has.
+        if _git_out(["update-ref", ref, commit, ""], root)[0] == 0:
+            squeezed = _squeezed_line(check)
+            return _Attempt(n, ref, verdict[0], figure, len(cases), squeezed, digest, by)
+    return None
+
+
+def _best_attempt(attempts: list[_Attempt]) -> _Attempt | None:
+    return max(attempts, key=lambda a: a.rank, default=None)
+
+
+def _attempt_said(attempt: _Attempt) -> str:
+    """What `attempt`'s check run reached, as the note says it."""
+    if not attempt.total and attempt.exit == 0:
+        return "passed the check"
+    if not attempt.total:
+        return f"failed the check (exit {attempt.exit})"
+    if attempt.exit == 0:
+        return f"passed all {attempt.total} cases"
+    return f"passed {attempt.figure} of {attempt.total} cases"
+
+
+def _attempt_now(attempt: _Attempt) -> str:
+    """What the tree as it is reaches, after "this tree"."""
+    if not attempt.total:
+        return "passes it" if attempt.exit == 0 else f"fails it (exit {attempt.exit})"
+    if attempt.exit == 0:
+        return f"passes all {attempt.total}"
+    return f"passes {attempt.figure}"
+
+
+def _attempt_note(
+    task: str, latest: _Attempt, attempts: list[_Attempt], scope: list[str] | tuple[str, ...]
+) -> str:
+    """What the model is told when `latest` ranks below the best of `attempts`: the
+    best one's ref and figure, and the git commands that show and take back what
+    changed since; "" when `latest` is the best.
+
+    R131 (q35 cobs): the last worker's rewrite took T0002 from 19 of 21 cases to 4,
+    and the step ended there. The commit and the diff keep what a worse attempt got
+    right, which a whole restore would throw away (R132).
+    """
+    best = _best_attempt(attempts)
+    if best is None or best.n == latest.n or best.rank <= latest.rank:
+        return ""
+    where = " ".join(shlex.quote(path) for path in scope) or "."
+    return (
+        f"{task}: attempt {best.n} (`{best.ref}`) {_attempt_said(best)}; this tree "
+        f"{_attempt_now(latest)}. `git diff {best.ref} -- {where}` shows what changed "
+        "since. Keep what helped and put back what broke; "
+        f"`git checkout {best.ref} -- <path>` puts one file back."
+    )
+
+
+def _restore_attempt(
+    root: Path,
+    best: _Attempt,
+    latest: _Attempt,
+    scope: list[str] | tuple[str, ...],
+    case_files: list[str],
+) -> list[str]:
+    """Put the files in `scope` back as `best` kept them, where `latest` differs, and
+    return the paths put back. The case files are left as `_settle_case_edits`
+    settled them, and the index is not touched: the files are written, not checked
+    out."""
+    paths = [path for path in scope if path and not os.path.isabs(path)]
+    if not paths:
+        return []
+    argv = ["diff", "--name-only", "--no-renames", "--relative", "-z", best.ref, latest.ref]
+    rc, out = _git_out([*argv, "--", *paths], root)
+    if rc != 0:
+        return []
+    pinned = {os.path.normpath(rel) for rel in case_files}
+    restored: list[str] = []
+    for rel in filter(None, out.decode(errors="surrogateescape").split("\0")):
+        if os.path.normpath(rel) in pinned:
+            continue
+        rc, entry = _git_out(["ls-tree", "-z", best.ref, "--", rel], root)
+        if rc != 0:
+            continue
+        target = root / rel
+        meta = entry.decode(errors="surrogateescape").rstrip("\0").partition("\t")[0]
+        try:
+            if not meta:
+                if target.is_file() or target.is_symlink():
+                    target.unlink()
+                    restored.append(rel)
+                continue
+            mode, kind, sha = meta.split()
+            if kind != "blob":
+                continue
+            rc, blob = _git_out(["cat-file", "blob", sha], root)
+            if rc != 0:
+                continue
+            target.parent.mkdir(parents=True, exist_ok=True)
+            if target.is_symlink():
+                target.unlink()
+            if mode == "120000":
+                target.symlink_to(blob.decode(errors="surrogateescape"))
+            else:
+                target.write_bytes(blob)
+                if mode == "100755":
+                    target.chmod(target.stat().st_mode | 0o111)
+            restored.append(rel)
+        except (OSError, ValueError):
+            continue
+    return restored
+
+
+#: The note for the next step's first worker after a step put a task's best
+#: attempt back, by (project root, task); consumed when briefed.
+_RESTORED: dict[tuple[str, str], str] = {}
+
+
+def _below_best_note(
+    root: Path, task: str, scope: list[str] | tuple[str, ...], latest: _Attempt | None
+) -> str:
+    """`_attempt_note` for `latest` among the kept attempts of its check and cases."""
+    if latest is None:
+        return ""
+    return _attempt_note(task, latest, _attempts(root, task, latest.check, latest.cases), scope)
+
+
+def _standing_attempt_note(
+    root: Path, task: str, scope: list[str], case_files: list[str], check: str
+) -> str:
+    """The note for a step's first worker when the task's last kept attempt ranks
+    below its best, or ""."""
+    attempts = _attempts(root, task, check, _cases_digest(root, case_files))
+    note = _attempt_note(task, attempts[-1], attempts, scope) if attempts else ""
+    return f"\n\n{note}" if note else ""
+
+
+async def _keep_best_attempt(
+    root: Path,
+    task: str,
+    scope: list[str],
+    case_files: list[str],
+    check: str,
+    latest: _Attempt,
+    verdict: tuple[int, str],
+    timeout: float,
+) -> tuple[tuple[int, str], str]:
+    """The fallback when a step ends with `task` open on an attempt below its best:
+    the scope's files are put back as the best attempt kept them, the check runs
+    again on them, and the worse tree stays at its ref. The verdict to report (the
+    re-run's while it fails) and a paragraph saying what was done; when nothing
+    could be put back, the paragraph is the attempt note alone.
+
+    R131 (q35 cobs): T0002's last worker took it from 19 of 21 cases to 4, the
+    step returned there, and the round ended on the worse tree. The case files are
+    left as `_settle_case_edits` settled them.
+    """
+    attempts = await asyncio.to_thread(_attempts, root, task, latest.check, latest.cases)
+    best = _best_attempt(attempts)
+    if best is None or best.rank <= latest.rank or attempts[-1].n != latest.n:
+        return verdict, ""
+    put = await asyncio.to_thread(_restore_attempt, root, best, latest, scope, case_files)
+    if not put:
+        return verdict, _attempt_note(task, latest, attempts, scope) + "\n\n"
+    again = await _run_check(check, root, timeout)
+    _note_check_run((str(root), task), check, again)
+    now = await asyncio.to_thread(
+        _record_attempt, root, task, scope, case_files, check, again, "restore"
+    )
+    where = " ".join(shlex.quote(path) for path in scope)
+    files = ", ".join(put[:8]) + (f" and {len(put) - 8} more" if len(put) > 8 else "")
+    if again[0] == 0:
+        on_it = "On those files the check passes (exit 0)"
+    else:
+        on_it = f"On those files the check exits {again[0]}" + (
+            f", passing {now.figure} of {now.total} cases" if now and now.total else ""
+        )
+    diff = f"`git diff {best.ref} {latest.ref} -- {where}`"
+    _RESTORED[(str(root), task)] = (
+        f"\n\nThe files in {task}'s scope were put back as attempt {best.n} "
+        f"(`{best.ref}`) left them: it {_attempt_said(best)}, and the attempt after "
+        f"it {_attempt_said(latest)}. That worse tree is kept at `{latest.ref}`; {diff} "
+        "shows what it changed. Start from the files as they are now, and take from the "
+        "worse attempt only what helped, one file at a time "
+        f"(`git checkout {latest.ref} -- <path>`)."
+    )
+    return (verdict if again[0] == 0 else again), (
+        f"Attempt {latest.n} {_attempt_said(latest)}, below attempt {best.n} "
+        f"(`{best.ref}`), which {_attempt_said(best)}; so {task}'s files are put back as "
+        f"attempt {best.n} left them: {files}. {on_it}. Attempt {latest.n}'s tree is "
+        f"kept at `{latest.ref}`, and {diff} shows what it changed; the next sub-agent "
+        "is told both.\n\n"
+    )
+
+
+#: Options that run fewer cases than the check, or stop at the first failure: a
+#: worker's run with one counts less than the check would, so it is no attempt.
+_NARROWING_OPTIONS = (
+    *("-x", "--exitfirst", "--lf", "--last-failed", "--sw", "--stepwise", "--maxfail"),
+    *("-k", "--deselect", "--ignore", "-t", "--testNamePattern", "--bail"),
+    *("--onlyFailures", "--skip", "--exact", "--filter", "-run"),
+)
+#: A worker's run of its check whose exit or output may not be the check's (piped
+#: to `tail`, after `;`) is run again as the host runs it, when the worker's run
+#: took no longer than this many seconds; the re-run gets twice that.
+WORKER_CHECK_RERUN_SECONDS = 120.0
+
+
+def _narrows(arg: str) -> bool:
+    """Whether a command-line option is one of `_NARROWING_OPTIONS` (`-xq` and
+    `-kzero` included)."""
+    short = arg[1:] if arg.startswith("-") and not arg.startswith("--") else ""
+    if short.isalpha() and ("x" in short or short[:1] in ("k", "t")):
+        return True
+    return any(arg == option or arg.startswith(option + "=") for option in _NARROWING_OPTIONS)
+
+
+def _program_base(word: str) -> str:
+    """A program's name without its directory and version: `.venv/bin/python3` is `python`."""
+    return re.sub(r"[\d.]+$", "", Path(word).name)
+
+
+def _runs_whole_check(argv: list[str], check: list[str]) -> bool:
+    """Whether one simple command runs all of `check`: the same program, the check's
+    words in order, and nothing more but options that do not narrow the run."""
+    argv = _past_runner(_unwrapped(argv))
+    if not argv or not check or _program_base(argv[0]) != _program_base(check[0]):
+        return False
+
+    def word(arg: str) -> str:
+        return arg if arg.startswith("-") else os.path.normpath(arg)
+
+    wanted = [word(arg) for arg in check[1:]]
+    at = 0
+    for arg in argv[1:]:
+        if at < len(wanted) and word(arg) == wanted[at]:
+            at += 1
+        elif not arg.startswith("-") or _narrows(arg):
+            return False
+    return at == len(wanted)
+
+
+def _command_segments(command: str) -> list[tuple[list[str], str]] | None:
+    """A bash command's simple commands, redirections dropped, each with the
+    operator after it ("" for the last); None when it will not parse."""
+    tokens = _shell_tokens(command)
+    if tokens is None:
+        return None
+    segments: list[tuple[list[str], str]] = []
+    current: list[str] = []
+    skip = False
+    for token in tokens:
+        if skip:
+            skip = False
+        elif _is_operator(token) and ("<" in token or ">" in token):
+            if current and current[-1].isdigit():
+                current.pop()  # the fd of `2>&1`
+            skip = True  # and its target
+        elif _is_operator(token):
+            segments.append((current, token))
+            current = []
+        else:
+            current.append(token)
+    segments.append((current, ""))
+    while len(segments) > 1 and not segments[-1][0]:
+        segments.pop()
+        segments[-1] = (segments[-1][0], "")
+    return segments
+
+
+def _check_run_kind(command: str, check: str) -> str | None:
+    """How a worker's bash `command` runs its task's `check`: "exit" when it runs the
+    whole check and the command's exit is the check's (nothing after it but `&&`),
+    "rerun" when it runs the whole check but its exit or output may not be the
+    check's (`| tail`, `|| true`, `; echo`), None when it does not run the whole
+    check (`-x`, `-k`, one test, another path)."""
+    try:
+        wanted = _past_runner(_unwrapped(shlex.split(check)))
+    except ValueError:
+        return None
+    if wanted and Path(wanted[0]).name in _SHELLS and "-c" in wanted[1:]:
+        script_at = wanted.index("-c") + 1
+        script = wanted[script_at] if script_at < len(wanted) else ""
+        said = _squeezed_line(command)
+        return "exit" if said in (_squeezed_line(script), _squeezed_line(check)) else None
+    segments = _command_segments(command)
+    for at, (argv, _op) in enumerate(segments or []):
+        if not _runs_whole_check(argv, wanted):
+            continue
+        after = [op for _, op in segments[at:]] if segments else []
+        return "exit" if all(op in ("&&", "") for op in after) else "rerun"
+    return None
+
+
+def make_attempt_keeper() -> Any:
+    """Build the worker's `tool_result` hook that keeps each run of its task's check
+    as an attempt, and tells it when its tree ranks below the task's best.
+
+    R131 (q35 cobs): W3 ran T0002's check at 19 of 21 cases, rewrote encode(), and
+    ran it at 4 of 21, and nothing said what the earlier run had passed. A run whose
+    exit or output may not be the check's is run again as the host runs it; a run
+    narrowed to fewer cases keeps nothing. Text is added to the tool's result only.
+    """
+
+    async def keep(event: Any, context: ExtensionContext) -> ToolResultHookResult | None:
+        try:
+            if event.tool_name != "bash":
+                return None
+            sent = _worker_scope()
+            goal = _find_goal(Path(context.cwd))
+            if sent is None or goal is None or not _ATTEMPT_TASK.fullmatch(sent[0]):
+                return None
+            task, scope = sent
+            check = _task_check(goal, task)
+            kind = _check_run_kind(str(event.arguments.get("command") or ""), check)
+            if not check or kind is None:
+                return None
+            root = goal.parent.parent
+            details = event.result.details or {}
+            rc = details.get("exit_code")
+            if details.get("timed_out") or details.get("cancelled"):
+                return None
+            if kind == "exit" and isinstance(rc, int):
+                verdict = (rc, event.result.text)
+            else:
+                seconds = details.get("duration_seconds")
+                if not isinstance(seconds, int | float) or seconds > WORKER_CHECK_RERUN_SECONDS:
+                    return None
+                verdict = await _run_check(check, root, 2 * WORKER_CHECK_RERUN_SECONDS)
+            cases = _strings(_task_record(goal, task).get("cases"))
+            kept = await asyncio.to_thread(
+                _record_attempt, root, task, scope, cases, check, verdict, "worker"
+            )
+            note = await asyncio.to_thread(_below_best_note, root, task, scope, kept)
+            if not note:
+                return None
+            return ToolResultHookResult(content=f"{event.result.text}\n\n{note}")
+        except Exception:  # noqa: BLE001 - fail open; a note must not break the tool
+            return None
+
+    return keep
+
+
 async def _write_cases(
     task: str,
     title: str,
@@ -13336,6 +13901,13 @@ def make_step_tool() -> Any:
         self_import = _self_import_note(check, scope, root) if check else ""
         retry_note = self_import + retry_note
         missing_data = _missing_data(check, scope, root) if check else []
+        case_files = _strings(record.get("cases")) if isinstance(record, dict) else []
+        host_attempt: _Attempt | None = None
+        if status == "open" and check:
+            # R131: a step that ended below its best tree; its first worker hears of it.
+            retry_note += _RESTORED.pop(unproven_key, "") or await asyncio.to_thread(
+                _standing_attempt_note, root, task, scope, case_files, check
+            )
         if unproven_key in _UNPROVEN:
             # Run R23: the breaker quotes only a result's first line; the call goes there.
             call = _unproven_call(task, check, scope, root, missing_data, nodes)
@@ -13536,6 +14108,9 @@ def make_step_tool() -> Any:
                 break
             verdict = await _run_check(check, root, check_timeout)
             _note_check_run(unproven_key, check, verdict)
+            host_attempt = await asyncio.to_thread(
+                _record_attempt, root, task, scope, case_files, check, verdict, "host"
+            )
             # q35 R53: W4 was killed at its second cut-off and wrote no report, and
             # W5's brief said "An earlier attempt reported back".
             ended = (
@@ -13602,6 +14177,10 @@ def make_step_tool() -> Any:
             if no_tests is not None:
                 retry_note = f"\n\n{no_tests}" + retry_note
             retry_note += _fix_the_work(verdict[0], verdict[1], check)
+            below_best = await asyncio.to_thread(_below_best_note, root, task, scope, host_attempt)
+            if below_best:
+                # R131: W4 rewrote T0002 from 19 of 21 cases to 4; W5 heard only exit 1.
+                retry_note += "\n\n" + below_best
             if missing:
                 retry_note += "\n\n" + missing.rstrip()
             # q35 R58: W2's cut-off kill note was briefed as its notes. A cut-off
@@ -13622,6 +14201,11 @@ def make_step_tool() -> Any:
         if budget_spent:
             attempt -= 1
         if check and verdict[0] != 0:
+            kept_best = ""
+            if host_attempt is not None:
+                verdict, kept_best = await _keep_best_attempt(
+                    root, task, scope, case_files, check, host_attempt, verdict, check_timeout
+                )
             state = "stays blocked" if retrying else "stays open"
             fix_check = (
                 "pass a corrected done_when with notes saying what this route does "
@@ -13707,6 +14291,7 @@ def make_step_tool() -> Any:
                 + f"{route}{task} — {title}: the check still fails after {attempt} "
                 f"sub-agent run(s), so the task {state}.\n\n`{check}` exit {verdict[0]}:\n"
                 f"{verdict[1][-CHECK_TAIL_CHARS:]}\n\n"
+                + kept_best
                 + ("" if collection else _implementation_in_tests_lead(root, scope, check))
                 + _unreported_runs(unreported, attempt)
                 + f"Last report:\n{shown}\n\n"
@@ -17717,6 +18302,7 @@ def setup(tau: ExtensionAPI) -> None:
     tau.on("tool_call", make_bash_hooks())
     if _is_worker():
         tau.on("tool_call", make_worker_scope_guard())
+        tau.on("tool_result", make_attempt_keeper())
     else:
         tau.on("tool_call", make_scope_guard())
         tau.on("tool_result", make_stopped_worker_note())
