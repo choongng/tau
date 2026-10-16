@@ -143,7 +143,7 @@ import tempfile
 import time
 import tomllib
 import uuid
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -1751,6 +1751,8 @@ class _WorkerRun:
     killed_at: str | None = None
     #: The command of the tool call its last assistant message made, if any.
     pending_command: str = ""
+    #: The paths outside its scope it was refused, for the driver's next call.
+    refused_writes: tuple[str, ...] = ()
 
     @property
     def unreported(self) -> bool:
@@ -1881,6 +1883,8 @@ NO_CALL_CUT = (
 _THINKING_OFF_NEXT: dict[str, str] = {}
 #: How tau words the tool result of a call an extension blocked.
 _BLOCKED = "Tool call blocked: "
+#: The scope guard's refusal of a write outside the task's scope, up to the path.
+_OUTSIDE_SCOPE = re.compile(r"Tool call blocked: refusing to write (\S.*?): it is outside ")
 #: The countdown sentence tau appends to each refusal's problem.
 _REFUSAL_COUNTDOWN = re.compile(r"\s*\d+ more refused calls? in a row stop the run\.\s*$")
 
@@ -1917,6 +1921,8 @@ class _WorkerEvents:
     refusal: str | None = None
     #: Whether tau's breaker stopped the run after refused calls in a row.
     stopped: bool = False
+    #: The project paths the scope guard refused to write, in the order first refused.
+    refused_writes: list[str] = field(default_factory=list)
     #: How many assistant turns in a row, up to the last, ended at the output-token
     #: limit. Audit 7: a count over the whole run blamed the limit for a wall a
     #: worker hit long after its last cut-off turn. Run R27: a turn whose call was
@@ -2042,6 +2048,9 @@ class _WorkerEvents:
         else:
             return
         text = text.strip()
+        outside = _OUTSIDE_SCOPE.match(text)
+        if outside is not None and outside.group(1) not in self.refused_writes:
+            self.refused_writes.append(outside.group(1))
         if text.removeprefix(_BLOCKED).startswith(CUT_OFF_REFUSAL):
             if self._turn_cut:
                 self.cut_fills[-1:] = [CUT_CALL]
@@ -2422,6 +2431,7 @@ async def _run_worker(
                 transcript=transcript,
                 stop_reason="length",
                 last_words=events.report,
+                refused_writes=tuple(events.refused_writes),
             )
         if signal is not None and signal.is_cancelled():
             problem = "cancelled; the worker was killed and its partial work is in the tree."
@@ -2448,6 +2458,7 @@ async def _run_worker(
             problem=problem,
             transcript=transcript,
             said_last=events.last_said() if walled else ("", ""),
+            refused_writes=tuple(events.refused_writes),
         )
 
     stderr = talk.result()
@@ -2472,6 +2483,7 @@ async def _run_worker(
         last_words=events.report,
         killed_at=limit if note else None,
         pending_command=events.pending_command,
+        refused_writes=tuple(events.refused_writes),
     )
 
 
@@ -13185,6 +13197,7 @@ def make_step_tool() -> Any:
         _KILLED_PROGRESS.pop(progress_key, None)
         unreported: list[tuple[int, _WorkerRun, list[str]]] = []
         reported: tuple[int, str] | None = None
+        refused_out: list[str] = []
         # Run R39: one step is bounded by one budget, not a full timeout per attempt.
         step_budget = timeout * STEP_BUDGET_FACTOR
         budget_spent = ""
@@ -13224,6 +13237,8 @@ def make_step_tool() -> Any:
             )
             resume = ""
             worker_ran = True
+            refused_out += [rel for rel in run.refused_writes if rel not in refused_out]
+            widen = _refused_writes_note(task, refused_out, scope)
             if run.spent is not None:
                 spent = (spent or 0) + run.spent
             if run.problem is not None:
@@ -13236,6 +13251,7 @@ def make_step_tool() -> Any:
                     + _killed_attempt_context(
                         run, shown, verdict, check, root, scope, ended == "reported back"
                     )
+                    + (f"{widen}\n\n" if widen else "")
                     + f'Call pursuit_step with task="{task}" to send it again.',
                 )
             if run.unreported:
@@ -13260,6 +13276,8 @@ def make_step_tool() -> Any:
             settled = _settle_case_edits(task, report, root)
             if settled:
                 shown = f"{shown}\n\n{settled}"
+            if widen:
+                shown = f"{shown}\n\n{widen}"
             if not check:
                 verdict = (0, "")
                 break
@@ -14482,6 +14500,44 @@ def _scratch_like(rel: Path) -> bool:
     return bool(_SCRATCH_WORDS & set(re.split(r"[^a-z0-9]+", rel.stem.lower())))
 
 
+#: Words in a refused file's name that say it is the worker's report, written to disk.
+_REPORT_WORDS = frozenset({"report", "analysis", "summary", "findings"})
+
+
+def _report_like(rel: Path) -> bool:
+    """Whether a refused path is a report written as a file (docs/report.md, REPORT.md).
+
+    R104-R131: about 15% of the out-of-scope writes refused were report files;
+    the worker's report is its final message, which the driver reads.
+    """
+    if rel.suffix.lower() not in {".md", ".txt", ".rst", ""}:
+        return False
+    return bool(_REPORT_WORDS & set(re.split(r"[^a-z0-9]+", rel.stem.lower())))
+
+
+def _refused_writes_note(task: str, refused: Iterable[str], scope: list[str]) -> str:
+    """For the driver: the paths a worker on `task` was refused outside its scope,
+    and the call that widens the scope to them; "" when none is work.
+
+    R104-R131: 44 refused out-of-scope writes ended with the worker reporting the
+    path, or not, and nothing carried the path to the driver's next call.
+    """
+    paths = [
+        rel
+        for rel in dict.fromkeys(refused)
+        if not _scratch_like(Path(rel)) and not _report_like(Path(rel))
+    ]
+    if not paths:
+        return ""
+    widened = list(dict.fromkeys([*scope, *paths]))
+    return (
+        f"The sub-agent was refused writes outside {task}'s scope: {', '.join(paths)}. "
+        f"If {task}'s work needs them, widen its scope on the next call: pursuit_step "
+        f'task="{task}", scope={json.dumps(widened)}. If another task owns them, leave '
+        "them to it."
+    )
+
+
 def _task_record(goal: Path, task: str) -> dict[str, Any]:
     """The task's record in the pursuit's tree, or {}."""
     try:
@@ -14958,12 +15014,11 @@ def make_worker_scope_guard() -> Any:
         rel = target.relative_to(root) if target != root else target
         if in_store:
             return ToolCallHookResult(block=True, reason=_store_write_refusal(rel, root, log))
+        # Run R09: refused src/, W4 wrote the library to tests/itc/ instead. Said of
+        # any refused path now, in any language: the move is the same mistake.
         source = (
-            # Run R09: refused src/, W4 wrote the library to tests/itc/ instead.
-            " The implementation does not go under tests/ either: it is a later "
-            "task's work, so report it instead."
-            if rel.suffix == ".py" and not _is_test_path(rel.as_posix())
-            else ""
+            f" Do not write it to another path in the scope instead: {rel} is a later "
+            "task's work, so report it."
         )
         scopes = ", ".join(scope)
         refusals[rel] = refusals.get(rel, 0) + 1
@@ -14976,6 +15031,15 @@ def make_worker_scope_guard() -> Any:
             if times > 1
             else ""
         )
+        if _report_like(rel):
+            # R104-R131: about 15% of these refusals were report files.
+            return ToolCallHookResult(
+                block=True,
+                reason=(
+                    f"refusing to write {rel}: it is outside {task}'s scope ({scopes}). "
+                    "Your report is your final message, not a file: end the turn with it."
+                ),
+            )
         if _scratch_like(rel):
             if again:
                 return ToolCallHookResult(

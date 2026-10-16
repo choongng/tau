@@ -1498,6 +1498,10 @@ if tamper:
 mends = os.environ.get("FAKE_TAU_RESUMED_MENDS")
 if mends and "--session" in sys.argv:  # a resumed worker clears what refused its cases
     Path(mends).unlink(missing_ok=True)
+for rel in json.loads(os.environ.get("FAKE_TAU_REFUSED_WRITES") or "[]"):  # the scope guard's
+    refused = f"Tool call blocked: refusing to write {rel}: it is outside T0002's scope (x)."
+    result = {"role": "toolResult", "content": [{"type": "text", "text": refused}]}
+    print(json.dumps({"type": "message_end", "message": result}), flush=True)
 reports = json.loads(os.environ.get("FAKE_TAU_REPORTS") or "[]")  # one per run, in order
 message = {
     "role": "assistant",
@@ -8656,7 +8660,7 @@ async def test_worker_of_a_known_answers_task_is_refused_a_write_to_source(
         result = await _tool_with_hooks(runtime, tool).execute("c1", arguments)
 
         assert "refusing to write itc/itc.py: it is outside T0003's scope" in result.text
-        assert "The implementation does not go under tests/ either" in result.text
+        assert "Do not write it to another path in the scope instead" in result.text
 
     data = {"path": "tests/cases.json", "content": "[]"}
     assert (await _tool_with_hooks(runtime, "write").execute("c2", data)).text == "ran"
@@ -9373,6 +9377,57 @@ def _cut_off_events() -> tuple[bytes, bytes, bytes]:
     cut = end({"role": "toolResult", "content": [{"type": "text", "text": refused}]})
     ran = end({"role": "toolResult", "content": [{"type": "text", "text": "ok"}]})
     return call, cut, ran
+
+
+def test_worker_events_keep_the_paths_refused_outside_the_scope() -> None:
+    def refused(text: str) -> bytes:
+        result = {"role": "toolResult", "content": [{"type": "text", "text": text}]}
+        return json.dumps({"type": "message_end", "message": result}).encode()
+
+    events = _module()._WorkerEvents()
+    for rel in ("cmd/main.go", "go.mod", "cmd/main.go"):
+        events.feed(refused(f"Tool call blocked: refusing to write {rel}: it is outside T0004's"))
+    events.feed(refused("Tool call blocked: refusing to write .git/beagle/x: beagle's store"))
+
+    assert events.refused_writes == ["cmd/main.go", "go.mod"]
+
+
+def test_refused_writes_note_offers_the_widened_scope_and_skips_reports() -> None:
+    note = _module()._refused_writes_note(
+        "T0004", ["cmd/main.go", "REPORT.md", "scratch.log", "go.mod"], ["cmd/main_test.go"]
+    )
+
+    assert note == (
+        "The sub-agent was refused writes outside T0004's scope: cmd/main.go, go.mod. If "
+        "T0004's work needs them, widen its scope on the next call: pursuit_step "
+        'task="T0004", scope=["cmd/main_test.go", "cmd/main.go", "go.mod"]. If another '
+        "task owns them, leave them to it."
+    )
+    assert _module()._refused_writes_note("T0004", ["docs/report.md"], []) == ""
+
+
+@pytest.mark.anyio
+async def test_step_result_names_the_writes_refused_outside_the_scope(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # R104-R131: 44 refused out-of-scope writes, and no path reached the driver.
+    monkeypatch.chdir(_pursuit_project(tmp_path))
+    monkeypatch.setenv("FAKE_TAU_SUCCEEDS_ON", "99")
+    monkeypatch.setenv("FAKE_TAU_REFUSED_WRITES", json.dumps(["lib/core.rs"]))
+    _open_task_in_scope(fake_beagle, ["done.txt"], "grep -q done done.txt")
+    runtime, _ = _bound(tmp_path)
+
+    result = await _tool(runtime, "pursuit_step").execute("c1", {"task": "T0002", "attempts": 1})
+
+    assert (
+        "The sub-agent was refused writes outside T0002's scope: lib/core.rs. If T0002's "
+        'work needs them, widen its scope on the next call: pursuit_step task="T0002", '
+        'scope=["done.txt", "lib/core.rs"].'
+    ) in result.text
 
 
 def test_worker_events_counts_truncated_refusal_as_length_stop() -> None:
@@ -11814,19 +11869,28 @@ async def test_prove_refused_step_names_implementation_written_under_tests(
 
 
 @pytest.mark.anyio
-async def test_worker_scope_refusal_of_source_says_not_under_tests_either(
+async def test_worker_scope_refusal_says_not_to_move_the_file_into_scope(
     tmp_path: Path, beagle: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    # R09's "not under tests/ either" held for .py only; the move is the same
+    # mistake in any language (owner, 2026-10-15).
     runtime = _scoped_worker(tmp_path, monkeypatch, scope="tests/")
     write = _tool_with_hooks(runtime, "write")
 
     source = await write.execute("c1", {"path": "src/x.py", "content": "class X: ...\n"})
-    doc = await write.execute("c2", {"path": "docs/x.md", "content": "x\n"})
+    go = await write.execute("c2", {"path": "pkg/x.go", "content": "package pkg\n"})
+    report = await write.execute("c3", {"path": "docs/REPORT.md", "content": "x\n"})
 
-    either = "The implementation does not go under tests/ either: it is a later task's work"
     assert "refusing to write src/x.py: it is outside T0003's scope (tests/)" in source.text
-    assert either in source.text
-    assert "refusing to write docs/x.md" in doc.text and either not in doc.text
+    assert source.text.endswith(
+        "Do not write it to another path in the scope instead: src/x.py is a later "
+        "task's work, so report it."
+    )
+    assert "pkg/x.go is a later task's work" in go.text
+    assert "tests/" not in go.text.split("(tests/)", 1)[1]
+    assert report.text.endswith(
+        "Your report is your final message, not a file: end the turn with it."
+    )
 
 
 @pytest.mark.anyio
@@ -11872,7 +11936,7 @@ async def test_scope_refusal_of_a_path_refused_before_counts_and_sends_to_report
         "again, 2 times now. No write outside the scope will be taken: write only under "
         "tests/, or end the turn now with your report naming itc/core.py as needed."
     ) in second.text
-    assert "The implementation does not go under tests/ either" in second.text
+    assert "Do not write it to another path in the scope instead" in second.text
     assert "is lost when the step ends" not in second.text
     assert "refused again, 3 times now" in third.text
     assert not (tmp_path / "itc" / "core.py").exists()
@@ -11897,8 +11961,8 @@ async def test_scope_refusal_first_time_is_unchanged(
     assert code.text.endswith(
         "refusing to write itc/core.py: it is outside T0003's scope (tests/). Work written "
         "outside T0003's scope is not its work and is lost when the step ends: do what the "
-        "scope holds, and report that itc/core.py is needed. The implementation does not go "
-        "under tests/ either: it is a later task's work, so report it instead."
+        "scope holds, and report that itc/core.py is needed. Do not write it to another path "
+        "in the scope instead: itc/core.py is a later task's work, so report it."
     )
     assert log.text.endswith(
         "refusing to write run.log: it is outside T0003's scope (tests/); name it in your "
@@ -12312,10 +12376,10 @@ async def test_scratch_script_refusal_does_not_mention_the_implementation(
 
         assert f"refusing to write {name}: it is outside T0003's scope" in result.text
         assert "Scratch files go in /tmp." in result.text
-        assert "implementation" not in result.text and "tests/ either" not in result.text
+        assert "another path in the scope" not in result.text
 
     code = await write.execute("c2", {"path": "itc/core.py", "content": "class Stamp: ...\n"})
-    assert "The implementation does not go under tests/ either" in code.text
+    assert "Do not write it to another path in the scope instead" in code.text
 
 
 @pytest.mark.anyio
