@@ -859,6 +859,11 @@ system prompts, foreground and background modes, agent types defined in
 also the reference for the `[tool.tau]` manifest shape above (a `src/` layout
 package that feature-detects newer API seams).
 
+[choongng/beagle](https://github.com/choongng/beagle) ships a tau extension
+that drives its pursuit loop, in `plugins/beagle-pursuit/hosts/tau/`, tested
+there against the tau release it pins. Link its `beagle.py` into
+`~/.tau/extensions/` to use it.
+
 ```bash
 git clone git@github.com:rian-dolphin/tau-subagents.git
 tau -e ./tau-subagents

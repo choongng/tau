@@ -68,6 +68,3 @@ ignore_missing_imports = true
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-ra"
-markers = [
-    "real_beagle: runs the beagle extension against the real, pinned beagle CLI",
-]
