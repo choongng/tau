@@ -20909,3 +20909,202 @@ def test_cited_text_holds_the_sentence_a_cited_line_ends(tmp_path: Path) -> None
     )
     text = module._squeezed(module._cited_text("wf:5#abc", tmp_path))
     assert text == "the one-byte form never holds 63: 63 is written as 0x40 0x3f."
+
+
+# --------------------------------------------------------------------------- #
+# attempts: each check run kept as a ref, ranked by its figure (ask 12)
+# --------------------------------------------------------------------------- #
+
+ATTEMPT_CASES = (
+    "import pytest\n\n"
+    "# beagle-case: single-zero cite=spec:1#abc kind=example op=encode\n"
+    "def test_single_zero():\n    assert True\n\n"
+    "# beagle-case: two-zeros cite=spec:2#abc kind=example op=encode\n"
+    "def test_two_zeros():\n    assert True\n\n"
+    "# beagle-case: window-limit cite=spec:3#abc kind=limit op=encode\n"
+    "def test_window_limit():\n    assert True\n"
+)
+
+
+def test_marked_cases_name_the_test_each_marker_heads(tmp_path: Path) -> None:
+    module = _module()
+    (tmp_path / "t.py").write_text(ATTEMPT_CASES)
+    (tmp_path / "t.rs").write_text(
+        "// beagle-case: zero-one-byte cite=s:1#a\n#[test]\nfn encodes_zero() {}\n"
+    )
+    (tmp_path / "t.test.js").write_text(
+        "// beagle-case: empty-input cite=s:1#a\ntest('encodes empty input', () => {});\n"
+    )
+    found = module._marked_cases(tmp_path, ["t.py", "t.rs", "t.test.js", "missing.py"])
+    assert found == [
+        ("single-zero", "test_single_zero"),
+        ("two-zeros", "test_two_zeros"),
+        ("window-limit", "test_window_limit"),
+        ("zero-one-byte", "encodes_zero"),
+        ("empty-input", "encodes empty input"),
+    ]
+
+
+def test_attempt_figure_counts_the_cases_a_runner_does_not_name_failing() -> None:
+    # R131 (q35 cobs): the check failed at 19/21 and at 4/21; the exit code was 1
+    # both times, and only the failing names told the trees apart.
+    figure = _module()._attempt_figure
+    cases = [
+        ("single-zero", "test_single_zero"),
+        ("two-zeros", "test_two_zeros"),
+        ("window-limit", "test_window_limit"),
+    ]
+    pytest_out = (
+        "..F\n=== short test summary info ===\n"
+        "FAILED tests/test_encode.py::test_window_limit - AssertionError: b'\\x01'\n"
+        "1 failed, 2 passed in 0.02s\n"
+    )
+    assert figure(1, pytest_out, cases) == 2
+    # The marker's id names the case as well as its test's name.
+    assert figure(1, "ERROR tests/t.py - window-limit raised\n", cases) == 2
+    cargo_out = (
+        "running 3 tests\ntest tests::single_zero ... ok\n"
+        "test tests::two_zeros ... FAILED\ntest tests::window_limit ... FAILED\n"
+        "thread 'tests::two_zeros' panicked at src/lib.rs:9:5\n"
+    )
+    assert figure(101, cargo_out, cases) == 1
+    jest = [("empty-input", "encodes empty input"), ("one-zero", "encodes one zero")]
+    jest_out = "  \u2713 encodes empty input (2 ms)\n  \u2715 encodes one zero (1 ms)\n"
+    assert figure(1, jest_out, jest) == 1
+    tap = [("a", "encodes a"), ("b", "encodes b"), ("c", "encodes c")]
+    tap_out = "ok 1 - encodes a\nnot ok 2 - encodes b\nnot ok 3 - encodes c\n"
+    assert figure(1, tap_out, tap) == 1
+    # A passing case's name on an "ok" line is not a failure.
+    assert figure(1, "test tests::single_zero ... ok\nerror: 1 failed\n", cases) == 0
+    # A failing run that names none of the cases says nothing of which ran.
+    assert figure(2, "ImportError: No module named 'cobs'\n", cases) == 0
+    # A passing run reaches every case; a task with no cases counts one.
+    assert figure(0, "", cases) == 3
+    assert figure(0, "", []) == 1
+    assert figure(1, "FAILED x\n", []) == 0
+    # One id inside another's name is not a match.
+    assert figure(1, "FAILED t.py::test_not_two_zeros\n", [("two-zeros", "")]) == 0
+
+
+def _committed_project(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    project = _git_project(tmp_path, monkeypatch)
+    (project / "cobs").mkdir()
+    (project / "cobs" / "__init__.py").write_text("def encode(data):\n    return data\n")
+    (project / "tests").mkdir()
+    (project / "tests" / "test_encode.py").write_text(ATTEMPT_CASES)
+    (project / "README").write_text("cobs\n")
+    _git(project, "add", "-A")
+    _git(project, "commit", "-q", "-m", "start")
+    return project
+
+
+def test_record_attempt_keeps_the_scope_and_leaves_index_and_work_tree_alone(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = _module()
+    project = _committed_project(tmp_path, monkeypatch)
+    (project / "README").write_text("staged, out of scope\n")
+    _git(project, "add", "README")
+    (project / "cobs" / "__init__.py").write_text("def encode(data):\n    return b'x'\n")
+    (project / "cobs" / "util.py").write_text("ONE = 1\n")  # untracked, in scope
+    status = _git(project, "status", "--porcelain")
+    staged = _git(project, "diff", "--cached")
+    unstaged = _git(project, "diff")
+    head = _git(project, "rev-parse", "HEAD")
+    out = "FAILED tests/test_encode.py::test_window_limit - assert\n"
+
+    attempt = module._record_attempt(
+        project,
+        "T0002",
+        ["cobs/", "pyproject.toml"],
+        ["tests/test_encode.py"],
+        "python3 -m pytest -q   tests/test_encode.py",
+        (1, out),
+        "host",
+    )
+
+    assert attempt is not None
+    assert (attempt.n, attempt.ref) == (1, "refs/tau/attempts/T0002/1")
+    assert (attempt.exit, attempt.figure, attempt.total) == (1, 2, 3)
+    assert _git(project, "status", "--porcelain") == status
+    assert _git(project, "diff", "--cached") == staged
+    assert _git(project, "diff") == unstaged
+    assert _git(project, "rev-parse", "HEAD") == head
+    ref = attempt.ref
+    assert _git(project, "show", f"{ref}:cobs/util.py") == "ONE = 1\n"
+    assert "b'x'" in _git(project, "show", f"{ref}:cobs/__init__.py")
+    assert _git(project, "show", f"{ref}:README") == "cobs\n"  # HEAD's, not the index's
+    assert _git(project, "rev-parse", f"{ref}^") == head
+    message = _git(project, "log", "-1", "--format=%B", ref)
+    assert "Tau-Attempt-Exit: 1" in message and "Tau-Attempt-Figure: 2" in message
+    assert "Tau-Attempt-Check: python3 -m pytest -q tests/test_encode.py" in message
+    [kept] = module._attempts(project, "T0002", "python3 -m pytest -q tests/test_encode.py")
+    assert kept == attempt
+    assert module._attempts(project, "T0002", "python3 -m pytest -q") == []
+    again = module._record_attempt(
+        project, "T0002", ["cobs/"], ["tests/test_encode.py"], "pytest", (0, ""), "worker"
+    )
+    assert again is not None and again.n == 2 and again.figure == 3
+    # Not a git project, a task id no ref can hold, or nothing to keep: no attempt.
+    assert module._record_attempt(tmp_path, "T0002", ["x"], [], "c", (1, ""), "host") is None
+    assert module._record_attempt(project, "a b", ["cobs/"], [], "c", (1, ""), "host") is None
+    assert module._record_attempt(project, "T0002", [], [], "c", (1, ""), "host") is None
+
+
+def test_attempts_rank_a_pass_first_then_the_figure_then_the_latest() -> None:
+    module = _module()
+
+    def attempt(n: int, exit: int, figure: int, total: int = 21) -> Any:
+        return module._Attempt(n, f"refs/tau/attempts/T0002/{n}", exit, figure, total)
+
+    best = module._best_attempt
+    assert best([attempt(1, 1, 19), attempt(2, 1, 4)]).n == 1
+    assert best([attempt(1, 1, 19), attempt(2, 0, 21)]).n == 2
+    assert best([attempt(1, 0, 21), attempt(2, 1, 20)]).n == 1
+    assert best([attempt(1, 1, 4), attempt(2, 1, 4)]).n == 2
+    assert best([]) is None
+
+    worse = attempt(5, 1, 4)
+    note = module._attempt_note("T0002", worse, [attempt(3, 1, 19), worse], ["cobs/", "a b.py"])
+    assert note == (
+        "T0002: attempt 3 (`refs/tau/attempts/T0002/3`) passed 19 of 21 cases; this tree "
+        "passes 4. `git diff refs/tau/attempts/T0002/3 -- cobs/ 'a b.py'` shows what "
+        "changed since. Keep what helped and put back what broke; "
+        "`git checkout refs/tau/attempts/T0002/3 -- <path>` puts one file back."
+    )
+    tied = attempt(6, 1, 19)
+    assert module._attempt_note("T0002", tied, [attempt(3, 1, 19), tied], ["cobs/"]) == ""
+    passed, failed = attempt(1, 0, 1, 0), attempt(2, 1, 0, 0)
+    note = module._attempt_note("T0002", failed, [passed, failed], ["cobs/"])
+    assert "attempt 1 (`refs/tau/attempts/T0002/1`) passed the check; " in note
+    assert "this tree fails it (exit 1)." in note
+
+
+def test_restore_attempt_puts_back_the_scope_but_not_the_cases(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = _module()
+    project = _committed_project(tmp_path, monkeypatch)
+    scope, cases = ["cobs/", "tests/test_encode.py"], ["tests/test_encode.py"]
+    init = project / "cobs" / "__init__.py"
+    init.write_text("def encode(data):\n    return b'good'\n")
+    (project / "cobs" / "tool.sh").write_text("#!/bin/sh\n")
+    (project / "cobs" / "tool.sh").chmod(0o755)
+    good = module._record_attempt(project, "T0002", scope, cases, "pytest", (1, ""), "host")
+    init.write_text("def encode(data):\n    return b'bad'\n")
+    (project / "cobs" / "tool.sh").unlink()
+    (project / "cobs" / "junk.py").write_text("JUNK = 1\n")
+    (project / "tests" / "test_encode.py").write_text(ATTEMPT_CASES + "# settled\n")
+    (project / "README").write_text("out of scope\n")
+    bad = module._record_attempt(project, "T0002", scope, cases, "pytest", (1, ""), "host")
+    staged = _git(project, "diff", "--cached")
+
+    restored = module._restore_attempt(project, good, bad, scope, cases)
+
+    assert sorted(restored) == ["cobs/__init__.py", "cobs/junk.py", "cobs/tool.sh"]
+    assert "b'good'" in init.read_text()
+    assert not (project / "cobs" / "junk.py").exists()
+    assert os.access(project / "cobs" / "tool.sh", os.X_OK)
+    assert (project / "tests" / "test_encode.py").read_text().endswith("# settled\n")
+    assert (project / "README").read_text() == "out of scope\n"
+    assert _git(project, "diff", "--cached") == staged
