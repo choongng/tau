@@ -15,8 +15,7 @@ Round i (from 0) runs model `M[i % 3]` on task `W[i % 4]`, so each 12 rounds cov
   - `g26` = gemma4-26b-a4b-qat-q4;
   - `lfm24` = lfm2.5-24b-a2b-qad-q4.
 - **Tasks:** wrenfold (spec), semver (bare goal), itc, cobs.
-- **Bars:** plain tau with q35 — B04 itc, B05 cobs, B06 wrenfold 9.1 min, B07 semver 8.1 min. g26 and
-  lfm24 have no plain baseline yet.
+- **Bars:** plain tau (`tau -p --no-extensions`), one run per pair. See *Plain baselines* below.
 
 Watch on lfm24: llama.cpp #30490. After about 8 rejected tool calls in a row it writes
 `<function=…>` as text. Tau's text-tool-call follow-up (2 in a row, 4 per run) is the only guard.
@@ -53,3 +52,41 @@ Watch on lfm24: llama.cpp #30490. After about 8 rejected tool calls in a row it 
 | 28 | R131 | q35 | cobs | 3/44 final (best encode 8/44); decode never started; a worked-out `limit` case the code worker could not satisfy or dispute, last edit regressed | none (no sound check; see eval) |
 | 29 | R132 | g26 | wrenfold | 51/54 final (54/54 at 13 min); T0002 never closed: an `example` case copied one integer's bytes as encode's output (end marker dropped), the worker's correction was accepted but cost a 6.4-min cut reply; bare `pytest` check failed collection, retry worker fixed it at its 277 s wall; decode rewrite regressed | none (clock; see eval) |
 | 30 | R133 | lfm24 | semver | | |
+
+## Plain baselines (B04–B15)
+
+These were run after R132, from the harness pinned at f331db78. Each pair has one plain
+`tau -p --no-extensions` run on the same prompt and cap. B04–B07 ran on 10-14 and B08–B15 on
+10-15. Every baseline ended on its own, and none was capped. The adapters are in
+`itc-harness/runs/BNN/adapter.py` (committed 2d99f05).
+
+| Model | Task | Plain | Min | Rounds (final; best seen) |
+|---|---|---|---|---|
+| q35 | wrenfold | B06 54/54 | 9.1 | R104 12, R116 **54 at 21 min**, R128 48 |
+| q35 | semver | B07 75/76 | 8.1 | R113 **75 at 4 min**, R125 75 at 27 min |
+| q35 | itc | B04 0/42 (interval lists, not ITC) | 5.0 | R110 **17**, R122 2 |
+| q35 | cobs | B05 41/44 | 48.8 | R107 37, R119 0, R131 3 |
+| g26 | wrenfold | B08 54/54 | 12.4 | R108 0, R120 48, R132 51 (54 at 13 min) |
+| g26 | semver | B09 75/76 | 5.1 | R105 0, R117 75 at 14 min, R129 27 (75 at t13) |
+| g26 | itc | B10 0/42 (interval lists, not ITC) | 4.8 | R114 0, R126 **9** |
+| g26 | cobs | B11 0/44 (no code: 3 turns of all-thinking, no tool call) | 15.9 | R111 3, R123 **35** |
+| lfm24 | wrenfold | B12 54/54, **contaminated** | 7.3 | R112 0, R124 0 |
+| lfm24 | semver | B13 62/76 | 3.9 | R109 0, R121 0 |
+| lfm24 | itc | B14 0/42 (interval lists, not ITC) | 6.0 | R106 0, R118 0, R130 0 |
+| lfm24 | cobs | B15 2/44 (an escape scheme, not COBS) | 3.3 | R115 0, R127 0 |
+
+Plain tau beats or matches beagle on the two bounded tasks, wrenfold and semver, for every model. It
+does so in a third to a half of the time, and with no runs at 0. Beagle comes out ahead only where
+plain tau built the wrong thing: itc for q35 and g26 (17 and 9 against 0) and cobs for g26 (35 against
+0). Even there its own scores are low. On lfm24 beagle never scored, while plain semver reached 62.
+The goal is to beat plain tau on reliability and time, and on these runs beagle doesn't yet do that on
+any pair.
+
+**B12 is contaminated.** After fetching the spec, lfm24 ran `find / -name "*wrenfold*"`. It then
+`cat` the harness's `wrenfold_ref.py`, `adapters/wrenfold_reference.py` and `adapters/wrenfold_broken.py`,
+and checked its module against the reference. R109 (lfm24 semver), R124 (lfm24 wrenfold) and R130
+(lfm24 itc) ran the same kind of `find /`, and their listings showed the harness's reference and
+broken adapters. None of them read those files, and all three scored 0. No other run's tool calls
+name a harness reference or grader file. The run directory can also reach earlier runs' finished
+trees, such as `~/wrenfold.b06` (54/54) and `~/<task>.rNNN`. Runs need a sandbox that shows them only
+the project, TAU_HOME, tau and beagle (bwrap is installed).
