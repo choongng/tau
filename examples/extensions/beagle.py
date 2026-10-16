@@ -3411,6 +3411,34 @@ def _relay_next(out: str, fallback: str) -> tuple[str, str]:
     return _NEXT_LINE.sub("", out).strip(), _tau_next(move)
 
 
+def _relayed(head: str, out: str, then: str) -> str:
+    """`head`, beagle's reply `out`, and the tau call to make next: the move its
+    `next:` line names, where a tool makes it, else `then`.
+
+    R104-R131: 24 refusals relayed beagle's text as it was, written for beagle's
+    own users; the driver was left with `pursuit <verb>` lines no tool runs, and
+    no call. A move no tool makes stays in the text, and `then` still ends it.
+    """
+    move = _beagle_next(out)
+    mapped = _tau_next(move) if move else ""
+    if mapped and not mapped.startswith("Next, as beagle says"):
+        out, then = _NEXT_LINE.sub("", out), mapped
+    return f"{head}\n{out.strip()}\n\n{then}"
+
+
+def _cannot_read(task: str, rc: int, out: str, root: Path) -> str:
+    """The step's reply when `beagle pursuit show` cannot read `task`: beagle's
+    words, and the ids in the tree to name one by."""
+    listed = _task_ids_listed(_tree_nodes(root))
+    return _relayed(
+        f"pursuit_step: cannot read {task} (exit {rc}):",
+        out,
+        (f"The tasks: {listed}. " if listed else "")
+        + "Next: call pursuit_step with task set to one of their ids, or with no arguments "
+        "for the next task.",
+    )
+
+
 def _strings(value: Any) -> list[str]:
     if isinstance(value, str):
         value = [value]
@@ -4381,8 +4409,13 @@ def make_found_tool(
             # Unwritten, so a corrected call founds afresh.
             goal.unlink(missing_ok=True)
             return _step_result(
-                f"pursuit_found: nothing founded; `beagle pursuit add --root-task` "
-                f"failed (exit {rc}):\n{out}"
+                _relayed(
+                    f"pursuit_found: nothing founded; `beagle pursuit add --root-task` "
+                    f"failed (exit {rc}):",
+                    out,
+                    "Nothing was written. Next: call pursuit_found again with the goal "
+                    "corrected as beagle says.",
+                )
             )
         root_task = found.group(0)
         references = await asyncio.to_thread(_references_for, root, _LAST_PROMPT)
@@ -4399,9 +4432,14 @@ def make_found_tool(
             rc, out = _pursuit(split, root)
         if rc != 0:
             return _step_result(
-                f"pursuit_found: founded {goal} with root task {root_task}, but the "
-                f"milestone split failed (exit {rc}):\n{out}\n\nAdd them with pursuit_plan."
-                f"\n\n{_goal_text(goal) or ''}"
+                _relayed(
+                    f"pursuit_found: founded {goal} with root task {root_task}, but the "
+                    f"milestone split failed (exit {rc}):",
+                    out,
+                    f'Next: add the milestones with pursuit_plan, task="{root_task}" and '
+                    "the milestones as its parts.",
+                )
+                + f"\n\n{_goal_text(goal) or ''}"
             )
         notes = []
         if initialized:
@@ -4912,7 +4950,12 @@ def make_plan_tool() -> Any:
             if rc != 0 and "already has children" in out:
                 rc, out = _add_children(task, parts, root)
         if rc != 0:
-            refused = f"pursuit_plan: beagle refused (exit {rc}):\n{out}"
+            refused = _relayed(
+                f"pursuit_plan: beagle refused (exit {rc}):",
+                out,
+                f'Nothing was added. Next: call pursuit_plan again with task="{task}" and '
+                "the parts corrected as beagle says.",
+            )
             if uncommitted_note:
                 refused += f"\n\n{uncommitted_note}"
             return result(refused)
@@ -9195,9 +9238,10 @@ async def _audit(
     """
     rc, brief = _pursuit(["audit"], root)
     if rc != 0:
-        return (
-            f"pursuit_step: an audit is due, but `beagle pursuit audit` failed (exit {rc}):"
-            f"\n{brief}"
+        return _relayed(
+            f"pursuit_step: an audit is due, but `beagle pursuit audit` failed (exit {rc}):",
+            brief,
+            "Next: call pursuit_step with no arguments; it sends the audit again.",
         )
     brief = brief.split("\nFor the driver:")[0].rstrip()
     if on_update is not None:
@@ -9229,9 +9273,12 @@ async def _audit(
         root,
     )
     if rc != 0:
-        return (
+        return _relayed(
             f"pursuit_step: an audit is due; its sub-agent reported, but `beagle pursuit "
-            f"audit --record` refused (exit {rc}):\n{kept}\n\nReport:\n{run.shown_report}"
+            f"audit --record` refused (exit {rc}):",
+            kept,
+            f"Report:\n{run.shown_report}\n\nNext: call pursuit_step with no arguments; "
+            "it sends the audit again.",
         )
     then = (
         "Each defect becomes work before more is opened: for each task the report finds "
@@ -9252,9 +9299,11 @@ def _abandon(task: str, why: str, root: Path, goal: Path) -> str:
     argv = ["close", task, "--outcome", "abandoned", "--reason", why[:500]]
     rc, out = _pursuit(argv, root)
     if rc != 0:
-        return (
-            f"pursuit_step: `beagle pursuit close {task} --outcome abandoned` refused "
-            f"(exit {rc}):\n{out}"
+        return _relayed(
+            f"pursuit_step: `beagle pursuit close {task} --outcome abandoned` refused (exit {rc}):",
+            out,
+            f"{task} is not closed. Next: call pursuit_step with no arguments for the next "
+            "task, or abandon it again with the reason corrected as beagle says.",
         )
     _forget_task(root, task)
     released = _release_waiters(task, why, root)
@@ -9334,9 +9383,12 @@ def _close_infeasible(
     ]  # fmt: skip
     rc, out = _pursuit(argv, root)
     if rc != 0:
-        return (
+        return _relayed(
             f"pursuit_step: `beagle pursuit close {task} --outcome infeasible` refused "
-            f"(exit {rc}):\n{out}"
+            f"(exit {rc}):",
+            out,
+            f"{task} is not closed. Next: call pursuit_step with no arguments for the next "
+            "task, or close it infeasible again with the evidence corrected as beagle says.",
         )
     _forget_task(root, task)
     parent = str(node.get("parent") or "")
@@ -10134,7 +10186,7 @@ async def _done_by(
     rc, out = _pursuit(["show", task], root)
     record = _json_reply(out) if rc == 0 else None
     if not isinstance(record, dict):
-        return f"pursuit_step: cannot read {task} (exit {rc}):\n{out}"
+        return _cannot_read(task, rc, out, root)
     given = str(arguments.get("done_when") or "").strip()
     check = given or str(record.get("done_when") or "").strip()
     title = str(record.get("title") or "")
@@ -10221,9 +10273,12 @@ async def _done_by(
         argv += ["--confirms", done]
     rc, opened = _pursuit(argv, root, timeout=DEFAULT_CHECK_TIMEOUT + 60)
     if rc != 0:
-        refused, then = _relay_next(opened, "")
-        return f"pursuit_step: `beagle pursuit open` refused (exit {rc}):\n{refused}" + (
-            f"\n\n{then}" if then else ""
+        return _relayed(
+            f"pursuit_step: `beagle pursuit open` refused (exit {rc}):",
+            opened,
+            f'{task} is not closed. Next: call pursuit_step task="{task}" with '
+            f'abandon="done by {done}" again once what beagle names is corrected, or work '
+            f'it with pursuit_step task="{task}".',
         )
     if witness:
         argv = ["prove", task, *(a for rel in witness for a in ("--absent", rel))]
@@ -12034,12 +12089,13 @@ async def _write_cases(
                 break
             if mends == CASES_DRY_RUN_MENDS or run.transcript is None:
                 rc, said_open = refused
-                relayed, then = _relay_next(said_open, "")
-                return (
-                    f"pursuit_step: `beagle pursuit open` refused (exit {rc}):\n{relayed}\n\n"
+                return _relayed(
+                    f"pursuit_step: `beagle pursuit open` refused (exit {rc}):",
+                    said_open,
                     f"{task} is not opened. The cases written from {source} stay in "
                     f"{', '.join(files)}; the next pursuit_step for {task} has them corrected."
-                    + (f"\n\n{then}" if then else "")
+                    f'\n\nNext: call pursuit_step task="{task}" again; its cases worker '
+                    "gets beagle's words.",
                 )
             brief = _cases_mend_brief(refused[1], cases_scope)
         wall = min(timeout, CASES_MEND_SECONDS)
@@ -12305,7 +12361,7 @@ def make_step_tool() -> Any:
         rc, out = _pursuit(["show", task], root)
         record = _json_reply(out) if rc == 0 else None
         if not isinstance(record, dict):
-            return _step_result(f"pursuit_step: cannot read {task} (exit {rc}):\n{out}")
+            return _step_result(_cannot_read(task, rc, out, root))
         title = str(record.get("title") or "")
         if _setup_milestone([title]) is not None:
             lead[:] = [_setup_lead(task)]
@@ -12542,7 +12598,8 @@ def make_step_tool() -> Any:
                     )
                 elif successor is None:
                     return _step_result(
-                        f"pursuit_step: `beagle pursuit spawn {task}` refused:\n{spawned}\n\n"
+                        f"pursuit_step: `beagle pursuit spawn {task}` refused:\n"
+                        f"{_NEXT_LINE.sub('', spawned).strip()}\n\n"
                         + (
                             _spawn_limit_offer(
                                 task,
@@ -12583,7 +12640,7 @@ def make_step_tool() -> Any:
                     rc, out = _pursuit(["show", task], root)
                     record = _json_reply(out) if rc == 0 else None
                     if not isinstance(record, dict):
-                        return _step_result(f"pursuit_step: cannot read {task} (exit {rc}):\n{out}")
+                        return _step_result(_cannot_read(task, rc, out, root))
         tried = _NOT_DONE.get((str(root), task), 0)
         if (
             not route
@@ -12886,17 +12943,20 @@ def make_step_tool() -> Any:
                     f'Send {first.group()} first, with pursuit_step task="{first.group()}".'
                 )
             if rc != 0:
-                refused, then = _relay_next(opened, "")
                 return _step_result(
-                    f"pursuit_step: `beagle pursuit open` refused (exit {rc}):\n{refused}"
-                    + (
-                        f"\n\n{task} is not opened. The cases written from {source} stay "
-                        f"in {', '.join(case_files)}; the next pursuit_step for {task} has "
-                        "them corrected."
-                        if case_files
-                        else ""
+                    _relayed(
+                        f"pursuit_step: `beagle pursuit open` refused (exit {rc}):",
+                        opened,
+                        (
+                            f"{task} is not opened. The cases written from {source} stay "
+                            f"in {', '.join(case_files)}; the next pursuit_step for {task} "
+                            "has them corrected.\n\n"
+                            if case_files
+                            else f"{task} is not opened. "
+                        )
+                        + f'Next: call pursuit_step task="{task}" again with what beagle '
+                        "names corrected.",
                     )
-                    + (f"\n\n{then}" if then else "")
                 )
             if case_files:
                 # beagle pins the cases by hash at the open; commit them as the
@@ -13028,8 +13088,14 @@ def make_step_tool() -> Any:
                 rc, amended = _pursuit(argv, root)
                 if rc != 0:
                     return _step_result(
-                        f"pursuit_step: `beagle pursuit amend` refused the new check (exit {rc}):"
-                        f"\n{amended}"
+                        _relayed(
+                            f"pursuit_step: `beagle pursuit amend` refused the new check "
+                            f"(exit {rc}):",
+                            amended,
+                            f"The old check `{bound_check}` stays bound to {task}. Next: call "
+                            f'pursuit_step task="{task}" with a done_when corrected as beagle '
+                            "says, or with no done_when to run the bound one.",
+                        )
                     )
                 opened = amended
                 record = {**record, "done_when": done_when}
@@ -13124,7 +13190,13 @@ def make_step_tool() -> Any:
         else:
             rc, brief = _pursuit(["brief", task], root)
             if rc != 0:
-                return _step_result(f"pursuit_step: `beagle pursuit brief {task}` failed:\n{brief}")
+                return _step_result(
+                    _relayed(
+                        f"pursuit_step: `beagle pursuit brief {task}` failed:",
+                        brief,
+                        "Next: call pursuit_step with no arguments for the next task.",
+                    )
+                )
             brief = _without_beagle_habits(
                 _without_commit_steps(brief),
                 _command_bound(_memory_max(), _worker_timeout(arguments.get("timeout"))[0]),
@@ -15884,7 +15956,14 @@ def make_bash_hooks() -> Any:
             return None
         if not reasons:
             return None
-        return ToolCallHookResult(block=True, reason="\n\n".join(reasons))
+        # R104-R131: the hook's words were beagle's, for Claude Code users, and
+        # ended on no call.
+        return ToolCallHookResult(
+            block=True,
+            reason="\n\n".join(reasons)
+            + "\n\nNothing was committed. Run the commit again with what this names "
+            "corrected.",
+        )
 
     return bash_hooks
 

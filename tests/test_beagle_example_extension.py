@@ -771,7 +771,10 @@ async def test_commit_claims_block_stops_the_bash_call(
     committed = await bash.execute("c1", {"command": "git commit -m wip"})
 
     assert ls.text == "ran"
-    assert committed.text == "Tool call blocked: beagle commit-claims: no Claims block"
+    assert committed.text == (
+        "Tool call blocked: beagle commit-claims: no Claims block\n\nNothing was committed. "
+        "Run the commit again with what this names corrected."
+    )
     [call] = [c for c in _calls(fake_beagle) if "commit-claims" in c["argv"]]
     assert call["argv"] == ["hook", "commit-claims"]
     assert Path(call["cwd"]) == project
@@ -997,7 +1000,9 @@ async def test_installed_commit_trailer_joins_commit_claims(
     committed = await bash.execute("c1", {"command": "git commit -m wip"})
 
     assert ls.text == "ran"
-    assert committed.text == "Tool call blocked: beagle commit-trailer: forbidden Co-Authored-By"
+    assert committed.text.startswith(
+        "Tool call blocked: beagle commit-trailer: forbidden Co-Authored-By\n\nNothing was"
+    )
     calls = _calls(fake_beagle)
     assert [c["argv"] for c in calls] == [["hook", "commit-claims"], ["hook", "commit-trailer"]]
     assert all(Path(c["cwd"]) == project for c in calls)
@@ -9411,6 +9416,44 @@ def _cut_off_events() -> tuple[bytes, bytes, bytes]:
     cut = end({"role": "toolResult", "content": [{"type": "text", "text": refused}]})
     ran = end({"role": "toolResult", "content": [{"type": "text", "text": "ok"}]})
     return call, cut, ran
+
+
+def test_relayed_beagle_refusal_ends_with_a_tau_call() -> None:
+    # R104-R131: 24 relays of beagle's text ended on `pursuit <verb>` lines.
+    relayed = _module()._relayed
+    then = "Next: call pursuit_step with no arguments for the next task."
+
+    mapped = relayed("pursuit_step: refused:", "no.\nnext: beagle pursuit open T0004\n", then)
+    unmapped = relayed("pursuit_step: refused:", "no.\nnext: beagle pursuit amend T0004", then)
+    bare = relayed("pursuit_step: refused:", "no such task\n", then)
+
+    assert (
+        mapped
+        == 'pursuit_step: refused:\nno.\n\nNext: pursuit_step with task="T0004", which opens it.'
+    )
+    assert unmapped.endswith("next: beagle pursuit amend T0004\n\n" + then)
+    assert bare == f"pursuit_step: refused:\nno such task\n\n{then}"
+
+
+@pytest.mark.anyio
+async def test_plan_refusal_ends_with_the_corrected_plan_call(
+    tmp_path: Path, beagle: Path, fake_beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(_pursuit_project(tmp_path))
+    (fake_beagle / "split.rc").write_text("2")
+    (fake_beagle / "split.out").write_text("beagle: a part title is empty\n")
+    (fake_beagle / "add.rc").write_text("2")
+    (fake_beagle / "add.out").write_text("beagle: a part title is empty\n")
+    runtime, _ = _bound(tmp_path)
+
+    result = await _tool(runtime, "pursuit_plan").execute(
+        "c1", {"task": "T0001", "parts": ["Parser::reads input", "Printer::writes output"]}
+    )
+
+    assert "pursuit_plan: beagle refused (exit 2):\nbeagle: a part title is empty" in result.text
+    assert result.text.rstrip().endswith(
+        'Next: call pursuit_plan again with task="T0001" and the parts corrected as beagle says.'
+    )
 
 
 def test_worker_events_keep_the_paths_refused_outside_the_scope() -> None:
