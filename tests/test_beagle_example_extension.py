@@ -6372,7 +6372,7 @@ async def test_a_long_goal_statement_is_cut_to_a_root_task_title(
 
 
 @pytest.mark.anyio
-async def test_founded_driver_dispatch_refused(
+async def test_founded_driver_dispatch_runs_as_a_step_on_the_offered_task(
     tmp_path: Path,
     beagle: Path,
     fake_beagle: Path,
@@ -6380,9 +6380,12 @@ async def test_founded_driver_dispatch_refused(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     # R01: founded, the 9B driver dispatched twice instead of stepping, and
-    # neither dispatch opened or closed a task.
+    # neither dispatch opened or closed a task. R104-R131: three such refusals
+    # were never recovered from; the step runs in the dispatch's place.
     monkeypatch.chdir(_pursuit_project(tmp_path))
     (fake_beagle / "next.out").write_text(json.dumps({"open": [], "ready": ["T0003"]}))
+    record = {"id": "T0003", "title": "Clock", "intent": "stamps fork", "status": "pending"}
+    (fake_beagle / "show.out").write_text(json.dumps(record))
     runtime, _ = _bound(tmp_path)
 
     result = await _tool(runtime, "pursuit_dispatch").execute(
@@ -6390,8 +6393,29 @@ async def test_founded_driver_dispatch_refused(
     )
 
     assert _runs(fake_tau) == []
+    assert result.text.startswith(
+        'pursuit_dispatch ran as pursuit_step task="T0003", with the brief as its notes'
+    )
+    assert "Next task: T0003 — Clock" in result.text
+
+
+@pytest.mark.anyio
+async def test_founded_driver_dispatch_with_nothing_offered_is_refused(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.chdir(_pursuit_project(tmp_path))
+    (fake_beagle / "next.out").write_text(json.dumps({"open": [], "ready": []}))
+    runtime, _ = _bound(tmp_path)
+
+    result = await _tool(runtime, "pursuit_dispatch").execute("c1", {"brief": "Implement it"})
+
+    assert _runs(fake_tau) == []
     assert "refused, nothing was spawned" in result.text
-    assert "pursuit_step with task=T0003" in result.text
+    assert "Call pursuit_step with no arguments" in result.text
 
 
 @pytest.mark.anyio
@@ -6430,7 +6454,7 @@ async def test_dispatch_text_in_a_founded_session_names_no_guard_refused_bash_co
     refused = await dispatch.execute("c1", {"brief": "Implement it"})
     # A worker sent to an unfounded cwd from a founded session still reports.
     reported = await dispatch.execute("c2", {"brief": "Implement it", "cwd": str(elsewhere)})
-    assert "refused, nothing was spawned" in refused.text
+    assert "pursuit_dispatch ran as pursuit_step" in refused.text
     assert "[pursuit_dispatch] step-executor" in reported.text
 
     texts = [refused.text, reported.text]

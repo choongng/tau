@@ -2590,7 +2590,6 @@ def make_dispatch() -> Any:
         signal: ToolCancellationToken | None = None,
         on_update: ToolUpdateCallback | None = None,
     ) -> AgentToolResult:
-        del tool_call_id, on_update
         brief = arguments.get("brief")
         if not isinstance(brief, str) or not brief.strip():
             return _make_dispatch_result(
@@ -2605,6 +2604,22 @@ def make_dispatch() -> Any:
             else _SEEN_CWD or Path.cwd()
         )
         refusal = _founded_dispatch_refusal(cwd)
+        goal = _find_goal(cwd) if refusal is not None else None
+        task = _offered_task(goal.parent.parent) if goal is not None else ""
+        if task:
+            # R104-R131: three founded drivers dispatched the offered task and
+            # never recovered from the refusal. The step is the call they meant;
+            # the brief goes to it as notes.
+            notes = brief.strip()
+            stepped = await make_step_tool()(
+                tool_call_id, {"task": task, "notes": notes}, signal, on_update
+            )
+            text = "".join(getattr(c, "text", "") for c in stepped.content)
+            return _make_dispatch_result(
+                f"pursuit_dispatch ran as pursuit_step task={json.dumps(task)}, with the "
+                "brief as its notes: in a founded pursuit a dispatch opens and closes no "
+                "task, and pursuit_step does. Call pursuit_step from here on.\n\n" + text
+            )
         if refusal is not None:
             return _make_dispatch_result(refusal)
 
