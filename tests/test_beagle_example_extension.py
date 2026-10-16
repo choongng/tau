@@ -4272,7 +4272,68 @@ def test_operator_refusal_says_the_worker_writes_the_test() -> None:
     found = _module()._check_problem("python3 -m pytest -q tests/ | tail -1")
 
     assert "bare '|'" in found and "the sub-agent writes it" in found
-    assert "tests/test_<name>.py" in found
+    assert "the project's own test command, narrowed to the one test file" in found
+    assert "tests/test_<name>.py" not in found and "python3 -m pytest" not in found.split("|")[1]
+
+
+def test_example_check_comes_from_the_project(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Owner 2026-10-15: every refusal said `python3 -m pytest -q tests/test_greet.py`,
+    # to a Go or Rust project too; the example is a check the project binds.
+    module = _module()
+    nodes = [
+        {"id": "T0003", "status": "open", "done_when": "cargo test --test parse"},
+        {"id": "T0002", "status": "done", "done_when": "go test ./pkg/x_test.go"},
+        {"id": "T0001", "status": "done", "done_when": "true"},
+    ]
+    monkeypatch.setattr(module, "_tree_nodes", lambda root: nodes)
+    assert module._example_check(tmp_path) == "go test ./pkg/x_test.go"
+    assert "in the form of a check this project already binds: `go test ./pkg/x_test.go`" in (
+        module._test_command("that file", tmp_path)
+    )
+
+    monkeypatch.setattr(module, "_tree_nodes", lambda root: [])
+    (tmp_path / ".beagle").mkdir()
+    (tmp_path / ".beagle" / "gates.toml").write_text(
+        '[[gate]]\nname = "tests"\ncommand = "npm test"\n'
+    )
+    assert module._example_check(tmp_path) == "npm test"
+
+    (tmp_path / ".beagle" / "gates.toml").unlink()
+    assert module._example_check(tmp_path) == ""
+    assert module._test_command("that file", tmp_path) == (
+        "the project's own test command, narrowed to that file"
+    )
+
+
+@pytest.mark.parametrize(
+    ("rel", "is_test"),
+    [
+        ("tests/test_a.py", True),
+        ("pkg/a_test.py", True),
+        ("conftest.py", True),
+        ("tests/__init__.py", True),
+        ("tests/helpers.py", False),
+        ("src/a.py", False),
+        ("tests/data/case.json", True),
+        ("pkg/parse_test.go", True),
+        ("pkg/parse.go", False),
+        ("src/parse.test.ts", True),
+        ("src/parse.spec.js", True),
+        ("src/parse.ts", False),
+        ("src/__tests__/parse.ts", True),
+        ("spec/parse_spec.rb", True),
+        ("test/parse.js", True),
+        ("src/test/java/x/ParserTest.java", True),
+        ("src/main/java/x/Parser.java", False),
+        ("app/src/ParserTests.kt", True),
+        ("rust/tests/parse.rs", True),
+        ("rust/src/lib.rs", False),
+    ],
+)
+def test_is_test_path_knows_each_languages_tests(rel: str, is_test: bool) -> None:
+    assert _module()._is_test_path(rel) is is_test
 
 
 @pytest.mark.anyio
@@ -12166,7 +12227,7 @@ async def test_no_write_guard_counts_in_scope_paging(
     assert again.text != "ran"
     assert "this is read 2 of a 1-line file that one pass reads in 1" in again.text
     assert "11 of 20 calls are used with nothing written" in again.text
-    assert "`python3 -c` over the file" in again.text and "write tests/ now" in again.text
+    assert "a one-line script over the file" in again.text and "write tests/ now" in again.text
     assert wrote.text == "ran" and after.text == "ran"
 
     refusal = _module()._reread_refusal(

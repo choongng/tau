@@ -3166,8 +3166,8 @@ def _turn_cap_note(work_note: str | None = None) -> str:
 #: ("15 zeros + 23 bits = 38"), wrong, then checked by one `python3 -c` in seconds.
 WORK_IT_OUT_NOTE = (
     "Work out arithmetic, bit layouts and expected outputs by running them "
-    "(`python3 -c`), not in your reasoning: a long turn of reasoning is cut at the "
-    "output limit, costs minutes, and is no surer than the run."
+    "(a one-line script or shell command), not in your reasoning: a long turn of "
+    "reasoning is cut at the output limit, costs minutes, and is no surer than the run."
 )
 #: The cases worker's form of it. Run R104: told both to work expected outputs
 #: out by running them and to assert no output it works out (CASES_VALUES_NOTE),
@@ -3175,7 +3175,8 @@ WORK_IT_OUT_NOTE = (
 #: cases workers wrote their own encoder to check the source's table, chased
 #: where it disagreed (the rows shortened with `...`), and wrote no test in 24 min.
 CASES_WORK_IT_OUT_NOTE = (
-    "Check arithmetic and bit layouts by running them (`python3 -c`), not in your "
+    "Check arithmetic and bit layouts by running them (a one-line script or shell "
+    "command), not in your "
     "reasoning: a long turn of reasoning is cut, costs minutes, and is no surer "
     "than the run. A run only checks a case; its expected values still come from "
     "the cited lines. The cited lines are right: do not write the code, or a "
@@ -5110,19 +5111,20 @@ def _check_problem(command: str) -> str | None:
         return None  # beagle says why it will not split
     if not words:
         return None
-    one_command = _ONE_COMMAND
     if _bash_find(command, lambda argv: "beagle" if _named(argv, "beagle") else None):
         # The close runs the check, so a check that runs beagle can only ever
         # answer how it was called, never whether the work is done.
         return (
             f"done_when runs beagle itself, which cannot say whether the work is done. "
-            f"{one_command}; pursuit_step does the close. Call pursuit_step again with that."
+            f"{_one_command()}; pursuit_step does the close. Call pursuit_step again with "
+            "that."
         )
     if any(".beagle" in word for word in words):
         return (
             "done_when reads .beagle/, beagle's record of the pursuit, which says what was "
             "written about the work, not what was built: a grep of a task's notes passes "
-            f"as soon as the notes say so. {one_command}. A file the task writes goes in the "
+            f"as soon as the notes say so. {_one_command()}. A file the task writes goes in "
+            "the "
             "project, not in .beagle/: a note or summary in docs/, checked with `grep -q "
             "'<a phrase it must contain>' docs/<name>.md`. Call pursuit_step again with that."
         )
@@ -5130,9 +5132,9 @@ def _check_problem(command: str) -> str | None:
     if operators:
         return (
             f"done_when has a bare {operators[0]!r}, but it runs without a shell, so "
-            f"{operators[0]!r} reaches {words[0]!r} as an argument. {one_command}; for "
-            "more than one thing, name a new test file (e.g. tests/test_<name>.py) in "
-            "scope and say in notes what it must check; the sub-agent writes it, not you. "
+            f"{operators[0]!r} reaches {words[0]!r} as an argument. {_one_command()}; for "
+            "more than one thing, name a new test file in scope and say in notes what it "
+            "must check; the sub-agent writes it, not you. "
             "Call pursuit_step again with it."
         )
     program = Path(words[0]).name
@@ -5152,14 +5154,14 @@ def _check_problem(command: str) -> str | None:
         # design's content was never judged.
         return (
             f"done_when `{command}` only tests that a file exists, so it passes whatever "
-            f"the file says. {one_command}; for a document, `grep -q '<a term the "
+            f"the file says. {_one_command()}; for a document, `grep -q '<a term the "
             "reference uses>' <doc>`, so the check reads what it must hold. Call "
             "pursuit_step again with that."
         )
     if program in _SHOWS_A_FILE or (program.startswith("python") and "json.tool" in words[1:3]):
         return (
             f"done_when `{command}` passes as soon as the file is there, whatever it says. "
-            f"{one_command}, testing what the file must hold; for a document, `grep -q "
+            f"{_one_command()}, testing what the file must hold; for a document, `grep -q "
             "'<a phrase it must contain>' <path>`. Call pursuit_step again with that."
         )
     python = _past_runner(words)
@@ -5170,7 +5172,7 @@ def _check_problem(command: str) -> str | None:
         # validate_fork_seed; print('OK')"`, which passes once the name exists.
         return (
             f"done_when `{command}` only imports and prints, so it passes as soon as the "
-            f"file is there, whatever it says. {one_command}, testing what the code must "
+            f"file is there, whatever it says. {_one_command()}, testing what the code must "
             "do. Call pursuit_step again with that."
         )
     if python and _judges_nothing(python[1:]):
@@ -5179,7 +5181,7 @@ def _check_problem(command: str) -> str | None:
         return (
             f"done_when `{command}` only constructs and calls, with no assert, so it "
             "passes on any code that does not crash, whatever it returns. "
-            f"{one_command}, asserting the values the reference gives. Call pursuit_step "
+            f"{_one_command()}, asserting the values the reference gives. Call pursuit_step "
             "again with that."
         )
     if _key_only_json_check(command):
@@ -5188,7 +5190,7 @@ def _check_problem(command: str) -> str | None:
         return (
             f"done_when `{command}` loads JSON and only asserts that keys are there, but a "
             "key check passes on any content; bind a test that compares values to the "
-            "reference. " + one_command + ", asserting the values the reference gives. "
+            "reference. " + _one_command() + ", asserting the values the reference gives. "
             "Call pursuit_step again with that."
         )
     found = [w for w in words[1:] if w.lower() in _PROSE_WORDS]
@@ -5197,22 +5199,80 @@ def _check_problem(command: str) -> str | None:
     return (
         f"done_when reads as a sentence (bare {', '.join(repr(w) for w in found[:3])}), not "
         "a command. It is split into words and run as-is, so it must be ONE command "
-        "that exits 0 exactly when the task is done, such as `python3 -m pytest -q "
-        "tests/test_greet.py`. Put what the test must assert in criteria and notes, "
-        "and call pursuit_step again."
+        "that exits 0 exactly when the task is done: "
+        + _test_command("the one test file the task's test goes in")
+        + ". Put what the test must assert in criteria and notes, and call pursuit_step "
+        "again."
     )
 
 
-_ONE_COMMAND = (
-    "It must be ONE command over the project that exits 0 exactly when the task is "
-    "done, such as `python3 -m pytest -q tests/test_greet.py`"
-)
+#: The longest check shown as an example: past it the form is lost in the detail.
+EXAMPLE_CHECK_CHARS = 100
+
+
+def _pursuit_root() -> Path | None:
+    """The root of the pursuit this session works in, or None."""
+    goal = _find_goal(_SEEN_CWD or Path.cwd())
+    return goal.parent.parent if goal is not None else None
+
+
+def _example_check(root: Path | None = None) -> str:
+    """A check already bound in this project that runs a test, to show as the form
+    one takes; or "" when there is none.
+
+    An earlier task's done_when (a done task's first), else a command in
+    .beagle/gates.toml. Owner, 2026-10-15: refusals are language- and
+    task-neutral, and an example comes from the project itself: every refusal
+    said `python3 -m pytest -q tests/test_greet.py`, to a Go or Rust project too.
+    """
+    root = root if root is not None else _pursuit_root()
+    if root is None:
+        return ""
+    nodes = sorted(_tree_nodes(root), key=lambda n: n.get("status") != "done")
+    for node in nodes:
+        check = " ".join(str(node.get("done_when") or "").split())
+        try:
+            words = shlex.split(check)
+        except ValueError:
+            continue
+        runs_test = any(
+            _is_test_path(word.split("::")[0]) or word.rstrip("/") in _TEST_DIRS
+            for word in words[1:]
+        )
+        if check and len(check) <= EXAMPLE_CHECK_CHARS and runs_test:
+            return check
+    try:
+        gates = tomllib.loads((root / ".beagle" / "gates.toml").read_text())
+    except (OSError, tomllib.TOMLDecodeError):
+        return ""
+    for gate in gates.get("gate") or []:
+        command = " ".join(str(gate.get("command") or "").split()) if isinstance(gate, dict) else ""
+        if command and len(command) <= EXAMPLE_CHECK_CHARS:
+            return command
+    return ""
+
+
+def _test_command(narrowed: str, root: Path | None = None) -> str:
+    """The check a refusal asks for, in words: the project's own test command
+    narrowed to `narrowed`, with a check already bound here as its form."""
+    example = _example_check(root)
+    return f"the project's own test command, narrowed to {narrowed}" + (
+        f", in the form of a check this project already binds: `{example}`" if example else ""
+    )
+
+
+def _one_command(root: Path | None = None) -> str:
+    """What a check must be, for a refusal of one that is not."""
+    return (
+        "It must be ONE command over the project that exits 0 exactly when the task is "
+        "done: " + _test_command("the one test file the task's test goes in", root)
+    )
 
 
 def _always_passes(command: str) -> str:
     return (
         f"done_when `{command}` exits 0 whatever the work does, so it cannot judge it. "
-        f"{_ONE_COMMAND}. {ABANDON_HINT}"
+        f"{_one_command()}. {ABANDON_HINT}"
     )
 
 
@@ -6267,7 +6327,7 @@ def _pytest_node_import_only_problem(command: str, scope: list[str], root: Path)
                 continue
             return (
                 f"done_when `{command}` runs {part}, which uses nothing from {source}: it "
-                f"passes once the import does, whatever {source} does. {_ONE_COMMAND}, "
+                f"passes once the import does, whatever {source} does. {_one_command(root)}, "
                 f"running a test that calls {source}'s code and asserts what it returns. "
                 "Call pursuit_step again with that."
             )
@@ -7663,12 +7723,21 @@ def _in_tests_dir(rel: str) -> bool:
     return bool({"test", "tests"} & set(Path(rel).parts[:-1]))
 
 
+#: Directories whose files are tests, in the languages' own layouts.
+_TEST_DIRS = frozenset({"test", "tests", "spec", "__tests__"})
+#: Suffixes of a JVM or .NET test class's file: FooTest.java, BarTests.kt.
+_CLASS_TEST_SUFFIXES = (".java", ".kt", ".kts", ".scala", ".groovy", ".cs")
+
+
 def _is_test_path(rel: str) -> bool:
     """Whether `rel` is a test: a test_*.py, *_test.py or conftest.py anywhere, a
-    package's __init__.py under a tests dir, or any non-.py file under one.
+    package's __init__.py under a tests dir, or any non-.py file under one; in
+    other languages a *_test.go, *.test.ts or *.spec.js, a FooTest.java, or any
+    file under test/, tests/, spec/ or __tests__/.
 
     Run R24: tests/interval_tree_clocks.py, the module a test imported, counted as
-    a test for prove and as misplaced implementation at the close.
+    a test for prove and as misplaced implementation at the close. Owner,
+    2026-10-15: the host's judgements hold in every language, not Python's only.
     """
     parts = Path(rel).parts
     name = parts[-1] if parts else rel
@@ -7676,7 +7745,14 @@ def _is_test_path(rel: str) -> bool:
         return True
     if name.endswith(".py"):
         return name == "__init__.py" and _in_tests_dir(rel)
-    return _in_tests_dir(rel)
+    stem, dot, suffix = name.partition(".")
+    if dot and (
+        stem.endswith(("_test", "_spec"))
+        or re.search(r"\.(test|spec)\.", f".{suffix}") is not None
+        or (name.endswith(_CLASS_TEST_SUFFIXES) and stem.endswith(("Test", "Tests")))
+    ):
+        return True
+    return bool(_TEST_DIRS & set(parts[:-1]))
 
 
 def _module_beside_tests(rel: str) -> bool:
@@ -9607,7 +9683,7 @@ def _already_passes(
     text = (
         f"`{check}` already passes, before any work, so it cannot tell this task's work "
         "from none. Bind a check that fails now: name a new test file for what this task "
-        "adds, e.g. `python3 -m pytest -q tests/test_<this task>.py`, put it in scope, and "
+        f"adds, run by {_test_command('that file')}; put it in scope, and "
         "say in the notes what it should test. It fails until the sub-agent writes it; do "
         "not write it yourself. If the work is there already, bind the goal criterion's "
         "test, which imports and runs the code."
@@ -11163,7 +11239,7 @@ def _check_run_files(check: str, root: Path) -> list[str]:
         rel = part.split("::")[0].rstrip("/")
         path = Path(rel)
         if (
-            rel.endswith(".py")
+            (rel.endswith(".py") or ("." in path.name and _is_test_path(rel)))
             and not path.is_absolute()
             and ".." not in path.parts
             and rel not in found
@@ -12035,8 +12111,8 @@ async def _write_cases(
             f"pursuit_step: {task} not opened — its source is {source}, so its check "
             f"runs the cases a sub-agent writes from that, and done_when names no test "
             f"file: `{done_when}`\n\nMake done_when the project's test command over the "
-            "file the cases go in, e.g. `python3 -m pytest -q tests/test_<part>.py`, with "
-            "no expected values in it: the cases read them from the source. Call "
+            + _test_command("the one test file the cases go in", root)
+            + ", with no expected values in it: the cases read them from the source. Call "
             f'pursuit_step with task="{task}" again.'
         )
     bad_thinking = _bad_thinking(arguments.get("thinking"))
@@ -12709,9 +12785,10 @@ def make_step_tool() -> Any:
                         if carried
                         else "  criteria: what will be true when it is done\n"
                     )
-                    + "  done_when: ONE command that exits 0 only then, e.g. `python3 -m "
-                    "pytest -q tests/test_x.py`. It is split into words and run without a "
-                    "shell: no prose, no &&, |, > or $(...). It should fail now.\n"
+                    + "  done_when: ONE command that exits 0 only then: "
+                    + _test_command("the one test file the task's test goes in", root)
+                    + ". It is split into words and run without a shell: no prose, no &&, "
+                    "|, > or $(...). It should fail now.\n"
                     "  scope: the paths it will touch\n"
                     "  notes: where to start, what to leave alone\n"
                     "A sub-agent does the work and the check decides. If you cannot write "
@@ -13302,8 +13379,8 @@ def make_step_tool() -> Any:
             else:
                 how = (
                     "The new route's done_when imports the code this task tests and runs "
-                    "it (e.g. `python3 -m pytest -q tests/test_<this task>.py`, a test "
-                    "that imports the module), with that code's source file in scope"
+                    f"it ({_test_command('a test that imports that code', root)}), with "
+                    "that code's source file in scope"
                 )
             return _not_done(
                 root,
@@ -13650,10 +13727,11 @@ def make_step_tool() -> Any:
                 )
             )
             fresh_check = (
-                "a done_when that runs a new test file, e.g. `python3 -m pytest -q "
-                f"tests/test_<this task>.py`, in scope: `{check}` passes on the committed "
+                "a done_when that runs a new test file in scope, "
+                f"{_test_command('that file', root)}: `{check}` passes on the committed "
                 "files too, so a route on it is refused as already passing. "
             )
+            behaviour_check = _test_command("a test of this task's behaviour", root)
             why = (
                 "the check passes even with a defect put back into the work, so it does "
                 "not test what this task built"
@@ -13692,9 +13770,9 @@ def make_step_tool() -> Any:
                     "WITNESS in the module the test imports, named above."
                     if proof.ask_module
                     else f'Next: pursuit_step with task="{task}" and a done_when that runs '
-                    "a test of the behaviour itself, e.g. `python3 -m pytest -q "
-                    "tests/test_<this task>.py`, with notes saying what that test must "
-                    "check. A bare import or file-exists check cannot be shown to refuse."
+                    f"a test of the behaviour itself, {behaviour_check}, with notes saying "
+                    "what that test must check. A bare import or file-exists check cannot be "
+                    "shown to refuse."
                     if proof.weak
                     else f"Next: {_spawn_limit_offer(task, check, scope, fresh)}"
                     if _at_spawn_limit(task, fresh := _tree_nodes(root))
@@ -13707,10 +13785,9 @@ def make_step_tool() -> Any:
                         if tests_only and missing_data
                         else f"a done_when that runs that file's test. {proof_note}"
                         if tests_only
-                        else "a done_when that runs a test of the behaviour itself, e.g. "
-                        "`python3 -m pytest -q tests/test_<this task>.py`. The test must "
-                        "import the code this task tests, and that code's source file "
-                        "must be in scope."
+                        else "a done_when that runs a test of the behaviour itself, "
+                        f"{behaviour_check}. The test must import the code this task "
+                        "tests, and that code's source file must be in scope."
                     )
                     + " Another step on this task without a new route runs no sub-agent."
                 ),
@@ -13978,8 +14055,8 @@ def make_driver_edit_guard() -> Any:
                 f"refusing to {what} from the driving session: in a pursuit the work, and "
                 f"its commits, are done by sub-agents. {call}; a sub-agent does it and the "
                 "task's check decides. For work no task covers (a failing gate, a lint fix), "
-                "add a task with pursuit_plan. Reading and running (tests, `ruff check` "
-                "without `--fix`, `git status`) is fine."
+                "add a task with pursuit_plan. Reading and running (tests, a linter without "
+                "its fix flag, `git status`) is fine."
             ),
         )
 
@@ -14993,7 +15070,8 @@ def _reread_refusal(
             f"refusing to read {path} again: this is read {seen} of a {count}-line file "
             f"{paging}, and "
             f"{calls - 1} of {cap} calls are used with nothing written. Query it instead, "
-            "e.g. `python3 -c` over the file for the case or line you need, and write "
+            "e.g. a grep or a one-line script over the file for the case or line you need, "
+            "and write "
             f"{', '.join(scope)} now."
         )
     # No scope names references/ (`_scope_problem`), so its reads land here.
