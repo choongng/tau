@@ -250,16 +250,21 @@ Ask: a ratchet in beagle, language-neutral because the figures come from the pro
      heuristic: most runners print the names of failing tests, and beagle knows each case's
      name from its marker.
 2. **Rank the attempts.** A passing check beats a failing one; otherwise the higher figure wins.
-3. **Say so when an attempt is worse than the best.** When the latest attempt ranks below the best,
-   the close, `pursuit check`, `next` and `status` all report it, addressed to the model: "T0002's
-   attempt 4 passes 4 of 21 cases; attempt 3 passed 19. Restore it with `beagle pursuit restore
-   T0002 --attempt 3`, and say in the next brief what attempt 4 changed." The restore puts that
-   tree back, limited to the task's scope. A host may do the restore itself after a worker's
-   report.
+3. **Give the model the best attempts' commits, not just a verdict.** Every attempt is a real commit
+   under `refs/beagle/attempts/<task>/<n>`, and so is every close. The close, `pursuit check`,
+   `next`, `status` and the next worker's brief all name the top-scoring ones with their figures,
+   addressed to the model:
+   "T0002: attempt 3 (`refs/beagle/attempts/T0002/3`) passed 19 of 21 cases; the tree now passes 4.
+   `git diff refs/beagle/attempts/T0002/3 -- <scope>` shows what changed since. Keep what helped,
+   and put back what broke; `beagle pursuit restore T0002 --attempt 3` puts the whole tree back."
+   Restoring a whole tree throws away whatever a worse attempt got right. R132's final tree held
+   the correct `sixty-three` fix next to the `decode` regression. So the commits and the diff are
+   the main tool, and a whole restore is the fallback. Commits and diffs work in any language, since
+   beagle already runs on git. A host may restore by itself when the model doesn't act.
 4. **Keep closed work closed.** At each close, re-run the checks of the tasks already closed (a
    regression gate). A close that breaks one is refused, naming the task and the restore. This
    would have caught R132's `decode` only if T0003 had closed first, so it is about later tasks,
    not this run.
 
-Tau could carry 1–3 for its own step (snapshot each worker's report and its check result, and
-restore the better one), but the ranking and the restore belong in beagle, so every host gets them.
+Tau could carry 1–3 for its own step: commit each worker's report as an attempt ref with its
+check result, and name the best ones, with the diff command, in the retry brief, but the ranking and the restore belong in beagle, so every host gets them.
