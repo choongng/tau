@@ -12168,6 +12168,88 @@ def _restore_attempt(
     return restored
 
 
+#: The note for the next step's first worker after a step put a task's best
+#: attempt back, by (project root, task); consumed when briefed.
+_RESTORED: dict[tuple[str, str], str] = {}
+
+
+def _below_best_note(
+    root: Path, task: str, scope: list[str] | tuple[str, ...], latest: _Attempt | None
+) -> str:
+    """`_attempt_note` for `latest` among the kept attempts of its check and cases."""
+    if latest is None:
+        return ""
+    return _attempt_note(task, latest, _attempts(root, task, latest.check, latest.cases), scope)
+
+
+def _standing_attempt_note(
+    root: Path, task: str, scope: list[str], case_files: list[str], check: str
+) -> str:
+    """The note for a step's first worker when the task's last kept attempt ranks
+    below its best, or ""."""
+    attempts = _attempts(root, task, check, _cases_digest(root, case_files))
+    note = _attempt_note(task, attempts[-1], attempts, scope) if attempts else ""
+    return f"\n\n{note}" if note else ""
+
+
+async def _keep_best_attempt(
+    root: Path,
+    task: str,
+    scope: list[str],
+    case_files: list[str],
+    check: str,
+    latest: _Attempt,
+    verdict: tuple[int, str],
+    timeout: float,
+) -> tuple[tuple[int, str], str]:
+    """The fallback when a step ends with `task` open on an attempt below its best:
+    the scope's files are put back as the best attempt kept them, the check runs
+    again on them, and the worse tree stays at its ref. The verdict to report (the
+    re-run's while it fails) and a paragraph saying what was done; when nothing
+    could be put back, the paragraph is the attempt note alone.
+
+    R131 (q35 cobs): T0002's last worker took it from 19 of 21 cases to 4, the
+    step returned there, and the round ended on the worse tree. The case files are
+    left as `_settle_case_edits` settled them.
+    """
+    attempts = await asyncio.to_thread(_attempts, root, task, latest.check, latest.cases)
+    best = _best_attempt(attempts)
+    if best is None or best.rank <= latest.rank or attempts[-1].n != latest.n:
+        return verdict, ""
+    put = await asyncio.to_thread(_restore_attempt, root, best, latest, scope, case_files)
+    if not put:
+        return verdict, _attempt_note(task, latest, attempts, scope) + "\n\n"
+    again = await _run_check(check, root, timeout)
+    _note_check_run((str(root), task), check, again)
+    now = await asyncio.to_thread(
+        _record_attempt, root, task, scope, case_files, check, again, "restore"
+    )
+    where = " ".join(shlex.quote(path) for path in scope)
+    files = ", ".join(put[:8]) + (f" and {len(put) - 8} more" if len(put) > 8 else "")
+    if again[0] == 0:
+        on_it = "On those files the check passes (exit 0)"
+    else:
+        on_it = f"On those files the check exits {again[0]}" + (
+            f", passing {now.figure} of {now.total} cases" if now and now.total else ""
+        )
+    diff = f"`git diff {best.ref} {latest.ref} -- {where}`"
+    _RESTORED[(str(root), task)] = (
+        f"\n\nThe files in {task}'s scope were put back as attempt {best.n} "
+        f"(`{best.ref}`) left them: it {_attempt_said(best)}, and the attempt after "
+        f"it {_attempt_said(latest)}. That worse tree is kept at `{latest.ref}`; {diff} "
+        "shows what it changed. Start from the files as they are now, and take from the "
+        "worse attempt only what helped, one file at a time "
+        f"(`git checkout {latest.ref} -- <path>`)."
+    )
+    return (verdict if again[0] == 0 else again), (
+        f"Attempt {latest.n} {_attempt_said(latest)}, below attempt {best.n} "
+        f"(`{best.ref}`), which {_attempt_said(best)}; so {task}'s files are put back as "
+        f"attempt {best.n} left them: {files}. {on_it}. Attempt {latest.n}'s tree is "
+        f"kept at `{latest.ref}`, and {diff} shows what it changed; the next sub-agent "
+        "is told both.\n\n"
+    )
+
+
 async def _write_cases(
     task: str,
     title: str,
@@ -13326,6 +13408,13 @@ def make_step_tool() -> Any:
         self_import = _self_import_note(check, scope, root) if check else ""
         retry_note = self_import + retry_note
         missing_data = _missing_data(check, scope, root) if check else []
+        case_files = _strings(record.get("cases")) if isinstance(record, dict) else []
+        host_attempt: _Attempt | None = None
+        if status == "open" and check:
+            # R131: a step that ended below its best tree; its first worker hears of it.
+            retry_note += _RESTORED.pop(unproven_key, "") or await asyncio.to_thread(
+                _standing_attempt_note, root, task, scope, case_files, check
+            )
         if unproven_key in _UNPROVEN:
             # Run R23: the breaker quotes only a result's first line; the call goes there.
             call = _unproven_call(task, check, scope, root, missing_data, nodes)
@@ -13520,6 +13609,9 @@ def make_step_tool() -> Any:
                 break
             verdict = await _run_check(check, root, check_timeout)
             _note_check_run(unproven_key, check, verdict)
+            host_attempt = await asyncio.to_thread(
+                _record_attempt, root, task, scope, case_files, check, verdict, "host"
+            )
             # q35 R53: W4 was killed at its second cut-off and wrote no report, and
             # W5's brief said "An earlier attempt reported back".
             ended = (
@@ -13586,6 +13678,10 @@ def make_step_tool() -> Any:
             if no_tests is not None:
                 retry_note = f"\n\n{no_tests}" + retry_note
             retry_note += _fix_the_work(verdict[0], verdict[1], check)
+            below_best = await asyncio.to_thread(_below_best_note, root, task, scope, host_attempt)
+            if below_best:
+                # R131: W4 rewrote T0002 from 19 of 21 cases to 4; W5 heard only exit 1.
+                retry_note += "\n\n" + below_best
             if missing:
                 retry_note += "\n\n" + missing.rstrip()
             # q35 R58: W2's cut-off kill note was briefed as its notes. A cut-off
@@ -13606,6 +13702,11 @@ def make_step_tool() -> Any:
         if budget_spent:
             attempt -= 1
         if check and verdict[0] != 0:
+            kept_best = ""
+            if host_attempt is not None:
+                verdict, kept_best = await _keep_best_attempt(
+                    root, task, scope, case_files, check, host_attempt, verdict, check_timeout
+                )
             state = "stays blocked" if retrying else "stays open"
             fix_check = (
                 "pass a corrected done_when with notes saying what this route does "
@@ -13691,6 +13792,7 @@ def make_step_tool() -> Any:
                 + f"{route}{task} — {title}: the check still fails after {attempt} "
                 f"sub-agent run(s), so the task {state}.\n\n`{check}` exit {verdict[0]}:\n"
                 f"{verdict[1][-CHECK_TAIL_CHARS:]}\n\n"
+                + kept_best
                 + ("" if collection else _implementation_in_tests_lead(root, scope, check))
                 + _unreported_runs(unreported, attempt)
                 + f"Last report:\n{shown}\n\n"

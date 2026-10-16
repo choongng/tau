@@ -21108,3 +21108,135 @@ def test_restore_attempt_puts_back_the_scope_but_not_the_cases(
     assert (project / "tests" / "test_encode.py").read_text().endswith("# settled\n")
     assert (project / "README").read_text() == "out of scope\n"
     assert _git(project, "diff", "--cached") == staged
+
+
+ATTEMPT_CHECK_SCRIPT = (
+    "import sys\n"
+    "passing = open('cobs/impl.txt').read().split()\n"
+    "failed = [c for c in ('single_zero', 'two_zeros', 'window_limit') if c not in passing]\n"
+    "for case in failed:\n"
+    "    print(f'FAILED tests/test_encode.py::test_{case} - AssertionError')\n"
+    "sys.exit(1 if failed else 0)\n"
+)
+
+
+def _attempt_task(project: Path, fake: Path, status: str = "pending") -> None:
+    """T0002 on a committed project whose check passes the cases cobs/impl.txt names."""
+    if not (project / "check.py").exists():
+        (project / "check.py").write_text(ATTEMPT_CHECK_SCRIPT)
+        _git(project, "add", "check.py")
+        _git(project, "commit", "-q", "-m", "check")
+    _ready_task(fake, "python3 check.py")
+    record = json.loads((fake / "show.out").read_text())
+    record.update(status=status, scope=["cobs/"], cases=["tests/test_encode.py"])
+    (fake / "show.out").write_text(json.dumps(record))
+    if status == "open":
+        listed = {"open": [{"id": "T0002", "title": "Parser"}], "ready": [], "ready_total": 0}
+        (fake / "next.out").write_text(json.dumps(listed))
+
+
+@pytest.mark.anyio
+async def test_pursuit_step_names_the_best_attempt_and_puts_it_back_when_it_ends_below(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # R131 (q35 cobs): T0002 reached 19 of 21 cases, then the last worker's rewrite
+    # left 4, and the step and the round ended there.
+    project = _committed_project(tmp_path, monkeypatch)
+    monkeypatch.chdir(project)
+    _attempt_task(project, fake_beagle)
+    runtime, _ = _bound(tmp_path)
+    module = _loaded_module()
+    briefs: list[str] = []
+    writes = ["single_zero two_zeros", "", "single_zero", "single_zero two_zeros window"]
+
+    async def run_worker(brief: str, *args: Any, **kwargs: Any) -> Any:
+        briefs.append(brief)
+        (project / "cobs" / "impl.txt").write_text(writes[len(briefs) - 1] + "\n")
+        return module._WorkerRun(returncode=0, report="Wrote cobs/impl.txt.")
+
+    monkeypatch.setattr(module, "_run_worker", run_worker)
+    step = {"task": "T0002", "criteria": "it encodes", "done_when": "python3 check.py"}
+    step |= {"scope": ["cobs/"], "attempts": 3}
+
+    result = await _tool(runtime, "pursuit_step").execute("c1", step)
+
+    best = "refs/tau/attempts/T0002/1"
+    assert "attempt 1" not in briefs[1]
+    assert (
+        f"T0002: attempt 1 (`{best}`) passed 2 of 3 cases; this tree passes 0. "
+        f"`git diff {best} -- cobs/` shows what changed since. Keep what helped and put "
+        f"back what broke; `git checkout {best} -- <path>` puts one file back."
+    ) in briefs[2]
+    assert (
+        f"Attempt 3 passed 1 of 3 cases, below attempt 1 (`{best}`), which passed 2 of 3 "
+        "cases; so T0002's files are put back as attempt 1 left them: cobs/impl.txt. On "
+        "those files the check exits 1, passing 2 of 3 cases. Attempt 3's tree is kept at "
+        f"`refs/tau/attempts/T0002/3`, and `git diff {best} refs/tau/attempts/T0002/3 -- "
+        "cobs/` shows what it changed"
+    ) in result.text
+    assert (project / "cobs" / "impl.txt").read_text() == "single_zero two_zeros\n"
+    # The check output the result shows is the restored tree's.
+    assert "test_two_zeros" not in result.text.split("Attempt 3 passed")[0]
+    assert _git(project, "show", "refs/tau/attempts/T0002/3:cobs/impl.txt") == "single_zero\n"
+    attempts = module._attempts(project, "T0002")
+    assert [(a.n, a.by, a.figure) for a in attempts] == [
+        (1, "host", 2), (2, "host", 0), (3, "host", 1), (4, "restore", 2)
+    ]  # fmt: skip
+
+    # The next step's first worker hears what was put back, and from where.
+    _attempt_task(project, fake_beagle, status="open")
+    await _tool(runtime, "pursuit_step").execute("c2", {**step, "attempts": 1})
+
+    assert (
+        f"The files in T0002's scope were put back as attempt 1 (`{best}`) left them: it "
+        "passed 2 of 3 cases, and the attempt after it passed 1 of 3 cases."
+    ) in briefs[3]
+    assert "`git checkout refs/tau/attempts/T0002/3 -- <path>`" in briefs[3]
+
+
+@pytest.mark.anyio
+async def test_pursuit_step_first_worker_hears_of_a_better_attempt_left_behind(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _module()
+    project = _committed_project(tmp_path, monkeypatch)
+    monkeypatch.chdir(project)
+    _attempt_task(project, fake_beagle, status="open")
+    impl = project / "cobs" / "impl.txt"
+    for passing in ("single_zero two_zeros", ""):
+        impl.write_text(passing + "\n")
+        out = subprocess.run(
+            [sys.executable, "check.py"], cwd=project, capture_output=True, text=True
+        ).stdout
+        module._record_attempt(
+            project, "T0002", ["cobs/"], ["tests/test_encode.py"], "python3 check.py",
+            (1, out), "worker",
+        )  # fmt: skip
+    runtime, _ = _bound(tmp_path)
+    loaded = _loaded_module()
+    briefs: list[str] = []
+
+    async def run_worker(brief: str, *args: Any, **kwargs: Any) -> Any:
+        briefs.append(brief)
+        return loaded._WorkerRun(returncode=0, report="Looked.")
+
+    monkeypatch.setattr(loaded, "_run_worker", run_worker)
+    step = {"task": "T0002", "criteria": "it encodes", "done_when": "python3 check.py"}
+    step |= {"scope": ["cobs/"], "attempts": 1}
+
+    result = await _tool(runtime, "pursuit_step").execute("c1", step)
+
+    assert (
+        "T0002: attempt 1 (`refs/tau/attempts/T0002/1`) passed 2 of 3 cases; this tree passes 0."
+    ) in briefs[0]
+    # The worker changed nothing, so the step ends at 0 of 3, below attempt 1.
+    assert "so T0002's files are put back as attempt 1 left them" in result.text
+    assert impl.read_text() == "single_zero two_zeros\n"
