@@ -51,5 +51,5 @@ Watch on lfm24: llama.cpp #30490. After about 8 rejected tool calls in a row it 
 | 26 | R129 | g26 | semver | 27/76 final; **75/76 at t13–t23** then a witness-ask follow-up worker regressed the regex | T0647 |
 | 27 | R130 | lfm24 | itc | 0/42, no code; cases cited interval-tree-clocks lines under itc2008, re-anchoring made one a blank line, 3 cases workers | T0657 |
 | 28 | R131 | q35 | cobs | 3/44 final (best encode 8/44); decode never started; a worked-out `limit` case the code worker could not satisfy or dispute, last edit regressed | none (no sound check; see eval) |
-| 29 | R132 | g26 | wrenfold | | |
+| 29 | R132 | g26 | wrenfold | 51/54 final (54/54 at 13 min); T0002 never closed: an `example` case copied one integer's bytes as encode's output (end marker dropped), CASE route had no words on its cite; bare `pytest` check failed collection; decode rewrite regressed | held: CASE route quoting any line (after baselines) |
 | 30 | R133 | lfm24 | semver | | |

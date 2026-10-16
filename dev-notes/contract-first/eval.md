@@ -1731,3 +1731,50 @@ values are held by its cite needs per-task literal parsing (bytes, tuples, versi
 (3) letting a code worker drop a case by quoting its cite would let it rewrite any case. The
 sound place is beagle `rules 2e` (a case's asserted values are held by its cited lines), an
 upstream ask.
+
+## R132 — g26 wrenfold, round 29: right code at 13 min, an example case that dropped the end marker, a bare `pytest` check (51/54)
+
+Capped at 30 min (tau f331db78). Grade 51/54, and 54/54 in the t13 snapshot. Timeline:
+
+- founding at 1.1 min, with no refusals;
+- T0002's ("Encoding logic") cases worker ran 1.6–9.7 min and wrote 12 cases, all `op=encode`;
+- the code worker ran 9.7–23.1 min and stopped at the 60-turn limit;
+- the host's check failed, and a second code worker ran 23.1–27.7 min until killed at its 277 s wall;
+- the driver re-stepped at 28.8 min, and the cap came at 30.
+
+Nothing closed.
+
+Tied to the grade:
+
+- **The 3 lost cases are all decode or count accepting input with no end marker** (`decode(05)`,
+  `decode(01 02)`, `count(05)`). The code worker's write at 12.4 min graded 54/54. Its rewrites of
+  `decode` at 13.3 and 13.9 min dropped the end-marker check. Decode is T0003's work, so no T0002
+  case covered it and nothing caught the regression. This is the third run that ended on a worse
+  tree than it reached (after R129 and R131).
+- **Why nothing closed, (a): case `sixty-three` (`kind=example`, cite 35) asserted
+  `encode([63]) == 40 3F`.** Those are line 35's bytes, but they are one integer's form. Line 41
+  says a sequence is "followed by one end marker", so `encode` returns `40 3F 3F`. The
+  copy-the-output rule (`CASES_VALUES_NOTE`) was followed: the line gave bytes, and they were copied
+  as the operation's whole output. The code worker found the failure at 14.4 min. Its next reply ran
+  6.4 min to the output limit. It then edited the pinned case and ran out of turns. Its
+  `CASE <id>: "<words>"` route required words from line 35, and line 35 holds none about the end
+  marker; those words are on line 41. This is the same dead end as R131, where the words that
+  dispute the case are not on its cited line.
+- **Why nothing closed, (b): the driver's `done_when` was `pytest tests/test_encoding.py`.** Bare
+  `pytest` does not put the project root on `sys.path`, so collection failed with an import error
+  until a `pyproject.toml` set `pythonpath`. The code workers had tested with `python3 -m pytest`,
+  which passed. The second worker found this at 25.5 min and fixed it at 27.1, inside its 277 s
+  wall. The driver's re-step switched to `python3 -m pytest`.
+
+Fix candidates, held until the baseline queue (B08–B15) finishes:
+
+- **The `CASE` route quotes any source line by its number:** `CASE <id>: <line> "<words>"`, checked
+  against that line. It would have given R132's worker a way through with line 41. It would not
+  have helped R131, where no line holds the value. Its risk is that a code worker could quote
+  something unrelated to excuse a case.
+- **Rejected: a prose note that a cited piece is not the whole output.** R131 showed that prose
+  alone does not hold this.
+- **The bare `pytest` check** is Python-specific, and so is the obvious fix (prefer `python3 -m`).
+  The general form is to run the check once the code worker reports its own tests passing, and on
+  "collection or import error" tell the driver that the command, not the code, fails. That belongs
+  to the language-neutral repair work, not a one-run patch.
