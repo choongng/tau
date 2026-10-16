@@ -12005,25 +12005,31 @@ async def _write_cases(
     # R114 (g26) and R115 (lfm24): workers ended without the dry run their brief
     # names, and the open refused them 5-12 min in; the next call's worker read
     # the source again. The host runs it, and the same session mends the cases.
+    # A worker that left no marked test is resumed the same way, with the
+    # marker's form (R104-R131: refused, the next call's worker read the
+    # source again from the start).
     for mends in range(CASES_DRY_RUN_MENDS + 1):
         if not files:
-            break
-        moved = _reanchor_cites(root, files, cites)
-        reanchored.update(moved)
-        cites = [moved.get(cite, cite) for cite in cites]
-        refused = _cases_dry_run_refusal(task, criteria, done_when, scope, files, cites, root)
-        if refused is None:
-            break
-        if mends == CASES_DRY_RUN_MENDS or run.transcript is None:
-            rc, said_open = refused
-            relayed, then = _relay_next(said_open, "")
-            return (
-                f"pursuit_step: `beagle pursuit open` refused (exit {rc}):\n{relayed}\n\n"
-                f"{task} is not opened. The cases written from {source} stay in "
-                f"{', '.join(files)}; the next pursuit_step for {task} has them corrected."
-                + (f"\n\n{then}" if then else "")
-            )
-        brief = _cases_mend_brief(refused[1], cases_scope)
+            if mends == CASES_DRY_RUN_MENDS or run.transcript is None:
+                break
+            brief = _cases_marker_mend_brief(cases_scope, source)
+        else:
+            moved = _reanchor_cites(root, files, cites)
+            reanchored.update(moved)
+            cites = [moved.get(cite, cite) for cite in cites]
+            refused = _cases_dry_run_refusal(task, criteria, done_when, scope, files, cites, root)
+            if refused is None:
+                break
+            if mends == CASES_DRY_RUN_MENDS or run.transcript is None:
+                rc, said_open = refused
+                relayed, then = _relay_next(said_open, "")
+                return (
+                    f"pursuit_step: `beagle pursuit open` refused (exit {rc}):\n{relayed}\n\n"
+                    f"{task} is not opened. The cases written from {source} stay in "
+                    f"{', '.join(files)}; the next pursuit_step for {task} has them corrected."
+                    + (f"\n\n{then}" if then else "")
+                )
+            brief = _cases_mend_brief(refused[1], cases_scope)
         wall = min(timeout, CASES_MEND_SECONDS)
         run = await _run_worker(
             brief,
@@ -12039,11 +12045,11 @@ async def _write_cases(
             resume=run.transcript.stem,
         )
         spent = max(spent or 0, run.spent or 0) or None
+        said = f"\n\nIts report:\n{_capped_report(run)}" if run.report else ""
         if run.problem is not None:
-            said = f"\n\nIts report:\n{_capped_report(run)}" if run.report else ""
             return (
                 f"pursuit_step: {task} not opened — the sub-agent mending its cases from "
-                f"{source} after beagle refused them did not finish: {run.problem}{said}"
+                f"{source} did not finish: {run.problem}{said}"
                 f'\n\nCall pursuit_step with task="{task}" again to have them written.'
             )
         _repair_case_markers(root, cases_scope)
@@ -12103,6 +12109,18 @@ def _cases_mend_brief(refusal: str, cases_scope: list[str]) -> str:
         f"{', '.join(cases_scope)} so it passes, reading the source lines again with "
         "`beagle refs show` where a case needs them; write nowhere else. Run the dry "
         "run again yourself, then end with a report naming the case files and the cites."
+    )
+
+
+def _cases_marker_mend_brief(cases_scope: list[str], source: str) -> str:
+    """The next prompt of a cases worker that ended with no marked test."""
+    return (
+        f"You ended, and the host found no test in {', '.join(cases_scope)} with a "
+        "`beagle-case:` marker above it, so nothing ties the task to its source. "
+        + CASES_MARKER_NOTE.format(ref=Path(source).stem)
+        + f" Put the marker above each case you wrote; if you wrote none, write them now "
+        f"from {source}. Write nowhere else, then end with a report naming the case files "
+        "and the cites."
     )
 
 

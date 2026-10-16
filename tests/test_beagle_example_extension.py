@@ -1498,6 +1498,9 @@ if tamper:
 mends = os.environ.get("FAKE_TAU_RESUMED_MENDS")
 if mends and "--session" in sys.argv:  # a resumed worker clears what refused its cases
     Path(mends).unlink(missing_ok=True)
+if "--session" in sys.argv:  # what a resumed worker writes
+    for rel, text in json.loads(os.environ.get("FAKE_TAU_RESUMED_WRITES") or "{}").items():
+        Path(rel).write_text(text)
 for rel in json.loads(os.environ.get("FAKE_TAU_REFUSED_WRITES") or "[]"):  # the scope guard's
     refused = f"Tool call blocked: refusing to write {rel}: it is outside T0002's scope (x)."
     result = {"role": "toolResult", "content": [{"type": "text", "text": refused}]}
@@ -20863,8 +20866,39 @@ async def test_pursuit_step_spec_tied_cases_fail_without_a_marker_and_nothing_op
 
     assert "T0002 not opened" in result.text and "`beagle-case:` marker" in result.text
     assert "the spec has no parse section" in result.text
-    assert [run["role"] for run in _runs(fake_tau)] == ["cases"]
+    # The worker was resumed twice with the marker's form, then it was refused.
+    first, *mends = _runs(fake_tau)
+    assert [run["role"] for run in mends] == ["cases"] * 2
+    worker = first["argv"][first["argv"].index("--session-id") + 1]
+    assert all(run["argv"][run["argv"].index("--session") + 1] == worker for run in mends)
+    assert (
+        "found no test in tests/test_parse.py with a `beagle-case:` marker" in (mends[0]["stdin"])
+    )
     assert _pursuit_calls(fake_beagle, "open") == []
+
+
+@pytest.mark.anyio
+async def test_pursuit_step_resumes_a_cases_worker_that_left_no_marker(
+    tmp_path: Path,
+    beagle: Path,
+    fake_beagle: Path,
+    fake_tau: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # R104-R131: refused "no beagle-case marker", the next call's worker read
+    # the source again; the same session adds the markers instead.
+    monkeypatch.chdir(_pursuit_project(tmp_path))
+    monkeypatch.setenv("FAKE_TAU_CASES_WRITES", json.dumps({"tests/test_parse.py": "x = 1\n"}))
+    monkeypatch.setenv("FAKE_TAU_RESUMED_WRITES", json.dumps({"tests/test_parse.py": SPEC_CASES}))
+    _source_task(fake_beagle)
+    runtime, _ = _bound(tmp_path)
+
+    result = await _tool(runtime, "pursuit_step").execute("c1", SPEC_STEP)
+
+    first, mend, *_ = _runs(fake_tau)
+    assert first["role"] == mend["role"] == "cases" and "--session" in mend["argv"]
+    assert "not opened" not in result.text
+    assert "--dry-run" not in _pursuit_calls(fake_beagle, "open")[-1]
 
 
 @pytest.mark.anyio
