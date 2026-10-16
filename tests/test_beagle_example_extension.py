@@ -7054,6 +7054,36 @@ def _r25_nodes() -> list[dict[str, Any]]:
 
 
 @pytest.mark.anyio
+async def test_plan_takes_a_title_or_the_goal_statement_as_its_task_id(
+    tmp_path: Path, beagle: Path, fake_beagle: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # R104-R131: seven "no task '<title>' in the tree" relays from pursuit_plan.
+    monkeypatch.chdir(_pursuit_project(tmp_path))
+    (fake_beagle / "tree.out").write_text(json.dumps({"nodes": _r25_nodes()}))
+    runtime, _ = _bound(tmp_path)
+    plan = _tool(runtime, "pursuit_plan")
+
+    by_title = await plan.execute(
+        "c1", {"task": "known  answers", "parts": ["Cases::write", "Docs::write"]}
+    )
+    by_goal = await plan.execute(
+        "c2", {"task": "Ship it", "parts": ["Command line::add a CLI entry point"]}
+    )
+    unknown = await plan.execute("c3", {"task": "Port it", "parts": ["A::a", "B::b"]})
+
+    assert [call[0] for call in _pursuit_calls(fake_beagle, "split")] == ["T0006"]
+    assert by_title.text.startswith("Took 'known  answers' as T0006, the task it names")
+    assert 'task="T0006"' in by_title.text
+    assert [call[call.index("--parent") + 1] for call in _pursuit_calls(fake_beagle, "add")] == [
+        "T0001"
+    ]
+    assert by_goal.text.startswith("Took 'Ship it' as T0001")
+    assert unknown.text.startswith("pursuit_plan: nothing added — no task is titled 'Port it'")
+    assert 'T0006 "Known answers"' in unknown.text
+    assert len(_pursuit_calls(fake_beagle, "split")) == 1
+
+
+@pytest.mark.anyio
 async def test_plan_split_repairs_bare_label_titles(
     tmp_path: Path, beagle: Path, fake_beagle: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

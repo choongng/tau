@@ -4725,6 +4725,40 @@ def _steer_resemblance(out: str, root: Path) -> str:
     return _RESEMBLANCE_ROUTE.sub(route, out)
 
 
+def _task_named(named: str, nodes: list[dict[str, Any]], goal: Path) -> str | None:
+    """The id of the task `named` names by title, or the root for the goal's statement.
+
+    None when no live task, or more than one, carries that title. Runs R104-R131
+    sent pursuit_plan the goal statement or a task's title as `task` seven
+    times; beagle answered "no task '<title>' in the tree" and the driver lost
+    the plan.
+    """
+    live = [n for n in nodes if n.get("status") not in ("abandoned", "superseded")]
+    ids = {str(n.get("id")) for n in live}
+    cited = [t for t in dict.fromkeys(_TASK_ID.findall(named)) if t in ids]
+    if len(cited) == 1:
+        return cited[0]
+    folded = _fold(named.strip().strip("\"'`"))
+    try:
+        statement = str(tomllib.loads(goal.read_text(encoding="utf-8"))["goal"]["statement"])
+    except (OSError, tomllib.TOMLDecodeError, KeyError, TypeError, ValueError):
+        statement = ""
+    roots = [str(n.get("id")) for n in live if not n.get("parent")]
+    goal_named = statement.strip() and folded in (_fold(statement), _fold(_task_title(statement)))
+    if goal_named and len(roots) == 1:
+        return roots[0]
+    titled = [str(n.get("id")) for n in live if _fold(str(n.get("title") or "")) == folded]
+    return titled[0] if len(titled) == 1 else None
+
+
+def _task_ids_listed(nodes: list[dict[str, Any]], limit: int = 12) -> str:
+    """The live tasks as `T0001 "title"`, for a call that named none of them."""
+    live = [n for n in nodes if n.get("status") not in ("abandoned", "superseded", "done")]
+    shown = [f'{n.get("id")} "{n.get("title") or ""}"' for n in live[:limit]]
+    more = f", and {len(live) - limit} more" if len(live) > limit else ""
+    return ", ".join(shown) + more
+
+
 def make_plan_tool() -> Any:
     """Build `pursuit_plan`: split a task into steps, or add steps to a container."""
 
@@ -4743,9 +4777,29 @@ def make_plan_tool() -> Any:
         parts = _milestone_parts(arguments.get("parts"), root, source_notes)
         if not task or not parts:
             return _step_result("pursuit_plan: 'task' and 'parts' are both required.")
+        took: list[str] = []
+        if not _TASK_ID.fullmatch(task):
+            nodes = _tree_nodes(root)
+            named = _task_named(task, nodes, goal) if nodes else None
+            if named is None and nodes:
+                return _step_result(
+                    f"pursuit_plan: nothing added — no task is titled {task!r}: `task` "
+                    f"takes a task's id. The tasks: {_task_ids_listed(nodes)}. Call "
+                    "pursuit_plan again with task set to the id these parts go under."
+                )
+            if named is not None:
+                took.append(
+                    f"Took {task!r} as {named}, the task it names; name a task by "
+                    f'its id, as task="{named}".\n\n'
+                )
+                task = named
+
+        def result(text: str) -> AgentToolResult:
+            return _step_result("".join(took) + text)
+
         parts, split_notes = _split_part_lines(parts)
         if not parts:
-            return _step_result(f"pursuit_plan: nothing added — {split_notes[0]}")
+            return result(f"pursuit_plan: nothing added — {split_notes[0]}")
         split_notes += source_notes
         cut = [part for part in parts if _fit_part(part) != part]
         parts = [_fit_part(part) for part in parts]
@@ -4756,10 +4810,10 @@ def make_plan_tool() -> Any:
             )
         setup = _setup_milestone(parts)
         if setup is not None:
-            return _step_result(f"pursuit_plan: nothing added — {setup}")
+            return result(f"pursuit_plan: nothing added — {setup}")
         rerun = _rerun_only_part(parts)
         if rerun is not None:
-            return _step_result(f"pursuit_plan: nothing added — {rerun}")
+            return result(f"pursuit_plan: nothing added — {rerun}")
         ordered = arguments.get("ordered", True) is not False
         # Run R25 sent 'T0007::…' to `split` raw, and beagle titled the task
         # 'T0007': every part goes on as the title `_split_part` repairs.
@@ -4770,7 +4824,7 @@ def make_plan_tool() -> Any:
         ]
         if unlabeled:
             why = _bare_label_refusal(task, parts, unlabeled, _tree_nodes(root))
-            return _step_result(f"pursuit_plan: nothing added — {why}")
+            return result(f"pursuit_plan: nothing added — {why}")
         for part in parts:
             label = part.partition("::")[0].strip()
             if _BARE_LABEL.fullmatch(label):
@@ -4783,7 +4837,7 @@ def make_plan_tool() -> Any:
         ]
         reading = _reading_only_part(parts)
         if reading is not None:
-            return _step_result(f"pursuit_plan: nothing added — {reading}")
+            return result(f"pursuit_plan: nothing added — {reading}")
         # A small model re-sends the plan it already made; beagle adds every
         # part again, and the copies are then worked twice.
         existing = _children(task, root)
@@ -4794,13 +4848,13 @@ def make_plan_tool() -> Any:
         ]
         parts = [part for part in parts if _part_title(part).lower() not in existing]
         if not parts:
-            return _step_result(
+            return result(
                 f"pursuit_plan: nothing added — {task} already has {', '.join(repeated)}. "
                 "Work them with pursuit_step; call it with no arguments for the next ready one."
             )
         clash = _live_title_clash(task, parts, _tree_nodes(root))
         if clash is not None:
-            return _step_result(f"pursuit_plan: nothing added — {clash}")
+            return result(f"pursuit_plan: nothing added — {clash}")
         one_step = (
             f"pursuit_plan: nothing added — {task} is already one step, so one "
             "part does not break it down: a plan needs two or more parts, which "
@@ -4811,7 +4865,7 @@ def make_plan_tool() -> Any:
         # still takes one more child; a leaf with one part is already a single
         # step. Run R15's beagle refused the part's title before it got there.
         if len(parts) == 1 and _is_leaf(task, _tree_nodes(root)):
-            return _step_result(one_step)
+            return result(one_step)
         # Read before the split, which leaves the task a container.
         scope, uncommitted = _uncommitted_in_scope(root, task)
         uncommitted_note = _uncommitted_note(task, uncommitted) if uncommitted else ""
@@ -4820,7 +4874,7 @@ def make_plan_tool() -> Any:
             # beagle says "a pending leaf" or, for one being worked, "a open
             # leaf": run R06's plan of one part on open T0002 came back raw.
             if rc != 0 and "leaf with work of its own" in out:
-                return _step_result(one_step)
+                return result(one_step)
         else:
             if uncommitted:
                 uncommitted_note = _commit_before_split(root, task, scope, uncommitted)
@@ -4831,7 +4885,7 @@ def make_plan_tool() -> Any:
             refused = f"pursuit_plan: beagle refused (exit {rc}):\n{out}"
             if uncommitted_note:
                 refused += f"\n\n{uncommitted_note}"
-            return _step_result(refused)
+            return result(refused)
         _forget_task(root, task)
         notes = "".join(f"{note}\n\n" for note in split_notes)
         if uncommitted_note:
@@ -4841,7 +4895,7 @@ def make_plan_tool() -> Any:
         if "--outcome abandoned" in out:
             notes += f"{ABANDON_HINT}\n\n"
         shown = _steer_resemblance(out, root)
-        return _step_result(f"{shown}\n\n{_tree(root)}\n\n{notes}Next: pursuit_step.")
+        return result(f"{shown}\n\n{_tree(root)}\n\n{notes}Next: pursuit_step.")
 
     return execute
 
